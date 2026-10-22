@@ -1,0 +1,239 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1000" viewBox="0 0 1280 1000" role="img" aria-labelledby="title description">
+<title id="title">Symmetria PostgreSQL benchmark: latency, throughput and query construction</title>
+<desc id="description">2026-10-21T22-14-44-402Z-d39a2a12. Dots show every pass; lines show min to max, never a confidence interval. Each panel has its own zero-based linear scale. Full accessible tables are in benchmarks/report/README.md.</desc>
+<defs><linearGradient id="bg"><stop stop-color="#080e1d"/><stop offset=".55" stop-color="#101027"/><stop offset="1" stop-color="#160d20"/></linearGradient></defs>
+<rect width="1280" height="1000" rx="24" fill="url(#bg)"/>
+<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" fill="#e7edf8">
+<text x="38" y="49" font-size="14" letter-spacing="3" fill="#59bcff">SYMMETRIA / BENCHMARKS</text>
+<text x="38" y="91" font-size="30" font-weight="650">One workload. Every pass. No overall score.</text>
+<text x="38" y="123" font-size="16" fill="#aebad0">Bun 1.3.2 · PostgreSQL 16.10 · linux/arm64 · 3 independent passes</text>
+<rect x="24" y="150" width="608" height="358" rx="16" fill="#ffffff" fill-opacity=".025" stroke="#b8c7e0" stroke-opacity=".13"/>
+<text x="42" y="184" font-size="21" font-weight="600">Nested read · keyset</text>
+<text x="42" y="210" font-size="13" fill="#aebad0">50 users × up to 3 posts × tags · lower is better</text>
+<path d="M194 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="194" y="462" text-anchor="middle" font-size="11" fill="#aebad0">0</text>
+<path d="M263.5 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="263.5" y="462" text-anchor="middle" font-size="11" fill="#aebad0">0.75</text>
+<path d="M333 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="333" y="462" text-anchor="middle" font-size="11" fill="#aebad0">1.5</text>
+<path d="M402.5 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="402.5" y="462" text-anchor="middle" font-size="11" fill="#aebad0">2.25</text>
+<path d="M472 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="472" y="462" text-anchor="middle" font-size="11" fill="#aebad0">3</text>
+<text x="42" y="243" font-size="13" fill="#94a5b8">Bun.SQL · direct</text>
+<path d="M286.1419880003765 238H287.51252799980284" stroke="#94a5b8" stroke-width="2"/>
+<circle cx="287.51252799980284" cy="235" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 1: 1.009 ms/op</title></circle>
+<circle cx="286.64387066704023" cy="238" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 2: 1.000 ms/op</title></circle>
+<circle cx="286.1419880003765" cy="241" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 3: 0.994 ms/op</title></circle>
+<path d="M286.64387066704023 231v14" stroke="#94a5b8" stroke-width="2"/>
+<text x="612" y="243" text-anchor="end" font-size="13" fill="#94a5b8">1.000</text>
+<text x="42" y="274" font-size="13" fill="#b7c6d6">Bun.SQL · page first</text>
+<path d="M287.23536200002854 269H287.93323466662935" stroke="#b7c6d6" stroke-width="2"/>
+<circle cx="287.23536200002854" cy="266" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 1: 1.006 ms/op</title></circle>
+<circle cx="287.93323466662935" cy="269" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 2: 1.014 ms/op</title></circle>
+<circle cx="287.4239386668196" cy="272" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 3: 1.008 ms/op</title></circle>
+<path d="M287.4239386668196 262v14" stroke="#b7c6d6" stroke-width="2"/>
+<text x="612" y="274" text-anchor="end" font-size="13" fill="#b7c6d6">1.008</text>
+<text x="42" y="305" font-size="13" fill="#59bcff">Symmetria</text>
+<path d="M287.81740133352525 300H288.8408120000944" stroke="#59bcff" stroke-width="2"/>
+<circle cx="288.8408120000944" cy="297" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 1: 1.023 ms/op</title></circle>
+<circle cx="287.81740133352525" cy="300" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 2: 1.012 ms/op</title></circle>
+<circle cx="288.72701733333577" cy="303" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 3: 1.022 ms/op</title></circle>
+<path d="M288.72701733333577 293v14" stroke="#59bcff" stroke-width="2"/>
+<text x="612" y="305" text-anchor="end" font-size="13" fill="#59bcff">1.022</text>
+<text x="42" y="336" font-size="13" fill="#b9cf8b">Drizzle</text>
+<path d="M317.82249733357946 331H323.7105373331675" stroke="#b9cf8b" stroke-width="2"/>
+<circle cx="323.7105373331675" cy="328" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 1: 1.400 ms/op</title></circle>
+<circle cx="317.82249733357946" cy="331" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 2: 1.336 ms/op</title></circle>
+<circle cx="320.0929233335677" cy="334" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 3: 1.361 ms/op</title></circle>
+<path d="M320.0929233335677 324v14" stroke="#b9cf8b" stroke-width="2"/>
+<text x="612" y="336" text-anchor="end" font-size="13" fill="#b9cf8b">1.361</text>
+<text x="42" y="367" font-size="13" fill="#aca0ff">Kysely</text>
+<path d="M283.23067933319055 362H285.6284293331313" stroke="#aca0ff" stroke-width="2"/>
+<circle cx="283.4746706665295" cy="359" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 1: 0.966 ms/op</title></circle>
+<circle cx="283.23067933319055" cy="362" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 2: 0.963 ms/op</title></circle>
+<circle cx="285.6284293331313" cy="365" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 3: 0.989 ms/op</title></circle>
+<path d="M283.4746706665295 355v14" stroke="#aca0ff" stroke-width="2"/>
+<text x="612" y="367" text-anchor="end" font-size="13" fill="#aca0ff">0.966</text>
+<text x="42" y="398" font-size="13" fill="#f68bda">Prisma · join</text>
+<path d="M392.15182066678244 393H396.5876813336169" stroke="#f68bda" stroke-width="2"/>
+<circle cx="396.5876813336169" cy="390" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 1: 2.186 ms/op</title></circle>
+<circle cx="394.54716133324837" cy="393" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 2: 2.164 ms/op</title></circle>
+<circle cx="392.15182066678244" cy="396" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 3: 2.138 ms/op</title></circle>
+<path d="M394.54716133324837 386v14" stroke="#f68bda" stroke-width="2"/>
+<text x="612" y="398" text-anchor="end" font-size="13" fill="#f68bda">2.164</text>
+<text x="42" y="429" font-size="13" fill="#d6a3c9">Prisma · query</text>
+<path d="M359.1456220001589 424H361.29836133341934" stroke="#d6a3c9" stroke-width="2"/>
+<circle cx="359.1456220001589" cy="421" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 1: 1.782 ms/op</title></circle>
+<circle cx="361.29836133341934" cy="424" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 2: 1.805 ms/op</title></circle>
+<circle cx="359.49719933317346" cy="427" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 3: 1.786 ms/op</title></circle>
+<path d="M359.49719933317346 417v14" stroke="#d6a3c9" stroke-width="2"/>
+<text x="612" y="429" text-anchor="end" font-size="13" fill="#d6a3c9">1.786</text>
+<text x="612" y="462" text-anchor="end" font-size="11" fill="#aebad0">ms/op</text>
+<rect x="648" y="150" width="608" height="358" rx="16" fill="#ffffff" fill-opacity=".025" stroke="#b8c7e0" stroke-opacity=".13"/>
+<text x="666" y="184" font-size="21" font-weight="600">Bulk INSERT · 500 rows</text>
+<text x="666" y="210" font-size="13" fill="#aebad0">Durable writes · no RETURNING · lower is better</text>
+<path d="M818 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="818" y="462" text-anchor="middle" font-size="11" fill="#aebad0">0</text>
+<path d="M887.5 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="887.5" y="462" text-anchor="middle" font-size="11" fill="#aebad0">7.5</text>
+<path d="M957 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="957" y="462" text-anchor="middle" font-size="11" fill="#aebad0">15</text>
+<path d="M1026.5 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="1026.5" y="462" text-anchor="middle" font-size="11" fill="#aebad0">22.5</text>
+<path d="M1096 228V442" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="1096" y="462" text-anchor="middle" font-size="11" fill="#aebad0">30</text>
+<text x="666" y="243" font-size="13" fill="#94a5b8">Bun.SQL · direct</text>
+<path d="M855.7521219999782 238H856.301246133322" stroke="#94a5b8" stroke-width="2"/>
+<circle cx="855.7521219999782" cy="235" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 1: 4.074 ms/batch</title></circle>
+<circle cx="855.9475745333364" cy="238" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 2: 4.095 ms/batch</title></circle>
+<circle cx="856.301246133322" cy="241" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 3: 4.133 ms/batch</title></circle>
+<path d="M855.9475745333364 231v14" stroke="#94a5b8" stroke-width="2"/>
+<text x="1236" y="243" text-anchor="end" font-size="13" fill="#94a5b8">4.095</text>
+<text x="666" y="274" font-size="13" fill="#b7c6d6">Bun.SQL · page first</text>
+<path d="M854.0412080666441 269H856.8846662000127" stroke="#b7c6d6" stroke-width="2"/>
+<circle cx="855.1366392666554" cy="266" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 1: 4.008 ms/batch</title></circle>
+<circle cx="854.0412080666441" cy="269" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 2: 3.889 ms/batch</title></circle>
+<circle cx="856.8846662000127" cy="272" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 3: 4.196 ms/batch</title></circle>
+<path d="M855.1366392666554 262v14" stroke="#b7c6d6" stroke-width="2"/>
+<text x="1236" y="274" text-anchor="end" font-size="13" fill="#b7c6d6">4.008</text>
+<text x="666" y="305" font-size="13" fill="#59bcff">Symmetria</text>
+<path d="M864.2121624000067 300H865.6002071333321" stroke="#59bcff" stroke-width="2"/>
+<circle cx="864.5778806666918" cy="297" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 1: 5.026 ms/batch</title></circle>
+<circle cx="864.2121624000067" cy="300" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 2: 4.987 ms/batch</title></circle>
+<circle cx="865.6002071333321" cy="303" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 3: 5.137 ms/batch</title></circle>
+<path d="M864.5778806666918 293v14" stroke="#59bcff" stroke-width="2"/>
+<text x="1236" y="305" text-anchor="end" font-size="13" fill="#59bcff">5.026</text>
+<text x="666" y="336" font-size="13" fill="#b9cf8b">Drizzle</text>
+<path d="M914.7305633333235 331H917.9656122666032" stroke="#b9cf8b" stroke-width="2"/>
+<circle cx="917.9656122666032" cy="328" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 1: 10.788 ms/batch</title></circle>
+<circle cx="914.7305633333235" cy="331" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 2: 10.439 ms/batch</title></circle>
+<circle cx="915.1263241333314" cy="334" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 3: 10.481 ms/batch</title></circle>
+<path d="M915.1263241333314 324v14" stroke="#b9cf8b" stroke-width="2"/>
+<text x="1236" y="336" text-anchor="end" font-size="13" fill="#b9cf8b">10.481</text>
+<text x="666" y="367" font-size="13" fill="#aca0ff">Kysely</text>
+<path d="M861.2438266666373 362H861.8114655999786" stroke="#aca0ff" stroke-width="2"/>
+<circle cx="861.2438266666373" cy="359" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 1: 4.667 ms/batch</title></circle>
+<circle cx="861.8114655999786" cy="362" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 2: 4.728 ms/batch</title></circle>
+<circle cx="861.758719733323" cy="365" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 3: 4.722 ms/batch</title></circle>
+<path d="M861.758719733323 355v14" stroke="#aca0ff" stroke-width="2"/>
+<text x="1236" y="367" text-anchor="end" font-size="13" fill="#aca0ff">4.722</text>
+<text x="666" y="398" font-size="13" fill="#f68bda">Prisma · join</text>
+<path d="M1011.3589801999885 393H1021.2560396666693" stroke="#f68bda" stroke-width="2"/>
+<circle cx="1011.3589801999885" cy="390" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 1: 20.866 ms/batch</title></circle>
+<circle cx="1021.2560396666693" cy="393" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 2: 21.934 ms/batch</title></circle>
+<circle cx="1020.0076343333188" cy="396" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 3: 21.799 ms/batch</title></circle>
+<path d="M1020.0076343333188 386v14" stroke="#f68bda" stroke-width="2"/>
+<text x="1236" y="398" text-anchor="end" font-size="13" fill="#f68bda">21.799</text>
+<text x="666" y="429" font-size="13" fill="#d6a3c9">Prisma · query</text>
+<path d="M1006.8006790666713 424H1021.9015834666543" stroke="#d6a3c9" stroke-width="2"/>
+<circle cx="1006.8006790666713" cy="421" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 1: 20.374 ms/batch</title></circle>
+<circle cx="1012.0941141333295" cy="424" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 2: 20.945 ms/batch</title></circle>
+<circle cx="1021.9015834666543" cy="427" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 3: 22.004 ms/batch</title></circle>
+<path d="M1012.0941141333295 417v14" stroke="#d6a3c9" stroke-width="2"/>
+<text x="1236" y="429" text-anchor="end" font-size="13" fill="#d6a3c9">20.945</text>
+<text x="1236" y="462" text-anchor="end" font-size="11" fill="#aebad0">ms/batch</text>
+<rect x="24" y="524" width="608" height="358" rx="16" fill="#ffffff" fill-opacity=".025" stroke="#b8c7e0" stroke-opacity=".13"/>
+<text x="42" y="558" font-size="21" font-weight="600">Point lookup · concurrency 16</text>
+<text x="42" y="584" font-size="13" fill="#aebad0">Application operations, not SQL statements · higher is better</text>
+<path d="M194 602V816" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="194" y="836" text-anchor="middle" font-size="11" fill="#aebad0">0k</text>
+<path d="M263.5 602V816" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="263.5" y="836" text-anchor="middle" font-size="11" fill="#aebad0">20k</text>
+<path d="M333 602V816" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="333" y="836" text-anchor="middle" font-size="11" fill="#aebad0">40k</text>
+<path d="M402.5 602V816" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="402.5" y="836" text-anchor="middle" font-size="11" fill="#aebad0">60k</text>
+<path d="M472 602V816" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="472" y="836" text-anchor="middle" font-size="11" fill="#aebad0">80k</text>
+<text x="42" y="617" font-size="13" fill="#94a5b8">Bun.SQL · direct</text>
+<path d="M391.8178630213979 612H396.9314834742443" stroke="#94a5b8" stroke-width="2"/>
+<circle cx="396.8253898522944" cy="609" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 1: 58367.019 ops/s</title></circle>
+<circle cx="391.8178630213979" cy="612" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 2: 56926.004 ops/s</title></circle>
+<circle cx="396.9314834742443" cy="615" r="3" fill="#94a5b8" fill-opacity=".65"><title>Pass 3: 58397.549 ops/s</title></circle>
+<path d="M396.8253898522944 605v14" stroke="#94a5b8" stroke-width="2"/>
+<text x="612" y="617" text-anchor="end" font-size="13" fill="#94a5b8">58,367</text>
+<text x="42" y="648" font-size="13" fill="#b7c6d6">Bun.SQL · page first</text>
+<path d="M387.33212314476685 643H395.9245149586275" stroke="#b7c6d6" stroke-width="2"/>
+<circle cx="387.33212314476685" cy="640" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 1: 55635.143 ops/s</title></circle>
+<circle cx="395.9245149586275" cy="643" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 2: 58107.774 ops/s</title></circle>
+<circle cx="392.9733618411126" cy="646" r="3" fill="#b7c6d6" fill-opacity=".65"><title>Pass 3: 57258.521 ops/s</title></circle>
+<path d="M392.9733618411126 636v14" stroke="#b7c6d6" stroke-width="2"/>
+<text x="612" y="648" text-anchor="end" font-size="13" fill="#b7c6d6">57,259</text>
+<text x="42" y="679" font-size="13" fill="#59bcff">Symmetria</text>
+<path d="M295.4442180781922 674H307.3975650565234" stroke="#59bcff" stroke-width="2"/>
+<circle cx="304.6357632574053" cy="671" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 1: 31837.630 ops/s</title></circle>
+<circle cx="307.3975650565234" cy="674" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 2: 32632.393 ops/s</title></circle>
+<circle cx="295.4442180781922" cy="677" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 3: 29192.581 ops/s</title></circle>
+<path d="M304.6357632574053 667v14" stroke="#59bcff" stroke-width="2"/>
+<text x="612" y="679" text-anchor="end" font-size="13" fill="#59bcff">31,838</text>
+<text x="42" y="710" font-size="13" fill="#b9cf8b">Drizzle</text>
+<path d="M282.2441660657929 705H285.8021366445464" stroke="#b9cf8b" stroke-width="2"/>
+<circle cx="282.48270245332674" cy="702" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 1: 25462.648 ops/s</title></circle>
+<circle cx="285.8021366445464" cy="705" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 2: 26417.881 ops/s</title></circle>
+<circle cx="282.2441660657929" cy="708" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 3: 25394.005 ops/s</title></circle>
+<path d="M282.48270245332674 698v14" stroke="#b9cf8b" stroke-width="2"/>
+<text x="612" y="710" text-anchor="end" font-size="13" fill="#b9cf8b">25,463</text>
+<text x="42" y="741" font-size="13" fill="#aca0ff">Kysely</text>
+<path d="M278.77408257196424 736H320.72447460285395" stroke="#aca0ff" stroke-width="2"/>
+<circle cx="278.77408257196424" cy="733" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 1: 24395.419 ops/s</title></circle>
+<circle cx="320.662464905544" cy="736" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 2: 36449.630 ops/s</title></circle>
+<circle cx="320.72447460285395" cy="739" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 3: 36467.475 ops/s</title></circle>
+<path d="M320.662464905544 729v14" stroke="#aca0ff" stroke-width="2"/>
+<text x="612" y="741" text-anchor="end" font-size="13" fill="#aca0ff">36,450</text>
+<text x="42" y="772" font-size="13" fill="#f68bda">Prisma · join</text>
+<path d="M429.706706323136 767H446.68660254187415" stroke="#f68bda" stroke-width="2"/>
+<circle cx="446.68660254187415" cy="764" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 1: 72715.569 ops/s</title></circle>
+<circle cx="429.706706323136" cy="767" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 2: 67829.268 ops/s</title></circle>
+<circle cx="434.3628160165582" cy="770" r="3" fill="#f68bda" fill-opacity=".65"><title>Pass 3: 69169.156 ops/s</title></circle>
+<path d="M434.3628160165582 760v14" stroke="#f68bda" stroke-width="2"/>
+<text x="612" y="772" text-anchor="end" font-size="13" fill="#f68bda">69,169</text>
+<text x="42" y="803" font-size="13" fill="#d6a3c9">Prisma · query</text>
+<path d="M423.50783278471135 798H450.397446507855" stroke="#d6a3c9" stroke-width="2"/>
+<circle cx="450.397446507855" cy="795" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 1: 73783.438 ops/s</title></circle>
+<circle cx="436.20341118934584" cy="798" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 2: 69698.823 ops/s</title></circle>
+<circle cx="423.50783278471135" cy="801" r="3" fill="#d6a3c9" fill-opacity=".65"><title>Pass 3: 66045.420 ops/s</title></circle>
+<path d="M436.20341118934584 791v14" stroke="#d6a3c9" stroke-width="2"/>
+<text x="612" y="803" text-anchor="end" font-size="13" fill="#d6a3c9">69,699</text>
+<text x="612" y="836" text-anchor="end" font-size="11" fill="#aebad0">ops/s</text>
+<rect x="648" y="524" width="608" height="358" rx="16" fill="#ffffff" fill-opacity=".025" stroke="#b8c7e0" stroke-opacity=".13"/>
+<text x="666" y="558" font-size="21" font-weight="600">Build + compile · no database</text>
+<text x="666" y="584" font-size="13" fill="#aebad0">Fresh query each time · 100 builds/sample · lower is better</text>
+<path d="M818 602V692" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="818" y="712" text-anchor="middle" font-size="11" fill="#aebad0">0</text>
+<path d="M887.5 602V692" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="887.5" y="712" text-anchor="middle" font-size="11" fill="#aebad0">50</text>
+<path d="M957 602V692" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="957" y="712" text-anchor="middle" font-size="11" fill="#aebad0">100</text>
+<path d="M1026.5 602V692" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="1026.5" y="712" text-anchor="middle" font-size="11" fill="#aebad0">150</text>
+<path d="M1096 602V692" stroke="#b8c7e0" stroke-opacity=".12"/>
+<text x="1096" y="712" text-anchor="middle" font-size="11" fill="#aebad0">200</text>
+<text x="666" y="617" font-size="13" fill="#59bcff">Symmetria</text>
+<path d="M866.7046130999806 612H869.5256458999756" stroke="#59bcff" stroke-width="2"/>
+<circle cx="867.2623228000659" cy="609" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 1: 35.441 µs/build</title></circle>
+<circle cx="869.5256458999756" cy="612" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 2: 37.069 µs/build</title></circle>
+<circle cx="866.7046130999806" cy="615" r="3" fill="#59bcff" fill-opacity=".65"><title>Pass 3: 35.039 µs/build</title></circle>
+<path d="M867.2623228000659 605v14" stroke="#59bcff" stroke-width="2"/>
+<text x="1236" y="617" text-anchor="end" font-size="13" fill="#59bcff">35.4</text>
+<text x="666" y="648" font-size="13" fill="#b9cf8b">Drizzle</text>
+<path d="M1036.034704999988 643H1037.0633189" stroke="#b9cf8b" stroke-width="2"/>
+<circle cx="1036.8990069999993" cy="640" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 1: 157.481 µs/build</title></circle>
+<circle cx="1036.034704999988" cy="643" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 2: 156.859 µs/build</title></circle>
+<circle cx="1037.0633189" cy="646" r="3" fill="#b9cf8b" fill-opacity=".65"><title>Pass 3: 157.600 µs/build</title></circle>
+<path d="M1036.8990069999993 636v14" stroke="#b9cf8b" stroke-width="2"/>
+<text x="1236" y="648" text-anchor="end" font-size="13" fill="#b9cf8b">157.5</text>
+<text x="666" y="679" font-size="13" fill="#aca0ff">Kysely</text>
+<path d="M846.9679613999557 674H847.9476890000042" stroke="#aca0ff" stroke-width="2"/>
+<circle cx="846.9679613999557" cy="671" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 1: 20.840 µs/build</title></circle>
+<circle cx="847.9476890000042" cy="674" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 2: 21.545 µs/build</title></circle>
+<circle cx="847.2229847000214" cy="677" r="3" fill="#aca0ff" fill-opacity=".65"><title>Pass 3: 21.024 µs/build</title></circle>
+<path d="M847.2229847000214 667v14" stroke="#aca0ff" stroke-width="2"/>
+<text x="1236" y="679" text-anchor="end" font-size="13" fill="#aca0ff">21.0</text>
+<text x="1236" y="712" text-anchor="end" font-size="11" fill="#aebad0">µs/build</text>
+<text x="666" y="772" font-size="13" fill="#aebad0">Raw: no query compiler. Prisma: no equivalent sync API.</text>
+<text x="666" y="796" font-size="13" fill="#aebad0">Prepared OFFSET cases are in the full report.</text>
+<text x="38" y="927" font-size="13" fill="#aebad0">Dots = individual passes · tick = median · line = min–max · linear axes start at zero · each panel has its own scale</text>
+<text x="38" y="950" font-size="13" fill="#aebad0">Warm synthetic workload · 2,000 users / 40,000 posts · durability on · environment + limits in full report</text>
+<text x="38" y="975" font-size="12" fill="#7e90ac">Run 2026-10-21T22-14-44-402Z-d39a2a12 · source 0f1b78cf491d2523 · tables + raw samples: benchmarks/</text>
+</g></svg>

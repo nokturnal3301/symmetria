@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.build/
+*.tgz
+packages/runtime/LICENSE
+packages/kit/LICENSE
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+.symmetria-generate.lock/
+.symmetria-*/

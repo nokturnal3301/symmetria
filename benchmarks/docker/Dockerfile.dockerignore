@@ -1,0 +1,14 @@
+**
+!tsconfig.json
+!packages
+!packages/runtime
+!packages/runtime/src
+!packages/runtime/src/**
+!packages/kit
+!packages/kit/src
+!packages/kit/src/**
+!benchmarks
+!benchmarks/**
+benchmarks/node_modules
+benchmarks/.cache
+benchmarks/report

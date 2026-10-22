@@ -1,0 +1,12 @@
+{
+  "name": "@symmetria/style",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dependencies": {
+    "@typescript-eslint/parser": "^8.72.0",
+    "typescript": "^6.0.0"
+  }
+}

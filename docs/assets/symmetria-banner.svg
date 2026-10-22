@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="480" viewBox="0 0 1280 480" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">Symmetria — animated wordmark cover</title>
+  <desc id="description">Symmetria in a minimal sans-serif wordmark beside a mirrored ribbon of blue, violet and pink light. Fine filaments breathe, luminous particles follow the continuous curve, and distant points slowly orbit the composition.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1280" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#080e1d"/><stop offset=".5" stop-color="#101027"/><stop offset="1" stop-color="#160d20"/>
+    </linearGradient>
+    <linearGradient id="spectrum" x1="-190" y1="0" x2="190" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#59bcff"/><stop offset=".48" stop-color="#aca0ff"/><stop offset="1" stop-color="#f68bda"/>
+    </linearGradient>
+    <radialGradient id="blue"><stop stop-color="#418fff" stop-opacity=".2"/><stop offset="1" stop-color="#418fff" stop-opacity="0"/></radialGradient>
+    <radialGradient id="pink"><stop stop-color="#c45cf5" stop-opacity=".2"/><stop offset="1" stop-color="#c45cf5" stop-opacity="0"/></radialGradient>
+    <radialGradient id="vignette"><stop offset=".35" stop-color="#080b16" stop-opacity="0"/><stop offset="1" stop-color="#080b16" stop-opacity=".5"/></radialGradient>
+    <filter id="glow" x="-60%" y="-100%" width="220%" height="300%"><feGaussianBlur stdDeviation="10"/></filter>
+    <filter id="point" x="-200%" y="-200%" width="500%" height="500%"><feGaussianBlur stdDeviation="3"/></filter>
+    <path id="ribbon" pathLength="1000" d="M0 0C-70-108-174-108-174 0S-70 108 0 0C70-108 174-108 174 0S70 108 0 0Z"/>
+    <clipPath id="bounds"><rect x="1" y="1" width="1278" height="478" rx="24"/></clipPath>
+  </defs>
+  <style>
+    .current { stroke-dasharray: 4 996; animation: current 10s linear infinite; }
+    .second { animation-delay: -5s; }
+    .third { animation-delay: -2.5s; }
+    .fourth { animation-delay: -7.5s; }
+    .drift { animation: drift 14s ease-in-out infinite; }
+    .breathe { animation: breathe 7s ease-in-out infinite; }
+    .orbit { animation: orbit 65s linear infinite; }
+    .counter { animation: orbit 85s linear infinite reverse; }
+    .halo { animation: halo 12s ease-in-out infinite; }
+    @keyframes current { to { stroke-dashoffset: -1000; } }
+    @keyframes drift { 0%,100% { transform: rotate(-24deg); } 50% { transform: rotate(-17deg); } }
+    @keyframes breathe { 0%,100% { opacity: .4; } 50% { opacity: .85; } }
+    @keyframes orbit { to { transform: rotate(360deg); } }
+    @keyframes halo { 0%,100% { transform: scale(1); opacity: .6; } 50% { transform: scale(1.12); opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .current,.drift,.breathe,.orbit,.counter,.halo { animation: none; }
+      .drift { transform: rotate(-24deg); }
+    }
+  </style>
+  <rect x="1" y="1" width="1278" height="478" rx="24" fill="url(#background)" stroke="#252b42"/>
+  <g clip-path="url(#bounds)">
+    <g transform="translate(640 240)">
+      <g class="halo">
+        <ellipse cx="-160" cy="65" rx="390" ry="260" fill="url(#blue)"/>
+        <ellipse cx="160" cy="-65" rx="390" ry="260" fill="url(#pink)"/>
+      </g>
+      <ellipse rx="565" ry="187" stroke="#a5a5f6" stroke-opacity=".06"/>
+      <ellipse rx="480" ry="213" stroke="#a5a5f6" stroke-opacity=".05"/>
+      <g transform="scale(1.6 .68)">
+        <g class="orbit">
+          <circle r="270" stroke="#a5a5f6" stroke-opacity=".055"/>
+          <circle cx="270" r="2" fill="#b8bbf8" opacity=".6"/>
+          <circle cx="-270" r="2" fill="#b8bbf8" opacity=".6"/>
+        </g>
+      </g>
+      <g transform="scale(1.8 .76)">
+        <g class="counter">
+          <circle cy="230" r="1.5" fill="#e2c3ff" opacity=".65"/>
+          <circle cy="-230" r="1.5" fill="#b3dcff" opacity=".65"/>
+        </g>
+      </g>
+      <g transform="translate(-370 0) scale(.95)">
+        <g class="drift" transform="rotate(-24)">
+          <use href="#ribbon" stroke="url(#spectrum)" stroke-width="30" opacity=".55" filter="url(#glow)" class="breathe"/>
+          <g stroke="url(#spectrum)">
+            <use href="#ribbon" transform="scale(1.12 1.48)" stroke-width=".5" opacity=".12"/>
+            <use href="#ribbon" transform="scale(1.09 1.36)" stroke-width=".6" opacity=".2"/>
+            <use href="#ribbon" transform="scale(1.06 1.24)" stroke-width=".7" opacity=".35"/>
+            <use href="#ribbon" transform="scale(1.03 1.12)" stroke-width=".9" opacity=".6"/>
+            <use href="#ribbon" stroke="#0c1024" stroke-width="12"/>
+            <use href="#ribbon" stroke-width="5"/>
+            <use href="#ribbon" transform="scale(.97 .88)" stroke-width=".9" opacity=".65"/>
+            <use href="#ribbon" transform="scale(.94 .76)" stroke-width=".7" opacity=".4"/>
+            <use href="#ribbon" transform="scale(.91 .64)" stroke-width=".6" opacity=".25"/>
+            <use href="#ribbon" transform="scale(.88 .52)" stroke-width=".5" opacity=".12"/>
+          </g>
+          <g stroke-linecap="round">
+            <use href="#ribbon" stroke="#e5e5ff" stroke-width="6" filter="url(#point)" class="current"/>
+            <use href="#ribbon" stroke="#e5e5ff" stroke-width="6" filter="url(#point)" class="current second"/>
+            <use href="#ribbon" stroke="#f6eeff" stroke-width="2.5" class="current"/>
+            <use href="#ribbon" stroke="#f6eeff" stroke-width="2.5" class="current second"/>
+            <use href="#ribbon" transform="scale(1.03 1.12)" stroke="#cfdbff" stroke-width="1.5" class="current third"/>
+            <use href="#ribbon" transform="scale(.97 .88)" stroke="#eccaff" stroke-width="1.5" class="current fourth"/>
+          </g>
+        </g>
+      </g>
+    </g>
+    <rect width="1280" height="480" fill="url(#vignette)"/>
+    <!-- Avenir Next Medium, outlined for consistent rendering. -->
+    <g id="wordmark" transform="translate(516 270) scale(.128 -.128)" fill="#eeedf5">
+      <path d="M438 577Q417 606 381 624.5Q345 643 300 643Q276 643 251.5 636.5Q227 630 207 615.5Q187 601 174.5 579.5Q162 558 162 528Q162 499 173.5 479.5Q185 460 204.5 446.5Q224 433 250.5 423.5Q277 414 307 404Q343 393 380 379Q417 365 447 342Q477 319 496 284.5Q515 250 515 197Q515 142 494.5 101.5Q474 61 440 34.5Q406 8 361.5 -5Q317 -18 270 -18Q203 -18 140.5 8Q78 34 37 85L114 150Q139 113 181 90Q223 67 272 67Q297 67 322 74Q347 81 367.5 96Q388 111 401 133.5Q414 156 414 188Q414 220 400.5 241.5Q387 263 364 278Q341 293 310.5 303.5Q280 314 246 325Q212 335 179 349.5Q146 364 120 386.5Q94 409 78 442Q62 475 62 524Q62 577 83.5 615Q105 653 139.5 678Q174 703 217.5 714.5Q261 726 305 726Q367 726 421 704Q475 682 508 645Z"/>
+      <path d="M824 102H826L957 474H1057L827 -112Q815 -142 801 -165.5Q787 -189 768 -205.5Q749 -222 723.5 -231Q698 -240 663 -240Q648 -240 632.5 -238.5Q617 -237 601 -233L610 -150Q634 -158 657 -158Q694 -158 712 -137.5Q730 -117 745 -79L775 0L572 474H677Z"/>
+      <path d="M1234 396Q1252 434 1291.5 460.5Q1331 487 1385 487Q1433 487 1471.5 465Q1510 443 1532 392Q1556 438 1599 462.5Q1642 487 1693 487Q1739 487 1772 471.5Q1805 456 1827 430Q1849 404 1859.5 369Q1870 334 1870 294V0H1776V263Q1776 292 1771 318Q1766 344 1754 364Q1742 384 1722 396Q1702 408 1671 408Q1639 408 1616 394.5Q1593 381 1578.5 359.5Q1564 338 1557.5 311Q1551 284 1551 256V0H1457V282Q1457 310 1452 333Q1447 356 1435 372.5Q1423 389 1404 398.5Q1385 408 1357 408Q1305 408 1270.5 365.5Q1236 323 1236 252V0H1142V372Q1142 391 1141 421Q1140 451 1138 474H1227Q1229 456 1230 433.5Q1231 411 1231 396H1234Z"/>
+      <path d="M2115 396Q2133 434 2172.5 460.5Q2212 487 2266 487Q2314 487 2352.5 465Q2391 443 2413 392Q2437 438 2480 462.5Q2523 487 2574 487Q2620 487 2653 471.5Q2686 456 2708 430Q2730 404 2740.5 369Q2751 334 2751 294V0H2657V263Q2657 292 2652 318Q2647 344 2635 364Q2623 384 2603 396Q2583 408 2552 408Q2520 408 2497 394.5Q2474 381 2459.5 359.5Q2445 338 2438.5 311Q2432 284 2432 256V0H2338V282Q2338 310 2333 333Q2328 356 2316 372.5Q2304 389 2285 398.5Q2266 408 2238 408Q2186 408 2151.5 365.5Q2117 323 2117 252V0H2023V372Q2023 391 2022 421Q2021 451 2019 474H2108Q2110 456 2111 433.5Q2112 411 2112 396H2115Z"/>
+      <path d="M3251 279Q3250 307 3241.5 331.5Q3233 356 3216.5 374Q3200 392 3175.5 402.5Q3151 413 3118 413Q3088 413 3061.5 402.5Q3035 392 3015.5 374Q2996 356 2983.5 331.5Q2971 307 2969 279ZM3346 241Q3346 233 3346 225Q3346 217 3345 209H2969Q2970 179 2982.5 152.5Q2995 126 3016 106.5Q3037 87 3064.5 76Q3092 65 3123 65Q3171 65 3206 86Q3241 107 3261 137L3327 84Q3289 34 3237.5 10.5Q3186 -13 3123 -13Q3069 -13 3023 5Q2977 23 2944 55.5Q2911 88 2892 134Q2873 180 2873 236Q2873 291 2891.5 337.5Q2910 384 2943 417Q2976 450 3021 468.5Q3066 487 3118 487Q3170 487 3212.5 470Q3255 453 3284.5 421Q3314 389 3330 343.5Q3346 298 3346 241Z"/>
+      <path d="M3703 397H3577V150Q3577 107 3593 88.5Q3609 70 3644 70Q3657 70 3672 73Q3687 76 3699 82L3702 5Q3685 -1 3664.5 -4.5Q3644 -8 3622 -8Q3555 -8 3519.5 29Q3484 66 3484 140V397H3393V474H3484V610H3577V474H3703Z"/>
+      <path d="M3794 372Q3794 391 3793 421Q3792 451 3790 474H3879Q3881 456 3882 432.5Q3883 409 3883 394H3886Q3906 436 3944.5 461.5Q3983 487 4031 487Q4053 487 4068 483L4064 396Q4044 401 4021 401Q3987 401 3962 388.5Q3937 376 3920.5 355Q3904 334 3896 306.5Q3888 279 3888 249V0H3794V372Z"/>
+      <path d="M4245 0H4151V474H4245ZM4261 645Q4261 619 4242.5 602Q4224 585 4198 585Q4172 585 4154 602.5Q4136 620 4136 645Q4136 671 4154 688.5Q4172 706 4198 706Q4224 706 4242.5 688.5Q4261 671 4261 645Z"/>
+      <path d="M4698 307Q4698 360 4666 385.5Q4634 411 4581 411Q4541 411 4505.5 395.5Q4470 380 4446 356L4396 416Q4431 449 4481.5 468Q4532 487 4590 487Q4641 487 4678.5 472.5Q4716 458 4740 433Q4764 408 4776 374Q4788 340 4788 301V94Q4788 70 4789.5 43.5Q4791 17 4795 0H4710Q4702 34 4702 68H4699Q4673 30 4633.5 9Q4594 -12 4540 -12Q4512 -12 4481.5 -4.5Q4451 3 4426 20Q4401 37 4384.5 65Q4368 93 4368 134Q4368 188 4397 219.5Q4426 251 4473 267.5Q4520 284 4579 289Q4638 294 4698 294ZM4675 226Q4640 226 4602.5 223Q4565 220 4534.5 211Q4504 202 4484 184Q4464 166 4464 136Q4464 115 4472.5 101Q4481 87 4495 78Q4509 69 4526 65.5Q4543 62 4561 62Q4627 62 4662.5 101.5Q4698 141 4698 201V226Z"/>
+    </g>
+  </g>
+</svg>

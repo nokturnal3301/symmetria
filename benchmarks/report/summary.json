@@ -1,0 +1,1832 @@
+{
+  "run": "2026-10-21T22-14-44-402Z-d39a2a12",
+  "environment": {
+    "bun": "1.3.2",
+    "postgres": "PostgreSQL 16.10 (Debian 16.10-1.pgdg12+1) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+    "arch": "arm64",
+    "host": "Apple M3 Pro",
+    "vm": "OrbStack",
+    "passes": 3
+  },
+  "sourceHash": "0f1b78cf491d252395f8be4af9481c4c78dda3c7a361c21955da88fad8ce564d",
+  "manifestHash": "f850f551f0ea0e5516fc7a54708b2bd6a2505b51ffd146f7a15f9103009757fc",
+  "archive": "data.tar.gz",
+  "archiveBytes": 6597555,
+  "archiveSha256": "aabdd58900bedbb0664a0d0b963c9f248bc60eaeb668a0ae45570cc5e38c97e4",
+  "renderer": {
+    "src/publish.ts": "23a857a09706c2d00773d2e1068eefbaf66ec4cb48bee2829954970bb52be85e",
+    "src/report.ts": "11fb7d9caa25e0f895f243c10545e6a42edff17102ebcce77fc7ea3a9d644a35",
+    "src/harness/summary.ts": "3ea3697513677db3ee6495a874e2a688d07054e35795758ce0df280a262acbad",
+    "src/render/report.ts": "8f7a6b87d10e34401fa73c1115ebe8e10961e57a2c5f765405f87c1d58514b13",
+    "src/render/animate.py": "3d7ad761b3da05c93cbf47c6e5169b778de8addf947bb8f8b9bfd4bc5be920c9"
+  },
+  "generated": {
+    "report/README.md": "13687942cff669858f754e9552686f73fe2d306c58f4c2a772e7c89cef546f12",
+    "docs/assets/benchmarks.svg": "f3c963fd37130bc0a9bd1b3650556b102234efd70b7103fcb38c8dba117e67a9",
+    "docs/assets/benchmarks.gif": "4eb8e3cccac48bd072f65d0990ee16622709926daa53ffac0b6e53aecc59f1d0"
+  },
+  "summary": {
+    "pointLookup": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 0.042666999999937616,
+        "p50MinMs": 0.01704199999994671,
+        "p50MaxMs": 0.04287500000009459,
+        "p50PassesMs": [
+          0.04287500000009459,
+          0.01704199999994671,
+          0.042666999999937616
+        ],
+        "p95Ms": 0.055292000000008557,
+        "p99Ms": 0.06037500000002183,
+        "samplesMin": 55332,
+        "samplesMax": 64789,
+        "sequentialOps": 28764.499382652742,
+        "concurrentOps": 58367.018662530754,
+        "concurrentMin": 56926.003747164854,
+        "concurrentMax": 58397.54920122139,
+        "concurrentPasses": [
+          58367.018662530754,
+          56926.003747164854,
+          58397.54920122139
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 0.04454200000009223,
+        "p50MinMs": 0.04382599999996728,
+        "p50MaxMs": 0.050787000000013904,
+        "p50PassesMs": [
+          0.04454200000009223,
+          0.04382599999996728,
+          0.050787000000013904
+        ],
+        "p95Ms": 0.055250999999998385,
+        "p99Ms": 0.06125100000008388,
+        "samplesMin": 42392,
+        "samplesMax": 49502,
+        "sequentialOps": 23311.67693462247,
+        "concurrentOps": 57258.52139312593,
+        "concurrentMin": 55635.14335101204,
+        "concurrentMax": 58107.774088813676,
+        "concurrentPasses": [
+          55635.14335101204,
+          58107.774088813676,
+          57258.52139312593
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 0.024667000000135886,
+        "p50MinMs": 0.024581999999895743,
+        "p50MaxMs": 0.054542000000083135,
+        "p50PassesMs": [
+          0.054542000000083135,
+          0.024667000000135886,
+          0.024581999999895743
+        ],
+        "p95Ms": 0.0711660000001757,
+        "p99Ms": 0.07908399999996618,
+        "samplesMin": 38268,
+        "samplesMax": 55756,
+        "sequentialOps": 27151.33465654424,
+        "concurrentOps": 31837.629714361243,
+        "concurrentMin": 29192.58074192581,
+        "concurrentMax": 32632.392822021116,
+        "concurrentPasses": [
+          31837.629714361243,
+          32632.392822021116,
+          29192.58074192581
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 0.03533300000003692,
+        "p50MinMs": 0.03274999999996453,
+        "p50MaxMs": 0.07254200000002697,
+        "p50PassesMs": [
+          0.03274999999996453,
+          0.07254200000002697,
+          0.03533300000003692
+        ],
+        "p95Ms": 0.07541700000001583,
+        "p99Ms": 0.09658400000000711,
+        "samplesMin": 28380,
+        "samplesMax": 49625,
+        "sequentialOps": 21585.75502162982,
+        "concurrentOps": 25462.6481880077,
+        "concurrentMin": 25394.00462324975,
+        "concurrentMax": 26417.88104879033,
+        "concurrentPasses": [
+          25462.6481880077,
+          26417.88104879033,
+          25394.00462324975
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 0.022167999999993526,
+        "p50MinMs": 0.021125000000040473,
+        "p50MaxMs": 0.02374800000001187,
+        "p50PassesMs": [
+          0.022167999999993526,
+          0.021125000000040473,
+          0.02374800000001187
+        ],
+        "p95Ms": 0.02979299999999796,
+        "p99Ms": 0.0484599999999773,
+        "samplesMin": 52573,
+        "samplesMax": 85908,
+        "sequentialOps": 40638.70685435832,
+        "concurrentOps": 36449.630188645766,
+        "concurrentMin": 24395.419445169566,
+        "concurrentMax": 36467.474705857254,
+        "concurrentPasses": [
+          24395.419445169566,
+          36449.630188645766,
+          36467.474705857254
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 0.09283400000003894,
+        "p50MinMs": 0.07821100000001024,
+        "p50MaxMs": 0.10162599999966915,
+        "p50PassesMs": [
+          0.07821100000001024,
+          0.09283400000003894,
+          0.10162599999966915
+        ],
+        "p95Ms": 0.10616700000002766,
+        "p99Ms": 0.1800010000000043,
+        "samplesMin": 13872,
+        "samplesMax": 25703,
+        "sequentialOps": 11050.840381661526,
+        "concurrentOps": 69169.15568821819,
+        "concurrentMin": 67829.26800665786,
+        "concurrentMax": 72715.56907679832,
+        "concurrentPasses": [
+          72715.56907679832,
+          67829.26800665786,
+          69169.15568821819
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 0.06454200000007404,
+        "p50MinMs": 0.04545900000016445,
+        "p50MaxMs": 0.09241700000006858,
+        "p50PassesMs": [
+          0.04545900000016445,
+          0.06454200000007404,
+          0.09241700000006858
+        ],
+        "p95Ms": 0.10816700000009405,
+        "p99Ms": 0.19116699999999298,
+        "samplesMin": 21758,
+        "samplesMax": 37320,
+        "sequentialOps": 12552.340735900743,
+        "concurrentOps": 69698.82336384054,
+        "concurrentMin": 66045.41950639174,
+        "concurrentMax": 73783.43784398705,
+        "concurrentPasses": [
+          73783.43784398705,
+          69698.82336384054,
+          66045.41950639174
+        ],
+        "statements": 1
+      }
+    ],
+    "listJoin": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 0.07175000000006548,
+        "p50MinMs": 0.047083999999813386,
+        "p50MaxMs": 0.08420900000055553,
+        "p50PassesMs": [
+          0.047083999999813386,
+          0.08420900000055553,
+          0.07175000000006548
+        ],
+        "p95Ms": 0.09133400000064285,
+        "p99Ms": 0.11237499999970169,
+        "samplesMin": 26722,
+        "samplesMax": 33119,
+        "sequentialOps": 14901.37725735553,
+        "concurrentOps": 36195.14038789916,
+        "concurrentMin": 31932.209715616737,
+        "concurrentMax": 36318.12452112582,
+        "concurrentPasses": [
+          31932.209715616737,
+          36318.12452112582,
+          36195.14038789916
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 0.07833399999981339,
+        "p50MinMs": 0.04932999999982712,
+        "p50MaxMs": 0.08377699999982724,
+        "p50PassesMs": [
+          0.07833399999981339,
+          0.08377699999982724,
+          0.04932999999982712
+        ],
+        "p95Ms": 0.09195999999974447,
+        "p99Ms": 0.1087310000002617,
+        "samplesMin": 24107,
+        "samplesMax": 31801,
+        "sequentialOps": 12588.539272051183,
+        "concurrentOps": 32248.186933990328,
+        "concurrentMin": 30535.45441184296,
+        "concurrentMax": 33274.94819875431,
+        "concurrentPasses": [
+          32248.186933990328,
+          30535.45441184296,
+          33274.94819875431
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 0.1132499999994252,
+        "p50MinMs": 0.11203500000010536,
+        "p50MaxMs": 0.11400200000025507,
+        "p50PassesMs": [
+          0.11400200000025507,
+          0.1132499999994252,
+          0.11203500000010536
+        ],
+        "p95Ms": 0.13266700000076526,
+        "p99Ms": 0.3716260000001057,
+        "samplesMin": 15010,
+        "samplesMax": 17324,
+        "sequentialOps": 8422.782755375782,
+        "concurrentOps": 17799.397297768817,
+        "concurrentMin": 17227.251241553375,
+        "concurrentMax": 17823.50114781678,
+        "concurrentPasses": [
+          17227.251241553375,
+          17823.50114781678,
+          17799.397297768817
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 0.1579600000004575,
+        "p50MinMs": 0.11562599999979284,
+        "p50MaxMs": 0.1604589999997188,
+        "p50PassesMs": [
+          0.11562599999979284,
+          0.1579600000004575,
+          0.1604589999997188
+        ],
+        "p95Ms": 0.1751669999994192,
+        "p99Ms": 0.25104300000020885,
+        "samplesMin": 12215,
+        "samplesMax": 15920,
+        "sequentialOps": 6778.881603443356,
+        "concurrentOps": 11360.677867505101,
+        "concurrentMin": 11317.69602033532,
+        "concurrentMax": 11378.69421518795,
+        "concurrentPasses": [
+          11378.69421518795,
+          11317.69602033532,
+          11360.677867505101
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 0.13265599999976985,
+        "p50MinMs": 0.09029300000020157,
+        "p50MaxMs": 0.13683799999944313,
+        "p50PassesMs": [
+          0.13683799999944313,
+          0.09029300000020157,
+          0.13265599999976985
+        ],
+        "p95Ms": 0.15687499999967258,
+        "p99Ms": 0.38933499999984633,
+        "samplesMin": 10795,
+        "samplesMax": 18089,
+        "sequentialOps": 7776.645058366245,
+        "concurrentOps": 23392.33407092147,
+        "concurrentMin": 13872.508712354414,
+        "concurrentMax": 23951.09522314688,
+        "concurrentPasses": [
+          13872.508712354414,
+          23951.09522314688,
+          23392.33407092147
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 0.1187499999996362,
+        "p50MinMs": 0.11604299999999057,
+        "p50MaxMs": 0.1477969999996276,
+        "p50PassesMs": [
+          0.1477969999996276,
+          0.1187499999996362,
+          0.11604299999999057
+        ],
+        "p95Ms": 0.17520899999999529,
+        "p99Ms": 0.4291269999994256,
+        "samplesMin": 13179,
+        "samplesMax": 15803,
+        "sequentialOps": 7275.088753782926,
+        "concurrentOps": 14036.377207213944,
+        "concurrentMin": 14030.108885612488,
+        "concurrentMax": 14532.965524065063,
+        "concurrentPasses": [
+          14030.108885612488,
+          14532.965524065063,
+          14036.377207213944
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 0.21629500000017288,
+        "p50MinMs": 0.14470900000014808,
+        "p50MaxMs": 0.2361670000000231,
+        "p50PassesMs": [
+          0.21629500000017288,
+          0.2361670000000231,
+          0.14470900000014808
+        ],
+        "p95Ms": 0.26420799999959854,
+        "p99Ms": 0.7453009999999267,
+        "samplesMin": 8534,
+        "samplesMax": 12469,
+        "sequentialOps": 4428.473610725753,
+        "concurrentOps": 7034.452279509613,
+        "concurrentMin": 6666.9482499893,
+        "concurrentMax": 7136.650421991521,
+        "concurrentPasses": [
+          7136.650421991521,
+          7034.452279509613,
+          6666.9482499893
+        ],
+        "statements": 2
+      }
+    ],
+    "nestedFirst": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 1.0728799999997136,
+        "p50MinMs": 1.0669980000002397,
+        "p50MaxMs": 1.0827530000005936,
+        "p50PassesMs": [
+          1.0827530000005936,
+          1.0669980000002397,
+          1.0728799999997136
+        ],
+        "p95Ms": 1.21288099999947,
+        "p99Ms": 1.412216000000626,
+        "samplesMin": 1783,
+        "samplesMax": 1817,
+        "sequentialOps": 892.3797616432954,
+        "concurrentOps": 887.4799784311537,
+        "concurrentMin": 850.0965399316661,
+        "concurrentMax": 1095.9021331767958,
+        "concurrentPasses": [
+          1095.9021331767958,
+          850.0965399316661,
+          887.4799784311537
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 1.0131679999994958,
+        "p50MinMs": 1.0047940000004019,
+        "p50MaxMs": 1.0170129999987694,
+        "p50PassesMs": [
+          1.0170129999987694,
+          1.0131679999994958,
+          1.0047940000004019
+        ],
+        "p95Ms": 1.0848470000000816,
+        "p99Ms": 1.22626499999933,
+        "samplesMin": 1854,
+        "samplesMax": 1976,
+        "sequentialOps": 972.755030614263,
+        "concurrentOps": 941.6739154878943,
+        "concurrentMin": 914.168144434852,
+        "concurrentMax": 1055.9283029894511,
+        "concurrentPasses": [
+          1055.9283029894511,
+          914.168144434852,
+          941.6739154878943
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 1.1447929999994813,
+        "p50MinMs": 1.1413890000003448,
+        "p50MaxMs": 1.1486019999993005,
+        "p50PassesMs": [
+          1.1413890000003448,
+          1.1447929999994813,
+          1.1486019999993005
+        ],
+        "p95Ms": 1.3383080000003247,
+        "p99Ms": 1.618741999998747,
+        "samplesMin": 1673,
+        "samplesMax": 1716,
+        "sequentialOps": 848.9943707428251,
+        "concurrentOps": 1393.3371663456144,
+        "concurrentMin": 1284.8892107075644,
+        "concurrentMax": 1435.9067602181117,
+        "concurrentPasses": [
+          1435.9067602181117,
+          1284.8892107075644,
+          1393.3371663456144
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria-prepared",
+        "name": "Symmetria (prepared)",
+        "p50Ms": 0.9669219999998404,
+        "p50MinMs": 0.9656720000000405,
+        "p50MaxMs": 0.9714489999999785,
+        "p50PassesMs": [
+          0.9714489999999785,
+          0.9656720000000405,
+          0.9669219999998404
+        ],
+        "p95Ms": 1.0348259999999811,
+        "p99Ms": 1.2485890000000381,
+        "samplesMin": 2017,
+        "samplesMax": 2043,
+        "sequentialOps": 1014.315604523307,
+        "concurrentOps": 1361.9584432202935,
+        "concurrentMin": 1343.65897310305,
+        "concurrentMax": 1571.0626086794125,
+        "concurrentPasses": [
+          1343.65897310305,
+          1571.0626086794125,
+          1361.9584432202935
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 1.3865869999990537,
+        "p50MinMs": 1.3846310000008089,
+        "p50MaxMs": 1.4133399999991525,
+        "p50PassesMs": [
+          1.3865869999990537,
+          1.3846310000008089,
+          1.4133399999991525
+        ],
+        "p95Ms": 1.5783380000011675,
+        "p99Ms": 1.791838999999527,
+        "samplesMin": 1368,
+        "samplesMax": 1422,
+        "sequentialOps": 709.0517697330303,
+        "concurrentOps": 1417.1867946237276,
+        "concurrentMin": 1415.3139146193625,
+        "concurrentMax": 1426.001444091406,
+        "concurrentPasses": [
+          1415.3139146193625,
+          1417.1867946237276,
+          1426.001444091406
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 1.0576189999992494,
+        "p50MinMs": 1.0265879999988101,
+        "p50MaxMs": 1.0664980000001378,
+        "p50PassesMs": [
+          1.0576189999992494,
+          1.0265879999988101,
+          1.0664980000001378
+        ],
+        "p95Ms": 1.4111789999988105,
+        "p99Ms": 2.3702880000000732,
+        "samplesMin": 1751,
+        "samplesMax": 1873,
+        "sequentialOps": 882.5241967870688,
+        "concurrentOps": 1311.749756877473,
+        "concurrentMin": 1259.8572310890315,
+        "concurrentMax": 1356.4867111655763,
+        "concurrentPasses": [
+          1356.4867111655763,
+          1259.8572310890315,
+          1311.749756877473
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 2.15438499999982,
+        "p50MinMs": 2.1453439999986585,
+        "p50MaxMs": 2.2078249999995023,
+        "p50PassesMs": [
+          2.2078249999995023,
+          2.1453439999986585,
+          2.15438499999982
+        ],
+        "p95Ms": 2.5980039999994915,
+        "p99Ms": null,
+        "samplesMin": 885,
+        "samplesMax": 912,
+        "sequentialOps": 443.1529303801029,
+        "concurrentOps": 749.519100466492,
+        "concurrentMin": 749.2276713085436,
+        "concurrentMax": 767.5094488941039,
+        "concurrentPasses": [
+          767.5094488941039,
+          749.519100466492,
+          749.2276713085436
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 1.7863780000006955,
+        "p50MinMs": 1.7800219999990077,
+        "p50MaxMs": 1.9214259999989736,
+        "p50PassesMs": [
+          1.7800219999990077,
+          1.7863780000006955,
+          1.9214259999989736
+        ],
+        "p95Ms": 2.6175750000002154,
+        "p99Ms": null,
+        "samplesMin": 973,
+        "samplesMax": 1049,
+        "sequentialOps": 523.3043393856778,
+        "concurrentOps": 549.1181316301618,
+        "concurrentMin": 544.1684217327887,
+        "concurrentMax": 563.0184196952004,
+        "concurrentPasses": [
+          563.0184196952004,
+          544.1684217327887,
+          549.1181316301618
+        ],
+        "statements": 4
+      }
+    ],
+    "nestedMiddle": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 18.87934099999984,
+        "p50MinMs": 18.768840000000637,
+        "p50MaxMs": 19.266389000000345,
+        "p50PassesMs": [
+          19.266389000000345,
+          18.87934099999984,
+          18.768840000000637
+        ],
+        "p95Ms": 20.45684799999799,
+        "p99Ms": null,
+        "samplesMin": 102,
+        "samplesMax": 103,
+        "sequentialOps": 50.61415315158654,
+        "concurrentOps": 40.192813612039686,
+        "concurrentMin": 38.339218486063416,
+        "concurrentMax": 41.24728106000851,
+        "concurrentPasses": [
+          41.24728106000851,
+          38.339218486063416,
+          40.192813612039686
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 1.075167999999394,
+        "p50MinMs": 1.0611810000009427,
+        "p50MaxMs": 1.0769139999993058,
+        "p50PassesMs": [
+          1.0611810000009427,
+          1.075167999999394,
+          1.0769139999993058
+        ],
+        "p95Ms": 1.1879189999999653,
+        "p99Ms": 1.707711000000927,
+        "samplesMin": 1639,
+        "samplesMax": 1857,
+        "sequentialOps": 875.2815432936584,
+        "concurrentOps": 970.5222106962877,
+        "concurrentMin": 879.7223786404861,
+        "concurrentMax": 1063.3833597431426,
+        "concurrentPasses": [
+          970.5222106962877,
+          879.7223786404861,
+          1063.3833597431426
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 1.1904749999994237,
+        "p50MinMs": 1.1614190000000235,
+        "p50MaxMs": 1.195306999999957,
+        "p50PassesMs": [
+          1.195306999999957,
+          1.1614190000000235,
+          1.1904749999994237
+        ],
+        "p95Ms": 1.3509659999999712,
+        "p99Ms": 1.6486580000000686,
+        "samplesMin": 1564,
+        "samplesMax": 1682,
+        "sequentialOps": 820.8089792823183,
+        "concurrentOps": 1338.9852730999116,
+        "concurrentMin": 1232.2944127268527,
+        "concurrentMax": 1344.7316625432059,
+        "concurrentPasses": [
+          1338.9852730999116,
+          1344.7316625432059,
+          1232.2944127268527
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria-prepared",
+        "name": "Symmetria (prepared)",
+        "p50Ms": 1.0269630000002508,
+        "p50MinMs": 1.0157549999994444,
+        "p50MaxMs": 1.0286599999999453,
+        "p50PassesMs": [
+          1.0286599999999453,
+          1.0157549999994444,
+          1.0269630000002508
+        ],
+        "p95Ms": 1.120296999999482,
+        "p99Ms": 1.3192109999999957,
+        "samplesMin": 1908,
+        "samplesMax": 1940,
+        "sequentialOps": 960.9423261634687,
+        "concurrentOps": 1285.808013592666,
+        "concurrentMin": 1130.8412289358594,
+        "concurrentMax": 1382.6668457778653,
+        "concurrentPasses": [
+          1382.6668457778653,
+          1130.8412289358594,
+          1285.808013592666
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 19.95776300000034,
+        "p50MinMs": 19.889094999998633,
+        "p50MaxMs": 20.54818499999965,
+        "p50PassesMs": [
+          20.54818499999965,
+          19.95776300000034,
+          19.889094999998633
+        ],
+        "p95Ms": 21.287476999999853,
+        "p99Ms": null,
+        "samplesMin": 100,
+        "samplesMax": 100,
+        "sequentialOps": 49.29238052035901,
+        "concurrentOps": 34.32788075319507,
+        "concurrentMin": 33.57323657920006,
+        "concurrentMax": 34.68153385645752,
+        "concurrentPasses": [
+          34.32788075319507,
+          34.68153385645752,
+          33.57323657920006
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 17.41400000000067,
+        "p50MinMs": 17.40422000000035,
+        "p50MaxMs": 18.26020900000003,
+        "p50PassesMs": [
+          17.40422000000035,
+          17.41400000000067,
+          18.26020900000003
+        ],
+        "p95Ms": 19.60959399999956,
+        "p99Ms": null,
+        "samplesMin": 109,
+        "samplesMax": 111,
+        "sequentialOps": 54.933489661926274,
+        "concurrentOps": 42.02441685947074,
+        "concurrentMin": 40.738596709724945,
+        "concurrentMax": 43.00204415614093,
+        "concurrentPasses": [
+          43.00204415614093,
+          42.02441685947074,
+          40.738596709724945
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 35.00404300000082,
+        "p50MinMs": 34.93404300000111,
+        "p50MaxMs": 35.30018800000107,
+        "p50PassesMs": [
+          35.30018800000107,
+          34.93404300000111,
+          35.00404300000082
+        ],
+        "p95Ms": 36.88849100000152,
+        "p99Ms": null,
+        "samplesMin": 100,
+        "samplesMax": 100,
+        "sequentialOps": 28.38939756306439,
+        "concurrentOps": 21.49389798064903,
+        "concurrentMin": 21.251589506733943,
+        "concurrentMax": 21.625709760792738,
+        "concurrentPasses": [
+          21.625709760792738,
+          21.49389798064903,
+          21.251589506733943
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 1.8998009999995702,
+        "p50MinMs": 1.872814999998809,
+        "p50MaxMs": 1.9025439999986702,
+        "p50PassesMs": [
+          1.872814999998809,
+          1.9025439999986702,
+          1.8998009999995702
+        ],
+        "p95Ms": 2.6461710000003222,
+        "p99Ms": null,
+        "samplesMin": 973,
+        "samplesMax": 1003,
+        "sequentialOps": 494.8691435375985,
+        "concurrentOps": 544.1825060058878,
+        "concurrentMin": 526.4968543510051,
+        "concurrentMax": 557.5218376926488,
+        "concurrentPasses": [
+          526.4968543510051,
+          557.5218376926488,
+          544.1825060058878
+        ],
+        "statements": 4
+      }
+    ],
+    "nestedDeep": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 34.80666700000074,
+        "p50MinMs": 34.77416699999958,
+        "p50MaxMs": 35.51868699999977,
+        "p50PassesMs": [
+          35.51868699999977,
+          34.77416699999958,
+          34.80666700000074
+        ],
+        "p95Ms": 36.71763500000088,
+        "p99Ms": null,
+        "samplesMin": 100,
+        "samplesMax": 100,
+        "sequentialOps": 28.294921127415016,
+        "concurrentOps": 21.70572042544819,
+        "concurrentMin": 19.759229012746275,
+        "concurrentMax": 21.769112637166362,
+        "concurrentPasses": [
+          19.759229012746275,
+          21.70572042544819,
+          21.769112637166362
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 1.1120780000019295,
+        "p50MinMs": 1.1071689999989758,
+        "p50MaxMs": 1.1157640000019455,
+        "p50PassesMs": [
+          1.1157640000019455,
+          1.1071689999989758,
+          1.1120780000019295
+        ],
+        "p95Ms": 1.2087780000001658,
+        "p99Ms": 1.3577250000016647,
+        "samplesMin": 1745,
+        "samplesMax": 1773,
+        "sequentialOps": 883.8348505970741,
+        "concurrentOps": 957.4740813200472,
+        "concurrentMin": 928.6721602491248,
+        "concurrentMax": 984.4904856324773,
+        "concurrentPasses": [
+          984.4904856324773,
+          928.6721602491248,
+          957.4740813200472
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 1.2412220000005618,
+        "p50MinMs": 1.2110859999993409,
+        "p50MaxMs": 1.2440869999991264,
+        "p50PassesMs": [
+          1.2440869999991264,
+          1.2110859999993409,
+          1.2412220000005618
+        ],
+        "p95Ms": 1.4765020000013465,
+        "p99Ms": 1.9266830000015034,
+        "samplesMin": 1553,
+        "samplesMax": 1568,
+        "sequentialOps": 782.8083207717681,
+        "concurrentOps": 1283.0871264929203,
+        "concurrentMin": 1243.9032679033346,
+        "concurrentMax": 1349.444035467,
+        "concurrentPasses": [
+          1283.0871264929203,
+          1349.444035467,
+          1243.9032679033346
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria-prepared",
+        "name": "Symmetria (prepared)",
+        "p50Ms": 1.0702860000001237,
+        "p50MinMs": 1.0626720000000205,
+        "p50MaxMs": 1.1067970000003697,
+        "p50PassesMs": [
+          1.0702860000001237,
+          1.0626720000000205,
+          1.1067970000003697
+        ],
+        "p95Ms": 1.2671310000005178,
+        "p99Ms": 1.4408819999989646,
+        "samplesMin": 1653,
+        "samplesMax": 1849,
+        "sequentialOps": 919.6596031722687,
+        "concurrentOps": 1240.3616258684578,
+        "concurrentMin": 1207.2028254250342,
+        "concurrentMax": 1357.0041713094115,
+        "concurrentPasses": [
+          1240.3616258684578,
+          1357.0041713094115,
+          1207.2028254250342
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 36.679550999997446,
+        "p50MinMs": 36.46388400000069,
+        "p50MaxMs": 37.79615199999898,
+        "p50PassesMs": [
+          37.79615199999898,
+          36.679550999997446,
+          36.46388400000069
+        ],
+        "p95Ms": 39.277147000000696,
+        "p99Ms": null,
+        "samplesMin": 100,
+        "samplesMax": 100,
+        "sequentialOps": 27.002843827450118,
+        "concurrentOps": 18.474938843711588,
+        "concurrentMin": 17.866192246745165,
+        "concurrentMax": 19.017920159503433,
+        "concurrentPasses": [
+          17.866192246745165,
+          18.474938843711588,
+          19.017920159503433
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 32.066445999997086,
+        "p50MinMs": 31.98127899999963,
+        "p50MaxMs": 33.17739299999812,
+        "p50PassesMs": [
+          31.98127899999963,
+          32.066445999997086,
+          33.17739299999812
+        ],
+        "p95Ms": 33.93099599999914,
+        "p99Ms": null,
+        "samplesMin": 100,
+        "samplesMax": 100,
+        "sequentialOps": 30.860941615798918,
+        "concurrentOps": 22.382610565359226,
+        "concurrentMin": 21.390368480215947,
+        "concurrentMax": 23.15320983350029,
+        "concurrentPasses": [
+          23.15320983350029,
+          22.382610565359226,
+          21.390368480215947
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 64.86951899999985,
+        "p50MinMs": 64.04372400000284,
+        "p50MaxMs": 65.94571900000301,
+        "p50PassesMs": [
+          65.94571900000301,
+          64.04372400000284,
+          64.86951899999985
+        ],
+        "p95Ms": 68.4480939999994,
+        "p99Ms": null,
+        "samplesMin": 100,
+        "samplesMax": 100,
+        "sequentialOps": 15.148129998904292,
+        "concurrentOps": 11.31750901795911,
+        "concurrentMin": 11.262408457868988,
+        "concurrentMax": 11.3627058660186,
+        "concurrentPasses": [
+          11.31750901795911,
+          11.3627058660186,
+          11.262408457868988
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 1.9135869999990973,
+        "p50MinMs": 1.888398999999481,
+        "p50MaxMs": 2.0010130000009667,
+        "p50PassesMs": [
+          1.888398999999481,
+          1.9135869999990973,
+          2.0010130000009667
+        ],
+        "p95Ms": 2.731170999999449,
+        "p99Ms": null,
+        "samplesMin": 919,
+        "samplesMax": 1004,
+        "sequentialOps": 485.6556994912304,
+        "concurrentOps": 558.3476556337326,
+        "concurrentMin": 491.1832565753156,
+        "concurrentMax": 571.813154355466,
+        "concurrentPasses": [
+          571.813154355466,
+          558.3476556337326,
+          491.1832565753156
+        ],
+        "statements": 4
+      }
+    ],
+    "nestedKeyset": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 0.9997540000040317,
+        "p50MinMs": 0.9943380000040634,
+        "p50MaxMs": 1.0091279999978724,
+        "p50PassesMs": [
+          1.0091279999978724,
+          0.9997540000040317,
+          0.9943380000040634
+        ],
+        "p95Ms": 1.106419999996433,
+        "p99Ms": 1.3287559999953373,
+        "samplesMin": 1952,
+        "samplesMax": 1981,
+        "sequentialOps": 986.7503802761777,
+        "concurrentOps": 1225.8115040368623,
+        "concurrentMin": 1054.464767088563,
+        "concurrentMax": 1250.1807650797232,
+        "concurrentPasses": [
+          1250.1807650797232,
+          1054.464767088563,
+          1225.8115040368623
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 1.0081720000016503,
+        "p50MinMs": 1.006137000000308,
+        "p50MaxMs": 1.0136679999995977,
+        "p50PassesMs": [
+          1.006137000000308,
+          1.0136679999995977,
+          1.0081720000016503
+        ],
+        "p95Ms": 1.0845980000012787,
+        "p99Ms": 1.24758600000132,
+        "samplesMin": 1921,
+        "samplesMax": 1948,
+        "sequentialOps": 973.184322362249,
+        "concurrentOps": 1121.832227683722,
+        "concurrentMin": 951.6067607855852,
+        "concurrentMax": 1189.651378931821,
+        "concurrentPasses": [
+          1189.651378931821,
+          1121.832227683722,
+          951.6067607855852
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 1.0222340000000258,
+        "p50MinMs": 1.0124180000020715,
+        "p50MaxMs": 1.0234620000010182,
+        "p50PassesMs": [
+          1.0234620000010182,
+          1.0124180000020715,
+          1.0222340000000258
+        ],
+        "p95Ms": 1.1471270000001823,
+        "p99Ms": 1.4250460000002931,
+        "samplesMin": 1893,
+        "samplesMax": 1915,
+        "sequentialOps": 950.7582578284683,
+        "concurrentOps": 1693.3081227226419,
+        "concurrentMin": 1310.781033934367,
+        "concurrentMax": 1719.2662231699042,
+        "concurrentPasses": [
+          1693.3081227226419,
+          1719.2662231699042,
+          1310.781033934367
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 1.3607150000025285,
+        "p50MinMs": 1.3362140000026557,
+        "p50MaxMs": 1.399753999998211,
+        "p50PassesMs": [
+          1.399753999998211,
+          1.3362140000026557,
+          1.3607150000025285
+        ],
+        "p95Ms": 1.4778409999998985,
+        "p99Ms": 1.6562170000033802,
+        "samplesMin": 1403,
+        "samplesMax": 1476,
+        "sequentialOps": 727.2237055339451,
+        "concurrentOps": 1416.2819643563278,
+        "concurrentMin": 1380.7511956869962,
+        "concurrentMax": 1428.987721747815,
+        "concurrentPasses": [
+          1380.7511956869962,
+          1416.2819643563278,
+          1428.987721747815
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 0.9655539999985194,
+        "p50MinMs": 0.9629209999984596,
+        "p50MaxMs": 0.9887959999978193,
+        "p50PassesMs": [
+          0.9655539999985194,
+          0.9629209999984596,
+          0.9887959999978193
+        ],
+        "p95Ms": 1.085255000005418,
+        "p99Ms": 1.3392269999967539,
+        "samplesMin": 1950,
+        "samplesMax": 2042,
+        "sequentialOps": 1017.1411932726613,
+        "concurrentOps": 1579.7331214247458,
+        "concurrentMin": 1549.3057435350574,
+        "concurrentMax": 1611.2785961512766,
+        "concurrentPasses": [
+          1579.7331214247458,
+          1611.2785961512766,
+          1549.3057435350574
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 2.164177999999083,
+        "p50MinMs": 2.1383290000012494,
+        "p50MaxMs": 2.18619800000306,
+        "p50PassesMs": [
+          2.18619800000306,
+          2.164177999999083,
+          2.1383290000012494
+        ],
+        "p95Ms": 2.473541999999725,
+        "p99Ms": null,
+        "samplesMin": 898,
+        "samplesMax": 921,
+        "sequentialOps": 449.97517329477586,
+        "concurrentOps": 751.1702787777695,
+        "concurrentMin": 738.0378426014515,
+        "concurrentMax": 787.0467370890848,
+        "concurrentPasses": [
+          751.1702787777695,
+          738.0378426014515,
+          787.0467370890848
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 1.7859409999982745,
+        "p50MinMs": 1.7821470000017143,
+        "p50MaxMs": 1.8053780000009283,
+        "p50PassesMs": [
+          1.7821470000017143,
+          1.8053780000009283,
+          1.7859409999982745
+        ],
+        "p95Ms": 2.6118790000000445,
+        "p99Ms": 3.788755999998102,
+        "samplesMin": 1037,
+        "samplesMax": 1062,
+        "sequentialOps": 520.8600834392265,
+        "concurrentOps": 560.1317583633961,
+        "concurrentMin": 541.5713646128709,
+        "concurrentMax": 590.7663498749771,
+        "concurrentPasses": [
+          590.7663498749771,
+          560.1317583633961,
+          541.5713646128709
+        ],
+        "statements": 4
+      }
+    ],
+    "insertOne": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 0.5019589999938034,
+        "p50MinMs": 0.49650199999450706,
+        "p50MaxMs": 0.5083769999982906,
+        "p50PassesMs": [
+          0.5019589999938034,
+          0.49650199999450706,
+          0.5083769999982906
+        ],
+        "p95Ms": 0.6380860000062967,
+        "p99Ms": null,
+        "samplesMin": 256,
+        "samplesMax": 256,
+        "sequentialOps": 1904.137633805435,
+        "concurrentOps": 15825.69627577289,
+        "concurrentMin": 15031.947733213461,
+        "concurrentMax": 16079.408157183934,
+        "concurrentPasses": [
+          16079.408157183934,
+          15825.69627577289,
+          15031.947733213461
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 0.5027929999996559,
+        "p50MinMs": 0.4832139999998617,
+        "p50MaxMs": 0.5093780000024708,
+        "p50PassesMs": [
+          0.4832139999998617,
+          0.5027929999996559,
+          0.5093780000024708
+        ],
+        "p95Ms": 0.6352509999996983,
+        "p99Ms": null,
+        "samplesMin": 256,
+        "samplesMax": 256,
+        "sequentialOps": 1928.462900339925,
+        "concurrentOps": 15214.176379372782,
+        "concurrentMin": 15126.849863061072,
+        "concurrentMax": 16224.404298973135,
+        "concurrentPasses": [
+          16224.404298973135,
+          15214.176379372782,
+          15126.849863061072
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 0.5296679999992193,
+        "p50MinMs": 0.5287210000024061,
+        "p50MaxMs": 0.5305840000000899,
+        "p50PassesMs": [
+          0.5296679999992193,
+          0.5305840000000899,
+          0.5287210000024061
+        ],
+        "p95Ms": 0.6788759999981266,
+        "p99Ms": null,
+        "samplesMin": 256,
+        "samplesMax": 256,
+        "sequentialOps": 1824.0187689251377,
+        "concurrentOps": 14341.886943017425,
+        "concurrentMin": 14251.210966730428,
+        "concurrentMax": 14565.155159156191,
+        "concurrentPasses": [
+          14251.210966730428,
+          14565.155159156191,
+          14341.886943017425
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 0.5393770000009681,
+        "p50MinMs": 0.52741899999819,
+        "p50MaxMs": 0.5417930000039632,
+        "p50PassesMs": [
+          0.5417930000039632,
+          0.52741899999819,
+          0.5393770000009681
+        ],
+        "p95Ms": 0.6818770000027143,
+        "p99Ms": null,
+        "samplesMin": 256,
+        "samplesMax": 256,
+        "sequentialOps": 1785.6888256978089,
+        "concurrentOps": 13239.1649458767,
+        "concurrentMin": 11722.813390497664,
+        "concurrentMax": 13440.73248631831,
+        "concurrentPasses": [
+          13239.1649458767,
+          13440.73248631831,
+          11722.813390497664
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 0.5282110000043758,
+        "p50MinMs": 0.5155420000010054,
+        "p50MaxMs": 0.5509239999955753,
+        "p50PassesMs": [
+          0.5509239999955753,
+          0.5282110000043758,
+          0.5155420000010054
+        ],
+        "p95Ms": 0.6672529999996186,
+        "p99Ms": null,
+        "samplesMin": 256,
+        "samplesMax": 256,
+        "sequentialOps": 1828.6764076591974,
+        "concurrentOps": 13311.230451145364,
+        "concurrentMin": 13032.129263857305,
+        "concurrentMax": 13382.976333944109,
+        "concurrentPasses": [
+          13032.129263857305,
+          13382.976333944109,
+          13311.230451145364
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 0.5775859999994282,
+        "p50MinMs": 0.5724960000006831,
+        "p50MaxMs": 0.6073529999994207,
+        "p50PassesMs": [
+          0.6073529999994207,
+          0.5775859999994282,
+          0.5724960000006831
+        ],
+        "p95Ms": 0.7415449999971315,
+        "p99Ms": null,
+        "samplesMin": 256,
+        "samplesMax": 256,
+        "sequentialOps": 1627.6850094813817,
+        "concurrentOps": 12185.871091762672,
+        "concurrentMin": 11647.02291232169,
+        "concurrentMax": 12680.157768405743,
+        "concurrentPasses": [
+          12185.871091762672,
+          11647.02291232169,
+          12680.157768405743
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 0.575208999998722,
+        "p50MinMs": 0.5560489999988931,
+        "p50MaxMs": 0.5946750000002794,
+        "p50PassesMs": [
+          0.5560489999988931,
+          0.575208999998722,
+          0.5946750000002794
+        ],
+        "p95Ms": 0.7014669999989565,
+        "p99Ms": null,
+        "samplesMin": 256,
+        "samplesMax": 256,
+        "sequentialOps": 1651.7759921276406,
+        "concurrentOps": 11793.92131160236,
+        "concurrentMin": 11792.67066171019,
+        "concurrentMax": 12829.124678846185,
+        "concurrentPasses": [
+          12829.124678846185,
+          11792.67066171019,
+          11793.92131160236
+        ],
+        "statements": 1
+      }
+    ],
+    "insertMany500": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 4.0950620000003255,
+        "p50MinMs": 4.073969999997644,
+        "p50MaxMs": 4.13322799999878,
+        "p50PassesMs": [
+          4.073969999997644,
+          4.0950620000003255,
+          4.13322799999878
+        ],
+        "p95Ms": null,
+        "p99Ms": null,
+        "samplesMin": 32,
+        "samplesMax": 32,
+        "sequentialOps": 238.90741487313102,
+        "concurrentOps": 451.8883191345887,
+        "concurrentMin": 421.31878308917186,
+        "concurrentMax": 517.9197816709287,
+        "concurrentPasses": [
+          451.8883191345887,
+          517.9197816709287,
+          421.31878308917186
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 4.007550999998784,
+        "p50MinMs": 3.8893389999975625,
+        "p50MaxMs": 4.196187000001373,
+        "p50PassesMs": [
+          4.007550999998784,
+          3.8893389999975625,
+          4.196187000001373
+        ],
+        "p95Ms": null,
+        "p99Ms": null,
+        "samplesMin": 32,
+        "samplesMax": 32,
+        "sequentialOps": 241.93692281032236,
+        "concurrentOps": 524.1535354467168,
+        "concurrentMin": 430.72661534055766,
+        "concurrentMax": 561.1335346306378,
+        "concurrentPasses": [
+          430.72661534055766,
+          561.1335346306378,
+          524.1535354467168
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 5.026390000002721,
+        "p50MinMs": 4.986924000000727,
+        "p50MaxMs": 5.136712999999872,
+        "p50PassesMs": [
+          5.026390000002721,
+          4.986924000000727,
+          5.136712999999872
+        ],
+        "p95Ms": null,
+        "p99Ms": null,
+        "samplesMin": 32,
+        "samplesMax": 32,
+        "sequentialOps": 199.3494542045566,
+        "concurrentOps": 411.80188954910807,
+        "concurrentMin": 409.661728484706,
+        "concurrentMax": 442.5638492743132,
+        "concurrentPasses": [
+          411.80188954910807,
+          409.661728484706,
+          442.5638492743132
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 10.481257999999798,
+        "p50MinMs": 10.43854999999894,
+        "p50MaxMs": 10.787655999993149,
+        "p50PassesMs": [
+          10.787655999993149,
+          10.43854999999894,
+          10.481257999999798
+        ],
+        "p95Ms": null,
+        "p99Ms": null,
+        "samplesMin": 32,
+        "samplesMax": 32,
+        "sequentialOps": 93.4187069769643,
+        "concurrentOps": 144.42279719720912,
+        "concurrentMin": 139.4503979608221,
+        "concurrentMax": 147.22399213704378,
+        "concurrentPasses": [
+          139.4503979608221,
+          144.42279719720912,
+          147.22399213704378
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 4.722163999998884,
+        "p50MinMs": 4.6665999999968335,
+        "p50MaxMs": 4.727855999997701,
+        "p50PassesMs": [
+          4.6665999999968335,
+          4.727855999997701,
+          4.722163999998884
+        ],
+        "p95Ms": null,
+        "p99Ms": null,
+        "samplesMin": 32,
+        "samplesMax": 32,
+        "sequentialOps": 211.72654481923098,
+        "concurrentOps": 397.17304883729565,
+        "concurrentMin": 396.0497527353076,
+        "concurrentMax": 417.3859590854734,
+        "concurrentPasses": [
+          397.17304883729565,
+          396.0497527353076,
+          417.3859590854734
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 21.799384999998438,
+        "p50MinMs": 20.866076999998768,
+        "p50MaxMs": 21.934105000000272,
+        "p50PassesMs": [
+          20.866076999998768,
+          21.934105000000272,
+          21.799384999998438
+        ],
+        "p95Ms": null,
+        "p99Ms": null,
+        "samplesMin": 32,
+        "samplesMax": 32,
+        "sequentialOps": 45.66481284745916,
+        "concurrentOps": 61.08487206189713,
+        "concurrentMin": 60.17381839267835,
+        "concurrentMax": 61.66632399300652,
+        "concurrentPasses": [
+          60.17381839267835,
+          61.66632399300652,
+          61.08487206189713
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 20.94540799999959,
+        "p50MinMs": 20.374174000000494,
+        "p50MaxMs": 22.003767999998672,
+        "p50PassesMs": [
+          20.374174000000494,
+          20.94540799999959,
+          22.003767999998672
+        ],
+        "p95Ms": null,
+        "p99Ms": null,
+        "samplesMin": 32,
+        "samplesMax": 32,
+        "sequentialOps": 47.439740718215724,
+        "concurrentOps": 62.342359672535494,
+        "concurrentMin": 59.72521275098309,
+        "concurrentMax": 64.82631254728884,
+        "concurrentPasses": [
+          62.342359672535494,
+          64.82631254728884,
+          59.72521275098309
+        ],
+        "statements": 1
+      }
+    ],
+    "updateViews": [
+      {
+        "library": "raw",
+        "name": "Bun.SQL (direct LATERAL)",
+        "p50Ms": 0.5018359999958193,
+        "p50MinMs": 0.5014179999998305,
+        "p50MaxMs": 0.5254610000047251,
+        "p50PassesMs": [
+          0.5014179999998305,
+          0.5254610000047251,
+          0.5018359999958193
+        ],
+        "p95Ms": 0.6369190000041272,
+        "p99Ms": null,
+        "samplesMin": 512,
+        "samplesMax": 512,
+        "sequentialOps": 1893.6282162203013,
+        "concurrentOps": 15205.796384244219,
+        "concurrentMin": 14070.187011885198,
+        "concurrentMax": 15515.311840040926,
+        "concurrentPasses": [
+          15515.311840040926,
+          14070.187011885198,
+          15205.796384244219
+        ],
+        "statements": 1
+      },
+      {
+        "library": "raw-page-first",
+        "name": "Bun.SQL (page first)",
+        "p50Ms": 0.5001729999930831,
+        "p50MinMs": 0.49708499999542255,
+        "p50MaxMs": 0.5125840000036987,
+        "p50PassesMs": [
+          0.5001729999930831,
+          0.5125840000036987,
+          0.49708499999542255
+        ],
+        "p95Ms": 0.6506679999947664,
+        "p99Ms": null,
+        "samplesMin": 512,
+        "samplesMax": 512,
+        "sequentialOps": 1881.1493928605037,
+        "concurrentOps": 13864.872747108093,
+        "concurrentMin": 12808.42386021497,
+        "concurrentMax": 15041.343607971588,
+        "concurrentPasses": [
+          12808.42386021497,
+          15041.343607971588,
+          13864.872747108093
+        ],
+        "statements": 1
+      },
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 0.5410009999977774,
+        "p50MinMs": 0.536125999999058,
+        "p50MaxMs": 0.553594000004523,
+        "p50PassesMs": [
+          0.536125999999058,
+          0.5410009999977774,
+          0.553594000004523
+        ],
+        "p95Ms": 0.7620850000021164,
+        "p99Ms": null,
+        "samplesMin": 512,
+        "samplesMax": 512,
+        "sequentialOps": 1725.1993155285045,
+        "concurrentOps": 13351.294301068065,
+        "concurrentMin": 13252.953051407254,
+        "concurrentMax": 14254.298253833096,
+        "concurrentPasses": [
+          14254.298253833096,
+          13351.294301068065,
+          13252.953051407254
+        ],
+        "statements": 1
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 0.547668999999587,
+        "p50MinMs": 0.5354179999994813,
+        "p50MaxMs": 0.5510859999994864,
+        "p50PassesMs": [
+          0.5354179999994813,
+          0.547668999999587,
+          0.5510859999994864
+        ],
+        "p95Ms": 0.7444200000027195,
+        "p99Ms": null,
+        "samplesMin": 512,
+        "samplesMax": 512,
+        "sequentialOps": 1654.5404524395922,
+        "concurrentOps": 12515.073926841269,
+        "concurrentMin": 9319.728616783637,
+        "concurrentMax": 13941.930077639758,
+        "concurrentPasses": [
+          13941.930077639758,
+          9319.728616783637,
+          12515.073926841269
+        ],
+        "statements": 1
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 0.53583599999547,
+        "p50MinMs": 0.5263399999967078,
+        "p50MaxMs": 0.5835369999986142,
+        "p50PassesMs": [
+          0.5263399999967078,
+          0.53583599999547,
+          0.5835369999986142
+        ],
+        "p95Ms": 0.7292170000000624,
+        "p99Ms": null,
+        "samplesMin": 512,
+        "samplesMax": 512,
+        "sequentialOps": 1772.883554206855,
+        "concurrentOps": 14119.338232408598,
+        "concurrentMin": 13475.089697842986,
+        "concurrentMax": 14204.430975142177,
+        "concurrentPasses": [
+          14119.338232408598,
+          13475.089697842986,
+          14204.430975142177
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-join",
+        "name": "Prisma (join)",
+        "p50Ms": 0.5806200000006356,
+        "p50MinMs": 0.5716859999956796,
+        "p50MaxMs": 0.5998780000008992,
+        "p50PassesMs": [
+          0.5716859999956796,
+          0.5998780000008992,
+          0.5806200000006356
+        ],
+        "p95Ms": 1.1614219999974011,
+        "p99Ms": null,
+        "samplesMin": 512,
+        "samplesMax": 512,
+        "sequentialOps": 1463.8076977529831,
+        "concurrentOps": 10021.070278881534,
+        "concurrentMin": 8559.209249429196,
+        "concurrentMax": 11782.299736458705,
+        "concurrentPasses": [
+          11782.299736458705,
+          8559.209249429196,
+          10021.070278881534
+        ],
+        "statements": 1
+      },
+      {
+        "library": "prisma-query",
+        "name": "Prisma (query)",
+        "p50Ms": 0.5660840000055032,
+        "p50MinMs": 0.5540069999988191,
+        "p50MaxMs": 0.5807180000047083,
+        "p50PassesMs": [
+          0.5540069999988191,
+          0.5660840000055032,
+          0.5807180000047083
+        ],
+        "p95Ms": 0.7424170000012964,
+        "p99Ms": null,
+        "samplesMin": 512,
+        "samplesMax": 512,
+        "sequentialOps": 1673.5597881342446,
+        "concurrentOps": 9501.400111103225,
+        "concurrentMin": 4235.446283256564,
+        "concurrentMax": 10933.30888713788,
+        "concurrentPasses": [
+          10933.30888713788,
+          4235.446283256564,
+          9501.400111103225
+        ],
+        "statements": 1
+      }
+    ],
+    "buildNested": [
+      {
+        "library": "symmetria",
+        "name": "Symmetria",
+        "p50Ms": 0.0354405200000474,
+        "p50MinMs": 0.03503928999998607,
+        "p50MaxMs": 0.03706880999998248,
+        "p50PassesMs": [
+          0.0354405200000474,
+          0.03706880999998248,
+          0.03503928999998607
+        ],
+        "p95Ms": 0.04382345999998506,
+        "p99Ms": null,
+        "samplesMin": 515,
+        "samplesMax": 537,
+        "sequentialOps": 26529.120931863126,
+        "concurrentOps": null,
+        "concurrentMin": null,
+        "concurrentMax": null,
+        "concurrentPasses": [],
+        "statements": null
+      },
+      {
+        "library": "drizzle",
+        "name": "Drizzle",
+        "p50Ms": 0.15748129999999946,
+        "p50MinMs": 0.15685949999999138,
+        "p50MaxMs": 0.15759951,
+        "p50PassesMs": [
+          0.15748129999999946,
+          0.15685949999999138,
+          0.15759951
+        ],
+        "p95Ms": 0.1824979599999642,
+        "p99Ms": null,
+        "samplesMin": 121,
+        "samplesMax": 125,
+        "sequentialOps": 6228.322854825374,
+        "concurrentOps": null,
+        "concurrentMin": null,
+        "concurrentMax": null,
+        "concurrentPasses": [],
+        "statements": null
+      },
+      {
+        "library": "kysely",
+        "name": "Kysely",
+        "p50Ms": 0.02102373000001535,
+        "p50MinMs": 0.02084025999996811,
+        "p50MaxMs": 0.021545100000003002,
+        "p50PassesMs": [
+          0.02084025999996811,
+          0.021545100000003002,
+          0.02102373000001535
+        ],
+        "p95Ms": 0.02690595999993093,
+        "p99Ms": null,
+        "samplesMin": 883,
+        "samplesMax": 920,
+        "sequentialOps": 45124.18634820595,
+        "concurrentOps": null,
+        "concurrentMin": null,
+        "concurrentMax": null,
+        "concurrentPasses": [],
+        "statements": null
+      }
+    ]
+  }
+}

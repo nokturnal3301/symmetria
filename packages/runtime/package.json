@@ -1,0 +1,64 @@
+{
+  "name": "symmetria",
+  "version": "0.0.1",
+  "description": "Type-safe, SQL-first PostgreSQL query builder for Bun, with an embedded SQLite driver.",
+  "homepage": "https://github.com/nokturnal3301/symmetria#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nokturnal3301/symmetria.git",
+    "directory": "packages/runtime"
+  },
+  "bugs": {
+    "url": "https://github.com/nokturnal3301/symmetria/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./driver": {
+      "types": "./dist/driver.d.ts",
+      "default": "./dist/driver.js"
+    },
+    "./dialect": {
+      "types": "./dist/dialect.d.ts",
+      "default": "./dist/dialect.js"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "default": "./dist/internal.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun run --cwd ../.. build:runtime",
+    "prepack": "bun run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "bun": ">=1.3"
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "sqlite",
+    "sql",
+    "query-builder",
+    "orm",
+    "typesafe",
+    "typescript",
+    "bun"
+  ],
+  "author": "Mikhail Demidoff <demidoff.mikhail@gmail.com>",
+  "license": "MIT"
+}

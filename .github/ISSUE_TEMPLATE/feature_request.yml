@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose an API or tooling improvement with a concrete use case.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use case
+      description: What are you trying to express or accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description:
+        For query changes, show the desired TypeScript API, inferred result and
+        corresponding SQL.
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+      description: How do you handle this today, and what makes it difficult?

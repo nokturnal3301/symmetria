@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.json",
+  "include": ["src/**/*.ts", "fixtures/*.ts"],
+  "exclude": ["node_modules", ".cache", "src/diagnostics/micro.ts"]
+}

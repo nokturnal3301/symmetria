@@ -1,0 +1,45 @@
+name: Bug report
+description:
+  Report incorrect SQL, inferred types, migrations or runtime behavior.
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description:
+        Include symmetria and symmetria-kit versions, Bun version, database
+        version and operating system.
+      placeholder: |
+        symmetria:
+        symmetria-kit:
+        Bun:
+        PostgreSQL or SQLite:
+        OS:
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description:
+        Provide a small schema and query, migration steps, or a link to a
+        runnable reproduction. Use sample data.
+      render: typescript
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description:
+        Include the expected result type when reporting a type inference issue.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description:
+        Include the error, generated SQL and parameters, or unexpected result.
+    validations:
+      required: true

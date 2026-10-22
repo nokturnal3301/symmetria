@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "types": ["bun"],
+    "paths": {
+      "symmetria": ["./packages/runtime/src/index.ts"],
+      "symmetria/driver": ["./packages/runtime/src/driver.ts"],
+      "symmetria/dialect": ["./packages/runtime/src/dialect.ts"],
+      "symmetria/internal": ["./packages/runtime/src/internal.ts"],
+      "symmetria-kit": ["./packages/kit/src/index.ts"],
+      "symmetria-kit/inspect": ["./packages/kit/src/cli/query-inspect.ts"],
+      "symmetria-kit/testing": ["./packages/kit/src/testing.ts"]
+    }
+  },
+  "include": ["packages", "examples", "tests", "tsdown.config.ts"],
+  "exclude": ["node_modules", "**/dist", "tests/runtime/types"]
+}

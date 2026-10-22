@@ -1,0 +1,61 @@
+{
+  "name": "symmetria-kit",
+  "version": "0.0.1",
+  "description": "Migrations, schema browser and live query profiler for Symmetria on Bun.",
+  "homepage": "https://github.com/nokturnal3301/symmetria#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nokturnal3301/symmetria.git",
+    "directory": "packages/kit"
+  },
+  "bugs": {
+    "url": "https://github.com/nokturnal3301/symmetria/issues"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./inspect": {
+      "types": "./dist/cli/query-inspect.d.ts",
+      "default": "./dist/cli/query-inspect.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "symmetria": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun run --cwd ../.. build:kit",
+    "prepack": "bun run build"
+  },
+  "peerDependencies": {
+    "symmetria": "0.0.1"
+  },
+  "engines": {
+    "bun": ">=1.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "symmetria",
+    "postgres",
+    "migrations",
+    "bun",
+    "cli"
+  ],
+  "author": "Mikhail Demidoff <demidoff.mikhail@gmail.com>",
+  "license": "MIT"
+}

@@ -1,0 +1,6 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["runtime/types/**/*.types.ts"],
+  "exclude": []
+}
