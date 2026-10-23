@@ -53,6 +53,17 @@ export type Driver = {
     callback: (driver: TransactionDriver) => Promise<Result>,
     options?: TransactionOptions,
   ) => Promise<Result>;
+  /** Pin a connection across transaction boundaries. The callback owns its session state. */
+  readonly session?: <Result>(
+    callback: (driver: SessionDriver) => Promise<Result>,
+  ) => Promise<Result>;
+};
+
+export type SessionDriver = {
+  readonly execute: QueryExecutor;
+  readonly transaction: NonNullable<Driver["transaction"]>;
+  /** Cancel the active statement on this pinned connection, if supported. */
+  readonly cancel?: () => Promise<void>;
 };
 
 /** SQL flavour a plan compiles to; bindings inherit it from their driver. Custom dialects use their registered name. */

@@ -31,6 +31,44 @@ const run = async (directory: string, ...argumentsList: string[]) => {
   return { stdout, stderr, exitCode };
 };
 
+test("noninteractive generation requires destructive opt-in and lint still fails after generation", () =>
+  withMigrationDirectory(async (directory) => {
+    const config = join(directory, "symmetria.config.ts");
+
+    const save = (snapshot: unknown) =>
+      writeFile(
+        config,
+        `export default ${JSON.stringify({ schema: snapshot, directory: "migrations" })};`,
+      );
+
+    await save(
+      schema({ records: { id: int, email: text.nullable } }).$snapshot(),
+    );
+    expect(
+      (await run(directory, "generate", "initial", "--no-interactive"))
+        .exitCode,
+    ).toBe(0);
+    await save(
+      schema({ records: { id: int, mail: text.nullable } }).$snapshot(),
+    );
+    expect(
+      (await run(directory, "generate", "mail", "--no-interactive")).exitCode,
+    ).toBe(1);
+    expect(
+      (await run(directory, "generate", "mail", "--allow-destructive"))
+        .exitCode,
+    ).toBe(0);
+    const lint = await run(directory, "lint", "--json");
+    expect(lint.exitCode).toBe(1);
+    expect(JSON.parse(lint.stdout)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ level: "destructive", table: "000002_mail" }),
+      ]),
+    );
+    await writeFile(config, 'export default { directory: "migrations" };');
+    expect((await run(directory, "lint")).exitCode).toBe(1);
+  }));
+
 test("init scaffolds an importable offline schema and preserves existing files", () =>
   withMigrationDirectory(async (directory) => {
     expect((await run(directory, "init", "--json")).exitCode).toBe(0);

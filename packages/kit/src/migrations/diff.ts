@@ -31,6 +31,8 @@ export type RenameHints = {
   readonly columns?: Readonly<Record<string, Readonly<Record<string, string>>>>;
 };
 export type MigrationDiffOptions = {
+  /** Generate concurrent indexes, phased constraint validation and enum additions. Requires nontransactional execution. */
+  readonly online?: boolean;
   readonly renames?: RenameHints;
   /** SQL USING expressions, keyed by new table and column names. */
   readonly using?: Readonly<
@@ -68,6 +70,7 @@ const direction = (
   after: MigrationSnapshot,
   renames: RenameHints,
   casts: Casts,
+  online = false,
 ): string[] => {
   const beforeTables = new Map(
     before.tables.map((table) => [table.name, table]),
@@ -101,6 +104,23 @@ const direction = (
   const afterEnumerations = new Map(
     after.enumerations.map((enumeration) => [enumeration.name, enumeration]),
   );
+  const additiveEnums = new Set(
+    after.enumerations
+      .filter((next) => {
+        const previous = beforeEnumerations.get(next.name);
+
+        return (
+          online &&
+          previous &&
+          previous.values.length < next.values.length &&
+          equal(
+            next.values.filter((value) => previous.values.includes(value)),
+            previous.values,
+          )
+        );
+      })
+      .map((enumeration) => enumeration.name),
+  );
 
   const typeChanged = (
     previous: MigrationColumn,
@@ -110,6 +130,7 @@ const direction = (
     previous.enumeration !== next.enumeration ||
     !!(
       next.enumeration &&
+      !additiveEnums.has(next.enumeration) &&
       !equal(
         beforeEnumerations.get(next.enumeration),
         afterEnumerations.get(next.enumeration),
@@ -311,7 +332,9 @@ const direction = (
   for (const pair of pairs) {
     for (const definition of pair.before.indexes) {
       if (droppedIndexes.has(definition.sqlName)) {
-        statements.push(`DROP INDEX ${quoteIdentifier(definition.sqlName)}`);
+        statements.push(
+          `DROP INDEX ${online ? "CONCURRENTLY " : ""}${quoteIdentifier(definition.sqlName)}`,
+        );
       }
     }
 
@@ -385,6 +408,26 @@ const direction = (
       continue;
     }
 
+    if (previous && additiveEnums.has(enumeration.name)) {
+      const available = new Set(previous.values);
+
+      for (const [position, value] of enumeration.values.entries()) {
+        if (available.has(value)) {
+          continue;
+        }
+
+        const following = enumeration.values
+          .slice(position + 1)
+          .find((value) => available.has(value));
+        statements.push(
+          `ALTER TYPE ${quoteIdentifier(enumeration.name)} ADD VALUE ${quoteLiteral(value)}${following === undefined ? "" : ` BEFORE ${quoteLiteral(following)}`}`,
+        );
+        available.add(value);
+      }
+
+      continue;
+    }
+
     if (previous) {
       let counter = 0;
       let temporary: string;
@@ -447,7 +490,26 @@ const direction = (
       }
 
       if (previous.notNull !== next.notNull) {
-        statements.push(`${prefix} ${next.notNull ? "SET" : "DROP"} NOT NULL`);
+        if (online && next.notNull) {
+          const name = quoteIdentifier(
+            objectName(
+              pair.after.name,
+              next.name,
+              "not_null",
+              checksum(canonicalJSON(before)).slice(0, 8),
+            ),
+          );
+          statements.push(
+            `${alter} ADD CONSTRAINT ${name} CHECK (${quoteIdentifier(next.name)} IS NOT NULL) NOT VALID`,
+            `${alter} VALIDATE CONSTRAINT ${name}`,
+            `${prefix} SET NOT NULL`,
+            `${alter} DROP CONSTRAINT ${name}`,
+          );
+        } else {
+          statements.push(
+            `${prefix} ${next.notNull ? "SET" : "DROP"} NOT NULL`,
+          );
+        }
       }
 
       if (!previous.identity && next.identity) {
@@ -471,7 +533,15 @@ const direction = (
 
     for (const definition of pair.after.checks ?? []) {
       if (changedCheck(pair, definition.sqlName)) {
-        statements.push(`${alter} ADD ${checkSQL(definition)}`);
+        statements.push(
+          `${alter} ADD ${checkSQL(definition)}${online ? " NOT VALID" : ""}`,
+        );
+
+        if (online) {
+          statements.push(
+            `${alter} VALIDATE CONSTRAINT ${quoteIdentifier(definition.sqlName)}`,
+          );
+        }
       }
     }
 
@@ -481,7 +551,17 @@ const direction = (
       );
 
       if (column.unique && (!match || uniqueChanged(pair, match))) {
-        statements.push(`${alter} ADD ${uniqueSQL(pair.after, column)}`);
+        if (online) {
+          const name = quoteIdentifier(
+            objectName(pair.after.name, column.name, "key"),
+          );
+          statements.push(
+            `CREATE UNIQUE INDEX CONCURRENTLY ${name} ON ${quoteIdentifier(pair.after.name)} (${quoteIdentifier(column.name)})`,
+            `${alter} ADD CONSTRAINT ${name} UNIQUE USING INDEX ${name}`,
+          );
+        } else {
+          statements.push(`${alter} ADD ${uniqueSQL(pair.after, column)}`);
+        }
       }
     }
   }
@@ -497,7 +577,14 @@ const direction = (
           (previous) => previous.sqlName === definition.sqlName,
         )
       ) {
-        statements.push(indexSQL(table, definition));
+        statements.push(
+          online
+            ? indexSQL(table, definition).replace(
+                /^(CREATE (?:UNIQUE )?INDEX) /,
+                "$1 CONCURRENTLY ",
+              )
+            : indexSQL(table, definition),
+        );
       }
     }
   }
@@ -515,7 +602,15 @@ const direction = (
           !previous?.references ||
           droppedReferences.has(referenceKey(pair.before.name, previous.name))
         ) {
-          statements.push(foreignKeySQL(table, column));
+          statements.push(
+            `${foreignKeySQL(table, column)}${online ? " NOT VALID" : ""}`,
+          );
+
+          if (online) {
+            statements.push(
+              `ALTER TABLE ${quoteIdentifier(table.name)} VALIDATE CONSTRAINT ${quoteIdentifier(objectName(table.name, column.name, "fkey"))}`,
+            );
+          }
         }
       }
     }
@@ -581,12 +676,19 @@ export const diffSchemas = (
   return {
     before,
     after,
-    up: direction(before, after, options.renames ?? {}, forwardCasts),
+    up: direction(
+      before,
+      after,
+      options.renames ?? {},
+      forwardCasts,
+      options.online,
+    ),
     down: direction(
       after,
       before,
       { tables: reverseTables, columns: reverseColumns },
       reverseCasts,
+      options.online,
     ),
   };
 };

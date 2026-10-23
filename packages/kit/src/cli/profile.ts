@@ -20,6 +20,7 @@ export const profileScreen = async (
         let plan = "";
         let closed = false;
         let pending = false;
+        let token = "";
         let activeRequest: ProfiledRequest | undefined;
         const wasRaw = process.stdin.isRaw;
 
@@ -123,6 +124,13 @@ export const profileScreen = async (
               throw new Error("Invalid profiler response");
             }
 
+            const requestToken = response.headers.get("x-symmetria-token");
+
+            if (!requestToken) {
+              throw new Error("Profiler response is missing its request token");
+            }
+
+            token = requestToken;
             const selectedId = requests[selectedRequest]?.id;
             requests = updated.toSorted((left, right) => right.id - left.id);
             selectedRequest = Math.max(
@@ -159,7 +167,11 @@ export const profileScreen = async (
           try {
             const response = await fetch(
               new URL(`/explain?id=${selected.id}&analyze=${analyze}`, address),
-              { method: "POST", signal: AbortSignal.timeout(30000) },
+              {
+                method: "POST",
+                headers: { "x-symmetria-token": token },
+                signal: AbortSignal.timeout(30000),
+              },
             );
             const result = await response.json();
 

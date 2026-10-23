@@ -1,6 +1,8 @@
 /** Split PostgreSQL scripts without splitting quoted strings or function bodies. */
-export const splitMigrationSQL = (script: string): string[] => {
-  const statements: string[] = [];
+export const parseMigrationSQL = (
+  script: string,
+): { sql: string; words: string[] }[] => {
+  const statements: { sql: string; words: string[] }[] = [];
   let start = 0;
   let position = 0;
   let hasCode = false;
@@ -40,7 +42,7 @@ export const splitMigrationSQL = (script: string): string[] => {
         );
       }
 
-      statements.push(script.slice(start, end).trim());
+      statements.push({ sql: script.slice(start, end).trim(), words });
     }
 
     hasCode = false;
@@ -161,6 +163,9 @@ export const splitMigrationSQL = (script: string): string[] => {
 
   return statements;
 };
+
+export const splitMigrationSQL = (script: string): string[] =>
+  parseMigrationSQL(script).map((statement) => statement.sql);
 
 export const formatMigrationSQL = (statements: readonly string[]): string =>
   statements.length

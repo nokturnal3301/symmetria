@@ -292,6 +292,7 @@ export const createProfiler = (options: { capacity?: number } = {}) => {
     return Object.freeze({
       execute: wrapExecutor(driver.execute, driver.execute, dialect),
       close: driver.close,
+      ...(driver.session ? { session: driver.session } : {}),
       ...(dialect ? { dialect } : {}),
       ...(driver.transaction
         ? {
@@ -341,16 +342,54 @@ export const createProfiler = (options: { capacity?: number } = {}) => {
 
   const serve = (
     settings: { port?: number; hostname?: "127.0.0.1" | "::1" } = {},
-  ) =>
-    Bun.serve({
-      hostname: settings.hostname ?? "127.0.0.1",
+  ) => {
+    const hostname = settings.hostname ?? "127.0.0.1";
+
+    if (hostname !== "127.0.0.1" && hostname !== "::1") {
+      throw new Error(
+        "symmetria: profiler HTTP server requires a loopback address",
+      );
+    }
+
+    const token = crypto.randomUUID();
+    const headers = {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    };
+
+    return Bun.serve({
+      hostname,
       port: settings.port ?? 7331,
-      fetch: async (request) => {
+      fetch: async (request, server) => {
         const url = new URL(request.url);
+        const names = [hostname === "::1" ? "[::1]" : hostname, "localhost"];
+        const hosts = names.flatMap((name) =>
+          server.port === 80
+            ? [name, `${name}:80`]
+            : [`${name}:${server.port}`],
+        );
+        const origin = request.headers.get("origin");
+        const site = request.headers.get("sec-fetch-site");
+
+        if (
+          url.protocol !== "http:" ||
+          !hosts.includes(url.host) ||
+          !hosts.includes(request.headers.get("host")?.toLowerCase() ?? "") ||
+          (origin !== null && origin !== url.origin) ||
+          (site !== null && site !== "same-origin" && site !== "none") ||
+          (request.method === "POST" &&
+            request.headers.get("x-symmetria-token") !== token)
+        ) {
+          return Response.json(
+            { error: "Forbidden" },
+            { status: 403, headers },
+          );
+        }
 
         if (request.method === "GET" && url.pathname === "/requests") {
           return new Response(serialize(snapshot()), {
-            headers: { "content-type": "application/json" },
+            headers: { ...headers, "x-symmetria-token": token },
           });
         }
 
@@ -362,19 +401,20 @@ export const createProfiler = (options: { capacity?: number } = {}) => {
             );
 
             return new Response(serialize(result), {
-              headers: { "content-type": "application/json" },
+              headers,
             });
           } catch (error) {
             return Response.json(
               { error: error instanceof Error ? error.message : String(error) },
-              { status: 400 },
+              { status: 400, headers },
             );
           }
         }
 
-        return new Response("Not found", { status: 404 });
+        return Response.json({ error: "Not found" }, { status: 404, headers });
       },
     });
+  };
 
   return Object.freeze({
     trace,

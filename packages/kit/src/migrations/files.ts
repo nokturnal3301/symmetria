@@ -22,6 +22,16 @@ import {
   type MigrationSnapshot,
 } from "./snapshot";
 import { formatMigrationSQL, splitMigrationSQL } from "./sql";
+import { lintMigration } from "./lint";
+import {
+  fileIdentity,
+  generationLockName,
+  recordGenerationOwner,
+  rollbackPublication,
+  savePublication,
+  syncPath,
+  type Publication,
+} from "./publication";
 
 export type MigrationManifest = {
   version: 1;
@@ -29,6 +39,8 @@ export type MigrationManifest = {
   parent: string | null;
   before: string;
   after: string;
+  /** Omitted/batch preserves atomic execution of all pending transactional migrations. */
+  transaction?: "batch" | "each" | "none";
 };
 export type Migration = {
   id: string;
@@ -47,6 +59,8 @@ export type GenerateMigrationOptions = MigrationDiffOptions & {
   name: string;
   snapshot?: SchemaSnapshot | MigrationSnapshot;
   empty?: boolean;
+  allowDestructive?: boolean;
+  transaction?: "batch" | "each" | "none";
 };
 export type SquashMigrationsOptions = {
   directory: string;
@@ -59,7 +73,7 @@ type MigrationJournal = {
 const migrationIdPattern = /^\d{6}_[a-z0-9][a-z0-9_]*$/;
 const hashPattern = /^[a-f0-9]{64}$/;
 const metadataFiles = ["migration.json", "snapshot.json"];
-const lockName = ".symmetria-generate.lock";
+const lockName = generationLockName;
 
 const missing = (error: unknown): boolean =>
   !!error &&
@@ -153,7 +167,9 @@ const readMigrationState = async (
       manifest.parent !== (migrations.at(-1)?.id ?? null) ||
       manifest.before !== previousHash ||
       typeof manifest.after !== "string" ||
-      !hashPattern.test(manifest.after)
+      !hashPattern.test(manifest.after) ||
+      (manifest.transaction !== undefined &&
+        !["batch", "each", "none"].includes(manifest.transaction))
     ) {
       throw new Error(`symmetria: migration chain mismatch at "${id}"`);
     }
@@ -251,9 +267,13 @@ const withGenerationLock = async <Result>(
   });
 
   try {
+    await recordGenerationOwner(directory);
+
     return await callback();
   } finally {
-    await rm(lock, { recursive: true, force: true });
+    if (!(await exists(join(lock, "publication.json")))) {
+      await rm(lock, { recursive: true, force: true });
+    }
   }
 };
 
@@ -273,13 +293,26 @@ const writeMigrationFiles = async (
   const temporary = await mkdtemp(join(directory, ".symmetria-"));
   const staged = join(temporary, "staged");
   const backup = join(temporary, "backup");
-  const moved: { source: string; destination: string }[] = [];
+  const moved: Publication["moves"] = [];
   let preserveBackup = false;
   const hadMetadata = await exists(join(directory, "meta"));
+  const publication: Publication = {
+    temporary,
+    hadMetadata,
+    moves: moved,
+    committed: false,
+  };
 
   const move = async (source: string, destination: string): Promise<void> => {
+    moved.push({
+      source,
+      destination,
+      identity: (await fileIdentity(source))!,
+    });
+    await savePublication(directory, publication);
     await rename(source, destination);
-    moved.push({ source, destination });
+    await syncPath(resolve(source, ".."));
+    await syncPath(resolve(destination, ".."));
   };
 
   try {
@@ -301,6 +334,21 @@ const writeMigrationFiles = async (
         `${JSON.stringify(migration.snapshot, null, 2)}\n`,
       ),
     ]);
+
+    for (const path of [
+      join(staged, migration.id, "up.sql"),
+      join(staged, migration.id, "down.sql"),
+      ...metadataFiles.map((name) => join(staged, "meta", name)),
+      join(staged, migration.id),
+      join(staged, "meta"),
+      staged,
+      backup,
+      temporary,
+    ]) {
+      await syncPath(path);
+    }
+
+    await savePublication(directory, publication);
     await mkdir(join(directory, "meta"), { recursive: true });
 
     // Retain the old pair and SQL until every replacement has been published.
@@ -319,15 +367,23 @@ const writeMigrationFiles = async (
     }
 
     await move(join(staged, migration.id), join(directory, migration.id));
+    publication.committed = true;
+    await savePublication(directory, publication);
   } catch (error) {
+    if (publication.committed) {
+      preserveBackup = true;
+      throw new Error(
+        "symmetria: publication commit could not be confirmed; use recover after this process exits",
+        { cause: error },
+      );
+    }
+
     const failures: unknown[] = [error];
 
-    for (const { source, destination } of moved.reverse()) {
-      try {
-        await rename(destination, source);
-      } catch (rollbackError) {
-        failures.push(rollbackError);
-      }
+    try {
+      await rollbackPublication(publication);
+    } catch (rollbackError) {
+      failures.push(rollbackError);
     }
 
     if (failures.length > 1) {
@@ -342,10 +398,16 @@ const writeMigrationFiles = async (
       await rm(join(directory, "meta"), { recursive: true, force: true });
     }
 
+    preserveBackup = true;
+    publication.moves = [];
+    await savePublication(directory, publication);
+    preserveBackup = false;
+
     throw error;
   } finally {
     if (!preserveBackup) {
       await rm(temporary, { recursive: true, force: true });
+      await rm(join(directory, lockName, "publication.json"), { force: true });
     }
   }
 };
@@ -401,6 +463,19 @@ export const generateMigration = async (
   const directory = resolve(options.directory);
   const name = normalizeName(options.name);
 
+  if (
+    options.transaction !== undefined &&
+    !["batch", "each", "none"].includes(options.transaction)
+  ) {
+    throw new Error("symmetria: transaction must be batch, each, or none");
+  }
+
+  if (options.online && options.transaction && options.transaction !== "none") {
+    throw new Error(
+      'symmetria: online generation requires transaction: "none"',
+    );
+  }
+
   return withGenerationLock(directory, async () => {
     const { migrations, snapshot: before } =
       await readMigrationState(directory);
@@ -416,6 +491,17 @@ export const generateMigration = async (
         ? parseMigrationSnapshot(next)
         : migrationSnapshot(next);
     const plan = diffSchemas(before, after, options);
+
+    if (
+      !options.allowDestructive &&
+      lintMigration(plan, options.renames).some(
+        (finding) => finding.level === "destructive",
+      )
+    ) {
+      throw new Error(
+        "symmetria: destructive migration requires explicit rename hints or allowDestructive (--allow-destructive)",
+      );
+    }
 
     if (!options.empty && !plan.up.length && !plan.down.length) {
       return null;
@@ -434,6 +520,11 @@ export const generateMigration = async (
       parent: previous?.id ?? null,
       before: snapshotHash(before),
       after: snapshotHash(after),
+      ...(options.online
+        ? { transaction: "none" as const }
+        : options.transaction && options.transaction !== "batch"
+          ? { transaction: options.transaction }
+          : {}),
     };
     const up = formatMigrationSQL(plan.up);
     const down = formatMigrationSQL(plan.down);

@@ -14,7 +14,8 @@
   <a href="docs/reference.md">API reference</a> ·
   <a href="docs/advanced.md">Advanced recipes</a> ·
   <a href="examples/README.md">Examples</a> ·
-  <a href="#see-your-queries">Live demo</a> ·
+   <a href="#see-your-queries">Live demo</a> ·
+   <a href="#migrations-you-can-read">Migrations</a> ·
   <a href="#benchmarks">Benchmarks</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -233,8 +234,9 @@ the [inspector](docs/reference.md#query-inspector) and
 
 ## Migrations you can read
 
-Generate offline, review the SQL, then apply a transactional batch. SQL and
-metadata have separate locations:
+Generate offline, review the SQL, verify it on disposable PostgreSQL databases,
+then deploy with explicit execution boundaries. SQL and metadata have separate
+locations:
 
 ```text
 migrations/
@@ -249,10 +251,77 @@ migrations/
 `snapshot.json` holds the latest generated schema; `migration.json` holds the
 whole migration journal. Generation updates these two files in place.
 
-Kit verifies checksums, serializes migration batches with an advisory lock and
-rolls back a failed batch. `lint`, `drift`, `squash` and `adopt` cover schema
-review and history maintenance.
-[Migration workflow →](docs/reference.md#migrations)
+- **Controlled execution.** Atomic `batch` by default; `each` and `none` support
+  separate commits and online DDL. A pinned PostgreSQL session holds the
+  advisory lock across transaction boundaries.
+- **Bounded operations.** Advisory-lock, DDL-lock and statement timeouts,
+  cancellation, statement-level events and `migrate --plan` make deployments
+  observable.
+- **Verified schemas.** Drift checks defaults, identity, PK/FK/UNIQUE/CHECK
+  constraints, FK actions, enum ordering and index validity. `adopt` checks the
+  live schema before recording history.
+- **Recoverable state.** Nontransactional failures persist as `incomplete` and
+  require explicit `repair`. `recover` restores file publication after a crashed
+  generator. Column declarations keep their order; snapshot hashes are
+  canonical.
+
+[Migration workflow](docs/reference.md#migrations) ·
+[Execution modes and timeouts](docs/reference.md#execution-modes-timeouts-and-plans)
+· [Recording source and transcripts](docs/demos/README.md)
+
+### Generate safely. Review saved SQL.
+
+Renames use explicit hints. Dropped tables or columns require
+`--allow-destructive`. `lint` checks saved `up.sql` after generation and fails
+on destructive or blocking findings; `--pending` selects unapplied migrations.
+
+<a href="docs/assets/migration-safety.gif">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/migration-safety.png">
+    <img src="docs/assets/migration-safety.gif" width="1280" alt="Generation rejects an implicit nullable-column rename, an explicit rename preserves the existing row, and lint detects a saved DROP COLUMN after generation.">
+  </picture>
+</a>
+
+[Static preview](docs/assets/migration-safety.png)
+
+### Verify against real PostgreSQL.
+
+`verify` exercises installation, upgrades, rollback and reapplication in
+disposable databases. Data hooks assert application-specific invariants; the
+verification connection needs `CREATEDB`. Live drift and verified adoption catch
+manual schema changes before history is re-baselined.
+
+<a href="docs/assets/migration-verification.gif">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/migration-verification.png">
+    <img src="docs/assets/migration-verification.gif" width="1280" alt="Verification asserts that an existing user survives upgrade and rollback. Drift detects a removed default, and adoption succeeds after the live schema is reconciled.">
+  </picture>
+</a>
+
+[Static preview](docs/assets/migration-verification.png) ·
+[Verification hooks](docs/reference.md#disposable-database-verification)
+
+### Online DDL with explicit recovery.
+
+`generate --online` supports concurrent indexes, phased constraint validation
+and additive enum changes. If a nontransactional migration fails, inspect its
+durable state, reconcile the objects and data, then use `repair` to verify the
+boundary before retrying or recording completion.
+
+<a href="docs/assets/migration-recovery.gif">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/migration-recovery.png">
+    <img src="docs/assets/migration-recovery.gif" width="1280" alt="A concurrent unique index fails on duplicate data and leaves an incomplete migration. After deduplication and invalid-index cleanup, verified repair permits a successful retry.">
+  </picture>
+</a>
+
+[Static preview](docs/assets/migration-recovery.png) ·
+[Online DDL and recovery](docs/reference.md#online-ddl-and-recovery)
+
+These recordings use actual CLI output from PostgreSQL 16.10. Playback is paced
+for readability;
+[commands, exit codes and reproduction scripts](docs/demos/README.md) are
+included.
 
 ### Explore your schema
 

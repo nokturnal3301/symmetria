@@ -1,0 +1,292 @@
+{
+  "version": 1,
+  "recordedAt": "2026-10-22T20:05:11.823Z",
+  "environment": {
+    "bun": "1.3.2",
+    "postgres": "16.10 (Debian 16.10-1.pgdg12+1)",
+    "sourceHash": "16c623ce3a8dbc7373d0280400c4eba63bab3c9e6cd6ec362d3146a08780f36f"
+  },
+  "playback": "Unmodified CLI stdout/stderr; commands and pauses are paced for readability.",
+  "demos": [
+    {
+      "id": "migration-safety",
+      "label": "SAFE GENERATION",
+      "accent": "#bca4ff",
+      "preview": 1,
+      "scenes": [
+        {
+          "title": "A rename deserves a decision.",
+          "subtitle": "An existing nullable column disappears. Generation stops before writing SQL.",
+          "caption": "The existing row is still there. No implicit DROP / ADD.",
+          "hold": 4.5,
+          "commands": [
+            {
+              "command": "MODEL=renamed symmetria generate rename_email",
+              "stdout": "",
+              "stderr": "symmetria: destructive migration requires explicit rename hints or allowDestructive (--allow-destructive)",
+              "exitCode": 1,
+              "durationMs": 48
+            },
+            {
+              "command": "bun data.ts users",
+              "stdout": "{\"id\":1,\"email\":\"ada@example.com\"}",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 57
+            }
+          ]
+        },
+        {
+          "title": "Make the rename explicit.",
+          "subtitle": "rename.json maps users.email to users.mail using physical SQL names.",
+          "caption": "The migration renames the column and keeps Ada's email.",
+          "hold": 4.5,
+          "commands": [
+            {
+              "command": "MODEL=renamed symmetria generate rename_email --diff rename.json",
+              "stdout": "Generated 000002_rename_email",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 50
+            },
+            {
+              "command": "symmetria migrate",
+              "stdout": "Applied 000002_rename_email",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 70
+            },
+            {
+              "command": "bun data.ts users",
+              "stdout": "{\"id\":1,\"mail\":\"ada@example.com\"}",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 45
+            }
+          ]
+        },
+        {
+          "title": "Saved SQL stays under review.",
+          "subtitle": "An intentional removal is generated. Lint still checks its up.sql afterward.",
+          "caption": "The snapshot already matches the code. Lint still exits 1 for the pending DROP.",
+          "hold": 6,
+          "commands": [
+            {
+              "command": "MODEL=removed symmetria generate remove_mail --allow-destructive",
+              "stdout": "Generated 000003_remove_mail",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 51
+            },
+            {
+              "command": "MODEL=removed symmetria lint --pending",
+              "stdout": "DESTRUCTIVE 000003_remove_mail: Statement 1: Removes data or a database object.\n            Review the exact SQL and deploy dependent application changes first.",
+              "stderr": "",
+              "exitCode": 1,
+              "durationMs": 68
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "migration-verification",
+      "label": "VERIFY + DRIFT",
+      "accent": "#69c4ff",
+      "preview": 0,
+      "scenes": [
+        {
+          "title": "Exercise the SQL on PostgreSQL.",
+          "subtitle": "Verify creates disposable databases and tests installation, upgrade and rollback.",
+          "caption": "Data hooks assert that an existing user survives up, down and reapplication.",
+          "hold": 5,
+          "commands": [
+            {
+              "command": "symmetria verify",
+              "stdout": "Data check [up]: existing user retained.\nData check [down]: existing user retained.\nData check [reapply]: existing user retained.\nVerified 2 migrations: installation, upgrade, rollback and reapplication.",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 625
+            },
+            {
+              "command": "symmetria drift --strict",
+              "stdout": "No schema drift detected.",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 82
+            }
+          ]
+        },
+        {
+          "title": "Catch the smaller differences.",
+          "subtitle": "A manual change removes a default without changing the column type.",
+          "caption": "Drift checks defaults, identity, constraints, enums and index validity.",
+          "hold": 5,
+          "commands": [
+            {
+              "command": "bun data.ts drift",
+              "stdout": "ALTER TABLE users ALTER COLUMN active DROP DEFAULT;",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 41
+            },
+            {
+              "command": "symmetria drift --strict",
+              "stdout": "default-mismatch      \"users\".\"active\" (expected TRUE, found nothing)",
+              "stderr": "",
+              "exitCode": 1,
+              "durationMs": 55
+            }
+          ]
+        },
+        {
+          "title": "Adopt checks the live schema.",
+          "subtitle": "History cannot be re-baselined while the database differs from the target.",
+          "caption": "The failed adoption leaves the recorded migration history intact.",
+          "hold": 4.5,
+          "commands": [
+            {
+              "command": "symmetria adopt",
+              "stdout": "",
+              "stderr": "symmetria: schema does not match the adoption/recovery target\ndefault-mismatch      \"users\".\"active\" (expected TRUE, found nothing)",
+              "exitCode": 1,
+              "durationMs": 63
+            }
+          ]
+        },
+        {
+          "title": "Reconcile, then adopt.",
+          "subtitle": "Restore the declared default and verify the baseline again.",
+          "caption": "The live schema matches before migration history is recorded.",
+          "hold": 4.5,
+          "commands": [
+            {
+              "command": "bun data.ts restore",
+              "stdout": "ALTER TABLE users ALTER COLUMN active SET DEFAULT TRUE;",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 43
+            },
+            {
+              "command": "symmetria adopt",
+              "stdout": "Adopted 000001_initial\nAdopted 000002_add_active",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 74
+            },
+            {
+              "command": "symmetria drift --strict",
+              "stdout": "No schema drift detected.",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 65
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "migration-recovery",
+      "label": "ONLINE + RECOVERY",
+      "accent": "#76deb2",
+      "preview": 1,
+      "scenes": [
+        {
+          "title": "See the commit boundary.",
+          "subtitle": "Online index construction runs outside a transaction under a session-wide lock.",
+          "caption": "The plan prints the exact SQL and its nontransactional execution mode.",
+          "hold": 4.5,
+          "commands": [
+            {
+              "command": "MODEL=indexed symmetria generate email_index --online",
+              "stdout": "Generated 000002_email_index",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 49
+            },
+            {
+              "command": "symmetria migrate --plan",
+              "stdout": "-- group 1: none · 000002_email_index\nCREATE UNIQUE INDEX CONCURRENTLY \"users_email_idx\" ON \"users\" USING btree (\"email\");",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 61
+            }
+          ]
+        },
+        {
+          "title": "A partial failure stays visible.",
+          "subtitle": "Duplicate emails prevent the concurrent unique index from completing.",
+          "caption": "SQLSTATE, statement number and durable incomplete state identify the recovery boundary.",
+          "hold": 6,
+          "commands": [
+            {
+              "command": "symmetria migrate",
+              "stdout": "",
+              "stderr": "symmetria: migration \"000002_email_index\" failed (up, statement 1, SQLSTATE 23505): could not create unique index \"users_email_idx\"\n\nSQL:\nCREATE UNIQUE INDEX CONCURRENTLY \"users_email_idx\" ON \"users\" USING btree (\"email\")\ncould not create unique index \"users_email_idx\"",
+              "exitCode": 1,
+              "durationMs": 68
+            },
+            {
+              "command": "symmetria status",
+              "stdout": "applied 000001_initial\nincomplete 000002_email_index · up · 0 confirmed statements · repair required",
+              "stderr": "",
+              "exitCode": 1,
+              "durationMs": 62
+            }
+          ]
+        },
+        {
+          "title": "Reconcile data. Verify the boundary.",
+          "subtitle": "Keep the original user, remove the invalid index, then explicitly request a retry.",
+          "caption": "Repair replays the historical target in a disposable database to check the starting schema.",
+          "hold": 5,
+          "commands": [
+            {
+              "command": "bun data.ts reconcile",
+              "stdout": "Removed 1 duplicate row; retained the original user.\nDROP INDEX CONCURRENTLY users_email_idx;",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 49
+            },
+            {
+              "command": "symmetria repair 000002_email_index --action retry",
+              "stdout": "Repaired 000002_email_index: retry",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 371
+            }
+          ]
+        },
+        {
+          "title": "Retry the unchanged migration.",
+          "subtitle": "The concurrent index completes and the live catalog matches the generated schema.",
+          "caption": "One original user retained. A valid unique index. A clean migration journal.",
+          "hold": 4.5,
+          "commands": [
+            {
+              "command": "symmetria migrate",
+              "stdout": "Applied 000002_email_index",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 85
+            },
+            {
+              "command": "symmetria drift --strict",
+              "stdout": "No schema drift detected.",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 60
+            },
+            {
+              "command": "bun data.ts users",
+              "stdout": "{\"id\":1,\"email\":\"ada@example.com\"}",
+              "stderr": "",
+              "exitCode": 0,
+              "durationMs": 40
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

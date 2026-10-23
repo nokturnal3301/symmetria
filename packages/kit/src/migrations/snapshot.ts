@@ -312,81 +312,79 @@ export const parseMigrationSnapshot = (input: unknown): MigrationSnapshot => {
       }
 
       const name = identifier(table.name);
-      const columns = table.columns
-        .map((column): MigrationColumn => {
-          if (
-            !column ||
-            typeof column.notNull !== "boolean" ||
-            typeof column.unique !== "boolean" ||
-            typeof column.identity !== "boolean"
-          ) {
-            return fail();
-          }
+      const columns = table.columns.map((column): MigrationColumn => {
+        if (
+          !column ||
+          typeof column.notNull !== "boolean" ||
+          typeof column.unique !== "boolean" ||
+          typeof column.identity !== "boolean"
+        ) {
+          return fail();
+        }
 
-          if (
-            column.enumeration !== undefined &&
-            !enumerations.some(
-              (enumeration) => enumeration.name === column.enumeration,
-            )
-          ) {
-            return fail();
-          }
+        if (
+          column.enumeration !== undefined &&
+          !enumerations.some(
+            (enumeration) => enumeration.name === column.enumeration,
+          )
+        ) {
+          return fail();
+        }
 
-          if (
-            (column.sqlType === "enum") !==
-            (column.enumeration !== undefined)
-          ) {
-            return fail();
-          }
+        if (
+          (column.sqlType === "enum") !==
+          (column.enumeration !== undefined)
+        ) {
+          return fail();
+        }
 
-          if (
-            column.identity &&
-            (!column.notNull ||
-              !["smallint", "integer", "bigint"].includes(column.sqlType) ||
-              column.default !== undefined)
-          ) {
-            throw new Error(
-              "symmetria: identity requires a non-null integer column without another default",
-            );
-          }
+        if (
+          column.identity &&
+          (!column.notNull ||
+            !["smallint", "integer", "bigint"].includes(column.sqlType) ||
+            column.default !== undefined)
+        ) {
+          throw new Error(
+            "symmetria: identity requires a non-null integer column without another default",
+          );
+        }
 
-          if (
-            column.references &&
-            ![
-              "cascade",
-              "restrict",
-              "no action",
-              "set null",
-              "set default",
-            ].includes(column.references.onDelete)
-          ) {
-            return fail();
-          }
+        if (
+          column.references &&
+          ![
+            "cascade",
+            "restrict",
+            "no action",
+            "set null",
+            "set default",
+          ].includes(column.references.onDelete)
+        ) {
+          return fail();
+        }
 
-          return {
-            name: identifier(column.name),
-            sqlType: text(column.sqlType),
-            notNull: column.notNull,
-            unique: column.unique,
-            identity: column.identity,
-            ...(column.enumeration === undefined
-              ? {}
-              : { enumeration: column.enumeration }),
-            ...(column.default === undefined
-              ? {}
-              : { default: text(column.default) }),
-            ...(column.references
-              ? {
-                  references: {
-                    table: identifier(column.references.table),
-                    column: identifier(column.references.column),
-                    onDelete: column.references.onDelete,
-                  },
-                }
-              : {}),
-          };
-        })
-        .sort((left, right) => compareNames(left.name, right.name));
+        return {
+          name: identifier(column.name),
+          sqlType: text(column.sqlType),
+          notNull: column.notNull,
+          unique: column.unique,
+          identity: column.identity,
+          ...(column.enumeration === undefined
+            ? {}
+            : { enumeration: column.enumeration }),
+          ...(column.default === undefined
+            ? {}
+            : { default: text(column.default) }),
+          ...(column.references
+            ? {
+                references: {
+                  table: identifier(column.references.table),
+                  column: identifier(column.references.column),
+                  onDelete: column.references.onDelete,
+                },
+              }
+            : {}),
+        };
+      });
       uniqueNames(columns.map((column) => column.name));
       const primaryKey = table.primaryKey.map(identifier);
       uniqueNames(primaryKey);
@@ -504,5 +502,18 @@ export const parseMigrationSnapshot = (input: unknown): MigrationSnapshot => {
   return { version: 1, dialect: "postgresql", tables, enumerations };
 };
 
-export const snapshotHash = (snapshot: MigrationSnapshot): string =>
-  checksum(canonicalJSON(parseMigrationSnapshot(snapshot)));
+export const snapshotHash = (snapshot: MigrationSnapshot): string => {
+  const normalized = parseMigrationSnapshot(snapshot);
+
+  return checksum(
+    canonicalJSON({
+      ...normalized,
+      tables: normalized.tables.map((table) => ({
+        ...table,
+        columns: table.columns.toSorted((left, right) =>
+          compareNames(left.name, right.name),
+        ),
+      })),
+    }),
+  );
+};

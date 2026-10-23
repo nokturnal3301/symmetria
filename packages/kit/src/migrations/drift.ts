@@ -1,6 +1,9 @@
 import { normalizeResult, quoteIdentifier } from "symmetria/internal";
 import type { QueryExecutor, SchemaSnapshot } from "symmetria";
 import { indexSQL } from "./ddl";
+import { readCatalog } from "./catalog";
+import { constraintDrift } from "./drift-constraints";
+import { expressionsMatch } from "./drift-expressions";
 import {
   migrationSnapshot,
   parseMigrationSnapshot,
@@ -14,6 +17,16 @@ export type DriftKind =
   | "extra-column"
   | "type-mismatch"
   | "nullability-mismatch"
+  | "default-mismatch"
+  | "identity-mismatch"
+  | "missing-constraint"
+  | "extra-constraint"
+  | "constraint-mismatch"
+  | "invalid-constraint"
+  | "missing-enum"
+  | "extra-enum"
+  | "enum-mismatch"
+  | "invalid-index"
   | "missing-index"
   | "index-mismatch"
   | "extra-index";
@@ -29,6 +42,8 @@ export type DriftOptions = {
   readonly snapshot: SchemaSnapshot | MigrationSnapshot;
   /** Schema to inspect; defaults to the connection's current_schema(). */
   readonly schemaName?: string;
+  /** Schema containing the migration journal; defaults to public. */
+  readonly metadataSchema?: string;
   readonly metadataTable?: string;
 };
 
@@ -45,55 +60,6 @@ const indexKey = (expression: string) => {
       ? ordering[2].toUpperCase() === "FIRST"
       : descending,
   };
-};
-
-const indexExpressionsMatch = async (
-  expected: readonly string[],
-  actual: readonly string[],
-  tableName: string,
-  options: DriftOptions,
-): Promise<boolean> => {
-  const table = `${options.schemaName ? `${quoteIdentifier(options.schemaName)}.` : ""}${quoteIdentifier(tableName)}`;
-
-  try {
-    // Let PostgreSQL normalize casts, parentheses and rewrites such as IN -> ANY.
-    // EXPLAIN without ANALYZE plans the expressions without scanning table data.
-    const result = normalizeResult(
-      await options.execute({
-        sql: `EXPLAIN (VERBOSE, FORMAT JSON, COSTS OFF) SELECT ${[...expected, ...actual].map((expression) => `(${expression})`).join(", ")} FROM ${table}`,
-        parameters: [],
-      }),
-    );
-    const plan = result.rows[0]?.["QUERY PLAN"] as {
-      Plan: { Output: string[] };
-    }[];
-    const output = plan[0]!.Plan.Output;
-
-    return (
-      output.length === expected.length * 2 &&
-      output
-        .slice(0, expected.length)
-        .every(
-          (expression, position) =>
-            expression === output[position + expected.length],
-        )
-    );
-  } catch (error) {
-    // A changed column/type can make the declared index expression unresolvable.
-    if (
-      error &&
-      typeof error === "object" &&
-      ["code", "errno"].some((field) =>
-        ["42703", "42704", "42804", "42846", "42883", "22P02"].includes(
-          String((error as Record<string, unknown>)[field]),
-        ),
-      )
-    ) {
-      return false;
-    }
-
-    throw error;
-  }
 };
 
 const typeAliases: Record<string, string> = {
@@ -144,35 +110,23 @@ export const detectDrift = async (
     "version" in options.snapshot
       ? parseMigrationSnapshot(options.snapshot)
       : migrationSnapshot(options.snapshot);
+  const catalog = await readCatalog(options);
   const metadataTable = options.metadataTable ?? "_symmetria_migrations";
   const schemaFilter = options.schemaName
-    ? "namespace.nspname = $2"
+    ? "namespace.nspname = $3"
     : "namespace.nspname = current_schema()";
-  const parameters = options.schemaName
-    ? [metadataTable, options.schemaName]
-    : [metadataTable];
-  const columns = normalizeResult(
-    await options.execute({
-      sql: `SELECT relation.relname AS table_name, attribute.attname AS column_name,
-        format_type(attribute.atttypid, attribute.atttypmod) AS data_type, attribute.attnotnull AS not_null
-      FROM pg_attribute attribute
-      JOIN pg_class relation ON relation.oid = attribute.attrelid
-      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-      WHERE ${schemaFilter} AND relation.relkind IN ('r', 'p') AND attribute.attnum > 0
-        AND NOT attribute.attisdropped AND relation.relname <> $1
-      ORDER BY relation.relname, attribute.attnum`,
-      parameters,
-    }),
-  ).rows as {
-    table_name: string;
-    column_name: string;
-    data_type: string;
-    not_null: boolean;
-  }[];
+  const metadataFilter =
+    "NOT (relation.relname = $1 AND namespace.nspname = $2)";
+  const parameters = [
+    metadataTable,
+    options.metadataSchema ?? "public",
+    ...(options.schemaName ? [options.schemaName] : []),
+  ];
+  const columns = catalog.columns;
   const indexes = normalizeResult(
     await options.execute({
       sql: `SELECT relation.relname AS table_name, indexrelation.relname AS index_name,
-        index.indisunique AS is_unique, accessmethod.amname AS method,
+        index.indisunique AS is_unique, index.indnullsnotdistinct AS nulls_not_distinct, accessmethod.amname AS method,
         ARRAY(SELECT pg_get_indexdef(index.indexrelid, position, true)
           FROM generate_series(1, index.indnkeyatts) position) AS keys,
         ARRAY(SELECT index.indoption[position - 1]::integer
@@ -186,7 +140,7 @@ export const detectDrift = async (
       JOIN pg_class indexrelation ON indexrelation.oid = index.indexrelid
       JOIN pg_am accessmethod ON accessmethod.oid = indexrelation.relam
       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-      WHERE ${schemaFilter} AND relation.relname <> $1 AND NOT index.indisprimary
+      WHERE ${schemaFilter} AND ${metadataFilter} AND NOT index.indisprimary
       ORDER BY relation.relname, indexrelation.relname`,
       parameters,
     }),
@@ -194,6 +148,7 @@ export const detectDrift = async (
     table_name: string;
     index_name: string;
     is_unique: boolean;
+    nulls_not_distinct: boolean;
     method: string;
     keys: string[];
     options: number[];
@@ -206,6 +161,10 @@ export const detectDrift = async (
     string,
     Map<string, { type: string; notNull: boolean }>
   >();
+
+  for (const table of catalog.tables) {
+    actualTables.set(table.name, new Map());
+  }
 
   for (const row of columns) {
     const table = actualTables.get(row.table_name) ?? new Map();
@@ -233,12 +192,21 @@ export const detectDrift = async (
         continue;
       }
 
+      const details = catalog.columns.find(
+        (entry) =>
+          entry.table_name === table.name && entry.column_name === column.name,
+      )!;
       const expectedType = normalizeSqlType(
         column.enumeration ?? column.sqlType,
       );
       const actualType = normalizeSqlType(live.type);
 
-      if (expectedType !== actualType) {
+      if (
+        column.enumeration
+          ? details.enum_name !== column.enumeration ||
+            details.enum_schema !== null
+          : expectedType !== actualType
+      ) {
         findings.push({
           kind: "type-mismatch",
           table: table.name,
@@ -257,6 +225,45 @@ export const detectDrift = async (
           actual: live.notNull ? "NOT NULL" : "NULL",
         });
       }
+
+      if (details.identity !== (column.identity ? "a" : "")) {
+        findings.push({
+          kind: "identity-mismatch",
+          table: table.name,
+          column: column.name,
+          expected: column.identity ? "GENERATED ALWAYS" : "none",
+          actual:
+            details.identity === "a"
+              ? "GENERATED ALWAYS"
+              : details.identity === "d"
+                ? "GENERATED BY DEFAULT"
+                : "none",
+        });
+      }
+
+      if (
+        (column.default === undefined) !== (details.default === null) ||
+        (column.default !== undefined &&
+          details.default !== null &&
+          !(await expressionsMatch(
+            [
+              `(${column.default})::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
+            ],
+            [
+              `(${details.default})::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
+            ],
+            table.name,
+            options,
+          )))
+      ) {
+        findings.push({
+          kind: "default-mismatch",
+          table: table.name,
+          column: column.name,
+          ...(column.default === undefined ? {} : { expected: column.default }),
+          ...(details.default === null ? {} : { actual: details.default }),
+        });
+      }
     }
 
     for (const columnName of actual.keys()) {
@@ -270,6 +277,21 @@ export const detectDrift = async (
     }
 
     const liveIndexes = indexes.filter((row) => row.table_name === table.name);
+
+    for (const index of catalog.indexes.filter(
+      (index) =>
+        index.table_name === table.name && (!index.valid || !index.ready),
+    )) {
+      findings.push({
+        kind: "invalid-index",
+        table: table.name,
+        actual: index.name,
+      });
+    }
+
+    findings.push(
+      ...(await constraintDrift(table, catalog.constraints, options)),
+    );
 
     for (const definition of table.indexes) {
       const live = liveIndexes.find(
@@ -289,6 +311,7 @@ export const detectDrift = async (
 
       if (
         definition.unique !== live.is_unique ||
+        live.nulls_not_distinct ||
         definition.method !== live.method ||
         declaredKeys.length !== live.keys.length ||
         definition.include.length !== live.included.length ||
@@ -297,7 +320,7 @@ export const detectDrift = async (
             key.descending !== !!(live.options[position]! & 1) ||
             key.nullsFirst !== !!(live.options[position]! & 2),
         ) ||
-        !(await indexExpressionsMatch(
+        !(await expressionsMatch(
           [
             ...declaredKeys.map((key) => key.expression),
             ...definition.include,
@@ -320,7 +343,12 @@ export const detectDrift = async (
     for (const { index_name: name } of liveIndexes) {
       const declared =
         table.indexes.some((definition) => definition.sqlName === name) ||
-        name.endsWith("_key");
+        catalog.indexes.some(
+          (index) =>
+            index.table_name === table.name &&
+            index.name === name &&
+            index.constraint,
+        );
 
       if (!declared) {
         findings.push({ kind: "extra-index", table: table.name, actual: name });
@@ -331,6 +359,33 @@ export const detectDrift = async (
   for (const name of actualTables.keys()) {
     if (!expected.tables.some((table) => table.name === name)) {
       findings.push({ kind: "extra-table", table: name });
+    }
+  }
+
+  for (const enumeration of expected.enumerations) {
+    const live = catalog.enumerations.find(
+      (entry) => entry.name === enumeration.name,
+    );
+
+    if (!live) {
+      findings.push({ kind: "missing-enum", table: enumeration.name });
+    } else if (
+      JSON.stringify(live.values) !== JSON.stringify(enumeration.values)
+    ) {
+      findings.push({
+        kind: "enum-mismatch",
+        table: enumeration.name,
+        expected: JSON.stringify(enumeration.values),
+        actual: JSON.stringify(live.values),
+      });
+    }
+  }
+
+  for (const enumeration of catalog.enumerations) {
+    if (
+      !expected.enumerations.some((entry) => entry.name === enumeration.name)
+    ) {
+      findings.push({ kind: "extra-enum", table: enumeration.name });
     }
   }
 

@@ -74,7 +74,9 @@ test("custom default codecs produce storage defaults in migration snapshots", ()
     wallets: { id: int.auto, balance: amount.default({ cents: 123n }) },
   });
   expect(
-    migrationSnapshot(model.$snapshot()).tables[0]?.columns[0]?.default,
+    migrationSnapshot(model.$snapshot()).tables[0]?.columns.find(
+      (column) => column.name === "balance",
+    )?.default,
   ).toBe("E'123'");
   const optional = customType<string | null>("text", {
     encode: (value) => value ?? "sentinel",
@@ -101,7 +103,9 @@ test("JSON defaults follow JSON serialization semantics and enum ownership is un
     },
   });
   expect(
-    migrationSnapshot(model.$snapshot()).tables[0]?.columns[0]?.default,
+    migrationSnapshot(model.$snapshot()).tables[0]?.columns.find(
+      (column) => column.name === "details",
+    )?.default,
   ).toBe(`E'{"date":"2026-01-01T00:00:00.000Z"}'::jsonb`);
   const conflicting = schema({
     firstSecond: { id: int, status: oneOf("a") },

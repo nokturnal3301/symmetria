@@ -1,6 +1,6 @@
 {
   "name": "symmetria-kit",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Migrations, schema browser and live query profiler for Symmetria on Bun.",
   "homepage": "https://github.com/nokturnal3301/symmetria#readme",
   "repository": {
@@ -41,7 +41,7 @@
     "prepack": "bun run build"
   },
   "peerDependencies": {
-    "symmetria": "0.0.1"
+    "symmetria": "0.1.0"
   },
   "engines": {
     "bun": ">=1.3"

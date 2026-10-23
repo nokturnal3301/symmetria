@@ -273,15 +273,17 @@ export const formatStatus = (
   }
 
   const applied = statuses.filter((entry) => entry.status === "applied").length;
+  const pending = statuses.filter((entry) => entry.status === "pending").length;
+  const incomplete = statuses.length - applied - pending;
 
   return [
     heading("Migration history", `${statuses.length} total`, color),
     ...statuses.map(
       (entry) =>
-        `  ${style(entry.status === "applied" ? "✓" : "○", entry.status === "applied" ? "success" : "warning")} ${style(entry.id.padEnd(36), "strong")} ${style(entry.status, entry.status === "applied" ? "success" : "warning")}${entry.appliedAt ? style(` · ${entry.appliedAt.toISOString()}`, "muted") : ""}`,
+        `  ${style(entry.status === "applied" ? "✓" : "○", entry.status === "applied" ? "success" : "warning")} ${style(entry.id.padEnd(36), "strong")} ${style(entry.status, entry.status === "applied" ? "success" : "warning")}${entry.status === "incomplete" ? ` · ${entry.direction} · ${entry.statement} confirmed statements · repair required` : entry.appliedAt ? style(` · ${entry.appliedAt.toISOString()}`, "muted") : ""}`,
     ),
     "",
-    `  ${style(`${applied} applied`, "success")} ${style("·", "muted")} ${style(`${statuses.length - applied} pending`, statuses.length === applied ? "muted" : "warning")}\n`,
+    `  ${style(`${applied} applied`, "success")} ${style("·", "muted")} ${style(`${pending} pending`, pending ? "warning" : "muted")}${incomplete ? ` · ${style(`${incomplete} incomplete`, "warning")}` : ""}\n`,
   ].join("\n");
 };
 

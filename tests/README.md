@@ -1,5 +1,10 @@
 # Tests
 
+Migration integration tests cover transaction groups, online DDL failure and
+repair, advisory/DDL/statement timeouts, cancellation, expanded drift checks and
+schema-verified adoption. Disposable verification tests require `CREATEDB` on
+the PostgreSQL test connection and clean up their generated databases.
+
 Run `bun run test` for the database-free suite. Test schemas live in
 `fixtures/`, independently of the runnable examples.
 

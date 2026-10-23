@@ -23,6 +23,9 @@ import {
   generateMigration,
   squashMigrations,
   lintMigration,
+  lintMigrationSQL,
+  verifyMigrations,
+  recoverMigrationFiles,
   formatLintFindings,
   detectDrift,
   formatDriftFindings,
@@ -38,7 +41,7 @@ const help = `symmetria <command>
 
   init [directory]     Create modular tables, connection and migration config
   diff                 Compare schema code with the latest migration snapshot
-  lint                 Review the pending diff for destructive or blocking changes
+  lint                 Review saved up.sql files and ungenerated schema changes
   inspect [table]      Inspect tables, columns, relations, indexes and checks
   profile              Observe live application requests and SQL timings
   generate <name>       Generate up.sql, down.sql and a versioned snapshot
@@ -48,6 +51,9 @@ const help = `symmetria <command>
   squash <name>        Replace the migration chain with one baseline migration
   adopt                Record the local chain as applied after a squash or baseline
   drift                Compare the live database with the latest migration snapshot
+  verify               Exercise installation, upgrade and rollback in disposable databases
+  repair <id>          Resolve an incomplete migration after verifying its schema
+  recover              Recover files left by a crashed generation process
   (no command)         Open the interactive dashboard in a terminal
 
   --config <file>       Config module (default: symmetria.config.ts)
@@ -56,6 +62,16 @@ const help = `symmetria <command>
   --profile-url <url>   Profiler endpoint (default: http://127.0.0.1:7331)
   --diff <file.json>    Explicit rename hints and USING conversions for generate
   --empty              Generate an empty, editable SQL migration
+  --allow-destructive  Explicitly permit destructive generation
+  --transaction <mode> batch (default), each, or none
+  --pending            Lint only migrations pending in the configured database
+  --online             Generate concurrent indexes and phased validation (transaction none)
+  --plan               Show SQL and transaction groups without executing migrations
+  --action <action>    repair: retry or complete, after manual data reconciliation
+  --verify-url <url>   Administrative PostgreSQL URL for disposable verification databases
+  --advisory-lock-timeout <ms>  Migration lock wait (default: 10000)
+  --lock-timeout <ms>   DDL lock wait (default: 5000; 0 disables)
+  --statement-timeout <ms>  Statement duration (default: 600000; 0 disables)
   --to <migration-id>   Apply up to a migration
   --steps <number>      Number of migrations to rollback (default: 1)
   --strict             Exit with code 1 when lint or drift report findings
@@ -84,6 +100,16 @@ export const runMigrationCLI = async (
       diff: { type: "string" },
       strict: { type: "boolean" },
       empty: { type: "boolean" },
+      "allow-destructive": { type: "boolean" },
+      transaction: { type: "string" },
+      pending: { type: "boolean" },
+      online: { type: "boolean" },
+      plan: { type: "boolean" },
+      action: { type: "string" },
+      "verify-url": { type: "string" },
+      "advisory-lock-timeout": { type: "string" },
+      "lock-timeout": { type: "string" },
+      "statement-timeout": { type: "string" },
       to: { type: "string" },
       steps: { type: "string" },
       help: { type: "boolean", short: "h" },
@@ -142,6 +168,9 @@ export const runMigrationCLI = async (
       "inspect",
       "dashboard",
       "profile",
+      "verify",
+      "repair",
+      "recover",
     ].includes(command)
   ) {
     throw new Error(`symmetria: unknown command "${command}"`);
@@ -149,7 +178,9 @@ export const runMigrationCLI = async (
 
   if (
     positionals.length >
-    (["generate", "inspect", "init", "squash"].includes(command) ? 2 : 1)
+    (["generate", "inspect", "init", "squash", "repair"].includes(command)
+      ? 2
+      : 1)
   ) {
     throw new Error("symmetria: unexpected positional arguments");
   }
@@ -160,6 +191,43 @@ export const runMigrationCLI = async (
 
   if (command === "squash" && !name) {
     throw new Error("symmetria: squash requires a migration name");
+  }
+
+  if (
+    (values["allow-destructive"] || values.transaction || values.online) &&
+    command !== "generate"
+  ) {
+    throw new Error(
+      "symmetria: --allow-destructive and --transaction are generate options",
+    );
+  }
+
+  if (
+    values.transaction &&
+    !["batch", "each", "none"].includes(values.transaction)
+  ) {
+    throw new Error("symmetria: --transaction must be batch, each, or none");
+  }
+
+  if (values.pending && command !== "lint") {
+    throw new Error("symmetria: --pending is a lint option");
+  }
+
+  if (values.plan && !["migrate", "rollback"].includes(command)) {
+    throw new Error("symmetria: --plan is a migrate/rollback option");
+  }
+
+  if (values.action && command !== "repair") {
+    throw new Error("symmetria: --action is a repair option");
+  }
+
+  if (
+    command === "repair" &&
+    (!name || !["retry", "complete"].includes(values.action ?? ""))
+  ) {
+    throw new Error(
+      "symmetria: repair requires an ID and --action retry|complete",
+    );
   }
 
   if (values.strict && !["lint", "drift"].includes(command)) {
@@ -292,7 +360,47 @@ export const runMigrationCLI = async (
     directory,
     ...(config.metadataSchema ? { metadataSchema: config.metadataSchema } : {}),
     ...(config.metadataTable ? { metadataTable: config.metadataTable } : {}),
+    ...(config.verificationDatabaseUrl || values["verify-url"]
+      ? {
+          verificationDatabaseUrl:
+            values["verify-url"] ?? config.verificationDatabaseUrl!,
+        }
+      : {}),
+    ...Object.fromEntries(
+      (
+        [
+          ["advisoryLockTimeoutMs", "advisory-lock-timeout"],
+          ["lockTimeoutMs", "lock-timeout"],
+          ["statementTimeoutMs", "statement-timeout"],
+        ] as const
+      ).flatMap(([key, flag]) => {
+        const value =
+          values[flag] === undefined ? config[key] : Number(values[flag]);
+
+        if (value === undefined) {
+          return [];
+        }
+
+        if (!Number.isSafeInteger(value) || value < 0 || value > 2147483647) {
+          throw new Error(`symmetria: invalid --${flag}`);
+        }
+
+        return [[key, value]];
+      }),
+    ),
+    ...(config.onEvent ? { onEvent: config.onEvent } : {}),
   };
+
+  if (command === "recover") {
+    await recoverMigrationFiles(directory);
+    output(
+      values.json
+        ? JSON.stringify({ recovered: true })
+        : "Migration files recovered.",
+    );
+
+    return;
+  }
 
   if (command === "dashboard") {
     if (!interactive) {
@@ -340,9 +448,16 @@ export const runMigrationCLI = async (
             applied = statuses.filter(
               (entry) => entry.status === "applied",
             ).length;
-            pending = statuses.length - applied;
+            pending = statuses.filter(
+              (entry) => entry.status === "pending",
+            ).length;
             connection = "connected";
             migrationSummary = `${applied} applied · ${pending} pending`;
+            const incomplete = statuses.length - applied - pending;
+
+            if (incomplete) {
+              migrationSummary += ` · ${incomplete} incomplete (repair required)`;
+            }
           } catch (error) {
             connection = "unavailable";
             migrationSummary = `Unavailable: ${error instanceof Error ? error.message : String(error)}`;
@@ -466,7 +581,7 @@ export const runMigrationCLI = async (
   if (["generate", "diff", "inspect", "lint"].includes(command)) {
     const source = config.schema;
 
-    if (!values.empty && !source) {
+    if (command !== "lint" && !values.empty && !source) {
       throw new Error(
         "symmetria: configure schema in symmetria.config.ts before inspecting or generating a migration",
       );
@@ -521,7 +636,13 @@ export const runMigrationCLI = async (
     let diffOptions: MigrationDiffOptions = values.diff
       ? JSON.parse(await readFile(resolve(values.diff), "utf8"))
       : {};
-    const { snapshot: before } = await loadMigrationState(directory);
+
+    if (values.online) {
+      diffOptions = { ...diffOptions, online: true };
+    }
+
+    const { snapshot: before, migrations } =
+      await loadMigrationState(directory);
     const after =
       snapshot && !values.empty ? migrationSnapshot(snapshot) : before;
 
@@ -532,14 +653,53 @@ export const runMigrationCLI = async (
     const plan = diffSchemas(before, after, diffOptions);
 
     if (command === "lint") {
-      const findings = lintMigration(plan, diffOptions.renames);
+      let selected = migrations;
+
+      if (values.pending) {
+        if (!databaseUrl) {
+          throw new Error("symmetria: --pending requires databaseUrl");
+        }
+
+        const driver = postgres(databaseUrl);
+
+        try {
+          const statuses = await migrator({
+            driver,
+            ...runnerOptions,
+          }).status();
+
+          if (statuses.some((entry) => entry.status === "incomplete")) {
+            throw new Error(
+              "symmetria: repair incomplete migrations before linting the pending chain",
+            );
+          }
+
+          selected = migrations.filter((migration) =>
+            statuses.some(
+              (status) =>
+                status.id === migration.id && status.status === "pending",
+            ),
+          );
+        } finally {
+          await driver.close();
+        }
+      }
+
+      const findings = [
+        ...selected.flatMap((migration) =>
+          lintMigrationSQL(migration.up, migration.id),
+        ),
+        ...lintMigration(plan, diffOptions.renames),
+      ];
       output(
         values.json
           ? JSON.stringify(findings, null, 2)
           : formatLintFindings(findings),
       );
 
-      if (values.strict && findings.length) {
+      if (
+        findings.some((finding) => values.strict || finding.level !== "caution")
+      ) {
         process.exitCode = 1;
       }
 
@@ -577,6 +737,11 @@ export const runMigrationCLI = async (
         name: name!,
         ...(snapshot ? { snapshot } : {}),
         ...(values.empty ? { empty: true } : {}),
+        ...(values["allow-destructive"] ? { allowDestructive: true } : {}),
+        ...(values.transaction
+          ? { transaction: values.transaction as "batch" | "each" | "none" }
+          : {}),
+        ...(values.online ? { online: true } : {}),
       }),
     );
     output(
@@ -611,21 +776,91 @@ export const runMigrationCLI = async (
     return;
   }
 
-  if (!databaseUrl) {
+  if (!databaseUrl && command !== "verify") {
     throw new Error("symmetria: configure databaseUrl or DATABASE_URL");
   }
 
-  const driver = postgres(databaseUrl);
+  const cancellation = new AbortController();
+
+  const interrupt = () => {
+    process.exitCode = 130;
+    cancellation.abort(new Error("symmetria: interrupted"));
+  };
+
+  const terminate = () => {
+    process.exitCode = 143;
+    cancellation.abort(new Error("symmetria: terminated"));
+  };
+
+  process.once("SIGINT", interrupt);
+  process.once("SIGTERM", terminate);
+  const driver = command === "verify" ? undefined : postgres(databaseUrl!);
 
   try {
+    if (command === "verify") {
+      const url =
+        values["verify-url"] ?? config.verificationDatabaseUrl ?? databaseUrl;
+
+      if (!url) {
+        throw new Error(
+          "symmetria: verify requires --verify-url or a configured database URL with CREATEDB permission",
+        );
+      }
+
+      const result = await verifyMigrations({
+        ...runnerOptions,
+        ...config.verify,
+        url,
+        signal: cancellation.signal,
+      });
+      output(
+        values.json
+          ? JSON.stringify(result)
+          : `Verified ${result.migrations.length} migrations: installation, upgrade, rollback and reapplication.`,
+      );
+
+      return;
+    }
+
     const runner = migrator({
-      driver,
-      directory,
-      ...(config.metadataSchema
-        ? { metadataSchema: config.metadataSchema }
-        : {}),
-      ...(config.metadataTable ? { metadataTable: config.metadataTable } : {}),
+      ...runnerOptions,
+      driver: driver!,
+      signal: cancellation.signal,
     });
+
+    if (values.plan) {
+      const plan = await runner.plan({
+        ...(values.to ? { to: values.to } : {}),
+        ...(values.steps ? { steps: Number(values.steps) } : {}),
+        direction: command === "rollback" ? "down" : "up",
+      });
+      output(
+        values.json
+          ? JSON.stringify(plan, null, 2)
+          : plan
+              .map(
+                (step) =>
+                  `-- group ${step.group}: ${step.transaction} · ${step.id}\n${step.statements.map((sql) => `${sql};`).join("\n\n")}`,
+              )
+              .join("\n\n"),
+      );
+
+      return;
+    }
+
+    if (command === "repair") {
+      await runner.repair({
+        id: name!,
+        action: values.action as "retry" | "complete",
+      });
+      output(
+        values.json
+          ? JSON.stringify({ repaired: name, action: values.action })
+          : `Repaired ${name}: ${values.action}`,
+      );
+
+      return;
+    }
 
     if (command === "drift") {
       const { migrations, snapshot } = await loadMigrationState(directory);
@@ -646,10 +881,10 @@ export const runMigrationCLI = async (
 
       const findings = await progress("Inspecting the database", () =>
         detectDrift({
-          execute: driver.execute,
+          execute: driver!.execute,
           snapshot: expected,
           ...(config.metadataSchema
-            ? { schemaName: config.metadataSchema }
+            ? { metadataSchema: config.metadataSchema }
             : {}),
           ...(config.metadataTable
             ? { metadataTable: config.metadataTable }
@@ -680,6 +915,11 @@ export const runMigrationCLI = async (
       const statuses = await progress("Reading migration history", () =>
         runner.status(),
       );
+
+      if (statuses.some((entry) => entry.status === "incomplete")) {
+        process.exitCode = 1;
+      }
+
       output(
         values.json
           ? JSON.stringify(statuses)
@@ -687,7 +927,10 @@ export const runMigrationCLI = async (
             ? formatStatus(statuses, color)
             : statuses.length
               ? statuses
-                  .map((entry) => `${entry.status.padEnd(7)} ${entry.id}`)
+                  .map(
+                    (entry) =>
+                      `${entry.status.padEnd(7)} ${entry.id}${entry.status === "incomplete" ? ` · ${entry.direction} · ${entry.statement} confirmed statements · repair required` : ""}`,
+                  )
                   .join("\n")
               : "No migrations.",
       );
@@ -732,7 +975,9 @@ export const runMigrationCLI = async (
       );
     }
   } finally {
-    await driver.close();
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", terminate);
+    await driver?.close();
   }
 };
 

@@ -32,6 +32,19 @@ export {
   type LintFinding,
   type LintLevel,
 } from "./migrations/lint";
+export { lintMigrationSQL, type SQLFinding } from "./migrations/sql-lint";
+export {
+  verifyMigrations,
+  type VerifyOptions,
+  type VerificationContext,
+} from "./migrations/verify";
+export {
+  MigrationExecutionError,
+  type ExecutionOptions,
+  type MigrationEvent,
+  type ExecutionStep,
+} from "./migrations/execution";
+export { recoverMigrationFiles } from "./migrations/publication";
 export {
   detectDrift,
   formatDriftFindings,

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.0 — 2026-10-23
+
+### Migrations
+
+- Explicit destructive-generation opt-in, SQL-file linting with failure exit
+  codes, declaration-order DDL and canonical order-independent hashes.
+- Pinned PostgreSQL sessions, batch/each/none execution, bounded lock and
+  statement timeouts, cancellation, SQL execution plans and structured events.
+- Durable incomplete-migration state and verified repair; crash-recoverable
+  filesystem publication and live-owner generation-lock checks.
+- Defaults, identity, constraints, FK actions, enum ordering and invalid-index
+  drift checks; schema-verified adoption, including historical SQL replay.
+- Disposable-database installation, upgrade, rollback and reapplication checks,
+  with hooks for representative data and application invariants.
+- Online concurrent indexes, phased constraint validation and additive enum DDL.
+- Transactional creation of custom migration-journal schemas; drift inspects the
+  application schema independently of the journal location.
+
+### Runtime and tooling
+
+- Reserved PostgreSQL sessions and cancellation support for migration execution.
+- Loopback profiler Host/origin validation and per-server tokens for HTTP
+  EXPLAIN.
+- Expanded migration documentation and three reproducible CLI recordings with
+  reduced-motion previews: safe generation, verification and online recovery.
+
 ## 0.0.1
 
 Initial release of `symmetria` and `symmetria-kit` for Bun 1.3+.

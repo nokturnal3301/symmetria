@@ -713,6 +713,11 @@ SQL statement with Enter. `e` requests an estimated plan; `a` explicitly runs
 `↻`. `--profile-url` selects another endpoint; `--json` returns the retained
 requests.
 
+The HTTP server binds to `127.0.0.1` or `::1`, validates the request Host and
+rejects cross-origin browser requests. `GET /requests` returns a per-server
+`X-Symmetria-Token` header; include that header in `POST /explain` requests. Kit
+handles this exchange automatically. Responses use `Cache-Control: no-store`.
+
 `profiler.trace("job name", async () => ...)` groups background work. The fetch
 wrapper labels requests with HTTP method and pathname; concurrent requests have
 independent contexts. This tracing context does not change transaction handling.
@@ -1556,6 +1561,12 @@ choices produce explicit rename SQL in the saved migration. `--no-interactive`
 disables prompts; automated runs can provide the existing `--diff` rename-hint
 file.
 
+Generation rejects dropped tables or columns unless `--allow-destructive` is
+explicitly supplied. A rename needs a `--diff` hint; it is never guessed from
+similar names. The API uses `allowDestructive: true` for intentional removals.
+Column declarations keep their order in `CREATE TABLE`; snapshot hashes ignore
+column order so reordering source declarations does not create a migration.
+
 `diff` compares the current declaration to the latest local snapshot, not to the
 live database. In a terminal, `inspect` opens a two-pane schema browser: tables
 on the left and Columns / Relations / Indexes / Checks / SQL tabs on the right.
@@ -1619,24 +1630,35 @@ appends a journal entry without changing the snapshot.
   names.
 - `migrate --to <id>` applies through a target; `rollback --steps 2` reverts the
   latest two applied migrations in reverse order.
-- `lint` reviews the pending diff: destructive (dropped tables/columns),
-  blocking (NOT NULL or UNIQUE on populated columns, removed enum labels) and
-  cautionary (type rewrites, renames, index builds) findings with the safe
-  sequence to use. `--strict` exits with code 1 when anything is reported.
+- `lint` inspects saved `up.sql` files and any ungenerated schema diff. It exits
+  with code 1 for destructive or blocking findings by default; `--strict` also
+  fails on cautionary findings. `--pending` uses database history to select only
+  pending SQL files. Offline lint checks the entire saved chain, including
+  previously applied migrations. Comments and quoted strings are not treated as
+  SQL; function bodies, `DO`, `CALL` and other executable SQL require review.
+  Static lint is conservative and does not prove a migration safe for every row.
 - `drift` compares the live database with the latest snapshot: missing or extra
-  tables, columns and indexes, type and nullability mismatches. `--strict` for
-  CI.
+  tables, columns and indexes; types, nullability, defaults and identity;
+  primary, unique, foreign-key and check constraints; FK actions; enum labels
+  and their order; invalid indexes and unvalidated constraints. Use `--strict`
+  for CI. It inspects the connection's `current_schema()`, independently of
+  `metadataSchema`, and excludes only the journal in its configured schema.
 - `squash <name>` replaces the chain with one baseline migration that creates
   the latest snapshot; databases that applied the old chain run `adopt`, which
-  rewrites the recorded history when the database snapshot hash matches a local
-  migration (`adopt --to <id>` baselines an existing database explicitly). An
-  unchanged applied migration retains its exact boundary. If several replacement
-  migrations have the same schema hash, use `--to` to identify the intended
-  baseline; data-only migrations cannot be distinguished by their schema hash
-  alone.
-- Each migrate/rollback batch runs in one transaction under a PostgreSQL
-  advisory lock. History defaults to `public._symmetria_migrations`. Config can
-  override `metadataSchema` and `metadataTable`.
+  verifies the live schema before rewriting recorded history (`adopt --to <id>`
+  chooses a baseline explicitly). An unchanged applied migration retains its
+  exact boundary. If several replacement migrations have the same schema hash,
+  use `--to` to identify the intended baseline; data-only migrations cannot be
+  distinguished by their schema hash alone. Historical targets are reconstructed
+  by replaying SQL into a disposable database using `verificationDatabaseUrl` /
+  `--verify-url`. The API can instead accept `adopt({ to, snapshot })` when the
+  supplied snapshot hash matches that target. The latest target uses the shared
+  snapshot directly.
+- Default migrate/rollback batches run in one transaction. A session-wide
+  advisory lock covers all transaction boundaries. History defaults to
+  `public._symmetria_migrations`. Config can override `metadataSchema` and
+  `metadataTable`. `migrate` and `adopt` create a missing journal schema inside
+  that transaction; `status` and `rollback` do not create it.
 - Applied checksums cover SQL in both directions and journal entries, including
   their schema hashes. Adding a migration does not change earlier checksums.
   Missing, reordered or edited applied migrations are rejected before execution.
@@ -1647,17 +1669,148 @@ appends a journal entry without changing the snapshot.
 Generated down SQL restores schema structure; it cannot recreate deleted data.
 Data backfills and nontrivial conversions can be added to the SQL before
 applying. Constraint violations or enum values that cannot be narrowed cause an
-atomic rollback of the migration attempt. The runner manages transaction
-boundaries; SQL requiring execution outside a transaction, such as
-`CREATE INDEX CONCURRENTLY`, belongs outside this transactional runner.
+atomic rollback of the current transactional group. The runner manages
+transaction boundaries; explicit `BEGIN`, `COMMIT` and savepoints in migration
+files are rejected.
+
+### Execution modes, timeouts and plans
+
+`generate <name> --transaction batch|each|none` records the execution mode in
+the shared journal. The API accepts the same `transaction` option:
+
+- `batch` (default): adjacent batch migrations commit atomically as one group.
+- `each`: commit this migration separately; earlier groups remain committed if
+  it fails.
+- `none`: each SQL statement commits independently. Use for
+  `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY` or `VACUUM`.
+
+Both directions use the recorded mode. Nontransactional work requires a driver
+with pinned-session support, supplied by the official PostgreSQL driver.
+Transaction-only custom drivers support the default atomic batch mode.
+
+```sh
+symmetria migrate --plan --json
+symmetria rollback --steps 2 --plan
+symmetria migrate --advisory-lock-timeout 10000 --lock-timeout 5000 --statement-timeout 600000
+```
+
+Plans include SQL, migration IDs, execution modes and transaction group numbers;
+they do not execute migrations. Config/API settings `advisoryLockTimeoutMs`,
+`lockTimeoutMs` and `statementTimeoutMs` use milliseconds and default to 10,000,
+5,000 and 600,000 respectively. A zero advisory timeout tries the lock once;
+zero disables the PostgreSQL DDL or statement timeout. Session settings are
+restored when the operation finishes. The CLI cancels work on SIGINT/SIGTERM;
+the API accepts an `AbortSignal`.
+
+`status` exits with code 1 when an incomplete migration needs repair.
+
+`onEvent(event)` is a synchronous observer for `statement-start`,
+`statement-end` and `statement-error`. Events include migration ID, direction,
+one-based statement number, SQL and, after execution, duration. Errors expose
+`MigrationExecutionError` with `migration`, `direction`, `statement`, `sql`,
+`sqlState` and the underlying `cause`.
+
+### Online DDL and recovery
+
+`generate <name> --online` sets `transaction: "none"` and generates concurrent
+indexes, `NOT VALID` / `VALIDATE CONSTRAINT` phases for checks and foreign keys,
+and validated checks before setting existing columns to `NOT NULL`. New unique
+constraints on existing columns use a concurrent unique index followed by
+`UNIQUE USING INDEX`. Additive enum changes use `ALTER TYPE ... ADD VALUE`,
+preserving the type and dependent columns; a commit separates each addition from
+later defaults or data using that value. Enum removals and reordering still
+rebuild the type and may rewrite dependent columns.
+
+For populated tables, introduce nullable columns first, deploy compatible code,
+backfill in bounded batches, then generate a separate validation migration.
+Online execution does not eliminate every lock: constraint attachment and
+metadata changes still acquire short-lived locks. Review both SQL directions.
+
+Before nontransactional SQL starts, the journal stores `incomplete`, direction
+and a confirmed-statement count. Success changes it to `applied` (or removes it
+after rollback). Failure or disconnect leaves a durable recovery boundary;
+subsequent migrate, rollback and adopt refuse to proceed.
+
+```sh
+symmetria status --json
+# Inspect and reconcile the affected objects and data, then choose a boundary:
+symmetria repair 000003_email_index --action retry --verify-url "$VERIFY_DATABASE_URL"
+# Or finish the migration manually and confirm its final schema:
+symmetria repair 000003_email_index --action complete --verify-url "$VERIFY_DATABASE_URL"
+```
+
+`retry` verifies the schema at the starting boundary and resets the journal so
+the unchanged SQL can run again. `complete` verifies the destination boundary
+and records completion. The API is `runner.repair({ id, action, snapshot? })`. A
+crash may occur after PostgreSQL commits but before the statement count is
+saved; that count is not an exactly-once guarantee. Reconcile data changes as
+well as schema before repair. Schema verification cannot establish whether a
+backfill, external function or other data-only operation has already run.
+
+Generation and squash use a durable filesystem publication journal. After a
+process crash, `symmetria recover` restores the previous files or finishes
+cleanup of a committed publication. It refuses a lock owned by a live process or
+another host. Keep the SQL directories and both shared metadata files on the
+same filesystem. A lock without readable ownership metadata requires manual
+inspection.
+
+### Disposable-database verification
+
+```sh
+symmetria verify --verify-url "$VERIFY_DATABASE_URL" --json
+```
+
+The verification connection needs `CREATEDB` permission. Kit creates uniquely
+named databases from `template0`, executes migration SQL there, and drops them
+in `finally`. It checks a fresh installation against the latest snapshot, then
+upgrades each boundary, rolls it back, compares catalogs and reapplies it. A
+hard process or server crash can leave a `symmetria_verify_*` database for
+manual cleanup. Use a PostgreSQL instance matching the deployment version and
+required extensions.
+
+For representative-data tests, use config `verify.beforeMigration` /
+`verify.afterMigration`, or the equivalent `verifyMigrations` API hooks:
+
+```ts
+import { verifyMigrations } from "symmetria-kit";
+
+await verifyMigrations({
+  directory: "./migrations",
+  url: process.env.VERIFY_DATABASE_URL!,
+  beforeMigration: async ({ driver, migration, phase }) => {
+    if (migration === "000002_add_note" && phase === "up") {
+      await driver.execute({
+        sql: "INSERT INTO users (name) VALUES ($1)",
+        parameters: ["existing user"],
+      });
+    }
+  },
+  afterMigration: async ({ driver, migration, phase }) => {
+    // Assert application-specific data invariants using this disposable driver.
+  },
+});
+```
+
+Hooks run during the upgrade/rollback/reapplication pass; `phase` is `up`,
+`down` or `reapply`. Configure `verify.schemaName` for a non-public application
+schema. Managed catalog checks cover tables, columns, constraints, indexes and
+enums; use hooks for data preservation and custom SQL objects such as functions
+and views. Historical snapshots remain unnecessary.
 
 Programmatic APIs are exported from `symmetria-kit`: `migrationSnapshot`,
-`createSchemaSQL`, `diffSchemas`, `lintMigration`, `detectDrift`,
-`generateMigration`, `squashMigrations`, `loadMigrations`, `loadMigrationState`
-(returns `{ migrations, snapshot }`), and `migrator({ driver, directory })` with
-`migrate`, `rollback`, `status` and `adopt`. `loadMigrations` returns the SQL
-chain and checksums; historical migrations do not carry snapshots.
-`generateMigration` and `squashMigrations` also return the new snapshot.
+`createSchemaSQL`, `diffSchemas`, `lintMigration`, `lintMigrationSQL`,
+`detectDrift`, `generateMigration`, `squashMigrations`, `loadMigrations`,
+`loadMigrationState` (returns `{ migrations, snapshot }`), and
+`migrator({ driver, directory })` with `migrate`, `rollback`, `status`, `plan`,
+`repair` and `adopt`; plus `verifyMigrations` and `recoverMigrationFiles`.
+`loadMigrations` returns the SQL chain and checksums; historical migrations do
+not carry snapshots. `generateMigration` and `squashMigrations` also return the
+new snapshot.
+
+`detectDrift({ execute, snapshot, schemaName, metadataSchema, metadataTable })`
+accepts an explicit application `schemaName`; omitting it uses
+`current_schema()`. The journal defaults to `public._symmetria_migrations`,
+matching `migrator`.
 
 `symmetria-kit/testing` exports `testDatabase({ url, schema })`: it creates an
 isolated PostgreSQL schema, runs the DDL, binds a pool whose `search_path`
@@ -1696,7 +1849,6 @@ and profiling. They also demonstrate reusable projections, enum mappings and
 relation aggregates. They use the public packages directly and close their
 database pools.
 
-Further migration work: online and non-transactional migration strategies.
 Package validation and release commands: [publishing](publishing.md).
 
 ## License

@@ -59,7 +59,32 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
   };
 
   const runner = () =>
-    migrator({ driver, directory, metadataSchema: namespace });
+    migrator({
+      driver,
+      directory,
+      metadataSchema: namespace,
+      verificationDatabaseUrl: databaseUrl!,
+    });
+
+  const runCli = async (config: string, ...argumentsList: string[]) => {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        resolve("packages/kit/src/cli.ts"),
+        ...argumentsList,
+        "--config",
+        config,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+
+    return { stdout, stderr, exitCode };
+  };
 
   const catalog = async () => ({
     columns: await execute(
@@ -242,6 +267,7 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     const changed = await generateMigration({
       directory,
       name: "members",
+      allowDestructive: true,
       snapshot: second.$snapshot(),
       renames: {
         tables: { accounts: "members" },
@@ -397,7 +423,7 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
         .execute(),
     ).toEqual({ status: "archived" });
     const baseline = await catalog();
-    await expect(runner().rollback()).rejects.toThrow(/failed \(down\)/);
+    await expect(runner().rollback()).rejects.toThrow(/failed \(down,/);
     expect(await catalog()).toEqual(baseline);
     expect((await runner().status()).map((entry) => entry.status)).toEqual([
       "applied",
@@ -922,25 +948,8 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       `export default ${JSON.stringify({ schema: snapshot, directory: "files", databaseUrl: url.toString(), metadataSchema: namespace })};\n`,
     );
 
-    const run = async (...argumentsList: string[]) => {
-      const child = Bun.spawn(
-        [
-          process.execPath,
-          resolve("packages/kit/src/cli.ts"),
-          ...argumentsList,
-          "--config",
-          config,
-        ],
-        { stdout: "pipe", stderr: "pipe" },
-      );
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ]);
-
-      return { stdout, stderr, exitCode };
-    };
+    const run = (...argumentsList: string[]) =>
+      runCli(config, ...argumentsList);
 
     expect(await run("generate", "cli")).toMatchObject({
       exitCode: 0,
@@ -951,6 +960,10 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       stdout: "Applied 000001_cli\n",
     });
     expect((await run("status")).stdout).toContain("applied 000001_cli");
+    expect(await run("drift", "--strict", "--json")).toMatchObject({
+      exitCode: 0,
+      stdout: "[]\n",
+    });
     expect(
       (await execute("SELECT to_regclass('cli_records')::text AS name"))[0]
         ?.name,
@@ -1001,6 +1014,7 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
         execute: driver.execute,
         snapshot: second.$snapshot(),
         schemaName: namespace,
+        metadataSchema: namespace,
       });
 
     expect(await drift()).toEqual([]);
@@ -1040,6 +1054,10 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     const squashed = await squashMigrations({ directory, name: "baseline" });
     expect(squashed?.id).toBe("000001_baseline");
     await expect(runner().status()).rejects.toThrow(/missing or out of order/);
+    await expect(runner().adopt()).rejects.toThrow(/schema does not match/);
+    await execute("ALTER TABLE users DROP COLUMN manual");
+    await execute("ALTER TABLE users ALTER COLUMN name SET NOT NULL");
+    await execute("ALTER TABLE tags ALTER COLUMN label TYPE text");
     expect(await runner().adopt()).toEqual(["000001_baseline"]);
     expect(await runner().status()).toMatchObject([
       { id: "000001_baseline", status: "applied" },
@@ -1064,5 +1082,85 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     await expect(runner().adopt({ to: "000009_missing" })).rejects.toThrow(
       /unknown migration target/,
     );
+  });
+
+  test("CLI creates a separate metadata schema and checks drift in the application schema", async () => {
+    const metadataSchema = `${namespace}_meta`;
+    const model = schema({
+      users: { id: int.auto, email: text.unique },
+      history: { id: int.auto, note: text },
+    });
+    const config = join(directory, "config.ts");
+    const url = new URL(databaseUrl!);
+    url.searchParams.set("options", `-c search_path=${namespace}`);
+    await writeFile(
+      config,
+      `export default ${JSON.stringify({ schema: model.$snapshot(), directory: "files", databaseUrl: url.toString(), metadataSchema, metadataTable: "history" })};\n`,
+    );
+
+    try {
+      expect((await runCli(config, "generate", "initial")).exitCode).toBe(0);
+      expect((await runCli(config, "status")).stdout).toContain("pending");
+      expect(
+        (
+          await execute("SELECT to_regnamespace($1)::text AS name", [
+            metadataSchema,
+          ])
+        )[0]?.name,
+      ).toBeNull();
+      const migrated = await runCli(config, "migrate");
+      expect(migrated.exitCode, migrated.stderr).toBe(0);
+      expect(
+        await execute(`SELECT id FROM "${metadataSchema}".history`),
+      ).toEqual([{ id: "000001_initial" }]);
+      expect((await execute("SELECT current_schema() AS name"))[0]?.name).toBe(
+        namespace,
+      );
+      expect((await runCli(config, "status")).stdout).toContain("applied");
+      expect(await runCli(config, "drift", "--strict", "--json")).toMatchObject(
+        {
+          exitCode: 0,
+          stdout: "[]\n",
+        },
+      );
+      await execute("ALTER TABLE history ADD COLUMN manual text");
+      const drift = await runCli(config, "drift", "--strict", "--json");
+      expect(drift.exitCode, drift.stderr).toBe(1);
+      expect(JSON.parse(drift.stdout)).toEqual([
+        { kind: "extra-column", table: "history", column: "manual" },
+      ]);
+      expect((await runCli(config, "rollback")).exitCode).toBe(0);
+      expect(
+        await execute(`SELECT id FROM "${metadataSchema}".history`),
+      ).toEqual([]);
+      expect((await runCli(config, "status")).stdout).toContain("pending");
+    } finally {
+      await execute(`DROP SCHEMA IF EXISTS "${metadataSchema}" CASCADE`);
+    }
+  });
+
+  test("a failed migration rolls back its newly created metadata schema", async () => {
+    const metadataSchema = `${namespace}_meta`;
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: schema({ users: { id: int } }).$snapshot(),
+    });
+    await execute("CREATE TABLE users (id int)");
+
+    try {
+      await expect(
+        migrator({ driver, directory, metadataSchema }).migrate(),
+      ).rejects.toThrow(/migration.*failed/);
+      expect(
+        (
+          await execute("SELECT to_regnamespace($1)::text AS name", [
+            metadataSchema,
+          ])
+        )[0]?.name,
+      ).toBeNull();
+    } finally {
+      await execute(`DROP SCHEMA IF EXISTS "${metadataSchema}" CASCADE`);
+    }
   });
 });
