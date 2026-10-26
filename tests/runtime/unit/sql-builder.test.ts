@@ -21,6 +21,8 @@ import {
   exists,
   not,
   defaultValue,
+  table,
+  index,
   type CompiledQuery,
 } from "../../../packages/runtime/src";
 
@@ -107,6 +109,81 @@ test("upsert exposes the excluded row only to DO UPDATE", () => {
   ).toEndWith("ON CONFLICT DO NOTHING");
 });
 
+test("raw SQL operands keep their own precedence", () => {
+  const totals = schema({
+    n: table({ id: int.auto, a: int, b: int })
+      .computed((n) => ({ total: sql<number>`${n.a} + ${n.b}` }))
+      .checks((n) => ({ capped: sql<number>`${n.a} + ${n.b}`.atMost(10) }))
+      .indexes((n) => ({
+        small: index(n.a).where(sql<number>`${n.a} - ${n.b}`.below(0)),
+      })),
+  });
+  expect(
+    totals
+      .n((n) => ({
+        doubled: n.total.multiply(2),
+        nested: sql<number>`${n.total} * 2`,
+        $where: [
+          n.total.is(3),
+          n.total.between(1, 5),
+          n.total.in([3, 4]),
+          n.total.isNot(null),
+        ],
+      }))
+      .toSQL(),
+  ).toEqual({
+    sql: 'SELECT (("n"."a" + "n"."b") * $1) AS "doubled", ("n"."a" + "n"."b") * 2 AS "nested"\nFROM "n" AS "n"\nWHERE ("n"."a" + "n"."b") = $2 AND ("n"."a" + "n"."b") BETWEEN $3 AND $4 AND ("n"."a" + "n"."b") IN ($5, $6) AND ("n"."a" + "n"."b") IS NOT NULL',
+    parameters: [2, 3, 1, 5, 3, 4],
+  });
+  const [snapshot] = totals.$snapshot().tables;
+  expect(snapshot?.checks?.[0]?.expression).toBe('("a" + "b") <= 10');
+  expect(snapshot?.indexes?.[0]?.where).toBe('("a" - "b") < 0');
+});
+
+test("undefined write fields are omitted like undefined query controls", () => {
+  expect(
+    model.users.insert({ name: "Ada", visits: undefined }).toSQL(),
+  ).toEqual(model.users.insert({ name: "Ada" }).toSQL());
+  expect(
+    model.posts
+      .insert([
+        { title: "a", authorId: 1, views: undefined },
+        { title: "b", authorId: 1, views: 2n },
+      ])
+      .toSQL(),
+  ).toEqual({
+    sql: 'INSERT INTO "posts" AS "posts"\n("title", "views", "author_id") VALUES ($1, DEFAULT, $2), ($3, $4, $5)',
+    parameters: ["a", 1, "b", "2", 1],
+  });
+  expect(
+    model.users
+      .update({ name: "Grace", visits: undefined })
+      .where((users) => users.id.is(1))
+      .toSQL(),
+  ).toEqual({
+    sql: 'UPDATE "users" AS "users" SET "name" = $1\nWHERE "users"."id" = $2',
+    parameters: ["Grace", 1],
+  });
+  expect(
+    model.users
+      .insert({ name: "Ada" })
+      .onConflict("name")
+      .doUpdate({ visits: 1, active: undefined })
+      .toSQL().sql,
+  ).toEndWith('DO UPDATE SET "visits" = $2');
+  // @ts-expect-error title is required even when spelled as undefined
+  expect(() => model.posts.insert({ title: undefined, authorId: 1 })).toThrow(
+    /missing required column "posts.title"/,
+  );
+  expect(() => model.users.update({ visits: undefined })).toThrow(
+    /at least one/,
+  );
+  // @ts-expect-error unknown keys fail even when undefined
+  expect(() => model.users.insert({ name: "Ada", nmae: undefined })).toThrow(
+    /unknown column/,
+  );
+});
+
 test("write validation catches missing values, unknown columns and generated identities", () => {
   // @ts-expect-error title is required
   expect(() => model.posts.insert({ authorId: 1 })).toThrow(/missing required/);
@@ -114,14 +191,10 @@ test("write validation catches missing values, unknown columns and generated ide
   expect(() => model.users.insert({ id: 1, name: "Ada" })).toThrow(
     /generated always/,
   );
-  // @ts-expect-error undefined is not an explicit SQL value
-  expect(() => model.users.insert({ name: "Ada", visits: undefined })).toThrow(
-    /undefined/,
-  );
   // @ts-expect-error unknown column
   expect(() => model.users.update({ missing: 1 })).toThrow(/unknown column/);
   expect(() => model.users.update({})).toThrow(/at least one/);
-  expect(() => model.users.insert([])).toThrow(/at least one/);
+  expect(() => model.users.insert([]).toSQL()).toThrow(/no-op/);
   expect(() =>
     model.users
       .insert({ name: "Ada" })
@@ -335,6 +408,16 @@ test("execution returns affected rows, decodes results, and first preserves LIMI
   ).toBeNull();
   expect(queries.at(-1)?.parameters).toEqual([]);
   expect(queries.at(-1)?.sql).toContain("LIMIT 0");
+  // insert([]) executes nothing and resolves like a zero-row write.
+  const executed = queries.length;
+  expect(await local.events.insert([]).execute()).toEqual({ affectedRows: 0 });
+  expect(
+    await local.events
+      .insert([])
+      .returning((events) => [events.id])
+      .execute(),
+  ).toEqual([]);
+  expect(queries.length).toBe(executed);
 });
 
 test("findMany compiles nested relations into one query and decodes nested values", async () => {
@@ -562,9 +645,45 @@ test("$scope filters reads, writes, paths, joins and collections of scoped table
   expect(
     tenant.posts.insert({ title: "x", authorId: 1 }).toSQL().sql,
   ).not.toContain("WHERE");
+  // An upsert never rewrites a conflicting row outside the scope.
   expect(
-    tenant.users((users) => ({ total: users.posts.count() })).toSQL().sql,
-  ).toContain('"author_id" = $1');
+    tenant.posts
+      .insert({ title: "x", authorId: 1 })
+      .onConflict("id")
+      .doUpdate("title")
+      .toSQL(),
+  ).toMatchObject({
+    sql: expect.stringContaining(
+      'ON CONFLICT ("id") DO UPDATE SET "title" = "excluded"."title"\nWHERE "posts"."author_id" = $3',
+    ),
+    parameters: ["x", 1, 7],
+  });
+  expect(
+    tenant.posts
+      .insert({ title: "x", authorId: 1 })
+      .onConflict("id")
+      .doNothing()
+      .toSQL().sql,
+  ).not.toContain("WHERE");
+
+  // Relation subqueries carry the scope once, inside their correlation.
+  for (const query of [
+    tenant.users((users) => ({ total: users.posts.count() })),
+    tenant.users((users) => ({
+      latest: users.posts.maximum((posts) => posts.views),
+    })),
+    tenant.users((users) => ({
+      titles: users.posts((posts) => ({ title: posts.title })),
+    })),
+    tenant.users((users) => ({ id: users.id, $where: users.posts.some() })),
+  ]) {
+    const compiled = query.toSQL();
+    expect(compiled.parameters).toEqual([7]);
+    expect(compiled.sql).toContain(
+      'WHERE ("users"."id" = "__symmetria_aggregate_0"."author_id" AND "__symmetria_aggregate_0"."author_id" = $1)',
+    );
+  }
+
   expect(
     tenant
       .users((users, { join }) => {
@@ -590,6 +709,32 @@ test("$scope filters reads, writes, paths, joins and collections of scoped table
   expect(model.posts((posts) => ({ id: posts.id })).toSQL().sql).not.toContain(
     "WHERE",
   );
+});
+
+test("UPDATE and DELETE where() combines predicate arrays with AND, like $where", () => {
+  expect(
+    model.posts
+      .update({ title: "x" })
+      .where((posts) => [posts.authorId.is(1), posts.views.above(0n)])
+      .toSQL(),
+  ).toEqual(
+    model.posts
+      .update({ title: "x" })
+      .where((posts) => and(posts.authorId.is(1), posts.views.above(0n)))
+      .toSQL(),
+  );
+  expect(
+    model.posts
+      .delete()
+      .where((posts) => [posts.author.name.is("Ada"), posts.views.is(0n)])
+      .toSQL().sql,
+  ).toContain('"__symmetria_path_0"."name" = $1 AND "posts"."views" = $2');
+  expect(
+    model.posts
+      .delete()
+      .where(() => [])
+      .toSQL().sql,
+  ).toBe('DELETE FROM "posts" AS "posts"\nWHERE TRUE');
 });
 
 test("UPDATE and DELETE accept relation paths and quantifiers through primary-key subqueries", () => {
@@ -805,6 +950,7 @@ const inferred = model.posts((posts, { leftJoin }) => {
   return {
     title: posts.title,
     editorName: coalesce(editor.name, "Nobody").as("editorName"),
+    shownName: coalesce(editor.name, posts.title),
     count: count(),
   };
 });
@@ -814,10 +960,60 @@ type AreEqual<Actual, Expected> = [Actual] extends [Expected]
     : false
   : false;
 type Expect<Condition extends true> = Condition;
+test("jsonb(schema).contains() takes a partial value without schema validation", () => {
+  const strict = {
+    "~standard": {
+      version: 1,
+      vendor: "test",
+      validate: (value: unknown) =>
+        value && typeof (value as { id?: unknown }).id === "number"
+          ? { value: value as { id: number; type: string } }
+          : { issues: [{ message: "id is required" }] },
+    },
+  } as const;
+  const events = schema({ events: { id: int.auto, payload: jsonb(strict) } });
+  expect(
+    events
+      .events((event) => ({
+        id: event.id,
+        $where: event.payload.contains({ type: "created" }),
+      }))
+      .toSQL(),
+  ).toEqual({
+    sql: 'SELECT "events"."id" AS "id"\nFROM "events" AS "events"\nWHERE "events"."payload" @> $1::text::jsonb',
+    parameters: ['{"type":"created"}'],
+  });
+  expect(() =>
+    events.events.insert({ payload: { type: "created" } as never }).toSQL(),
+  ).toThrow(/id is required/);
+});
+
+test("long literal IN lists bind one array parameter on PostgreSQL", () => {
+  const ids = Array.from({ length: 1001 }, (_, id) => id);
+  const query = model.users((users) => ({
+    id: users.id,
+    $where: [users.id.in(ids), users.name.notIn(ids.map(String))],
+  }));
+  expect(query.toSQL()).toEqual({
+    sql: 'SELECT "users"."id" AS "id"\nFROM "users" AS "users"\nWHERE "users"."id" = ANY(($1)::integer[]) AND "users"."name" <> ALL(($2)::text[])',
+    parameters: [ids, ids.map(String)],
+  });
+  expect(
+    model
+      .users((users) => ({ id: users.id, $where: users.id.in([1, 2]) }))
+      .toSQL().sql,
+  ).toEndWith('WHERE "users"."id" IN ($1, $2)');
+});
+
+test("coalesce accepts a non-null expression fallback", () => {
+  expect(inferred.toSQL().sql).toContain(
+    'COALESCE("editor"."name", "posts"."title") AS "shownName"',
+  );
+});
 type ResultMatches = Expect<
   AreEqual<
     Awaited<ReturnType<typeof inferred.execute>>,
-    { title: string; editorName: string; count: number }[]
+    { title: string; editorName: string; shownName: string; count: number }[]
   >
 >;
 const returned = model.users

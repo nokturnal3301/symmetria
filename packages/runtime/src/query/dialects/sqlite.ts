@@ -10,6 +10,10 @@ import type { DialectStrategy, JsonObjectEntry } from "./types";
 
 const sqlString = (text: string): string => `'${text.replaceAll("'", "''")}'`;
 
+/** Enum labels sort by declaration position, as PostgreSQL orders them. */
+const enumPosition = (value: string, labels: readonly string[]): string =>
+  `(CASE ${value} ${labels.map((label, position) => `WHEN ${sqlString(label)} THEN ${position}`).join(" ")} END)`;
+
 const jsonArray = (value: string): string =>
   `(CASE WHEN json_type(${value}) = 'null' THEN NULL ELSE ${value} END)`;
 
@@ -78,6 +82,8 @@ export const sqliteDialect: DialectStrategy = {
     serializedJsonArrayElements: true,
     containmentOperators: false,
     fullTextSearch: true,
+    typedParameters: false,
+    explicitNulls: true,
   },
   placeholder: (position) => `?${position}`,
   cast: (value, target) =>
@@ -113,6 +119,40 @@ export const sqliteDialect: DialectStrategy = {
     );
   },
   textCast: { prefix: "CAST(", suffix: " AS TEXT)" },
+  // numeric lives in TEXT storage and enums are plain text: compare by magnitude
+  // and by declaration position, as PostgreSQL does.
+  orderedOperand: (value, type, equality) => {
+    if (/^(?:numeric|decimal)\b/.test(type.sqlType)) {
+      return `CAST(${value} AS REAL)`;
+    }
+
+    if (type.enumerationValues && !equality) {
+      return enumPosition(value, type.enumerationValues);
+    }
+
+    return undefined;
+  },
+  orderedAggregate: (name, value, type) => {
+    // REAL keeps 15 significant digits; wider or unbounded numerics stay text
+    // so custom codecs over them read back exactly.
+    const precision = /^(?:numeric|decimal)\((\d+)/.exec(type.sqlType)?.[1];
+
+    if (precision !== undefined && Number(precision) <= 15) {
+      return `${name}(CAST(${value} AS REAL))`;
+    }
+
+    if (type.enumerationValues) {
+      return `(CASE ${name}(${enumPosition(value, type.enumerationValues)}) ${type.enumerationValues.map((label, position) => `WHEN ${position} THEN ${sqlString(label)}`).join(" ")} END)`;
+    }
+
+    return undefined;
+  },
+  // The driver sets PRAGMA case_sensitive_like; PostgreSQL's escape character is
+  // the backslash, and ILIKE folds case (ASCII only, as SQLite's lower() does).
+  patternMatch: (left, right, caseInsensitive) =>
+    caseInsensitive
+      ? `lower(${left}) LIKE lower(${right}) ESCAPE '\\'`
+      : `${left} LIKE ${right} ESCAPE '\\'`,
   jsonArray,
   jsonObject,
   jsonRows: (nested, fields, many, _jsonOutput, context) => {
@@ -197,11 +237,11 @@ export const sqliteDialect: DialectStrategy = {
       const alias = context.nestedAlias("__symmetria_search");
 
       // One JSON parameter keeps the prepared SQL stable for any number of terms.
-      return `(SELECT COUNT(*) > 0 AND MIN(${value} LIKE '%' || ${alias}.value || '%') FROM json_each(${terms}) AS ${alias})`;
+      return `(SELECT COUNT(*) > 0 AND MIN(lower(${value}) LIKE '%' || lower(${alias}.value) || '%') FROM json_each(${terms}) AS ${alias})`;
     }
 
     if (query.literal === undefined) {
-      return `${value} LIKE '%' || ${query.render()} || '%'`;
+      return `lower(${value}) LIKE '%' || lower(${query.render()}) || '%'`;
     }
 
     const terms = query.literal.split(/\s+/).filter(Boolean);
@@ -210,7 +250,7 @@ export const sqliteDialect: DialectStrategy = {
       return "FALSE";
     }
 
-    return `(${terms.map((term) => `${value} LIKE '%' || ${context.parameter(term)} || '%'`).join(" AND ")})`;
+    return `(${terms.map((term) => `lower(${value}) LIKE '%' || lower(${context.parameter(term)}) || '%'`).join(" AND ")})`;
   },
   defaultValue: (column, context) =>
     sqliteDefaultSQL(column, context.parameter),
@@ -232,7 +272,8 @@ export const sqliteDialect: DialectStrategy = {
       plan: (rows) => rows,
     };
   },
-  nullsDefault: (direction) => (direction === "ASC" ? "FIRST" : "LAST"),
+  // PostgreSQL's default; ORDER BY spells it out because SQLite's own is the reverse.
+  nullsDefault: (direction) => (direction === "ASC" ? "LAST" : "FIRST"),
 };
 
 Object.freeze(sqliteDialect.capabilities);

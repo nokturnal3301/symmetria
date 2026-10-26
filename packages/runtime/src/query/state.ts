@@ -33,9 +33,9 @@ export type IsolationLevel =
   (typeof IsolationLevel)[keyof typeof IsolationLevel];
 
 export type TransactionOptions = {
-  readonly isolationLevel?: IsolationLevel;
-  readonly readOnly?: boolean;
-  readonly deferrable?: boolean;
+  readonly isolationLevel?: IsolationLevel | undefined;
+  readonly readOnly?: boolean | undefined;
+  readonly deferrable?: boolean | undefined;
 };
 export type TransactionDriver = {
   readonly execute: QueryExecutor;
@@ -137,6 +137,8 @@ export type ConflictDescription = {
   readonly action: "nothing" | "update";
   readonly values: Readonly<Record<string, ValueNode | typeof DEFAULT_VALUE>>;
   readonly excluded?: TableBinding;
+  /** `$scope()` predicates on the target row: a conflict outside the scope updates nothing. */
+  readonly predicates?: readonly PredicateDescription[];
 };
 
 export type MutationPlan = {

@@ -62,7 +62,7 @@ public package entries rather than source paths.
 ## Local validation
 
 Development pins Bun in the root `packageManager` field and Node in
-`.node-version`. CI reads these same files. Applications require Bun 1.3+; the
+`.node-version`. CI reads these same files. Applications require Bun 1.4.4+; the
 development toolchain requires Node 24.11 or newer. See
 [contributing](../CONTRIBUTING.md) for setup.
 

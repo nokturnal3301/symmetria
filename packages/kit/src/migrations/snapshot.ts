@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { quoteIdentifier } from "symmetria/internal";
+import { postgresArrayLiteral, quoteIdentifier } from "symmetria/internal";
 import type { SchemaSnapshot, IndexSnapshot, CheckSnapshot } from "symmetria";
 
 export type MigrationColumn = {
@@ -112,6 +112,34 @@ export const quoteLiteral = (value: unknown): string => {
   );
 };
 
+/** A value default as a typed PostgreSQL literal, naming the column when it cannot be encoded. */
+const defaultValueSQL = (
+  column: string,
+  sqlType: string,
+  value: unknown,
+): string => {
+  try {
+    if (["json", "jsonb"].includes(sqlType)) {
+      return `${quoteLiteral(canonicalJSON(JSON.parse(JSON.stringify(value))))}::${sqlType}`;
+    }
+
+    if (sqlType.endsWith("[]") && Array.isArray(value)) {
+      if (value.some(Array.isArray)) {
+        throw new Error("nested arrays are not supported");
+      }
+
+      return `${quoteLiteral(postgresArrayLiteral(value))}::${sqlType}`;
+    }
+
+    return quoteLiteral(value);
+  } catch (error) {
+    throw new Error(
+      `symmetria: unsupported default for "${column}" (${error instanceof Error ? error.message : String(error)}); provide an encoded scalar or an SQL default`,
+      { cause: error },
+    );
+  }
+};
+
 export const emptySnapshot = (): MigrationSnapshot => ({
   version: 1,
   dialect: "postgresql",
@@ -188,9 +216,11 @@ export const migrationSnapshot = (
           ? undefined
           : column.default.kind === "sql"
             ? column.default.sql
-            : ["json", "jsonb"].includes(column.sqlType)
-              ? `${quoteLiteral(canonicalJSON(JSON.parse(JSON.stringify(column.default.value))))}::${column.sqlType}`
-              : quoteLiteral(column.default.value);
+            : defaultValueSQL(
+                `${table.sqlName}.${column.sqlName}`,
+                column.sqlType,
+                column.default.value,
+              );
 
       return {
         name: column.sqlName,

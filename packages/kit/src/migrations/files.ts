@@ -492,14 +492,20 @@ export const generateMigration = async (
         : migrationSnapshot(next);
     const plan = diffSchemas(before, after, options);
 
-    if (
-      !options.allowDestructive &&
-      lintMigration(plan, options.renames).some(
-        (finding) => finding.level === "destructive",
-      )
-    ) {
+    const destructive = options.allowDestructive
+      ? []
+      : lintMigration(plan, options.renames).filter(
+          (finding) => finding.level === "destructive",
+        );
+
+    if (destructive.length) {
       throw new Error(
-        "symmetria: destructive migration requires explicit rename hints or allowDestructive (--allow-destructive)",
+        `symmetria: destructive migration requires explicit rename hints or allowDestructive (--allow-destructive):\n${destructive
+          .map(
+            (finding) =>
+              `  - ${finding.table}${finding.column ? `.${finding.column}` : ""}: ${finding.message}`,
+          )
+          .join("\n")}`,
       );
     }
 

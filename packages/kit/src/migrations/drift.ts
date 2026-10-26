@@ -96,7 +96,8 @@ export const normalizeSqlType = (sqlType: string): string => {
     ? base.slice(base.indexOf(".") + 1)
     : base;
 
-  return `${typeAliases[qualified] ?? qualified}${match[2] ?? ""}`;
+  // format_type() prints modifiers without spaces: `numeric(12, 2)` is `numeric(12,2)`.
+  return `${typeAliases[qualified] ?? qualified}${match[2]?.replace(/\s+/g, "") ?? ""}`;
 };
 
 /**

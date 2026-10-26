@@ -181,8 +181,9 @@ database.posts((post, { innerJoin, join }) => {
 
 Also supported: `crossJoin`, `$distinct`, `$groupBy`, `$having`, `$offset`,
 `ascending.nullsLast`, `is` / `isNot` (equality; `is(null)` compiles to
-`IS NULL`), ordering comparisons, `in` / `notIn`, `between`, `like` / `ilike`,
-`isDistinctFrom`, and `and` / `or` / `not`.
+`IS NULL`), ordering comparisons, `in` / `notIn` (lists longer than 1,000 values
+bind one array parameter on PostgreSQL: `= ANY($1::type[])`), `between`, `like`
+/ `ilike`, `isDistinctFrom`, and `and` / `or` / `not`.
 
 ### Shape-first queries
 
@@ -625,12 +626,16 @@ for await (const page of pageQuery.pages({ size: 500 })) {
 ```
 
 Pages use keyset comparisons and fetch one extra row. ORDER BY must use root
-columns and include a full PK or a non-null unique column. Both directions and
-NULLS FIRST/LAST work; ordering keys can be omitted from the projection. Cursor
-values preserve PostgreSQL timestamp microseconds and storage precision. Cursors
-are checked against the query, its parameters and ordering. The initial API
-covers root-table queries without joins, grouping, DISTINCT, LIMIT or OFFSET.
-Pass a non-null next cursor to continue; null marks the last page.
+columns, computed fields or raw SQL over root columns, and include a full PK or
+a non-null unique column. Both directions and NULLS FIRST/LAST work; ordering
+keys can be omitted from the projection. Cursor values preserve PostgreSQL
+timestamp microseconds and storage precision. Cursors are checked against the
+query, its parameters, ordering and the value formats of the ordering columns;
+expressions are treated as nullable, and on SQLite numeric-looking expression
+values bind as numbers (declare the type with `sql.of(column)` when an
+expression yields text that looks numeric). The initial API covers root-table
+queries without joins, grouping, DISTINCT, LIMIT or OFFSET. Pass a non-null next
+cursor to continue; null marks the last page.
 
 ## Query inspector
 
@@ -815,18 +820,28 @@ await database.users
   .where((users) => users.posts.none());
 ```
 
-Bulk INSERT accepts arrays, including rows with different omitted defaults.
-`defaultValue` explicitly emits SQL `DEFAULT`. Mutations resolve to
-`{ affectedRows }` without `returning()`. With `returning()`, `insert(object)`
-resolves to one row (`null` when `onConflict().doNothing()` skipped it) and
-`insert(array)`, UPDATE and DELETE resolve to arrays. `bigint` columns accept
-safe integers on write and in comparisons. Relation paths in `where()` compile
-to a primary-key subquery (`WHERE "posts"."id" IN (SELECT ... JOIN ...)`), so
-they need a primary key. UPDATE/DELETE without WHERE operate on all rows,
-following SQL semantics. `onConflict().doNothing()` handles conflicts.
-`doUpdate("name", "active")` assigns those fields from `excluded`; object and
-callback forms support custom assignments. Generated and computed fields cannot
-be written through the shorthand.
+Bulk INSERT accepts arrays, including rows with different omitted defaults. An
+array whose parameters exceed the driver's wire-protocol limit (65,535 on
+PostgreSQL) runs as several INSERT statements in one transaction, or in a
+savepoint inside one, with `RETURNING` rows concatenated in order. An
+`undefined` field is omitted, as with query controls, so optional request fields
+can be passed through; required columns still fail when `undefined`, and unknown
+keys fail even when `undefined`. Nullable references accept `undefined` in the
+nested form too (`editor: body.editor` with `{ connect }` or nothing).
+`insert([])` executes no statement and resolves to `{ affectedRows: 0 }` or `[]`
+with `returning()`; its `toSQL()` throws. `defaultValue` explicitly emits SQL
+`DEFAULT`. Mutations resolve to `{ affectedRows }` without `returning()`. With
+`returning()`, `insert(object)` resolves to one row (`null` when
+`onConflict().doNothing()` skipped it) and `insert(array)`, UPDATE and DELETE
+resolve to arrays. `bigint` columns accept safe integers on write and in
+comparisons. Relation paths in `where()` compile to a primary-key subquery
+(`WHERE "posts"."id" IN (SELECT ... JOIN ...)`), so they need a primary key.
+UPDATE/DELETE without WHERE operate on all rows, following SQL semantics.
+`where()` may return an array of predicates combined with `AND`, like `$where`;
+an empty array adds no restriction. `onConflict().doNothing()` handles
+conflicts. `doUpdate("name", "active")` assigns those fields from `excluded`;
+object and callback forms support custom assignments. Generated and computed
+fields cannot be written through the shorthand.
 
 UPDATE assignments, WHERE and RETURNING callbacks receive the row directly,
 including nested-insert RETURNING. The upsert callback receives the current row
@@ -885,10 +900,11 @@ await database.posts
 - `create` recursively inserts the target. Reverse child inserts infer the
   parent's foreign key; junction relations insert both target and linking rows.
 - `connectOrCreate` takes a **flat insert payload**, including every required
-  target field. It chooses the first populated unique key (PK, unique columns,
-  then indexes) and uses `ON CONFLICT DO UPDATE` on those key fields. Existing
-  non-key fields are preserved; database UPDATE triggers can run. Supply only
-  the intended identifying key when several alternatives exist.
+  target field. `undefined` fields, operations and relations are omitted. It
+  chooses the first populated unique key (PK, unique columns, then indexes) and
+  uses `ON CONFLICT DO UPDATE` on those key fields. Existing non-key fields are
+  preserved; database UPDATE triggers can run. Supply only the intended
+  identifying key when several alternatives exist.
 
 Reverse `connect` reparents the existing child; junction `connect` adds a link.
 Supply a forward relation or its scalar FK, never both. Relation targets require
@@ -1067,6 +1083,12 @@ parameters and column expressions remain identifiers. The caller supplies the
 result type and any PostgreSQL casts needed by raw SQL, for example:
 ``sql<string>`concat(${"Hello "}::text, ${users.name})`.as("greeting")``.
 
+`sql.of(column)` types and decodes the fragment like that column type, on every
+driver and inside nested JSON: ``sql.of(bool)`${posts.views} > 0` `` returns
+booleans (SQLite reports 0/1 for a plain `sql<boolean>`),
+``sql.of(timestamptz)`…` `` Dates and ``sql.of(bigint)`…` `` bigints. Raw
+fragments are parenthesized wherever they are operands.
+
 ## Nested relations
 
 ```ts
@@ -1231,10 +1253,15 @@ await tenant.posts.delete().where((posts) => posts.id.is(7));
 `$scope()` returns a database with the same type whose reads, updates and
 deletes of the scoped tables carry the predicate: root queries, `byId()`, unique
 lookups, shape projections, relation paths, explicit joins (in `ON`), nested
-collections and quantifiers. Inserts are not filtered. Scopes compose: a scoped
-database can be scoped again and the predicates are ANDed. Transactions inherit
-the scope, and `transaction.$scope()` narrows it further inside the callback.
-Scope callbacks see the table's own columns.
+collections and quantifiers. Inserts are not filtered: a scoped database writes
+whatever row it is given. An upsert, however, never rewrites a row outside the
+scope: `ON CONFLICT … DO UPDATE` carries the scope as its `WHERE`, and a
+conflict the scope filters out throws with code `SYMMETRIA_OUT_OF_SCOPE` instead
+of updating it. Nested `connect` only finds rows inside the scope and
+`connectOrCreate` fails the same way for an existing row outside it. Scopes
+compose: a scoped database can be scoped again and the predicates are ANDed.
+Transactions inherit the scope, and `transaction.$scope()` narrows it further
+inside the callback. Scope callbacks see the table's own columns.
 
 ## SQLite driver
 
@@ -1252,7 +1279,16 @@ through the exported `sqliteDialect` strategy: placeholders, JSON collections,
 relation paths, upserts, `RETURNING`, savepoints, cursor pages and `inspect()`
 (`EXPLAIN QUERY PLAN`) all work. Types map to INTEGER/REAL/TEXT storage: `bool`
 ↔ 0/1, `jsonb`, arrays and `timestamptz` ↔ ISO text, `bigint` stays exact
-through safe integers. `driver.createTables(appSchema)` executes SQLite DDL;
+through safe integers. `numeric` is TEXT storage: reads round to the declared
+scale (`numeric(12,2)` returns `"0.00"`), ordering comparisons cast to REAL and
+enums order by declaration, so `ORDER BY`, `BETWEEN` and cursor pages agree with
+PostgreSQL; `ORDER BY` also places NULLs last for ascending keys and first for
+descending ones, and `minimum()`/`maximum()` pick by the same order. `average()`
+keeps SQLite's floating-point digits rather than PostgreSQL's 16-digit numeric.
+`like()` is case-sensitive (`PRAGMA case_sensitive_like`), `ilike()` and
+`search()` fold case through `lower()`, which handles ASCII letters only, and
+patterns use the backslash escape as in PostgreSQL.
+`driver.createTables(appSchema)` executes SQLite DDL;
 `sqliteSchemaSQL(snapshot)` from `symmetria/driver` returns it with rowid
 identities, enum CHECKs, foreign keys and plain indexes. Not available in
 SQLite: `contains`/`overlaps`, `searchRank()`, row locks (rejected),
@@ -1436,7 +1472,10 @@ subqueries and foreign callback scopes are rejected. PostgreSQL CHECK semantics
 apply: both TRUE and NULL pass; use non-null columns to reject NULL values.
 
 Keys and checks appear in snapshots, generated DDL and reversible migration
-diffs. Checks are rebuilt around affected column renames and type changes.
+diffs. Checks and indexes that use a retyped or dropped column are rebuilt;
+table and column renames keep them, renaming the constraints and indexes whose
+names derive from the table or column (`RENAME CONSTRAINT`,
+`ALTER INDEX … RENAME`) instead of rebuilding them.
 
 ## Transactions
 
@@ -1561,11 +1600,12 @@ choices produce explicit rename SQL in the saved migration. `--no-interactive`
 disables prompts; automated runs can provide the existing `--diff` rename-hint
 file.
 
-Generation rejects dropped tables or columns unless `--allow-destructive` is
-explicitly supplied. A rename needs a `--diff` hint; it is never guessed from
-similar names. The API uses `allowDestructive: true` for intentional removals.
-Column declarations keep their order in `CREATE TABLE`; snapshot hashes ignore
-column order so reordering source declarations does not create a migration.
+Generation rejects dropped tables or columns and removed enum labels unless
+`--allow-destructive` is explicitly supplied; the refusal lists each destructive
+operation. A rename needs a `--diff` hint; it is never guessed from similar
+names. The API uses `allowDestructive: true` for intentional removals. Column
+declarations keep their order in `CREATE TABLE`; snapshot hashes ignore column
+order so reordering source declarations does not create a migration.
 
 `diff` compares the current declaration to the latest local snapshot, not to the
 live database. In a terminal, `inspect` opens a two-pane schema browser: tables
@@ -1637,6 +1677,10 @@ appends a journal entry without changing the snapshot.
   previously applied migrations. Comments and quoted strings are not treated as
   SQL; function bodies, `DO`, `CALL` and other executable SQL require review.
   Static lint is conservative and does not prove a migration safe for every row.
+  Adding a nullable column, or a `NOT NULL` column with a constant default, and
+  renames pass without findings; a `NOT NULL` column without a default is
+  generated as `ADD COLUMN` plus a `-- Backfill …` marker and `SET NOT NULL`, so
+  the backfill can be written into the SQL before it is applied.
 - `drift` compares the live database with the latest snapshot: missing or extra
   tables, columns and indexes; types, nullability, defaults and identity;
   primary, unique, foreign-key and check constraints; FK actions; enum labels
@@ -1702,7 +1746,9 @@ zero disables the PostgreSQL DDL or statement timeout. Session settings are
 restored when the operation finishes. The CLI cancels work on SIGINT/SIGTERM;
 the API accepts an `AbortSignal`.
 
-`status` exits with code 1 when an incomplete migration needs repair.
+`status` reads the journal without taking the migration lock, so it reports
+while another process is migrating; it exits with code 1 when an incomplete
+migration needs repair.
 
 `onEvent(event)` is a synchronous observer for `statement-start`,
 `statement-end` and `statement-error`. Events include migration ID, direction,
@@ -1716,10 +1762,13 @@ one-based statement number, SQL and, after execution, duration. Errors expose
 indexes, `NOT VALID` / `VALIDATE CONSTRAINT` phases for checks and foreign keys,
 and validated checks before setting existing columns to `NOT NULL`. New unique
 constraints on existing columns use a concurrent unique index followed by
-`UNIQUE USING INDEX`. Additive enum changes use `ALTER TYPE ... ADD VALUE`,
-preserving the type and dependent columns; a commit separates each addition from
-later defaults or data using that value. Enum removals and reordering still
-rebuild the type and may rewrite dependent columns.
+`UNIQUE USING INDEX`. Additive enum changes use `ALTER TYPE ... ADD VALUE` in
+both modes (PostgreSQL 12+), preserving the type OID and dependent columns
+without a table rewrite. Inside a transaction a new label cannot be used before
+commit, so a transactional migration whose defaults or CHECKs already need the
+new label rebuilds the type instead; `--online` commits each statement and keeps
+`ADD VALUE`. Enum removals and reordering rebuild the type and rewrite dependent
+columns.
 
 For populated tables, introduce nullable columns first, deploy compatible code,
 backfill in bounded batches, then generate a separate validation migration.
@@ -1831,7 +1880,7 @@ SYMMETRIA_TEST_DATABASE_URL=postgres://user:password@localhost/testdb bun run te
 
 `tsdown` builds both workspace packages, including declarations, source maps and
 package validation; `bun run build:watch` rebuilds on edits. Development
-requires Node 24 LTS for the bundler and Bun 1.3+ for the runtime.
+requires Node 24 LTS for the bundler and Bun 1.4.4+ for the runtime.
 
 Runtime sources live in `packages/runtime/src`, grouped into `schema/`,
 `query/`, `driver/` and `observability/`. CLI and migration sources live in

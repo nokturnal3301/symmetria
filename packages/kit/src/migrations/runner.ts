@@ -352,28 +352,32 @@ export const migrator = (options: MigratorOptions) => {
   return Object.freeze({
     status: async (): Promise<MigrationStatus[]> => {
       const { migrations } = await loadMigrationState(options.directory);
+      // A read of committed journal rows: it must not wait for a running
+      // migration's advisory lock, so a deploy in progress still reports.
+      const history = await inspect(
+        options.driver.execute,
+        migrations,
+        false,
+        true,
+      );
 
-      return connection(async (session) => {
-        const history = await inspect(session.execute, migrations, false, true);
+      return migrations.map((migration, position) => {
+        const entry = history[position];
 
-        return migrations.map((migration, position) => {
-          const entry = history[position];
-
-          return entry
-            ? {
-                id: migration.id,
-                status: entry.state,
-                appliedAt: entry.appliedAt,
-                ...(entry.state === "incomplete"
-                  ? {
-                      direction: entry.direction,
-                      statement: entry.statement,
-                      ...(entry.error ? { error: entry.error } : {}),
-                    }
-                  : {}),
-              }
-            : { id: migration.id, status: "pending" };
-        });
+        return entry
+          ? {
+              id: migration.id,
+              status: entry.state,
+              appliedAt: entry.appliedAt,
+              ...(entry.state === "incomplete"
+                ? {
+                    direction: entry.direction,
+                    statement: entry.statement,
+                    ...(entry.error ? { error: entry.error } : {}),
+                  }
+                : {}),
+            }
+          : { id: migration.id, status: "pending" };
       });
     },
     plan: async (

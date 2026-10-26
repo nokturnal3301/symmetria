@@ -32,6 +32,7 @@ import {
   emptySnapshot,
   generateMigration,
   loadMigrationState,
+  migrationSnapshot,
   migrator,
   squashMigrations,
   type DriftFinding,
@@ -145,6 +146,15 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
           balance: bigint.default(9007199254740993n),
           settings: jsonb<{ theme: string }>().default({ theme: "dark" }),
           createdAt: timestamptz.default(new Date("2026-01-01T00:00:00Z")),
+          tags: text.array.default([]),
+          labels: text.array.default(['a "b"', "c\\d", "e'f"]),
+          preferences: jsonb({
+            "~standard": {
+              version: 1,
+              vendor: "test",
+              validate: (value: unknown) => ({ value }),
+            },
+          }).default({ digest: "weekly" }),
         }),
         teams: ({ users }) => ({ id: int.auto, owner: users.nullable }),
         tags: { id: int.auto, name: text },
@@ -175,6 +185,9 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
         users.balance,
         users.settings,
         users.createdAt,
+        users.tags,
+        users.labels,
+        users.preferences,
       ])
       .execute();
     expect(rows).toEqual({
@@ -183,6 +196,9 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       balance: 9007199254740993n,
       settings: { theme: "dark" },
       createdAt: new Date("2026-01-01T00:00:00Z"),
+      tags: [],
+      labels: ['a "b"', "c\\d", "e'f"],
+      preferences: { digest: "weekly" },
     });
     await expect(
       model.users.insert({ email: "ada" }).execute(),
@@ -203,6 +219,127 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       }
     });
     expect((await catalog()).columns).toEqual([]);
+  });
+
+  test("renames and enum rebuilds recreate only the indexes and keys that depend on them", async () => {
+    const before = schema({
+      users: table({
+        id: int.auto,
+        email: text.unique,
+        title: text.nullable,
+        managerId: int.nullable,
+      }).indexes((users) => ({
+        byManager: index(users.managerId).where(users.managerId.isNot(null)),
+        byTitle: index(users.title),
+      })),
+      tasks: ({ users }) =>
+        table({
+          id: int.auto,
+          owner: users,
+          slug: text,
+          status: oneOf("todo", "done", "blocked"),
+        }).indexes((tasks) => ({
+          bySlug: index(tasks.slug).unique,
+          byStatus: index(tasks.status),
+        })),
+      comments: ({ tasks }) => ({ id: int.auto, task: tasks }),
+    }).$snapshot();
+    const after = schema({
+      users: table({
+        id: int.auto,
+        email: text.unique,
+        jobTitle: text.nullable,
+        managerId: int.nullable,
+      }).indexes((users) => ({
+        byManager: index(users.managerId).where(users.managerId.isNot(null)),
+        byTitle: index(users.jobTitle),
+      })),
+      tasks: ({ users }) =>
+        table({
+          id: int.auto,
+          owner: users,
+          slug: text,
+          status: oneOf("todo", "done"),
+        }).indexes((tasks) => ({
+          bySlug: index(tasks.slug).unique,
+          byStatus: index(tasks.status),
+        })),
+      comments: ({ tasks }) => ({ id: int.auto, task: tasks }),
+    }).$snapshot();
+
+    const objects = async () =>
+      Object.fromEntries(
+        (
+          await execute(
+            `SELECT relname AS name, oid::text AS oid FROM pg_class
+            WHERE relnamespace = $1::regnamespace AND relkind = 'i'
+            UNION ALL SELECT conname, oid::text FROM pg_constraint
+            WHERE connamespace = $1::regnamespace AND contype = 'f'`,
+            [namespace],
+          )
+        ).map((row) => [String(row.name), String(row.oid)]),
+      );
+
+    await driver.transaction!(async (transaction) => {
+      for (const query of createSchemaSQL(before)) {
+        await transaction.execute(query);
+      }
+    });
+    await execute(
+      "INSERT INTO users (email, title) VALUES ('ada', 'Engineer') RETURNING id",
+    );
+    await execute(
+      "INSERT INTO tasks (owner_id, slug, status) VALUES (1, 'a', 'done')",
+    );
+    await execute("INSERT INTO comments (task_id) VALUES (1)");
+    const original = await catalog();
+    const initial = await objects();
+    const plan = diffSchemas(before, after, {
+      renames: { columns: { users: { title: "job_title" } } },
+    });
+    expect(
+      plan.up.filter((sql) => /^(DROP|CREATE).*INDEX|FOREIGN KEY/.test(sql)),
+    ).toEqual([
+      'DROP INDEX "tasks_by_status_idx"',
+      'CREATE INDEX "tasks_by_status_idx" ON "tasks" USING btree ("status")',
+    ]);
+
+    const apply = (statements: readonly string[]) =>
+      driver.transaction!(async (transaction) => {
+        for (const sql of statements) {
+          await transaction.execute({ sql, parameters: [] });
+        }
+      });
+
+    await apply(plan.up);
+    const upgraded = await objects();
+
+    for (const name of [
+      "users_by_manager_idx",
+      "users_by_title_idx",
+      "users_email_key",
+      "tasks_by_slug_idx",
+      "comments_task_id_fkey",
+      "tasks_owner_id_fkey",
+    ]) {
+      expect(upgraded[name]).toBe(initial[name]);
+    }
+
+    expect(upgraded.tasks_by_status_idx).not.toBe(initial.tasks_by_status_idx);
+    expect(
+      await detectDrift({
+        execute: (query) => driver.execute(query),
+        snapshot: migrationSnapshot(after),
+        metadataSchema: namespace,
+      }),
+    ).toEqual([]);
+    expect(
+      await execute(
+        "SELECT job_title, status::text AS status FROM users, tasks",
+      ),
+    ).toEqual([{ job_title: "Engineer", status: "done" }]);
+    await apply(plan.down);
+    expect(await catalog()).toEqual(original);
   });
 
   test("generate -> migrate -> rename/type/index changes -> rollback restores the catalog and retained data", async () => {

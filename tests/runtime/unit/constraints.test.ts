@@ -100,10 +100,13 @@ test("checks compile to DDL and diff reversibly with renamed and changed columns
   const renamedPlan = diffSchemas(checked.$snapshot(), renamed.$snapshot(), {
     renames: { columns: { products: { stock: "quantity" } } },
   });
-  expect(renamedPlan.up[0]).toStartWith(
-    'ALTER TABLE "products" DROP CONSTRAINT',
-  );
-  expect(renamedPlan.up.at(-1)).toContain('CHECK ("price" >');
+  // PostgreSQL renames the column inside its checks; nothing is rebuilt.
+  expect(renamedPlan.up).toEqual([
+    'ALTER TABLE "products" RENAME COLUMN "stock" TO "quantity"',
+  ]);
+  expect(renamedPlan.down).toEqual([
+    'ALTER TABLE "products" RENAME COLUMN "quantity" TO "stock"',
+  ]);
   expect(diffSchemas(initial.$snapshot(), emptySnapshot()).down).toEqual(
     diffSchemas(emptySnapshot(), initial.$snapshot()).up,
   );

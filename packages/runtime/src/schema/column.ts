@@ -299,9 +299,13 @@ export type StandardSchema<Output = unknown> = {
     ) => StandardResult<Output> | Promise<StandardResult<Output>>;
   };
 };
+// Matches the Standard Schema V1 spec, whose optional members include undefined
+// (required for compatibility under exactOptionalPropertyTypes).
 type StandardIssue = {
   readonly message: string;
-  readonly path?: readonly (PropertyKey | { readonly key: PropertyKey })[];
+  readonly path?:
+    | readonly (PropertyKey | { readonly key: PropertyKey })[]
+    | undefined;
 };
 type StandardResult<Output> =
   | { readonly value: Output; readonly issues?: undefined }

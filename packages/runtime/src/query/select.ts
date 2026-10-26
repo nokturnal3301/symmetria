@@ -61,6 +61,7 @@ import {
 import {
   createMutation,
   type TableMutations,
+  type AtomicRunner,
   type MutationOptions,
 } from "./mutations";
 import {
@@ -566,12 +567,12 @@ export type Query<
         readonly maybeOne: () => Promise<ProjectionRow<Selection> | null>;
         readonly page: (options: {
           size: number;
-          after?: PageCursor<ProjectionRow<Selection>> | null;
+          after?: PageCursor<ProjectionRow<Selection>> | null | undefined;
         }) => Promise<Page<ProjectionRow<Selection>>>;
         /** Iterate keyset pages: `for await (const page of query.pages({ size: 100 }))`. */
         readonly pages: (options: {
           size: number;
-          after?: PageCursor<ProjectionRow<Selection>> | null;
+          after?: PageCursor<ProjectionRow<Selection>> | null | undefined;
         }) => AsyncIterable<Page<ProjectionRow<Selection>>>;
         readonly as: <const AliasName extends string>(
           name: AliasName,
@@ -1028,6 +1029,7 @@ export const createQueryTables = (
   codecs: SchemaCodecs = {},
   dialect?: Dialect,
   scopes: TableScopes = {},
+  atomic?: AtomicRunner,
 ): Record<string, object> => {
   const profile = executorProfiling(executor);
   const tablesByName = new Map(
@@ -1951,10 +1953,8 @@ export const createQueryTables = (
                 ),
               ),
               joins: Object.freeze(joined.joins.slice(1)),
-              predicates: Object.freeze([
-                first.condition!,
-                ...scopePredicates(related),
-              ]),
+              // first.condition already carries the related table's scope from addJoin.
+              predicates: Object.freeze([first.condition!]),
             });
 
             return base;
@@ -2517,13 +2517,13 @@ export const createQueryTables = (
         },
         page(
           this: QueryHandle,
-          options: { size: number; after?: string | null },
+          options: { size: number; after?: string | null | undefined },
         ) {
           return executePage(this[QUERY_STATE].plan, options, executor);
         },
         pages(
           this: QueryHandle,
-          options: { size: number; after?: string | null },
+          options: { size: number; after?: string | null | undefined },
         ) {
           const state = this[QUERY_STATE].plan;
 
@@ -2594,6 +2594,7 @@ export const createQueryTables = (
     snapshot.tables.map((table) => {
       const root = bindingFor(table.name, table.name);
       const mutationOptions: MutationOptions = Object.freeze({
+        ...(atomic ? { atomic } : {}),
         scope: scopePredicates(root),
         context: (plan: SelectPlan) => createContext(plan),
       });

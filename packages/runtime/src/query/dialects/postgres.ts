@@ -40,6 +40,8 @@ export const postgresDialect: DialectStrategy = {
     serializedJsonArrayElements: false,
     containmentOperators: true,
     fullTextSearch: true,
+    typedParameters: true,
+    explicitNulls: false,
   },
   placeholder: (position) => `$${position}`,
   cast: (value, target) => {

@@ -255,6 +255,7 @@ export const collectCommonTables = (compilation: Compilation): void => {
 
       if (query.conflict?.action === "update") {
         walkAssignments(query.conflict.values);
+        query.conflict.predicates?.forEach(walkPredicate);
       }
     } else if (query.kind === "update") {
       walkAssignments(query.values[0]!);

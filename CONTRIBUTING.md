@@ -7,7 +7,7 @@ behavior.
 ## Setup
 
 Use the Bun version pinned in `package.json` and Node.js from `.node-version`.
-Node is used by the build tools; applications run on Bun 1.3+.
+Node is used by the build tools; applications run on Bun 1.4.4+.
 
 ```sh
 bun install --frozen-lockfile

@@ -31,6 +31,40 @@ const baseType = (sqlType: string): string =>
     .trim();
 
 const INTEGER_TYPES = new Set(["integer", "int", "int4", "smallint", "int2"]);
+
+/** The declared scale of `numeric(p, s)` / `decimal(p, s)`; undefined without one. */
+export const numericScale = (sqlType: string): number | undefined => {
+  const match = /^(?:numeric|decimal)\(\d+,\s*(\d+)\)$/.exec(sqlType);
+
+  return match ? Number(match[1]) : undefined;
+};
+
+/**
+ * A plain decimal string rounded half away from zero to `scale` fractional
+ * digits, as PostgreSQL stores it. Other text is returned unchanged.
+ */
+export const scaledDecimal = (text: string, scale: number): string => {
+  const match = /^([+-]?)(\d+)(?:\.(\d*))?$/.exec(text);
+
+  if (!match) {
+    return text;
+  }
+
+  const sign = match[1] === "-" ? "-" : "";
+  const fraction = match[3] ?? "";
+  let digits = `${match[2]}${fraction.slice(0, scale).padEnd(scale, "0")}`;
+
+  if (fraction.length > scale && fraction.charCodeAt(scale) >= 53) {
+    digits = (BigInt(digits) + 1n).toString().padStart(digits.length, "0");
+  }
+
+  const whole =
+    digits.slice(0, digits.length - scale).replace(/^0+(?=\d)/, "") || "0";
+  const value = scale ? `${whole}.${digits.slice(-scale)}` : whole;
+
+  return sign && /[1-9]/.test(value) ? `${sign}${value}` : value;
+};
+
 const REAL_TYPES = new Set(["real", "double precision", "float4", "float8"]);
 
 /** SQLite storage class for a PostgreSQL column type. */
@@ -345,11 +379,26 @@ export const sqliteRowConverter = (
         return (value) => value;
       case "integer":
         return (value) => (typeof value === "bigint" ? Number(value) : value);
-      default:
+      default: {
+        // numeric(p, s) text keeps whatever was written; PostgreSQL rounds to the
+        // scale, and SUM keeps its input's scale.
+        const scale = numericScale(
+          expressionSqlType(
+            node.kind === "aggregate" && node.name === "SUM" && node.value
+              ? { ...expression, node: node.value }
+              : expression,
+          ),
+        );
+
+        if (scale !== undefined) {
+          return (value) => scaledDecimal(String(value), scale);
+        }
+
         return (value) =>
           typeof value === "bigint" && Number.isSafeInteger(Number(value))
             ? Number(value)
             : value;
+      }
     }
   };
 

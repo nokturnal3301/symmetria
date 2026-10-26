@@ -1,13 +1,14 @@
 import { bigintCodec, numericCodec, cloneParameter } from "../codecs";
-import { expressionSqlType } from "../metadata";
+import { expressionEnumeration, expressionSqlType } from "../metadata";
 import { sameExpression } from "../equivalence";
 import { isJsonExpression } from "../dialect";
+import type { OrderedType } from "../dialects/types";
 import type {
   ExpressionDescription,
   ValueNode,
   WindowBoundary,
 } from "../expressions";
-import { containsBinding } from "../state";
+import { containsBinding, type OrderingDescription } from "../state";
 import {
   aliasSql,
   parameter,
@@ -76,6 +77,74 @@ export const valueSql = (
   cache?.push({ node, sql, jsonOutput });
 
   return sql;
+};
+
+/** Raw SQL is opaque: parenthesize it wherever an operator could bind into it. */
+export const operandSql = (
+  compilation: Compilation,
+  node: ValueNode,
+  bindings: Bindings,
+): string => {
+  const sql = valueSql(compilation, node, bindings);
+
+  return node.kind === "raw" ? `(${sql})` : sql;
+};
+
+/** The type an ordering comparison of `node` follows, when the dialect may need to adjust it. */
+export const orderedType = (node: ValueNode): OrderedType => {
+  const expression = { node, outputName: "value" };
+
+  return {
+    sqlType: expressionSqlType(expression),
+    enumerationValues: expressionEnumeration(expression),
+  };
+};
+
+/** `sql` wrapped for an ordering comparison or ORDER BY key of `type`. */
+export const orderedSql = (
+  compilation: Compilation,
+  sql: string,
+  type: OrderedType,
+  equality = false,
+): string => compilation.dialect.orderedOperand?.(sql, type, equality) ?? sql;
+
+/** An ordering operand: parenthesized raw SQL, adjusted for the dialect's sort order. */
+export const orderedOperandSql = (
+  compilation: Compilation,
+  node: ValueNode,
+  bindings: Bindings,
+  type: OrderedType = orderedType(node),
+  equality = false,
+): string =>
+  orderedSql(
+    compilation,
+    operandSql(compilation, node, bindings),
+    type,
+    equality,
+  );
+
+/** One ORDER BY key with its direction and, where the engine's default differs, its NULLS position. */
+export const orderingSql = (
+  compilation: Compilation,
+  ordering: OrderingDescription,
+  bindings: Bindings,
+): string => {
+  const { dialect } = compilation;
+  const node = ordering.expression.node;
+  const sql = dialect.orderedOperand
+    ? orderedSql(
+        compilation,
+        valueSql(compilation, node, bindings),
+        orderedType(node),
+      )
+    : valueSql(compilation, node, bindings);
+  const nulls =
+    ordering.nulls ??
+    (dialect.capabilities.explicitNulls
+      ? dialect.nullsDefault(ordering.direction)
+      : undefined);
+
+  return `${sql} ${ordering.direction}${nulls ? ` NULLS ${nulls}` : ""}`;
 };
 
 export const renderValue = (
@@ -152,12 +221,25 @@ export const renderValue = (
         .map((part) =>
           typeof part === "string"
             ? part
-            : valueSql(compilation, part, bindings),
+            : operandSql(compilation, part, bindings),
         )
         .join("");
     case "binary":
-      return `(${valueSql(compilation, node.left, bindings)} ${node.operator} ${valueSql(compilation, node.right, bindings)})`;
+      return `(${operandSql(compilation, node.left, bindings)} ${node.operator} ${operandSql(compilation, node.right, bindings)})`;
     case "aggregate": {
+      const ordered =
+        node.value && (node.name === "MIN" || node.name === "MAX")
+          ? dialect.orderedAggregate?.(
+              node.name,
+              valueSql(compilation, node.value, bindings),
+              orderedType(node.value),
+            )
+          : undefined;
+
+      if (ordered !== undefined) {
+        return ordered;
+      }
+
       const aggregate = `${node.name}(${node.value ? valueSql(compilation, node.value, bindings) : "*"})`;
 
       return node.numeric
@@ -189,7 +271,7 @@ export const renderValue = (
 
       if (node.orderBy.length) {
         fragments.push(
-          `ORDER BY ${node.orderBy.map((ordering) => `${valueSql(compilation, ordering.expression.node, bindings)} ${ordering.direction}${ordering.nulls ? ` NULLS ${ordering.nulls}` : ""}`).join(", ")}`,
+          `ORDER BY ${node.orderBy.map((ordering) => orderingSql(compilation, ordering, bindings)).join(", ")}`,
         );
       }
 

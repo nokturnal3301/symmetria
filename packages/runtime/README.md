@@ -4,7 +4,7 @@ A type-safe, SQL-first PostgreSQL query builder for Bun, with an embedded SQLite
 driver. Declare schemas in TypeScript, compose immutable queries and infer the
 exact result shape, including relationships and nullable joins.
 
-**Bun 1.3+ · ESM · MIT**
+**Bun 1.4.4+ · ESM · MIT**
 
 [Core concepts](https://github.com/nokturnal3301/symmetria/blob/main/docs/guide.md)
 explains shapes, relationships, nullability and bigint step by step.

@@ -44,7 +44,7 @@
     "symmetria": "0.1.0"
   },
   "engines": {
-    "bun": ">=1.3"
+    "bun": ">=1.4.4"
   },
   "publishConfig": {
     "access": "public"

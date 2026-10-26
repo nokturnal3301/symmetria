@@ -25,6 +25,7 @@ import {
   jsonPathTarget,
   jsonValueCodec,
 } from "./json-path";
+import { COLUMN_CODEC, type Column } from "../schema/column";
 
 export const COLUMN_EXPRESSION = Symbol("symmetria.query.expression");
 export const PREDICATE_EXPRESSION = Symbol("symmetria.query.predicate");
@@ -940,7 +941,16 @@ class ColumnHandle {
   }
 
   contains(value: unknown) {
-    return compare(this[COLUMN_EXPRESSION], "@>", value);
+    const description = this[COLUMN_EXPRESSION];
+    const sqlType = expressionSqlType(description);
+    const json = sqlType === "json" || sqlType === "jsonb";
+
+    // A containment operand is a partial JSON value: serialize it without the column's schema validation.
+    return compare(
+      json ? { ...description, codec: codecFor(sqlType)! } : description,
+      "@>",
+      value,
+    );
   }
 
   overlaps(value: unknown) {
@@ -1224,7 +1234,7 @@ export const maximum = <Value>(
 
 export const coalesce = <Value>(
   expression: SelectedColumn<Value>,
-  fallback: NonNullable<Value>,
+  fallback: NonNullable<Value> | SelectedColumn<NonNullable<Value>>,
 ): QueryColumn<NonNullable<Value>, "coalesce"> => {
   const description = readColumn(expression);
 
@@ -1268,11 +1278,16 @@ class SqlHandle extends ColumnHandle {
   }
 }
 
-/** Interpolations are parameters or expression nodes; only the template's literal text is SQL. */
-export const sql = <Value = unknown>(
+type SqlTemplate<Value> = QueryColumn<Value, "expression"> & {
+  kind: "sql";
+  sql: string;
+};
+
+const sqlTemplate = <Value>(
   strings: TemplateStringsArray,
-  ...values: unknown[]
-): QueryColumn<Value, "expression"> & { kind: "sql"; sql: string } => {
+  values: readonly unknown[],
+  codec?: RuntimeCodec,
+): SqlTemplate<Value> => {
   const parts: (string | ValueNode)[] = [];
   strings.forEach((text, index) => {
     parts.push(text);
@@ -1287,12 +1302,45 @@ export const sql = <Value = unknown>(
       {
         node: Object.freeze({ kind: "raw", parts: Object.freeze(parts) }),
         outputName: "expression",
+        ...(codec ? { codec } : {}),
       },
       strings,
       values.length > 0,
     ),
-  ) as unknown as QueryColumn<Value, "expression"> & {
-    kind: "sql";
-    sql: string;
-  };
+  ) as unknown as SqlTemplate<Value>;
 };
+
+type ColumnResult<Definition> =
+  Definition extends Column<infer Metadata>
+    ? Metadata["notNull"] extends false
+      ? Metadata["valueType"] | null
+      : Metadata["valueType"]
+    : never;
+
+/** Interpolations are parameters or expression nodes; only the template's literal text is SQL. */
+export const sql = Object.assign(
+  <Value = unknown>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): SqlTemplate<Value> => sqlTemplate<Value>(strings, values),
+  {
+    /**
+     * A template typed and decoded like a column: `sql.of(bool)` returns booleans on every
+     * driver, `sql.of(timestamptz)` returns Dates and `sql.of(bigint)` bigints.
+     */
+    of:
+      <Definition extends Column>(column: Definition) =>
+      (
+        strings: TemplateStringsArray,
+        ...values: unknown[]
+      ): SqlTemplate<ColumnResult<Definition>> =>
+        sqlTemplate<ColumnResult<Definition>>(
+          strings,
+          values,
+          column[COLUMN_CODEC] ??
+            (column.definition.sqlType === "boolean"
+              ? booleanCodec
+              : codecFor(column.definition.sqlType)),
+        ),
+  },
+);

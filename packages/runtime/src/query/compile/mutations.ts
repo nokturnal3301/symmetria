@@ -37,6 +37,12 @@ export const mutationSql = (
       .join(", ");
 
   if (query.kind === "insert") {
+    if (!query.values.length) {
+      throw new Error(
+        "symmetria: insert([]) has no SQL; executing it is a no-op",
+      );
+    }
+
     const names = query.root.table.columns.filter((column) =>
       query.values.some((values) => column.name in values),
     );
@@ -90,6 +96,13 @@ export const mutationSql = (
         fragments.push(
           `ON CONFLICT${target} DO UPDATE SET ${assignments(query.conflict.values, { ...query.bindings, ...(query.conflict.excluded ? { excluded: query.conflict.excluded } : {}) })}`,
         );
+
+        // A scoped database never updates a conflicting row outside its scope.
+        if (query.conflict.predicates?.length) {
+          fragments.push(
+            `WHERE ${query.conflict.predicates.map((description) => predicateSql(compilation, description, query.bindings)).join(" AND ")}`,
+          );
+        }
       }
     }
   } else if (query.kind === "update") {

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, expectTypeOf, test } from "bun:test";
 import {
   schema,
   table,
@@ -20,6 +20,8 @@ import {
   and,
   defaultValue,
   index,
+  sql,
+  type Predicate,
 } from "../../../packages/runtime/src";
 import { sqlite, sqliteSchemaSQL } from "../../../packages/runtime/src/driver";
 
@@ -373,6 +375,31 @@ describe("sqlite dialect", () => {
       }))
       .page({ size: 1, after: page.nextCursor });
     expect(next.items).toEqual([{ id: 2, title: "Draft" }]);
+    // Forged values that the ordering column could not hold are cursor errors, not SQL errors.
+    const posts = database.posts((posts) => ({
+      id: posts.id,
+      $orderBy: posts.id.ascending,
+    }));
+    const first = await posts.page({ size: 1 });
+    const decoded = JSON.parse(
+      Buffer.from(String(first.nextCursor), "base64url").toString(),
+    );
+
+    const forged = (values: unknown[]) =>
+      Buffer.from(JSON.stringify({ ...decoded, values })).toString(
+        "base64url",
+      ) as unknown as typeof first.nextCursor;
+
+    expect(
+      (await posts.page({ size: 1, after: forged(decoded.values) })).items,
+    ).toEqual([{ id: 2 }]);
+
+    for (const values of [["1; drop"], ["1.5"], [""]]) {
+      await expect(
+        posts.page({ size: 1, after: forged(values) }),
+      ).rejects.toThrow(/invalid page cursor/);
+    }
+
     const ranked = database
       .posts((posts) => ({
         id: posts.id,
@@ -429,6 +456,399 @@ describe("sqlite dialect", () => {
           users.posts.some((posts) => posts.title.is("nothing")),
         ),
     ).toEqual({ affectedRows: 0 });
+  });
+
+  test("computed raw SQL keeps its precedence inside arithmetic", async () => {
+    const driver = sqlite(":memory:");
+    const local = createDatabase({
+      schema: schema({
+        n: table({ id: int.auto, a: int, b: int }).computed((n) => ({
+          total: sql<number>`${n.a} + ${n.b}`,
+        })),
+      }),
+      driver,
+    });
+    driver.createTables(local);
+    await local.n.insert({ a: 1, b: 2 });
+    expect(
+      await local.n((n) => ({
+        doubled: n.total.multiply(2),
+        $where: n.total.multiply(2).is(6),
+      })),
+    ).toEqual([{ doubled: 6 }]);
+  });
+
+  test("a scoped upsert refuses a conflicting row outside the scope and rolls admitted rows back", async () => {
+    const driver = sqlite(":memory:");
+    const local = createDatabase({
+      schema: schema({
+        handles: table({ id: int.auto, tenant: text, handle: text.unique }),
+      }),
+      driver,
+    });
+    driver.createTables(local);
+    await local.handles.insert({ tenant: "globex", handle: "ada" });
+    const acme = local.$scope({
+      handles: (handles) => handles.tenant.is("acme"),
+    });
+    await expect(
+      acme.handles
+        .insert({ tenant: "acme", handle: "ada" })
+        .onConflict("handle")
+        .doUpdate("tenant")
+        .execute(),
+    ).rejects.toMatchObject({ code: "SYMMETRIA_OUT_OF_SCOPE" });
+    await expect(
+      acme.handles
+        .insert([
+          { tenant: "acme", handle: "bob" },
+          { tenant: "acme", handle: "ada" },
+        ])
+        .onConflict("handle")
+        .doUpdate("tenant")
+        .execute(),
+    ).rejects.toMatchObject({ code: "SYMMETRIA_OUT_OF_SCOPE" });
+    expect(
+      await local.handles((handles) => ({
+        tenant: handles.tenant,
+        handle: handles.handle,
+      })),
+    ).toEqual([{ tenant: "globex", handle: "ada" }]);
+    expect(
+      await acme.handles
+        .insert({ tenant: "acme", handle: "carol" })
+        .onConflict("handle")
+        .doUpdate("tenant")
+        .returning((handles) => ({ handle: handles.handle })),
+    ).toEqual({ handle: "carol" });
+  });
+
+  test("bulk INSERT above the parameter limit runs as atomic chunks", async () => {
+    const driver = sqlite(":memory:");
+    const local = createDatabase({
+      schema: schema({ items: { id: int.auto, code: text.unique, n: int } }),
+      driver,
+    });
+    driver.createTables(local);
+    const rows = Array.from({ length: 20_000 }, (_, n) => ({
+      code: `c${n}`,
+      n,
+    }));
+    const inserted = await local.items
+      .insert(rows)
+      .returning((items) => ({ n: items.n }));
+    expect(inserted.length).toBe(20_000);
+    expect(inserted.at(-1)).toEqual({ n: 19_999 });
+    // A failure in the last chunk rolls back the earlier ones.
+    await expect(
+      local.items
+        .insert([
+          ...Array.from({ length: 19_999 }, (_, n) => ({ code: `d${n}`, n })),
+          { code: "c0", n: -1 },
+        ])
+        .execute(),
+    ).rejects.toThrow();
+    expect(
+      await local.items((items, { count }) => ({ total: count() })).one(),
+    ).toEqual({ total: 20_000 });
+  });
+
+  test("sql.of(column) types and decodes raw SQL like that column", async () => {
+    const driver = sqlite(":memory:");
+    const local = createDatabase({
+      schema: schema({
+        events: table({
+          id: int.auto,
+          state: oneOf("open", "closed"),
+          at: timestamptz.default(new Date("2026-01-01T00:00:00Z")),
+        }).computed((events) => ({
+          open: sql.of(bool)`${events.state} = ${"open"}`,
+        })),
+      }),
+      driver,
+    });
+    driver.createTables(local);
+    await local.events.insert([{ state: "open" }, { state: "closed" }]);
+    const rows = await local.events((events) => ({
+      open: events.open,
+      at: sql.of(timestamptz)`${events.at}`,
+      big: sql.of(bigint)`9007199254740993`,
+      nested: { open: events.open },
+      $where: events.open.isNot(null),
+      $orderBy: events.id.ascending,
+    }));
+    expectTypeOf(rows).toEqualTypeOf<
+      { open: boolean; at: Date; big: bigint; nested: { open: boolean } }[]
+    >();
+    expect(rows).toEqual([
+      {
+        open: true,
+        at: new Date("2026-01-01T00:00:00Z"),
+        big: 9007199254740993n,
+        nested: { open: true },
+      },
+      {
+        open: false,
+        at: new Date("2026-01-01T00:00:00Z"),
+        big: 9007199254740993n,
+        nested: { open: false },
+      },
+    ]);
+  });
+
+  test("page() orders by computed fields and raw root expressions", async () => {
+    const driver = sqlite(":memory:");
+    const local = createDatabase({
+      schema: schema({
+        events: table({
+          id: int.auto,
+          state: oneOf("open", "closed"),
+          weight: int.nullable,
+        }).computed((events) => ({
+          open: sql.of(bool)`${events.state} = ${"open"}`,
+        })),
+      }),
+      driver,
+    });
+    driver.createTables(local);
+    await local.events.insert([
+      { state: "open", weight: 3 },
+      { state: "closed", weight: 1 },
+      { state: "open", weight: null },
+      { state: "closed", weight: 2 },
+      { state: "open", weight: 1 },
+    ]);
+
+    const walk = async (query: {
+      page: (options: {
+        size: number;
+        after?: string | null;
+      }) => Promise<{ items: { id: number }[]; nextCursor: string | null }>;
+    }) => {
+      const ids: number[] = [];
+      let after: string | null = null;
+
+      do {
+        const page = await query.page({ size: 2, after });
+        ids.push(...page.items.map((item) => item.id));
+        after = page.nextCursor;
+      } while (after);
+
+      return ids;
+    };
+
+    const byComputed = local.events((events) => ({
+      id: events.id,
+      $orderBy: [events.open.descending, events.id.ascending],
+    }));
+    expect(await walk(byComputed as never)).toEqual([1, 3, 5, 2, 4]);
+
+    const byExpression = local.events((events) => {
+      const score = sql<number>`coalesce(${events.weight}, 0) * 10`;
+
+      return {
+        id: events.id,
+        $orderBy: [score.ascending, events.id.descending],
+      };
+    });
+    expect(await walk(byExpression as never)).toEqual([3, 5, 2, 4, 1]);
+
+    const byNullable = local.events((events) => ({
+      id: events.id,
+      $orderBy: [events.weight.descending.nullsLast, events.id.ascending],
+    }));
+    expect(await walk(byNullable as never)).toEqual([1, 4, 2, 5, 3]);
+  });
+
+  test("numeric, enum and NULL ordering follow PostgreSQL semantics", async () => {
+    const driver = sqlite(":memory:");
+    const local = createDatabase({
+      schema: schema({
+        tickets: {
+          id: int.auto,
+          points: numeric(4, 1).nullable,
+          budget: numeric(12, 2).default("0"),
+          status: oneOf("backlog", "todo", "done"),
+        },
+      }),
+      driver,
+    });
+    driver.createTables(local);
+    await local.tickets.insert([
+      { points: "9.5", status: "todo", budget: "1500.5" },
+      { points: "10.0", status: "done" },
+      { points: null, status: "backlog", budget: "2.555" },
+      { points: "100.0", status: "todo", budget: "-0.004" },
+      { points: "2.5", status: "backlog" },
+    ]);
+
+    // Scale: text storage is read back as PostgreSQL would store it.
+    expect(
+      (
+        await local.tickets((tickets) => ({
+          budget: tickets.budget,
+          $orderBy: tickets.id.ascending,
+        }))
+      ).map((row) => row.budget),
+    ).toEqual(["1500.50", "0.00", "2.56", "0.00", "0.00"]);
+
+    // Magnitude, not text: '9.5' < '10.0' < '100.0'; NULLs last for ASC.
+    const byPoints = local.tickets((tickets) => ({
+      points: tickets.points,
+      $orderBy: [tickets.points.ascending, tickets.id.ascending],
+    }));
+    expect((await byPoints).map((row) => row.points)).toEqual([
+      "2.5",
+      "9.5",
+      "10.0",
+      "100.0",
+      null,
+    ]);
+    expect(byPoints.toSQL().sql).toContain(
+      'CAST("tickets"."points" AS REAL) ASC NULLS LAST',
+    );
+    expect(
+      (
+        await local.tickets((tickets) => ({
+          id: tickets.id,
+          $where: and(
+            tickets.points.above("2.0"),
+            tickets.points.atMost("10.0"),
+          ),
+          $orderBy: tickets.id.ascending,
+        }))
+      ).map((row) => row.id),
+    ).toEqual([1, 2, 5]);
+    expect(
+      (
+        await local.tickets((tickets) => ({
+          id: tickets.id,
+          $where: tickets.points.between("9.0", "11"),
+        }))
+      ).map((row) => row.id),
+    ).toEqual([1, 2]);
+    // DESC puts NULLs first, like PostgreSQL.
+    expect(
+      (
+        await local.tickets((tickets) => ({
+          points: tickets.points,
+          $orderBy: tickets.points.descending,
+        }))
+      ).map((row) => row.points),
+    ).toEqual([null, "100.0", "10.0", "9.5", "2.5"]);
+
+    // Enums order by declaration, including DISTINCT and cursor pages.
+    expect(
+      (
+        await local.tickets((tickets) => ({
+          status: tickets.status,
+          $distinct: true,
+          $orderBy: tickets.status.ascending,
+        }))
+      ).map((row) => row.status),
+    ).toEqual(["backlog", "todo", "done"]);
+    const byStatus = local.tickets((tickets) => ({
+      id: tickets.id,
+      $orderBy: [tickets.status.descending, tickets.id.ascending],
+    }));
+    const pages: number[] = [];
+    let after: unknown;
+
+    for (let i = 0; i < 5 && (i === 0 || after); i++) {
+      const page = await byStatus.page({
+        size: 2,
+        ...(after ? { after } : {}),
+      } as never);
+      pages.push(...page.items.map((item) => item.id));
+      after = page.nextCursor;
+    }
+
+    expect(pages).toEqual([2, 1, 4, 3, 5]);
+    expect(byStatus.toSQL().sql).toContain(
+      "WHEN 'backlog' THEN 0 WHEN 'todo' THEN 1 WHEN 'done' THEN 2",
+    );
+    // Equality stays a plain text comparison.
+    expect(
+      local
+        .tickets((tickets) => ({
+          id: tickets.id,
+          $where: tickets.status.is("todo"),
+        }))
+        .toSQL().sql,
+    ).toContain('"tickets"."status" = ?1');
+
+    // Aggregates and typed raw SQL over scaled numerics round too.
+    expect(
+      await local
+        .tickets((tickets, { sum, maximum }) => ({
+          total: sum(tickets.budget),
+          top: maximum(tickets.points),
+          doubled: sql.of(numeric(4, 1))`${tickets.points} * 2`,
+          $where: tickets.id.is(1),
+        }))
+        .one(),
+    ).toEqual({ total: "1500.50", top: "9.5", doubled: "19.0" });
+
+    // MIN/MAX compare numerics by magnitude and enums by declaration order:
+    // text storage would pick '9.5' over '100.0' and 'todo' over 'done'.
+    const extremes = local.tickets((tickets, { minimum, maximum }) => ({
+      most: maximum(tickets.points),
+      least: minimum(tickets.points),
+      lastStatus: maximum(tickets.status),
+      firstStatus: minimum(tickets.status),
+    }));
+    expect(await extremes.one()).toEqual({
+      most: "100.0",
+      least: "2.5",
+      lastStatus: "done",
+      firstStatus: "backlog",
+    });
+    expect(extremes.toSQL().sql).toContain(
+      'MAX(CAST("tickets"."points" AS REAL))',
+    );
+    await local.$close();
+  });
+
+  test("LIKE is case-sensitive, ILIKE folds case and backslash escapes", async () => {
+    const driver = sqlite(":memory:");
+    const local = createDatabase({
+      schema: schema({
+        notes: { id: int.auto, title: text },
+      }),
+      driver,
+    });
+    driver.createTables(local);
+    await local.notes.insert([
+      { title: "Alpha" },
+      { title: "alpha" },
+      { title: "back\\slash" },
+      { title: "backslash" },
+      { title: "100%" },
+    ]);
+
+    type Title = Parameters<Parameters<typeof local.notes>[0]>[0]["title"];
+
+    const ids = async (predicate: (title: Title) => Predicate) =>
+      (
+        await local.notes((notes) => ({
+          id: notes.id,
+          $where: predicate(notes.title),
+          $orderBy: notes.id.ascending,
+        }))
+      ).map((row) => row.id);
+
+    expect(await ids((title) => title.like("A%"))).toEqual([1]);
+    expect(await ids((title) => title.ilike("A%"))).toEqual([1, 2]);
+    expect(await ids((title) => title.like("back\\\\%"))).toEqual([3]);
+    expect(await ids((title) => title.like("back\\slash"))).toEqual([4]);
+    expect(await ids((title) => title.like("100\\%"))).toEqual([5]);
+    expect(await ids((title) => title.search("ALPHA"))).toEqual([1, 2]);
+    expect(
+      local
+        .notes((notes) => ({ id: notes.id, $where: notes.title.ilike("a%") }))
+        .toSQL().sql,
+    ).toContain(`lower("notes"."title") LIKE lower(?1) ESCAPE '\\'`);
+    await local.$close();
   });
 
   test("arrays and search fall back to JSON and LIKE in SQLite", async () => {

@@ -1,4 +1,4 @@
-import { compileQuery, executePlan } from "./compiler";
+import { compilePlan, compileQuery, executePlan } from "./compiler";
 import { executorProfiling } from "../observability/profiling";
 import {
   PREPARE_QUERY,
@@ -7,6 +7,7 @@ import {
   type Preparable,
 } from "./prepared";
 import {
+  and,
   readPredicate,
   valueNode,
   type Predicate,
@@ -34,17 +35,21 @@ import {
   type TableBinding,
 } from "./state";
 
+/** Optional write fields accept `undefined` as "omitted", even under exactOptionalPropertyTypes. */
 type InputValues<Insert extends Record<string, unknown>> = {
   [ColumnName in keyof Insert]:
     | Insert[ColumnName]
     | SelectedColumn<Exclude<Insert[ColumnName], undefined>>
-    | ({} extends Pick<Insert, ColumnName> ? typeof DEFAULT_VALUE : never);
+    | ({} extends Pick<Insert, ColumnName>
+        ? typeof DEFAULT_VALUE | undefined
+        : never);
 };
 type UpdateValues<Insert extends Record<string, unknown>> = {
   [ColumnName in keyof Insert]?:
     | Exclude<Insert[ColumnName], undefined>
     | SelectedColumn<Exclude<Insert[ColumnName], undefined>>
-    | ({} extends Pick<Insert, ColumnName> ? typeof DEFAULT_VALUE : never);
+    | ({} extends Pick<Insert, ColumnName> ? typeof DEFAULT_VALUE : never)
+    | undefined;
 };
 type WritableColumnNames<Insert> = {
   [Name in keyof Insert & string]: [Exclude<Insert[Name], undefined>] extends [
@@ -54,8 +59,20 @@ type WritableColumnNames<Insert> = {
     : Name;
 }[keyof Insert & string];
 
+/** Runs several statements atomically: a transaction, or a savepoint inside one. */
+export type AtomicRunner = <Result>(
+  run: (executor: QueryExecutor) => Promise<Result>,
+) => Promise<Result>;
+
+/** Wire-protocol bind-parameter limits; larger multi-row INSERTs are split into atomic chunks. */
+const PARAMETER_LIMITS: Record<string, number> = {
+  postgres: 65535,
+  sqlite: 32766,
+};
+
 /** Hooks a table's query machinery hands to its mutations: $scope() filters and relation-path contexts. */
 export type MutationOptions = {
+  readonly atomic?: AtomicRunner;
   readonly scope?: readonly PredicateDescription[];
   readonly context?: (plan: SelectPlan) => {
     readonly plan: SelectPlan;
@@ -66,7 +83,7 @@ export type MutationOptions = {
 type FlatInsert<
   Insert extends Record<string, unknown>,
   RelationNames extends string,
-> = InputValues<Insert> & { [Name in RelationNames]?: never };
+> = InputValues<Insert> & { [Name in RelationNames]?: undefined };
 
 /** `insert(object)` resolves to one row, `insert(array)` to an array; DO NOTHING may skip the row. */
 export type MutationResult<
@@ -168,7 +185,7 @@ type Mutation<
     : {
         /** Relation paths and quantifiers compile to a primary-key subquery. */
         readonly where: (
-          predicate: (scope: WhereScope) => Predicate,
+          predicate: (scope: WhereScope) => Predicate | readonly Predicate[],
         ) => Mutation<
           Row,
           Insert,
@@ -247,14 +264,21 @@ export const createMutation = (
    * UPDATE or DELETE, so they move into a primary-key subquery.
    */
   const wherePredicate = (
-    callback: (row: RuntimeScope[string]) => Predicate,
+    callback: (row: RuntimeScope[string]) => Predicate | readonly Predicate[],
   ): PredicateDescription => {
+    // An array combines with AND, like $where in shapes.
+    const evaluate = (row: RuntimeScope[string]): Predicate => {
+      const result = callback(row);
+
+      return Array.isArray(result) ? and(...result) : (result as Predicate);
+    };
+
     if (!options.context) {
-      return readPredicate(callback(scope[root.alias]!));
+      return readPredicate(evaluate(scope[root.alias]!));
     }
 
     const context = options.context(initialPlan(root));
-    const description = readPredicate(callback(context.scope()[root.alias]!));
+    const description = readPredicate(evaluate(context.scope()[root.alias]!));
 
     if (!context.plan.joins.length) {
       return description;
@@ -281,14 +305,8 @@ export const createMutation = (
       keys.length === 1
         ? columnNode(keys[0]!)
         : Object.freeze({
-            kind: "raw",
-            parts: Object.freeze([
-              "(",
-              ...keys.flatMap((column, position) =>
-                position ? [", ", columnNode(column)] : [columnNode(column)],
-              ),
-              ")",
-            ]),
+            kind: "tuple",
+            values: Object.freeze(keys.map(columnNode)),
           });
 
     return Object.freeze({
@@ -310,11 +328,20 @@ export const createMutation = (
       throw new Error("symmetria: values must be an object");
     }
 
-    const entries = Object.entries(values).map(([name, value]) => {
+    // undefined means omitted, as for query controls; unknown keys still fail.
+    const result: Record<string, ValueNode | typeof DEFAULT_VALUE> = {};
+    let assigned = 0;
+
+    for (const name of Object.keys(values)) {
+      const value = values[name];
       const column = root.table.columns.find((column) => column.name === name);
 
       if (!column) {
         throw new Error(`symmetria: unknown column "${root.alias}.${name}"`);
+      }
+
+      if (value === undefined) {
+        continue;
       }
 
       if (value === null && column.notNull) {
@@ -349,15 +376,16 @@ export const createMutation = (
         atomicValues = false;
       }
 
-      return [name, node];
-    });
+      result[name] = node;
+      assigned += 1;
+    }
 
     if (insert) {
       for (const column of root.table.columns) {
         if (
           column.notNull &&
           !column.default &&
-          !Object.hasOwn(values, column.name)
+          values[column.name] === undefined
         ) {
           throw new Error(
             `symmetria: missing required column "${root.alias}.${column.name}"`,
@@ -366,11 +394,11 @@ export const createMutation = (
       }
     }
 
-    if (!insert && !entries.length) {
+    if (!insert && !assigned) {
       throw new Error("symmetria: update() requires at least one value");
     }
 
-    return Object.freeze(Object.fromEntries(entries));
+    return Object.freeze(result);
   };
 
   const resolved =
@@ -378,8 +406,8 @@ export const createMutation = (
   const rows = Array.isArray(resolved) ? resolved : [resolved];
   const single = kind === "insert" && !Array.isArray(resolved);
 
-  if (kind !== "delete" && !rows.length) {
-    throw new Error("symmetria: insert() requires at least one row");
+  if (kind === "update" && !rows.length) {
+    throw new Error("symmetria: update() requires at least one value");
   }
 
   const initial: MutationPlan = Object.freeze({
@@ -399,9 +427,91 @@ export const createMutation = (
     ...(single ? { single: true as const } : {}),
   });
 
+  const executeChunked = async (
+    state: MutationPlan,
+    runner: QueryExecutor | undefined = executor,
+  ) => {
+    const limit = PARAMETER_LIMITS[root.dialect ?? "postgres"];
+
+    if (
+      state.kind !== "insert" ||
+      state.values.length < 2 ||
+      !options.atomic ||
+      !limit ||
+      // Atomic values bind at most one parameter each, so most inserts are
+      // provably under the limit without compiling; compilePlan caches otherwise.
+      (state.atomicValues &&
+        state.values.length * root.table.columns.length + 1000 <= limit) ||
+      compilePlan(state).parameters.length <= limit
+    ) {
+      return executePlan(state, runner);
+    }
+
+    // Halve until every chunk fits; rows may bind different numbers of parameters.
+    const chunks: MutationPlan[] = [];
+
+    const split = (values: MutationPlan["values"]): void => {
+      const chunk: MutationPlan = Object.freeze({ ...state, values });
+
+      if (values.length > 1 && compileQuery(chunk).parameters.length > limit) {
+        const middle = Math.ceil(values.length / 2);
+        split(values.slice(0, middle));
+        split(values.slice(middle));
+      } else {
+        chunks.push(chunk);
+      }
+    };
+
+    split(state.values);
+
+    return options.atomic(async (atomicExecutor) => {
+      const rows: Record<string, unknown>[] = [];
+      let affectedRows = 0;
+
+      for (const chunk of chunks) {
+        const result = await executePlan(chunk, atomicExecutor);
+        rows.push(...result.rows);
+        affectedRows += result.affectedRows;
+      }
+
+      return { rows, affectedRows };
+    });
+  };
+
   const build = (state: MutationPlan): object => {
     const execute = async () => {
-      const result = await executePlan(state, executor);
+      // `insert([])` is a no-op: nothing to write, nothing returned.
+      // A scoped upsert's DO UPDATE is filtered by the scope: a conflict with a
+      // row outside it writes nothing, which must not pass as success.
+      const inScope = <Result extends { affectedRows: number }>(
+        result: Result,
+      ): Result => {
+        if (
+          state.conflict?.predicates?.length &&
+          result.affectedRows < state.values.length
+        ) {
+          throw Object.assign(
+            new Error(
+              `symmetria: upsert on "${root.table.name}" conflicted with a row outside the database scope`,
+            ),
+            { code: "SYMMETRIA_OUT_OF_SCOPE" },
+          );
+        }
+
+        return result;
+      };
+
+      const result =
+        state.kind === "insert" && !state.values.length
+          ? { rows: [], affectedRows: 0 }
+          : state.conflict?.predicates?.length &&
+              state.values.length > 1 &&
+              options.atomic
+            ? // Several rows: the rows the scope admits must not stay written.
+              await options.atomic((atomicExecutor) =>
+                executeChunked(state, atomicExecutor).then(inScope),
+              )
+            : inScope(await executeChunked(state));
 
       if (!state.selection.length) {
         return { affectedRows: result.affectedRows };
@@ -422,7 +532,11 @@ export const createMutation = (
             selection: readSelection(selector(scope[root.alias]!), bindings),
           }),
         ),
-      where: (callback: (row: RuntimeScope[string]) => Predicate) => {
+      where: (
+        callback: (
+          row: RuntimeScope[string],
+        ) => Predicate | readonly Predicate[],
+      ) => {
         if (kind === "insert") {
           throw new Error("symmetria: INSERT has no WHERE clause");
         }
@@ -512,6 +626,9 @@ export const createMutation = (
                   columns: Object.freeze(columns),
                   action: "update",
                   excluded,
+                  ...(options.scope?.length
+                    ? { predicates: Object.freeze([...options.scope]) }
+                    : {}),
                   values: readValues(
                     typeof values === "string"
                       ? Object.fromEntries(

@@ -58,12 +58,29 @@ type TablePair = {
   after: MigrationTable;
   columns: ColumnPair[];
   primaryChanged: boolean;
-  rebuildIndexes: boolean;
+  /** The table rename changes the primary key's name, not its definition. */
+  primaryRenamed: boolean;
+  /** Quoted names of retyped or dropped columns; definitions mentioning them are rebuilt. */
+  affected: string[];
+  /** Applies column renames to a previous definition; PostgreSQL renames them in place. */
+  renamed: <Definition>(definition: Definition) => Definition;
 };
 type Casts = Readonly<Record<string, Readonly<Record<string, string>>>>;
 
 const equal = (left: unknown, right: unknown): boolean =>
   canonicalJSON(left ?? null) === canonicalJSON(right ?? null);
+
+/** A definition without its declared and SQL names: what a rename leaves unchanged. */
+const anonymous = (definition: unknown): unknown =>
+  Object.fromEntries(
+    Object.entries(definition as Record<string, unknown>).filter(
+      ([key]) => key !== "name" && key !== "sqlName",
+    ),
+  );
+
+/** A string as it appears inside canonical JSON, without the surrounding quotes. */
+const escapedJSON = (value: string): string =>
+  JSON.stringify(value).slice(1, -1);
 
 const direction = (
   before: MigrationSnapshot,
@@ -77,6 +94,21 @@ const direction = (
   );
   const afterTables = new Map(after.tables.map((table) => [table.name, table]));
   const tableNames = renames.tables ?? {};
+
+  /** A reference as it reads after this diff's table and column renames. */
+  const renamedReference = (reference: {
+    table: string;
+    column: string;
+    onDelete: string;
+  }): { table: string; column: string; onDelete: string } => {
+    const table = tableNames[reference.table] ?? reference.table;
+
+    return {
+      table,
+      column: renames.columns?.[table]?.[reference.column] ?? reference.column,
+      onDelete: reference.onDelete,
+    };
+  };
 
   for (const [previous, next] of Object.entries(tableNames)) {
     if (!beforeTables.has(previous) || !afterTables.has(next)) {
@@ -104,19 +136,46 @@ const direction = (
   const afterEnumerations = new Map(
     after.enumerations.map((enumeration) => [enumeration.name, enumeration]),
   );
+
+  // ALTER TYPE ... ADD VALUE runs inside a transaction on PostgreSQL 12+, but the new
+  // label cannot be used until commit. Values that a default or CHECK in this migration
+  // already needs force the replace-and-cast rewrite instead.
+  const usedInMigration = (enumeration: string, value: string): boolean => {
+    const literal = quoteLiteral(value);
+
+    return after.tables.some(
+      (table) =>
+        table.columns.some(
+          (column) =>
+            column.enumeration === enumeration &&
+            column.default !== undefined &&
+            column.default.includes(literal),
+        ) ||
+        (table.checks ?? []).some((check) =>
+          check.expression.includes(literal),
+        ),
+    );
+  };
+
   const additiveEnums = new Set(
     after.enumerations
       .filter((next) => {
         const previous = beforeEnumerations.get(next.name);
 
         return (
-          online &&
           previous &&
           previous.values.length < next.values.length &&
           equal(
             next.values.filter((value) => previous.values.includes(value)),
             previous.values,
-          )
+          ) &&
+          // Online migrations commit each statement, so later defaults may use the label.
+          (online ||
+            !next.values.some(
+              (value) =>
+                !previous.values.includes(value) &&
+                usedInMigration(next.name, value),
+            ))
         );
       })
       .map((enumeration) => enumeration.name),
@@ -192,26 +251,51 @@ const direction = (
         : [];
     });
     const primaryChanged =
-      previous.name !== next.name ||
-      !equal(previous.primaryKey, next.primaryKey) ||
+      !equal(
+        previous.primaryKey.map((name) => columnNames[name] ?? name),
+        next.primaryKey,
+      ) ||
       columns.some(
         (column) =>
           column.typeChanged &&
           previous.primaryKey.includes(column.before.name),
       );
-    const rebuildIndexes =
-      previous.name !== next.name ||
-      columns.length !== previous.columns.length ||
-      columns.some(
+    const affected = previous.columns
+      .filter(
         (column) =>
-          column.before.name !== column.after.name || column.typeChanged,
+          !columns.some(
+            (pair) => pair.before.name === column.name && !pair.typeChanged,
+          ),
+      )
+      .map((column) => quoteIdentifier(column.name));
+    const columnRenames = columns
+      .filter((column) => column.before.name !== column.after.name)
+      .map(
+        (column) =>
+          [
+            escapedJSON(quoteIdentifier(column.before.name)),
+            escapedJSON(quoteIdentifier(column.after.name)),
+          ] as const,
       );
     pairs.push({
       before: previous,
       after: next,
       columns,
       primaryChanged,
-      rebuildIndexes,
+      primaryRenamed:
+        !primaryChanged &&
+        previous.name !== next.name &&
+        previous.primaryKey.length > 0,
+      affected,
+      renamed: (definition) =>
+        columnRenames.length
+          ? JSON.parse(
+              columnRenames.reduce(
+                (text, [from, to]) => text.replaceAll(from, to),
+                canonicalJSON(definition),
+              ),
+            )
+          : definition,
     });
   }
 
@@ -248,59 +332,158 @@ const direction = (
   );
   const droppedIndexes = new Set<string>();
 
-  const changedCheck = (pair: TablePair, name: string): boolean =>
-    pair.rebuildIndexes ||
-    !equal(
-      pair.before.checks?.find((check) => check.sqlName === name),
-      pair.after.checks?.find((check) => check.sqlName === name),
+  /** A definition survives when only renamed columns changed and no column it uses is retyped or dropped. */
+  const changedDefinition = (
+    pair: TablePair,
+    previous: unknown,
+    next: unknown,
+  ): boolean => {
+    if (!previous || !next) {
+      return true;
+    }
+
+    const text = canonicalJSON(previous);
+
+    return (
+      pair.affected.some((name) => text.includes(escapedJSON(name))) ||
+      !equal(anonymous(pair.renamed(previous)), anonymous(next))
+    );
+  };
+
+  /**
+   * The definition each previous index or check continues as: the one with the
+   * same SQL name, or else the single one equal to it apart from names. Renamed
+   * tables and columns change SQL names, and snapshots keep no declared key.
+   */
+  const counterparts = <Definition extends { sqlName: string }>(
+    pair: TablePair,
+    previous: readonly Definition[],
+    next: readonly Definition[],
+  ): Map<string, Definition> => {
+    const matches = new Map<string, Definition>();
+    const taken = new Set<string>();
+
+    for (const definition of previous) {
+      const same = next.find(
+        (candidate) => candidate.sqlName === definition.sqlName,
+      );
+
+      if (same) {
+        matches.set(definition.sqlName, same);
+        taken.add(same.sqlName);
+      }
+    }
+
+    for (const definition of previous) {
+      if (matches.has(definition.sqlName)) {
+        continue;
+      }
+
+      const shape = canonicalJSON(anonymous(pair.renamed(definition)));
+      const candidates = next.filter(
+        (candidate) =>
+          !taken.has(candidate.sqlName) &&
+          canonicalJSON(anonymous(candidate)) === shape,
+      );
+
+      if (candidates.length === 1) {
+        matches.set(definition.sqlName, candidates[0]!);
+        taken.add(candidates[0]!.sqlName);
+      }
+    }
+
+    return matches;
+  };
+
+  const indexMatches = new Map(
+    pairs.map(
+      (pair) =>
+        [
+          pair,
+          counterparts(pair, pair.before.indexes, pair.after.indexes),
+        ] as const,
+    ),
+  );
+  const checkMatches = new Map(
+    pairs.map(
+      (pair) =>
+        [
+          pair,
+          counterparts(pair, pair.before.checks ?? [], pair.after.checks ?? []),
+        ] as const,
+    ),
+  );
+
+  /** The previous SQL name that continues as `next`, if any. */
+  const previousOf = <Definition extends { sqlName: string }>(
+    matches: Map<string, Definition> | undefined,
+    next: Definition,
+  ): string | undefined =>
+    matches &&
+    [...matches].find(
+      ([, candidate]) => candidate.sqlName === next.sqlName,
+    )?.[0];
+
+  const changedCheck = (
+    pair: TablePair,
+    definition: NonNullable<MigrationTable["checks"]>[number],
+  ): boolean =>
+    changedDefinition(
+      pair,
+      definition,
+      checkMatches.get(pair)?.get(definition.sqlName),
     );
 
-  const changedKeys = new Set<string>(removedTables.map((table) => table.name));
+  const referenceKey = (table: string, column: string): string =>
+    canonicalJSON([table, column]);
+
+  // Foreign keys depend on the referenced key column, not on the whole table.
+  const removedTableNames = new Set(removedTables.map((table) => table.name));
+  const changedKeys = new Set<string>();
 
   for (const pair of pairs) {
-    if (
-      pair.primaryChanged ||
-      pair.columns.some(
-        (column) =>
-          column.before.unique &&
-          (!column.after.unique ||
-            column.typeChanged ||
-            column.before.name !== column.after.name),
-      )
-    ) {
-      changedKeys.add(pair.before.name);
+    if (pair.primaryChanged) {
+      for (const column of pair.before.primaryKey) {
+        changedKeys.add(referenceKey(pair.before.name, column));
+      }
+    }
+
+    for (const column of pair.columns) {
+      if (
+        column.before.unique &&
+        (!column.after.unique || column.typeChanged)
+      ) {
+        changedKeys.add(referenceKey(pair.before.name, column.before.name));
+      }
     }
 
     for (const definition of pair.before.indexes) {
       if (
-        pair.rebuildIndexes ||
-        !equal(
+        changedDefinition(
+          pair,
           definition,
-          pair.after.indexes.find(
-            (candidate) => candidate.sqlName === definition.sqlName,
-          ),
+          indexMatches.get(pair)?.get(definition.sqlName),
         )
       ) {
         droppedIndexes.add(definition.sqlName);
 
+        // A unique index can back foreign keys that reference its single column.
         if (definition.unique) {
-          changedKeys.add(pair.before.name);
+          for (const column of pair.before.columns) {
+            if (equal(definition.keys, [quoteIdentifier(column.name)])) {
+              changedKeys.add(referenceKey(pair.before.name, column.name));
+            }
+          }
         }
       }
     }
   }
 
-  const uniqueChanged = (pair: TablePair, column: ColumnPair): boolean =>
-    pair.before.name !== pair.after.name ||
-    column.before.name !== column.after.name ||
-    column.typeChanged ||
-    column.before.unique !== column.after.unique;
+  const uniqueChanged = (column: ColumnPair): boolean =>
+    column.typeChanged || column.before.unique !== column.after.unique;
 
   const statements: string[] = [];
   const droppedReferences = new Set<string>();
-
-  const referenceKey = (table: string, column: string): string =>
-    canonicalJSON([table, column]);
 
   // Remove dependencies before changing or removing keys, types, columns or tables.
   for (const table of before.tables) {
@@ -314,11 +497,12 @@ const direction = (
         if (
           !pair ||
           !match ||
-          pair.before.name !== pair.after.name ||
-          match.before.name !== match.after.name ||
           match.typeChanged ||
-          !equal(column.references, match.after.references) ||
-          changedKeys.has(column.references.table)
+          !equal(renamedReference(column.references), match.after.references) ||
+          removedTableNames.has(column.references.table) ||
+          changedKeys.has(
+            referenceKey(column.references.table, column.references.column),
+          )
         ) {
           statements.push(
             `ALTER TABLE ${quoteIdentifier(table.name)} DROP CONSTRAINT ${quoteIdentifier(objectName(table.name, column.name, "fkey"))}`,
@@ -339,7 +523,7 @@ const direction = (
     }
 
     for (const definition of pair.before.checks ?? []) {
-      if (changedCheck(pair, definition.sqlName)) {
+      if (changedCheck(pair, definition)) {
         statements.push(
           `ALTER TABLE ${quoteIdentifier(pair.before.name)} DROP CONSTRAINT ${quoteIdentifier(definition.sqlName)}`,
         );
@@ -353,7 +537,7 @@ const direction = (
     }
 
     for (const column of pair.columns) {
-      if (column.before.unique && uniqueChanged(pair, column)) {
+      if (column.before.unique && uniqueChanged(column)) {
         statements.push(
           `ALTER TABLE ${quoteIdentifier(pair.before.name)} DROP CONSTRAINT ${quoteIdentifier(objectName(pair.before.name, column.before.name, "key"))}`,
         );
@@ -372,6 +556,68 @@ const direction = (
       if (column.before.name !== column.after.name) {
         statements.push(
           `ALTER TABLE ${quoteIdentifier(pair.after.name)} RENAME COLUMN ${quoteIdentifier(column.before.name)} TO ${quoteIdentifier(column.after.name)}`,
+        );
+      }
+    }
+
+    // Constraints and indexes named after the table or a column follow the
+    // rename; PostgreSQL keeps their definitions, so nothing is rebuilt.
+    const table = quoteIdentifier(pair.after.name);
+
+    const renameConstraint = (previous: string, next: string): void => {
+      if (previous !== next) {
+        statements.push(
+          `ALTER TABLE ${table} RENAME CONSTRAINT ${quoteIdentifier(previous)} TO ${quoteIdentifier(next)}`,
+        );
+      }
+    };
+
+    if (pair.primaryRenamed) {
+      renameConstraint(
+        objectName(pair.before.name, "pkey"),
+        objectName(pair.after.name, "pkey"),
+      );
+    }
+
+    for (const column of pair.columns) {
+      if (column.before.unique && !uniqueChanged(column)) {
+        renameConstraint(
+          objectName(pair.before.name, column.before.name, "key"),
+          objectName(pair.after.name, column.after.name, "key"),
+        );
+      }
+
+      if (
+        column.before.references &&
+        !droppedReferences.has(
+          referenceKey(pair.before.name, column.before.name),
+        )
+      ) {
+        renameConstraint(
+          objectName(pair.before.name, column.before.name, "fkey"),
+          objectName(pair.after.name, column.after.name, "fkey"),
+        );
+      }
+    }
+
+    for (const definition of pair.before.checks ?? []) {
+      const next = checkMatches.get(pair)?.get(definition.sqlName);
+
+      if (next && !changedCheck(pair, definition)) {
+        renameConstraint(definition.sqlName, next.sqlName);
+      }
+    }
+
+    for (const definition of pair.before.indexes) {
+      const next = indexMatches.get(pair)?.get(definition.sqlName);
+
+      if (
+        next &&
+        !droppedIndexes.has(definition.sqlName) &&
+        next.sqlName !== definition.sqlName
+      ) {
+        statements.push(
+          `ALTER INDEX ${quoteIdentifier(definition.sqlName)} RENAME TO ${quoteIdentifier(next.sqlName)}`,
         );
       }
     }
@@ -457,9 +703,21 @@ const direction = (
     const alter = `ALTER TABLE ${quoteIdentifier(pair.after.name)}`;
 
     for (const column of pair.after.columns) {
-      if (!pair.columns.some((match) => match.after.name === column.name)) {
-        statements.push(`${alter} ADD COLUMN ${columnSQL(column)}`);
+      if (pair.columns.some((match) => match.after.name === column.name)) {
+        continue;
       }
+
+      if (column.notNull && column.default === undefined && !column.identity) {
+        // Existing rows have no value for the column: add it nullable and leave a
+        // place for the backfill before NOT NULL is enforced.
+        statements.push(
+          `${alter} ADD COLUMN ${columnSQL({ ...column, notNull: false })}`,
+          `-- Backfill ${quoteIdentifier(pair.after.name)}.${quoteIdentifier(column.name)} for existing rows before this statement.\n${alter} ALTER COLUMN ${quoteIdentifier(column.name)} SET NOT NULL`,
+        );
+        continue;
+      }
+
+      statements.push(`${alter} ADD COLUMN ${columnSQL(column)}`);
     }
 
     for (const column of pair.columns) {
@@ -532,7 +790,12 @@ const direction = (
     }
 
     for (const definition of pair.after.checks ?? []) {
-      if (changedCheck(pair, definition.sqlName)) {
+      const previousName = previousOf(checkMatches.get(pair), definition);
+      const previous = pair.before.checks?.find(
+        (candidate) => candidate.sqlName === previousName,
+      );
+
+      if (!previous || changedCheck(pair, previous)) {
         statements.push(
           `${alter} ADD ${checkSQL(definition)}${online ? " NOT VALID" : ""}`,
         );
@@ -550,7 +813,7 @@ const direction = (
         (candidate) => candidate.after.name === column.name,
       );
 
-      if (column.unique && (!match || uniqueChanged(pair, match))) {
+      if (column.unique && (!match || uniqueChanged(match))) {
         if (online) {
           const name = quoteIdentifier(
             objectName(pair.after.name, column.name, "key"),
@@ -570,13 +833,11 @@ const direction = (
     const pair = nextPairs.get(table.name);
 
     for (const definition of table.indexes) {
-      if (
-        !pair ||
-        droppedIndexes.has(definition.sqlName) ||
-        !pair.before.indexes.some(
-          (previous) => previous.sqlName === definition.sqlName,
-        )
-      ) {
+      const previous = pair
+        ? previousOf(indexMatches.get(pair), definition)
+        : undefined;
+
+      if (!pair || previous === undefined || droppedIndexes.has(previous)) {
         statements.push(
           online
             ? indexSQL(table, definition).replace(

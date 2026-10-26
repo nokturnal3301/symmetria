@@ -533,13 +533,15 @@ export const assembleSchema = <
         .map((column) => column.key),
       ...analyzedTable.references
         .filter(
-          (reference) =>
+          (reference, position) =>
             reference.flags.index &&
             !reference.flags.unique &&
             !(
               analyzedTable.state.primaryKey?.length === 1 &&
               analyzedTable.state.primaryKey[0] === `${reference.key}Id`
-            ),
+            ) &&
+            // A junction's composite primary key already leads with its first foreign key.
+            !(analyzedTable.isJunction && position === 0),
         )
         .map((reference) => `${reference.key}Id`),
     ];

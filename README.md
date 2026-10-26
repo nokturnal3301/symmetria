@@ -37,7 +37,7 @@ const authors = await database.users((user) => ({
 // One SQL statement. Three posts per author. Bigints stay bigints.
 ```
 
-**Bun 1.3+ · ESM · MIT**
+**Bun 1.4.4+ · ESM · MIT**
 
 PostgreSQL is the primary database. An embedded
 [SQLite driver](docs/reference.md#sqlite-driver) supports local tools and tests.

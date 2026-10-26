@@ -79,7 +79,7 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
 
   beforeEach(async () => {
     await run(
-      "TRUNCATE users, posts, tags, post_tags, handles RESTART IDENTITY CASCADE",
+      "TRUNCATE users, posts, tags, post_tags, handles, wallets RESTART IDENTITY CASCADE",
     );
   });
 
@@ -133,6 +133,87 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
     const user = await database.users.by.email("ada").one();
     expect(user.visits).toBe(9007199254740993n);
     expect(user.createdAt).toBeInstanceOf(Date);
+  });
+
+  test("bulk INSERT above the wire-protocol parameter limit runs as atomic chunks", async () => {
+    const rows = Array.from({ length: 22_000 }, (_, n) => ({
+      email: `bulk${n}@example.com`,
+      name: `Bulk ${n}`,
+      visits: n,
+    }));
+    const inserted = await database.users
+      .insert(rows)
+      .returning((users) => ({ email: users.email }));
+    expect(inserted).toHaveLength(22_000);
+    expect(inserted.at(-1)).toEqual({ email: "bulk21999@example.com" });
+    await expect(
+      database.users
+        .insert([
+          ...rows.slice(1).map((row) => ({ ...row, email: `x${row.email}` })),
+          rows[0]!,
+        ])
+        .execute(),
+    ).rejects.toThrow();
+    expect(
+      await database.users((users, { count }) => ({ total: count() })).one(),
+    ).toEqual({ total: 22_000 });
+    // Inside a transaction the chunks use a savepoint and share its fate.
+    await expect(
+      database.$transaction(async (transaction) => {
+        await transaction.users
+          .insert(rows.map((row) => ({ ...row, email: `t${row.email}` })))
+          .execute();
+        throw new Error("rollback");
+      }),
+    ).rejects.toThrow("rollback");
+    expect(
+      await database.users((users, { count }) => ({ total: count() })).one(),
+    ).toEqual({ total: 22_000 });
+  });
+
+  test("undefined fields, operations and relations are omitted", async () => {
+    const post = await database.posts
+      .insert({
+        slug: "first",
+        title: "First",
+        author: {
+          create: { email: "ada", name: "Ada", visits: undefined },
+          connect: undefined,
+        },
+        tags: { connect: undefined, connectOrCreate: [{ label: "bun" }] },
+      })
+      .returning((posts) => ({ authorId: posts.authorId }));
+    expect((await database.users.byId(post.authorId).one()).visits).toBe(
+      9007199254740993n,
+    );
+    // An undefined relation keeps the flat single-statement INSERT.
+    const flat = database.posts.insert({
+      slug: "second",
+      title: "Second",
+      authorId: post.authorId,
+      author: undefined,
+      tags: undefined,
+    });
+    expect(flat.toSQL().sql).toStartWith('INSERT INTO "posts"');
+    await flat.execute();
+    await database.posts
+      .insert({
+        slug: "third",
+        title: "Third",
+        author: { connect: { email: "ada" }, create: undefined },
+      })
+      .execute();
+    expect(
+      await database.posts((posts) => ({
+        slug: posts.slug,
+        authorId: posts.authorId,
+        $orderBy: posts.id.ascending,
+      })),
+    ).toEqual([
+      { slug: "first", authorId: post.authorId },
+      { slug: "second", authorId: post.authorId },
+      { slug: "third", authorId: post.authorId },
+    ]);
   });
 
   test("snapshots custom codec values before cloning and decodes nested returning", async () => {
@@ -263,6 +344,92 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
     expect(
       await database.users((users) => ({ id: users.id })).execute(),
     ).toHaveLength(1);
+  });
+
+  test("a scoped database never rewrites or links a conflicting row outside its scope", async () => {
+    const [ada, bob] = await database.users
+      .insert([
+        { email: "ada", name: "Ada" },
+        { email: "bob", name: "Bob" },
+      ])
+      .returning((users) => ({ id: users.id }));
+
+    const cents = (value: bigint) => ({ cents: () => value });
+
+    await database.wallets
+      .insert([
+        { ownerId: ada!.id, amount: cents(100n) },
+        { ownerId: bob!.id, amount: cents(200n) },
+      ])
+      .execute();
+    const acme = database.$scope({
+      wallets: (wallets) => wallets.ownerId.is(ada!.id),
+      tags: (tags) => tags.label.like("acme-%"),
+    });
+    await expect(
+      acme.wallets
+        .insert({ ownerId: ada!.id, amount: cents(200n) })
+        .onConflict("amount")
+        .doUpdate("ownerId")
+        .returning((wallets) => ({ ownerId: wallets.ownerId }))
+        .execute(),
+    ).rejects.toMatchObject({
+      code: "SYMMETRIA_OUT_OF_SCOPE",
+      message: expect.stringContaining('upsert on "wallets"'),
+    });
+    await expect(
+      acme.wallets
+        .insert([
+          { ownerId: ada!.id, amount: cents(300n) },
+          { ownerId: ada!.id, amount: cents(200n) },
+        ])
+        .onConflict("amount")
+        .doUpdate("ownerId")
+        .execute(),
+    ).rejects.toMatchObject({ code: "SYMMETRIA_OUT_OF_SCOPE" });
+    const own = await acme.wallets
+      .insert({ ownerId: bob!.id, amount: cents(100n) })
+      .onConflict("amount")
+      .doUpdate("ownerId")
+      .returning((wallets) => ({ ownerId: wallets.ownerId }));
+    expect(own).toEqual({ ownerId: bob!.id });
+    expect(
+      await database.wallets((wallets) => ({
+        ownerId: wallets.ownerId,
+        $orderBy: wallets.id.ascending,
+      })),
+    ).toEqual([{ ownerId: bob!.id }, { ownerId: bob!.id }]);
+
+    await database.tags.insert({ label: "shared" }).execute();
+    await expect(
+      acme.posts
+        .insert({
+          slug: "first",
+          title: "First",
+          author: { create: { email: "eve", name: "Eve" } },
+          tags: { connectOrCreate: [{ label: "shared" }] },
+        })
+        .execute(),
+    ).rejects.toMatchObject({
+      code: "SYMMETRIA_OUT_OF_SCOPE",
+      message: expect.stringContaining('upsert on "tags"'),
+    });
+    expect(await database.posts.by.slug("first").maybeOne()).toBeNull();
+    expect(await database.users.by.email("eve").maybeOne()).toBeNull();
+    await acme.posts
+      .insert({
+        slug: "second",
+        title: "Second",
+        author: { create: { email: "eve", name: "Eve" } },
+        tags: { connectOrCreate: [{ label: "acme-only" }] },
+      })
+      .execute();
+    expect(
+      await database.tags((tags) => ({
+        label: tags.label,
+        $orderBy: tags.label.ascending,
+      })),
+    ).toEqual([{ label: "acme-only" }, { label: "shared" }]);
   });
 
   test("nested inputs are snapshotted and missing connects cannot create orphans", async () => {

@@ -58,11 +58,11 @@ type PostInsert = Expect<
   AreEqual<
     typeof model.posts.$insert,
     {
-      id?: never;
+      id?: undefined;
       title: string;
       authorId: string;
-      published?: boolean;
-      createdAt?: Date;
+      published?: boolean | undefined;
+      createdAt?: Date | undefined;
     }
   >
 >;

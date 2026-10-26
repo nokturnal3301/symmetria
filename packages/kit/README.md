@@ -2,7 +2,7 @@
 
 Migration and development tools for the
 [Symmetria](https://www.npmjs.com/package/symmetria) PostgreSQL query builder on
-Bun 1.3+.
+Bun 1.4.4+.
 
 ```sh
 bun add symmetria

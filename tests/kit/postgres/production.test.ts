@@ -248,6 +248,12 @@ describe.skipIf(!url)("production migrations", () => {
       await expect(
         runner.repair({ id: migration.id, action: "complete" }),
       ).rejects.toThrow(/invalid-index/);
+      // A retry names the leftover invalid index and how to reconcile it.
+      await expect(
+        runner.repair({ id: migration.id, action: "retry" }),
+      ).rejects.toThrow(
+        /unexpected invalid index records_name_idx \(left by a failed CONCURRENTLY build; DROP INDEX CONCURRENTLY it before retrying\)/,
+      );
       await driver.execute({
         sql: "DROP INDEX records_name_idx",
         parameters: [],
@@ -349,6 +355,18 @@ describe.skipIf(!url)("production migrations", () => {
             advisoryLockTimeoutMs: 30,
           }).migrate(),
         ).rejects.toThrow(/advisory lock timeout/);
+        // Reads do not queue behind the running migration.
+        expect(
+          await migrator({
+            driver: other,
+            directory,
+            metadataSchema: namespace,
+            advisoryLockTimeoutMs: 30,
+          }).status(),
+        ).toMatchObject([
+          { status: "applied" },
+          { id: slow.id, status: "incomplete", direction: "up" },
+        ]);
         await running;
         expect(
           events.filter((event) => event.type === "statement-end"),

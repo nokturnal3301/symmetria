@@ -100,6 +100,10 @@ const copyInput = (value: unknown, ancestors = new Set<object>()): unknown => {
   return Object.freeze(result);
 };
 
+/** Write payloads treat `undefined` as an omitted field or operation. */
+const definedEntries = (value: object): [string, unknown][] =>
+  Object.entries(value).filter(([, entry]) => entry !== undefined);
+
 /** Relational inserts are multi-statement operations and execute atomically. */
 export const createNestedInsert = (
   snapshot: SchemaSnapshot,
@@ -141,12 +145,15 @@ export const createNestedInsert = (
       !(COLUMN_EXPRESSION in value) &&
       uniqueKeys(table).some(
         (key) =>
-          key.length === Object.keys(value).length &&
-          key.every((column) => Object.hasOwn(value, column)),
+          key.length === definedEntries(value).length &&
+          key.every(
+            (column) =>
+              (value as Record<string, unknown>)[column] !== undefined,
+          ),
       )
     ) {
       return Object.fromEntries(
-        Object.entries(value).map(([column, entry]) => [
+        definedEntries(value).map(([column, entry]) => [
           column,
           scalar(name, column, entry),
         ]),
@@ -174,7 +181,7 @@ export const createNestedInsert = (
     ancestors.add(value);
     const table = tableByName.get(name)!;
     const result = Object.fromEntries(
-      Object.entries(value).map(([field, entry]) => {
+      definedEntries(value).map(([field, entry]) => {
         const relation = table.relations.find(
           (relation) => relation.name === field,
         );
@@ -189,7 +196,7 @@ export const createNestedInsert = (
         }
 
         const operations = Object.fromEntries(
-          Object.entries(entry).map(([operation, payload]) => {
+          definedEntries(entry).map(([operation, payload]) => {
             const target = (row: unknown) =>
               operation === "connect"
                 ? connect(relation.target, row)
@@ -428,6 +435,8 @@ export const createNestedInsert = (
               );
             }
 
+            // Under $scope() the upsert throws SYMMETRIA_OUT_OF_SCOPE when the
+            // existing row lies outside the scope, so nothing links to it.
             return mutate(target, "insert", payload)
               .onConflict(...key)
               .doUpdate(...key)

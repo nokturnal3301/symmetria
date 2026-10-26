@@ -48,9 +48,11 @@ import {
   type TableScopes,
 } from "../query/select";
 import { encodeValue, type RuntimeCodec } from "../query/codecs";
+import { quoteIdentifier } from "../query/compiler";
 import {
   applyIndexes,
   createIndexQuery,
+  index,
   type IndexDefinition,
   type IndexQuery,
   type CreateIndexesOptions,
@@ -257,6 +259,10 @@ type WriteValue<Value> = [NonNullable<Value>] extends [never]
 type Writable<Shape> = {
   [PropertyName in keyof Shape]: WriteValue<Shape[PropertyName]>;
 } & {};
+/** Optional write fields also accept `undefined`, which means "omitted". */
+type Omittable<Shape> = {
+  [PropertyName in keyof Shape]?: Shape[PropertyName] | undefined;
+};
 export type Insert<
   Definition extends SchemaDefinitions,
   TableName extends StringKeys<Definition>,
@@ -266,7 +272,7 @@ export type Insert<
     | OptionalColumnNames<Definition[TableName]>
     | GeneratedColumns<Definition[TableName]>
   > &
-    Partial<
+    Omittable<
       Pick<
         Row<Definition, TableName>,
         Exclude<
@@ -275,7 +281,7 @@ export type Insert<
         > &
           keyof Row<Definition, TableName>
       >
-    > & { [ColumnName in GeneratedColumns<Definition[TableName]>]?: never }
+    > & { [ColumnName in GeneratedColumns<Definition[TableName]>]?: undefined }
 >;
 
 type IsUnion<Member, EntireUnion = Member> = Member extends EntireUnion
@@ -535,18 +541,18 @@ type NestedOne<
 > =
   | {
       connect: ConnectValue<Definition, TableName>;
-      create?: never;
-      connectOrCreate?: never;
+      create?: undefined;
+      connectOrCreate?: undefined;
     }
   | {
       create: NestedInsert<Definition, Relations, TableName, Omitted>;
-      connect?: never;
-      connectOrCreate?: never;
+      connect?: undefined;
+      connectOrCreate?: undefined;
     }
   | {
       connectOrCreate: Omit<Insert<Definition, TableName>, Omitted>;
-      connect?: never;
-      create?: never;
+      connect?: undefined;
+      create?: undefined;
     };
 
 type ForwardInputs<
@@ -562,16 +568,29 @@ type ForwardInputs<
           | (Pick<
               Insert<Definition, TableName>,
               `${Name}Id` & keyof Insert<Definition, TableName>
-            > & { [RelationName in Name]?: never })
-          | ({
-              [RelationName in Name]: NestedOne<
-                Definition,
-                Relations,
-                ReferenceTarget<Definition[TableName][Name]> &
-                  StringKeys<Definition> &
-                  StringKeys<Relations>
-              >;
-            } & { [ColumnName in `${Name}Id`]?: never }),
+            > & { [RelationName in Name]?: undefined })
+          | ((`${Name}Id` extends OptionalColumnNames<Definition[TableName]>
+              ? {
+                  // A nullable reference may be omitted or `undefined` in the nested form too.
+                  [RelationName in Name]?:
+                    | NestedOne<
+                        Definition,
+                        Relations,
+                        ReferenceTarget<Definition[TableName][Name]> &
+                          StringKeys<Definition> &
+                          StringKeys<Relations>
+                      >
+                    | undefined;
+                }
+              : {
+                  [RelationName in Name]: NestedOne<
+                    Definition,
+                    Relations,
+                    ReferenceTarget<Definition[TableName][Name]> &
+                      StringKeys<Definition> &
+                      StringKeys<Relations>
+                  >;
+                }) & { [ColumnName in `${Name}Id`]?: undefined }),
   ) => void;
 }[ReferenceColumnNames<Definition[TableName]>] extends (
   value: infer Fields,
@@ -594,39 +613,47 @@ type NestedInsert<
     [Name in Exclude<
       keyof Relations[TableName] & string,
       ReferenceColumnNames<Definition[TableName]>
-    >]?: Relations[TableName][Name] extends {
-      target: infer Target extends StringKeys<Definition> &
-        StringKeys<Relations>;
-      many: infer Many;
-      origin: infer Origin;
-    }
-      ? Many extends true
-        ? {
-            connect?: readonly ConnectValue<Definition, Target>[];
-            create?: readonly NestedInsert<
-              Definition,
-              Relations,
-              Target,
-              Origin extends `reverse:${string}.${infer ReferenceName}`
-                ? `${ReferenceName}Id`
-                : never
-            >[];
-            connectOrCreate?: readonly Omit<
-              Insert<Definition, Target>,
-              Origin extends `reverse:${string}.${infer ReferenceName}`
-                ? `${ReferenceName}Id`
-                : never
-            >[];
-          }
-        : NestedOne<
-            Definition,
-            Relations,
-            Target,
-            Origin extends `reverse:${string}.${infer ReferenceName}`
-              ? `${ReferenceName}Id`
-              : never
-          >
-      : never;
+    >]?:
+      | undefined
+      | (Relations[TableName][Name] extends {
+          target: infer Target extends StringKeys<Definition> &
+            StringKeys<Relations>;
+          many: infer Many;
+          origin: infer Origin;
+        }
+          ? Many extends true
+            ? {
+                connect?:
+                  | readonly ConnectValue<Definition, Target>[]
+                  | undefined;
+                create?:
+                  | readonly NestedInsert<
+                      Definition,
+                      Relations,
+                      Target,
+                      Origin extends `reverse:${string}.${infer ReferenceName}`
+                        ? `${ReferenceName}Id`
+                        : never
+                    >[]
+                  | undefined;
+                connectOrCreate?:
+                  | readonly Omit<
+                      Insert<Definition, Target>,
+                      Origin extends `reverse:${string}.${infer ReferenceName}`
+                        ? `${ReferenceName}Id`
+                        : never
+                    >[]
+                  | undefined;
+              }
+            : NestedOne<
+                Definition,
+                Relations,
+                Target,
+                Origin extends `reverse:${string}.${infer ReferenceName}`
+                  ? `${ReferenceName}Id`
+                  : never
+              >
+          : never);
   };
 
 export type SchemaOptions<
@@ -1101,9 +1128,16 @@ const createSchema = <
       const codec = codecs[table.name]?.[column.name];
 
       if (codec && column.default?.kind === "value") {
+        const encoded = encodeValue(column.default.value, codec);
+
         column.default = {
           kind: "value",
-          value: encodeValue(column.default.value, codec),
+          // JSON codecs validate and serialize; keep the JSON value itself, as plain jsonb() does.
+          value:
+            ["json", "jsonb"].includes(column.sqlType) &&
+            typeof encoded === "string"
+              ? JSON.parse(encoded)
+              : encoded,
         };
       }
     }
@@ -1136,18 +1170,57 @@ const createSchema = <
     );
   }
 
+  // Junctions are traversed from both sides: unless a declared index already
+  // leads with it, the second key column (not covered by the PK) gets its own index.
+  for (const table of snapshot.tables) {
+    const second = table.junction
+      ? (table.primaryKey ??
+          table.columns
+            .filter((column) => column.primaryKey)
+            .map((column) => column.name))[1]
+      : undefined;
+    const column = table.columns.find((column) => column.name === second);
+
+    if (!second || !column) {
+      continue;
+    }
+
+    const leading = quoteIdentifier(column.sqlName);
+
+    if (
+      !table.indexes?.some(
+        ({ keys: [first] }) =>
+          first === leading || first?.startsWith(`${leading} `),
+      )
+    ) {
+      applyIndexes(
+        snapshot,
+        codecs,
+        (scope) => ({ [second]: index(scope[table.name]![second]!) }),
+        table.name,
+      );
+    }
+  }
+
   const bindDatabase = (
     executor?: QueryExecutor,
     transactionDriver?: TransactionDriver,
     driver: Driver | undefined = options.driver,
     scopes: TableScopes = {},
   ): object => {
+    // Atomic multi-statement work (chunked bulk inserts): a savepoint inside a
+    // transaction, otherwise a transaction of the configured driver.
+    const atomicDriver = transactionDriver ?? driver;
     const queryTables = createQueryTables(
       snapshot,
       executor,
       codecs,
       dialectName(driver?.dialect),
       scopes,
+      atomicDriver?.transaction
+        ? (run) =>
+            atomicDriver.transaction!((connection) => run(connection.execute))
+        : undefined,
     );
     const profile = executorProfiling(executor);
 
@@ -1186,6 +1259,9 @@ const createSchema = <
 
     const databaseTables = Object.fromEntries(
       snapshot.tables.map((tableSnapshot) => {
+        const relationNames = tableSnapshot.relations.map(
+          (relation) => relation.name,
+        );
         const table = extendBuilder(queryTables[tableSnapshot.name]!, {
           $name: tableSnapshot.sqlName,
           insert: (
@@ -1199,8 +1275,9 @@ const createSchema = <
               rows.some(
                 (row) =>
                   row &&
-                  tableSnapshot.relations.some((relation) =>
-                    Object.hasOwn(row, relation.name),
+                  relationNames.some(
+                    (name) =>
+                      (row as Record<string, unknown>)[name] !== undefined,
                   ),
               )
             ) {
@@ -1213,11 +1290,25 @@ const createSchema = <
               );
             }
 
+            // An omitted (undefined) relation keeps the flat, single-statement INSERT.
+            const flat = (row: Record<string, unknown>) =>
+              row && relationNames.some((name) => name in row)
+                ? Object.fromEntries(
+                    Object.entries(row).filter(
+                      ([name]) => !relationNames.includes(name),
+                    ),
+                  )
+                : row;
+
             return (
               queryTables[tableSnapshot.name] as {
                 insert: (values: unknown) => object;
               }
-            ).insert(values);
+            ).insert(
+              Array.isArray(values)
+                ? rows.map(flat)
+                : flat(values as Record<string, unknown>),
+            );
           },
         });
 

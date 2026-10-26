@@ -67,7 +67,9 @@ export const quoteIdentifier = (identifier: string): string => {
   }
 
   if (Buffer.byteLength(identifier) > 63) {
-    throw new Error("symmetria: PostgreSQL identifiers cannot exceed 63 bytes");
+    throw new Error(
+      `symmetria: PostgreSQL identifiers cannot exceed 63 bytes: "${identifier}" has ${Buffer.byteLength(identifier)}; shorten the table, column or index name`,
+    );
   }
 
   return `"${identifier.replaceAll('"', '""')}"`;

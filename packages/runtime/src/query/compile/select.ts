@@ -13,7 +13,7 @@ import {
   type Bindings,
   type Compilation,
 } from "./state";
-import { projectionSql, valueSql } from "./values";
+import { orderingSql, projectionSql, valueSql } from "./values";
 import { predicateSql } from "./predicates";
 
 export const tableSql = (
@@ -245,7 +245,7 @@ export const renderSelect = (
 
   // Rendered once: a second rendering would number its compilation.parameters again.
   const orderBy = query.ordering.length
-    ? `ORDER BY ${query.ordering.map((ordering) => `${valueSql(compilation, ordering.expression.node, bindings)} ${ordering.direction}${ordering.nulls ? ` NULLS ${ordering.nulls}` : ""}`).join(", ")}`
+    ? `ORDER BY ${query.ordering.map((ordering) => orderingSql(compilation, ordering, bindings)).join(", ")}`
     : undefined;
   const body = fragments.splice(0);
 

@@ -34,6 +34,10 @@ const literalSQL = (value: unknown): string => {
 export const ddlExpressions = (
   columnSQL: (node: Extract<ValueNode, { kind: "column" }>) => string,
 ) => {
+  /** Raw SQL is opaque: parenthesize it wherever an operator could bind into it. */
+  const operandSQL = (node: ValueNode): string =>
+    node.kind === "raw" ? `(${valueSQL(node)})` : valueSQL(node);
+
   const valueSQL = (node: ValueNode): string => {
     switch (node.kind) {
       case "column":
@@ -46,10 +50,10 @@ export const ddlExpressions = (
         return `${literalSQL(node.value)}${node.cast ? `::text::${node.cast}` : ""}`;
       case "raw":
         return node.parts
-          .map((part) => (typeof part === "string" ? part : valueSQL(part)))
+          .map((part) => (typeof part === "string" ? part : operandSQL(part)))
           .join("");
       case "binary":
-        return `(${valueSQL(node.left)} ${node.operator} ${valueSQL(node.right)})`;
+        return `(${operandSQL(node.left)} ${node.operator} ${operandSQL(node.right)})`;
       case "case":
         return `(CASE ${valueSQL(node.value)} ${node.branches.map((branch) => `WHEN ${valueSQL(branch.when)} THEN ${valueSQL(branch.then)}`).join(" ")} END)`;
       case "coalesce":
@@ -64,9 +68,9 @@ export const ddlExpressions = (
   const predicateSQL = (condition: PredicateDescription): string => {
     switch (condition.kind) {
       case "comparison":
-        return `${valueSQL(condition.left)} ${condition.operator} ${valueSQL(condition.right)}`;
+        return `${operandSQL(condition.left)} ${condition.operator} ${operandSQL(condition.right)}`;
       case "nullCheck":
-        return `${valueSQL(condition.value)} IS ${condition.negated ? "NOT " : ""}NULL`;
+        return `${operandSQL(condition.value)} IS ${condition.negated ? "NOT " : ""}NULL`;
       case "group":
         if (!condition.predicates.length) {
           return condition.operator === "AND" ? "TRUE" : "FALSE";
@@ -76,7 +80,7 @@ export const ddlExpressions = (
       case "not":
         return `NOT (${predicateSQL(condition.predicate)})`;
       case "between":
-        return `${valueSQL(condition.value)} BETWEEN ${valueSQL(condition.lower)} AND ${valueSQL(condition.upper)}`;
+        return `${operandSQL(condition.value)} BETWEEN ${operandSQL(condition.lower)} AND ${operandSQL(condition.upper)}`;
       case "membership": {
         if (!Array.isArray(condition.values)) {
           throw new Error(
@@ -88,7 +92,7 @@ export const ddlExpressions = (
           return condition.negated ? "TRUE" : "FALSE";
         }
 
-        return `${valueSQL(condition.value)} ${condition.negated ? "NOT " : ""}IN (${condition.values.map(valueSQL).join(", ")})`;
+        return `${operandSQL(condition.value)} ${condition.negated ? "NOT " : ""}IN (${condition.values.map(valueSQL).join(", ")})`;
       }
       default:
         throw new Error(

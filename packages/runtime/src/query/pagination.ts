@@ -1,9 +1,57 @@
 import { createHash } from "node:crypto";
 import { compileQuery, executePlan } from "./compiler";
 import { type PredicateDescription, type ValueNode } from "./expressions";
-import type { QueryExecutor, SelectPlan } from "./state";
+import type { QueryExecutor, SelectPlan, TableBinding } from "./state";
 import { derivedBinding } from "./derived";
 import { resolveDialect } from "./dialects/registry";
+import { expressionSqlType } from "./metadata";
+
+/** What a cursor needs to know about each ORDER BY position. */
+type CursorColumn = {
+  readonly name: string;
+  readonly sqlType: string;
+  readonly notNull: boolean;
+  readonly unique: boolean;
+  /** Set for ORDER BY expressions that are not plain columns. */
+  readonly expression?: true;
+};
+
+/** True when the expression reads root columns only: it can be re-evaluated per row by the cursor predicate. */
+const rootExpression = (node: ValueNode, root: TableBinding): boolean => {
+  switch (node.kind) {
+    case "column":
+      return node.description.binding === root;
+    case "parameter":
+    case "placeholder":
+      return true;
+    case "case":
+      return (
+        rootExpression(node.value, root) &&
+        node.branches.every(
+          (branch) =>
+            rootExpression(branch.when, root) &&
+            rootExpression(branch.then, root),
+        )
+      );
+    case "coalesce":
+    case "tuple":
+      return node.values.every((value) => rootExpression(value, root));
+    case "binary":
+      return (
+        rootExpression(node.left, root) && rootExpression(node.right, root)
+      );
+    case "raw":
+      return node.parts.every(
+        (part) => typeof part === "string" || rootExpression(part, root),
+      );
+    case "jsonPath":
+    case "arrayIndex":
+    case "arrayLength":
+      return rootExpression(node.value, root);
+    default:
+      return false;
+  }
+};
 
 const containsWindow = (node: ValueNode): boolean => {
   switch (node.kind) {
@@ -88,12 +136,63 @@ const windowPagePlan = (plan: SelectPlan): SelectPlan => {
 };
 
 declare const CURSOR_RESULT: unique symbol;
+
+const TIMESTAMP =
+  /^(\d{4,})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}(?::?\d{2}){0,2})?(?: BC)?$/;
+
+/** Cursor values are text renderings of the ordering columns; reject ones PostgreSQL could not cast back. */
+const cursorValueMatches = (sqlType: string, value: string): boolean => {
+  const type = sqlType.toLowerCase();
+
+  if (/^(?:smallint|integer|int|bigint|int[248])$/.test(type)) {
+    return /^-?\d{1,19}$/.test(value);
+  }
+
+  if (
+    /^(?:numeric|decimal)/.test(type) ||
+    /^(?:real|double precision)$/.test(type)
+  ) {
+    return /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value);
+  }
+
+  if (/^(?:timestamptz|timestamp|date)/.test(type)) {
+    if (value === "infinity" || value === "-infinity") {
+      return true;
+    }
+
+    const parts = TIMESTAMP.exec(value);
+
+    return (
+      !!parts &&
+      Number(parts[2]) >= 1 &&
+      Number(parts[2]) <= 12 &&
+      Number(parts[3]) >= 1 &&
+      Number(parts[3]) <= 31 &&
+      Number(parts[4] ?? 0) <= 23 &&
+      Number(parts[5] ?? 0) <= 59 &&
+      Number(parts[6] ?? 0) <= 60
+    );
+  }
+
+  if (type === "uuid") {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    );
+  }
+
+  if (type === "boolean" || type === "bool") {
+    return /^(?:t|f|true|false)$/.test(value);
+  }
+
+  return true;
+};
+
 export type PageCursor<Row> = string & { readonly [CURSOR_RESULT]: Row };
 export type Page<Row> = { items: Row[]; nextCursor: PageCursor<Row> | null };
 
 export const executePage = async (
   plan: SelectPlan,
-  options: { size: number; after?: string | null },
+  options: { size: number; after?: string | null | undefined },
   executor?: QueryExecutor,
 ): Promise<Page<Record<string, unknown>>> => {
   if (
@@ -118,16 +217,28 @@ export const executePage = async (
     );
   }
 
-  const columns = plan.ordering.map((ordering) => {
+  // Cursor positions: plain root columns, or deterministic expressions over them
+  // (computed fields, raw SQL). Expressions are treated as nullable, unknown-typed.
+  const columns: CursorColumn[] = plan.ordering.map((ordering, position) => {
     const node = ordering.expression.node;
 
-    if (node.kind !== "column" || node.description.binding !== plan.root) {
+    if (node.kind === "column" && node.description.binding === plan.root) {
+      return node.description.column;
+    }
+
+    if (!rootExpression(node, plan.root)) {
       throw new Error(
-        "symmetria: page() requires plain root columns in ORDER BY",
+        "symmetria: page() ORDER BY accepts root columns and expressions over them only",
       );
     }
 
-    return node.description.column;
+    return {
+      name: `__symmetria_expression_${position}`,
+      sqlType: expressionSqlType(ordering.expression),
+      notNull: false,
+      unique: false,
+      expression: true,
+    };
   });
   const names = columns.map((column) => column.name);
   const keys = plan.root.table.columns.filter((column) => column.primaryKey);
@@ -160,13 +271,26 @@ export const executePage = async (
     : plan;
   const predicates = [...pagePlan.predicates];
 
-  const cursorValue = (value: unknown, position: number): ValueNode => ({
-    kind: "parameter",
-    value,
-    ...(["json", "jsonb"].includes(columns[position]!.sqlType)
-      ? { cast: columns[position]!.sqlType as "json" | "jsonb" }
-      : {}),
-  });
+  const dialect = resolveDialect(plan.root.dialect);
+
+  const cursorValue = (value: unknown, position: number): ValueNode => {
+    const column = columns[position]!;
+
+    return {
+      kind: "parameter",
+      // Expressions have no column affinity on SQLite: numeric text would compare as text.
+      value:
+        column.expression &&
+        !dialect.capabilities.typedParameters &&
+        typeof value === "string" &&
+        /^-?\d+(?:\.\d+)?$/.test(value)
+          ? Number(value)
+          : value,
+      ...(["json", "jsonb"].includes(column.sqlType)
+        ? { cast: column.sqlType as "json" | "jsonb" }
+        : {}),
+    };
+  };
 
   if (options.after != null) {
     let values: unknown[];
@@ -192,7 +316,8 @@ export const executePage = async (
         cursor.values.some((value: unknown, position: number) =>
           value === null
             ? columns[position]!.notNull
-            : typeof value !== "string",
+            : typeof value !== "string" ||
+              !cursorValueMatches(columns[position]!.sqlType, value),
         )
       ) {
         throw new Error();

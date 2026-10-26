@@ -78,10 +78,49 @@ const disposableDatabase = async <Result>(
   }
 };
 
+/** Catalog rows present on one side only, so a refused repair or adoption says what to reconcile. */
+const catalogDifferences = (
+  expected: Record<string, readonly unknown[]>,
+  actual: Record<string, readonly unknown[]>,
+): string[] =>
+  Object.keys({ ...expected, ...actual })
+    .sort()
+    .flatMap((section) => {
+      const wanted = new Set((expected[section] ?? []).map(canonicalJSON));
+      const found = new Set((actual[section] ?? []).map(canonicalJSON));
+
+      return [
+        ...[...found]
+          .filter((row) => !wanted.has(row))
+          .map((row) => {
+            const index = JSON.parse(row) as { name?: string; valid?: boolean };
+
+            return section === "indexes" && index.valid === false
+              ? `  unexpected invalid index ${index.name} (left by a failed CONCURRENTLY build; DROP INDEX CONCURRENTLY it before retrying): ${row}`
+              : `  unexpected ${section}: ${row}`;
+          }),
+        ...[...wanted]
+          .filter((row) => !found.has(row))
+          .map((row) => `  missing ${section}: ${row}`),
+      ];
+    });
+
 const catalogMatches = (expected: unknown, actual: unknown, label: string) => {
   if (canonicalJSON(expected) !== canonicalJSON(actual)) {
+    const differences = catalogDifferences(
+      expected as Record<string, readonly unknown[]>,
+      actual as Record<string, readonly unknown[]>,
+    );
+    const shown = differences.slice(0, 20);
+
     throw new Error(
-      `symmetria: ${label}: database catalog does not match the verified migration boundary`,
+      [
+        `symmetria: ${label}: database catalog does not match the verified migration boundary`,
+        ...shown,
+        ...(differences.length > shown.length
+          ? [`  … ${differences.length - shown.length} more`]
+          : []),
+      ].join("\n"),
     );
   }
 };

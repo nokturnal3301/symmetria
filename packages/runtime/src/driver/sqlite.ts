@@ -24,7 +24,7 @@ export type SqliteOptions = {
   readonly create?: boolean;
   /** PRAGMA foreign_keys, enabled by default. */
   readonly foreignKeys?: boolean;
-  readonly profiler?: QueryProfiler;
+  readonly profiler?: QueryProfiler | undefined;
 };
 
 type SnapshotSource =
@@ -58,6 +58,9 @@ export const sqlite = (
   if (foreignKeys) {
     database.run("PRAGMA foreign_keys = ON");
   }
+
+  // LIKE is case-sensitive in PostgreSQL; the dialect folds case for ILIKE and search().
+  database.run("PRAGMA case_sensitive_like = ON");
 
   const run = (query: CompiledQuery): ExecutionResult => {
     const statement = database.query(query.sql);

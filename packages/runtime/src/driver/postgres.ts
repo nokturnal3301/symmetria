@@ -7,7 +7,7 @@ import { runPostgresSession } from "./session";
 export type PostgresOptions = Omit<
   SQL.PostgresOrMySQLOptions,
   "adapter" | "bigint"
-> & { readonly profiler?: QueryProfiler };
+> & { readonly profiler?: QueryProfiler | undefined };
 
 /** Bun owns the pool; query builders only depend on the functional Driver contract. */
 export type PostgresDriver = Driver;

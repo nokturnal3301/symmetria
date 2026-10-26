@@ -77,7 +77,7 @@ test("SQL lint inspects real statements, including optional COLUMN syntax, witho
     ALTER TABLE "drop" DROP "drop column";
     WITH removed AS (DELETE FROM "drop" RETURNING *) SELECT * FROM removed;
     DO $body$ BEGIN EXECUTE 'DROP TABLE secret'; END $body$;
-    ALTER TABLE "drop" ADD label text DEFAULT 'x' NOT NULL, ADD required text NOT NULL;
+    ALTER TABLE "legacy" ADD label text DEFAULT 'x' NOT NULL, ADD required text NOT NULL;
   `);
   expect(findings.map((finding) => [finding.statement, finding.level])).toEqual(
     [
@@ -85,6 +85,28 @@ test("SQL lint inspects real statements, including optional COLUMN syntax, witho
       [3, "destructive"],
       [4, "caution"],
       [5, "blocking"],
+    ],
+  );
+});
+
+test("SQL lint treats tables created earlier in the migration as new and empty", () => {
+  const findings = lintMigrationSQL(`
+    CREATE TABLE "users" ("id" integer NOT NULL, "email" text NOT NULL);
+    CREATE TABLE app.events ("id" integer NOT NULL);
+    CREATE UNIQUE INDEX "users_email_idx" ON "users" USING btree ("email");
+    CREATE INDEX "events_id_idx" ON app.events ("id");
+    ALTER TABLE "users" ADD CONSTRAINT "users_pkey" PRIMARY KEY ("id");
+    ALTER TABLE ONLY users ADD COLUMN "name" text NOT NULL;
+    ALTER TABLE "users" ADD CONSTRAINT "fk" FOREIGN KEY ("id") REFERENCES "accounts" ("id");
+    CREATE UNIQUE INDEX "accounts_email_idx" ON "accounts" ("email");
+    ALTER TABLE "Users" ADD COLUMN "flag" boolean NOT NULL;
+    DROP TABLE "users";
+  `);
+  expect(findings.map((finding) => [finding.statement, finding.level])).toEqual(
+    [
+      [8, "blocking"],
+      [9, "blocking"],
+      [10, "destructive"],
     ],
   );
 });
@@ -149,3 +171,29 @@ test("recovery refuses to steal a live generator's lock", () =>
       /still running/,
     );
   }));
+
+test("SQL lint passes safe column additions and renames, and downgrades rebuilt objects to cautions", () => {
+  const findings = lintMigrationSQL(`
+    ALTER TABLE "posts" ADD COLUMN "published_at" timestamptz;
+    ALTER TABLE "posts" ADD COLUMN "score" numeric(6, 2) DEFAULT 0 NOT NULL;
+    ALTER TABLE "posts" ADD COLUMN "seen_at" timestamptz DEFAULT now() NOT NULL;
+    ALTER TABLE "posts" ADD COLUMN "author_id" integer NOT NULL;
+    ALTER TABLE "categories" RENAME TO "topics";
+    ALTER TABLE "topics" RENAME CONSTRAINT "categories_pkey" TO "topics_pkey";
+    ALTER INDEX "categories_by_slug_idx" RENAME TO "topics_by_slug_idx";
+    ALTER TABLE "posts" DROP CONSTRAINT "posts_views_check";
+    ALTER TABLE "posts" ALTER COLUMN "views" TYPE bigint USING "views"::bigint;
+    ALTER TABLE "posts" ADD CONSTRAINT "posts_views_check" CHECK ("views" >= 0);
+    DROP INDEX "posts_old_idx";
+  `);
+  expect(findings.map((finding) => [finding.statement, finding.level])).toEqual(
+    [
+      [3, "caution"],
+      [4, "blocking"],
+      [8, "caution"],
+      [9, "caution"],
+      [10, "caution"],
+      [11, "destructive"],
+    ],
+  );
+});

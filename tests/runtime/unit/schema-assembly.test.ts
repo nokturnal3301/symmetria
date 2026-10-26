@@ -9,6 +9,9 @@ import {
   bool,
   oneOf,
   timestamptz,
+  self,
+  index,
+  type TableSnapshot,
 } from "../../../packages/runtime/src";
 
 const database = schema({
@@ -160,6 +163,36 @@ describe("foreign keys from table-valued columns", () => {
 });
 
 describe("junction()", () => {
+  test("indexes the second key unless a declared index already leads with it", () => {
+    const linkIndexes = (snapshot: { tables: readonly TableSnapshot[] }) =>
+      snapshot.tables
+        .find((table) => table.junction)!
+        .indexes?.map((index) => [index.sqlName, index.keys]);
+
+    expect(
+      linkIndexes(
+        schema({
+          posts: { id: int.auto },
+          tags: { id: int.auto },
+          postTags: ({ posts, tags }) =>
+            junction({ post: posts.index, tag: tags }),
+        }).$snapshot(),
+      ),
+    ).toEqual([["post_tags_tag_id_idx", ['"tag_id"']]]);
+    expect(
+      linkIndexes(
+        schema({
+          posts: { id: int.auto },
+          tags: { id: int.auto },
+          postTags: ({ posts, tags }) =>
+            junction({ post: posts, tag: tags }).indexes((link) => ({
+              byTag: index(link.tagId, link.postId),
+            })),
+        }).$snapshot(),
+      ),
+    ).toEqual([["post_tags_by_tag_idx", ['"tag_id"', '"post_id"']]]);
+  });
+
   test("both foreign keys form the composite primary key", () => {
     expect(tablesByName.postTags?.junction).toBe(true);
     expect(column("postTags", "postId").primaryKey).toBe(true);
@@ -280,6 +313,30 @@ describe("relations", () => {
       target: "categories",
       reverse: true,
     });
+  });
+
+  test("modular self: chain carries FK actions and the named reverse relation", () => {
+    const tree = schema({
+      tasks: table({
+        id: int.auto,
+        parent: self.nullable.onDelete.cascade.inverse("subtasks"),
+      }),
+    }).$snapshot().tables[0]!;
+    expect(
+      tree.columns.find((column) => column.name === "parentId"),
+    ).toMatchObject({
+      notNull: false,
+      references: { table: "tasks", column: "id", onDelete: "cascade" },
+    });
+    expect(tree.relations).toEqual([
+      expect.objectContaining({ name: "parent", kind: "one", target: "tasks" }),
+      expect.objectContaining({
+        name: "subtasks",
+        kind: "many",
+        target: "tasks",
+        reverse: true,
+      }),
+    ]);
   });
 });
 

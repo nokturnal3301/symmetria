@@ -37,6 +37,16 @@ export type DialectCapabilities = {
   readonly containmentOperators: boolean;
   /** Supports search(), including emulation; ranking also requires searchRank. */
   readonly fullTextSearch: boolean;
+  /** A text parameter compared with an expression takes that expression's type (PostgreSQL); SQLite compares by storage class. */
+  readonly typedParameters: boolean;
+  /** ORDER BY always spells out NULLS FIRST/LAST because the engine's own default differs from `nullsDefault`. */
+  readonly explicitNulls: boolean;
+};
+
+/** What an ordering comparison or ORDER BY key compares: its SQL type and, for enums, the declared labels. */
+export type OrderedType = {
+  readonly sqlType: string;
+  readonly enumerationValues: readonly string[] | undefined;
 };
 
 export type CastTarget =
@@ -121,6 +131,37 @@ export type DialectStrategy = {
   readonly rowLock: (lock: RowLock) => string;
   /** Wrapping that casts an expression to text in cursor columns. */
   readonly textCast: { readonly prefix: string; readonly suffix: string };
+  /**
+   * Wraps an operand of `<`/`>`/BETWEEN, a cursor tuple member or an ORDER BY
+   * key so it sorts as PostgreSQL does: numeric by magnitude and enums in
+   * declaration order. `equality` marks `=`-style comparisons. Absent when the
+   * engine's own comparison already matches.
+   */
+  readonly orderedOperand?: (
+    value: string,
+    type: OrderedType,
+    equality: boolean,
+  ) => string | undefined;
+  /**
+   * `MIN(…)`/`MAX(…)` over a value whose storage sorts differently from
+   * PostgreSQL (numeric text, enum labels). Returns SQL yielding the original
+   * value, or `undefined` for the plain aggregate.
+   */
+  readonly orderedAggregate?: (
+    name: "MIN" | "MAX",
+    value: string,
+    type: OrderedType,
+  ) => string | undefined;
+  /**
+   * `LIKE`/`ILIKE` where the engine's pattern matching differs from
+   * PostgreSQL's (case folding, escape character). Absent when
+   * `comparisonOperator` suffices.
+   */
+  readonly patternMatch?: (
+    left: string,
+    right: string,
+    caseInsensitive: boolean,
+  ) => string;
 
   readonly jsonArray: (value: string) => string;
   readonly jsonObject: (

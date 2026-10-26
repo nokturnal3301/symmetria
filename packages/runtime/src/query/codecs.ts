@@ -8,6 +8,8 @@ export type RuntimeCodec = {
   readonly decode: (value: unknown) => unknown;
   /** SQL type for `$n::text::<cast>` parameters, such as jsonb or text[]. */
   readonly parameterCast?: string;
+  /** Declared SQL type the codec decodes, when parameters need no cast: `numeric(12,2)`. */
+  readonly sqlType?: string;
   /** Element codec of an array column. */
   readonly element?: RuntimeCodec;
 };
@@ -97,7 +99,8 @@ export const codecFor = (sqlType: string): RuntimeCodec | undefined => {
   }
 
   if (sqlType.startsWith("numeric")) {
-    return numericCodec;
+    // The scale lets SQLite round decoded text like PostgreSQL stores it.
+    return sqlType.includes(",") ? { ...numericCodec, sqlType } : numericCodec;
   }
 
   if (sqlType === "jsonb" || sqlType === "json") {

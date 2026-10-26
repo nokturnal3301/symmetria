@@ -9,7 +9,7 @@
  *   - another table       → FK + relation (`author: users`)
  *   - table.nullable/.unique/.onDelete.* → FK with flags
  *   - a thunk `() => users` → lazy FK (cross-file cycles)
- *   - `self` / `self.nullable` → self-reference
+ *   - `self` (with the same chain as tables, e.g. `self.nullable.inverse("children")`) → self-reference
  */
 
 import { isColumn, type ColumnMetadata, type Column } from "./column";
@@ -175,6 +175,24 @@ type ReferenceChain<Columns, Flags extends ReferenceFlags> = ReferenceBuilder<
   readonly inverse: <const Name extends string>(
     name: Name,
   ) => ReferenceChain<Columns, Flags & { inverse: Name }>;
+};
+
+type SelfOnDeleteChain<Flags extends ReferenceFlags> = {
+  readonly cascade: SelfChain<Flags>;
+  readonly restrict: SelfChain<Flags>;
+  readonly setNull: SelfChain<Flags & { nullable: true }>;
+  readonly noAction: SelfChain<Flags>;
+};
+
+/** The reference chain for `self`; every step stays a SelfReference so the target resolves to its own table. */
+type SelfChain<Flags extends ReferenceFlags> = SelfReference<Flags> & {
+  readonly nullable: SelfChain<Flags & { nullable: true }>;
+  readonly unique: SelfChain<Flags & { unique: true }>;
+  readonly index: SelfChain<Flags & { index: true }>;
+  readonly onDelete: SelfOnDeleteChain<Flags>;
+  readonly inverse: <const Name extends string>(
+    name: Name,
+  ) => SelfChain<Flags & { inverse: Name }>;
 };
 
 /** Declaration references used by relation overrides during schema assembly. */
@@ -586,11 +604,8 @@ export const junction = <
   ) as JunctionHandle<ColumnDefinitions>;
 };
 
-/** Self-reference marker: `parent: self.nullable`. */
-export const self: SelfReference<{}> & {
-  readonly nullable: SelfReference<{ nullable: true }>;
-  readonly onDelete: OnDeleteChain<never, {}>;
-} = referenceChain("self", {}) as never;
+/** Self-reference marker: `parent: self.nullable.onDelete.cascade.inverse("children")`. */
+export const self: SelfChain<{}> = referenceChain("self", {}) as never;
 
 export const isTable = (
   value: unknown,

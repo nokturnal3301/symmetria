@@ -69,6 +69,32 @@ test("noninteractive generation requires destructive opt-in and lint still fails
     expect((await run(directory, "lint")).exitCode).toBe(1);
   }));
 
+test("strict lint passes a fresh initial migration with unique keys, indexes and foreign keys", () =>
+  withMigrationDirectory(async (directory) => {
+    const users = table({ id: int.auto, email: text.unique }).indexes(
+      (users) => ({ byEmail: index(users.email) }),
+    );
+    const posts = table({
+      id: int.auto,
+      author: users.index,
+      slug: text,
+    }).indexes((posts) => ({ bySlug: index(posts.slug).unique }));
+    await writeFile(
+      join(directory, "symmetria.config.ts"),
+      `export default ${JSON.stringify({
+        schema: schema({ users, posts }).$snapshot(),
+        directory: "migrations",
+      })};`,
+    );
+    expect(
+      (await run(directory, "generate", "initial", "--no-interactive"))
+        .exitCode,
+    ).toBe(0);
+    const lint = await run(directory, "lint", "--strict", "--json");
+    expect(JSON.parse(lint.stdout)).toEqual([]);
+    expect(lint.exitCode).toBe(0);
+  }));
+
 test("init scaffolds an importable offline schema and preserves existing files", () =>
   withMigrationDirectory(async (directory) => {
     expect((await run(directory, "init", "--json")).exitCode).toBe(0);

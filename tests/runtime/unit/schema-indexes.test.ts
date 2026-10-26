@@ -183,7 +183,7 @@ test("invalid index methods, payloads, names and unsupported expressions fail ea
     schema(definitions, {
       indexes: ({ records }) => ({ ["x".repeat(64)]: index(records.id) }),
     }),
-  ).toThrow(/63 bytes/);
+  ).toThrow(/63 bytes: "x{64}" has 64; shorten/);
 });
 
 test("index execution is explicit, ordered and surfaces database errors", async () => {

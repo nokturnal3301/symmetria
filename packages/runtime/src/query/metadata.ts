@@ -2,6 +2,40 @@ import type { ExpressionDescription } from "./expressions";
 import type { Dialect } from "./state";
 
 /** SQL storage type survives wrappers; JSON extraction is scalar only for known fields. */
+/** The enum labels, in declaration order, behind an expression over an enum column. */
+export const expressionEnumeration = (
+  expression: ExpressionDescription,
+): readonly string[] | undefined => {
+  const node = expression.node;
+
+  switch (node.kind) {
+    case "column": {
+      const source =
+        node.description.binding.projection?.[node.description.column.name];
+
+      return source
+        ? expressionEnumeration(source)
+        : node.description.column.enumerationValues;
+    }
+    case "coalesce":
+      return node.values[0]
+        ? expressionEnumeration({ ...expression, node: node.values[0] })
+        : undefined;
+    case "window":
+      return expressionEnumeration({ ...expression, node: node.expression });
+    case "aggregate":
+      return node.value && (node.name === "MIN" || node.name === "MAX")
+        ? expressionEnumeration({ ...expression, node: node.value })
+        : undefined;
+    case "subquery":
+      return node.query.selection[0]
+        ? expressionEnumeration(node.query.selection[0])
+        : undefined;
+    default:
+      return undefined;
+  }
+};
+
 export const expressionSqlType = (
   expression: ExpressionDescription,
 ): string => {
@@ -50,7 +84,11 @@ export const expressionSqlType = (
         ? expressionSqlType(node.query.selection[0])
         : "derived";
     default:
-      return expression.codec?.parameterCast ?? "derived";
+      return (
+        expression.codec?.parameterCast ??
+        expression.codec?.sqlType ??
+        "derived"
+      );
   }
 };
 

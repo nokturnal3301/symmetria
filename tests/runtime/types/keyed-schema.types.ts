@@ -90,7 +90,7 @@ type Expect<Condition extends true> = Condition;
   type InsertMatches = Expect<
     AreEqual<
       typeof model.profiles.$insert,
-      { id?: never; bio?: string | null; userId: string }
+      { id?: undefined; bio?: string | null | undefined; userId: string }
     >
   >;
 
