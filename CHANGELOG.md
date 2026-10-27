@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-27
 
 ### Runtime
 
@@ -33,6 +33,8 @@
   invalid cursors instead of surfacing a database error.
 - `sql.of(column)` types and decodes raw SQL like a column, so
   `` sql.of(bool)`…` `` returns booleans on SQLite too.
+- Published declarations keep the SQL template type named, avoiding recursive
+  expansion that could stall consumer typechecking with `skipLibCheck: false`.
 - Mutation `where()` accepts an array of predicates combined with `AND`, like
   `$where`.
 - Junction tables index their second key column unless a declared index already

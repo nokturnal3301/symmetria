@@ -1317,8 +1317,23 @@ type ColumnResult<Definition> =
       : Metadata["valueType"]
     : never;
 
+// Keep recursive column types named when this callable is included in ShapeTools.
+export interface SqlTag {
+  <Value = unknown>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): SqlTemplate<Value>;
+  /** A template typed and decoded like a column, including driver-specific codecs. */
+  of: <Definition extends Column>(
+    column: Definition,
+  ) => (
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ) => SqlTemplate<ColumnResult<Definition>>;
+}
+
 /** Interpolations are parameters or expression nodes; only the template's literal text is SQL. */
-export const sql = Object.assign(
+export const sql: SqlTag = Object.assign(
   <Value = unknown>(
     strings: TemplateStringsArray,
     ...values: unknown[]

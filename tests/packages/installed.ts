@@ -12,6 +12,8 @@ const directory = await mkdtemp(join(temporaryRoot, "symmetria-packages-"));
 const run = async (command: string[], cwd = directory) => {
   const child = Bun.spawn(command, {
     cwd,
+    timeout: 120_000,
+    killSignal: "SIGKILL",
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, DATABASE_URL: "", NO_COLOR: "1" },
@@ -175,7 +177,7 @@ try {
   await Bun.write(
     join(directory, "smoke.ts"),
     `import assert from "node:assert/strict";
-import { createDatabase, schema, table, int, text, bigint, oneOf, index, rowNumber, prepare, createProfiler, type Transaction } from "symmetria";
+import { createDatabase, schema, table, int, text, bigint, bool, jsonb, oneOf, index, rowNumber, prepare, createProfiler, type Transaction } from "symmetria";
 import { postgres, type Driver } from "symmetria/driver";
 import { postgresDialect, registerDialect, type DialectStrategy } from "symmetria/dialect";
 import { createSchemaSQL, migrator, generateMigration, loadMigrationState, type MigrationState } from "symmetria-kit";
@@ -189,6 +191,15 @@ const userCard = model.users.shape((user) => ({ email: user.email, total: user.p
 const reusable = model.posts((post) => ({ author: post.author(userCard), state: post.state.match({ draft: "Draft", published: "Published" }) }));
 const reusableType: Promise<{ author: { email: string; total: string | null } | null; state: "Draft" | "Published" }[]> = null as unknown as ReturnType<typeof reusable.execute>;
 void reusableType;
+const jsonColumn = jsonb<{ meta: { label: string } }>();
+const sqlShape = model.users((user, { sql }) => {
+  const value = sql.of(jsonColumn)\`'{}'::jsonb\`;
+  // @ts-expect-error installed shape tools retain JSON path validation
+  value.path("missing");
+  return { active: sql.of(bool)\`TRUE\`, label: value.path("meta", "label") };
+});
+const sqlShapeType: Promise<{ active: boolean; label: string | null }[]> = null as unknown as ReturnType<typeof sqlShape.execute>;
+void sqlShapeType;
 assert.match(reusable.toSQL().sql, /CASE/);
 assert.match(model.posts.update((post) => ({ views: post.views.plus(1n) })).where((post) => post.id.is(1)).returning((post) => ({ views: post.views })).toSQL().sql, /RETURNING/);
 const shape = model.users((user, { leftJoin }) => {

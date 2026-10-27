@@ -1,6 +1,6 @@
 {
   "name": "symmetria",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Type-safe, SQL-first PostgreSQL query builder for Bun, with an embedded SQLite driver.",
   "homepage": "https://github.com/nokturnal3301/symmetria#readme",
   "repository": {
