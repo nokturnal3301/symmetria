@@ -1,0 +1,83 @@
+/**
+ * Public symmetria-kit API: migration generation, execution, drift detection, verification, linting and testing helpers.
+ */
+export {
+  migrationSnapshot,
+  parseMigrationSnapshot,
+  snapshotHash,
+  emptySnapshot,
+  type MigrationSnapshot,
+  type MigrationTable,
+  type MigrationColumn,
+} from "./migrations/snapshot";
+export {
+  createSchemaSQL,
+  diffSchemas,
+  type MigrationPlan,
+  type MigrationDiffOptions,
+  type RenameHints,
+} from "./migrations/diff";
+export {
+  generateMigration,
+  loadMigrations,
+  loadMigrationState,
+  squashMigrations,
+  type Migration,
+  type GeneratedMigration,
+  type MigrationState,
+  type MigrationManifest,
+  type GenerateMigrationOptions,
+  type SquashMigrationsOptions,
+} from "./migrations/files";
+export {
+  lintMigration,
+  formatLintFindings,
+  type LintFinding,
+  type LintLevel,
+} from "./migrations/lint";
+export { lintMigrationSQL, type SQLFinding } from "./migrations/sql-lint";
+export {
+  verifyMigrations,
+  type VerifyOptions,
+  type VerificationContext,
+} from "./migrations/verify";
+export {
+  MigrationExecutionError,
+  type ExecutionOptions,
+  type MigrationEvent,
+  type ExecutionStep,
+} from "./migrations/execution";
+export { recoverMigrationFiles } from "./migrations/publication";
+export {
+  detectDrift,
+  formatDriftFindings,
+  normalizeSqlType,
+  type DriftFinding,
+  type DriftKind,
+  type DriftOptions,
+} from "./migrations/drift";
+export {
+  migrator,
+  type MigratorOptions,
+  type MigrationStatus,
+} from "./migrations/runner";
+export {
+  defineMigrationConfig,
+  type MigrationConfig,
+} from "./migrations/config";
+export {
+  pullSchema,
+  type PullOptions,
+  type PullResult,
+  type PullWarning,
+  type PullWarningCode,
+} from "./introspection";
+export {
+  schemaGraph,
+  renderMermaid,
+  type SchemaGraph,
+  type GraphTable,
+  type GraphColumn,
+  type GraphEdge,
+  type MermaidOptions,
+} from "./graph/mermaid";

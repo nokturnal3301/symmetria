@@ -1,0 +1,15 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "paths": {
+      "symmetria": ["../../../packages/runtime/dist/index.js"],
+      "symmetria/driver": ["../../../packages/runtime/dist/driver.js"],
+      "symmetria/internal": ["../../../packages/runtime/dist/internal.js"]
+    }
+  },
+  "include": ["*.mjs"],
+  "exclude": []
+}
