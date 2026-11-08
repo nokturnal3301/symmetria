@@ -27,7 +27,13 @@ import type {
   QueryInspection,
 } from "../../observability/inspection";
 import { limitedPlan } from "./scope";
-import { countPlan, existsPlan, readCount, readExists } from "./terminal";
+import {
+  countPlan,
+  existsPlan,
+  readCount,
+  readExists,
+  rowCountError,
+} from "./terminal";
 
 export const PREPARE_QUERY = Symbol("symmetria.query.prepare");
 /** The value a parameter handle stands for inside the query. */
@@ -36,13 +42,15 @@ type ParameterTypes<Definitions extends Record<string, Column>> = {
     ? Metadata["valueType"] | (Metadata["notNull"] extends false ? null : never)
     : never;
 };
-/** Values passed at execution; vector parameters accept plain number arrays, like writes do. */
+/** Values passed at execution; vectors accept plain number arrays and decimals any string, like writes do. */
 type ParameterValues<Definitions extends Record<string, Column>> = {
   [Name in keyof Definitions]: NonNullable<
     ParameterTypes<Definitions>[Name]
   > extends Vector
     ? ParameterTypes<Definitions>[Name] | readonly number[]
-    : ParameterTypes<Definitions>[Name];
+    : NonNullable<ParameterTypes<Definitions>[Name]> extends `${number}`
+      ? ParameterTypes<Definitions>[Name] | string
+      : ParameterTypes<Definitions>[Name];
 };
 type PreparedArguments<Values> = keyof Values extends never
   ? []
@@ -308,9 +316,7 @@ export const preparePlan = (
     const rows = await rowsOf(limited(2), values);
 
     if (rows.length > 1 || (required && !rows.length)) {
-      throw new Error(
-        `symmetria: expected ${required ? "exactly one" : "at most one"} row, received ${rows.length}`,
-      );
+      throw rowCountError(plan, rows.length, required);
     }
 
     return rows[0] ?? null;

@@ -117,15 +117,15 @@ test("renderMermaid produces an erDiagram with keys, comments and cardinalities"
   }
   posts {
     bigint id PK "identity"
+    integer author_id FK
+    integer editor_id FK "nullable"
     posts_state_enum state
     numeric(12_2) price
     timestamptz published_at "nullable"
-    integer author_id FK
-    integer editor_id FK "nullable"
   }
   profiles {
-    text bio "nullable"
     integer user_id FK, UK
+    text bio "nullable"
   }
   tags {
     integer id PK "identity"

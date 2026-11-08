@@ -63,8 +63,9 @@ closest match.
 
 **The schema is the source of truth.** One declaration drives queries,
 migrations, drift detection and `pull` for databases that already exist,
-including keys by unique columns, relations without foreign keys, full-text
-search and pgvector.
+including Prisma's: any table and column names, keys by unique columns,
+relations without foreign keys, full-text search and pgvector. Decimal
+arithmetic stays exact (`quantity.multiply(price)` is a decimal, not a float).
 
 **Nothing is hidden.** `inspect()` shows the SQL, the parameters and the plan;
 the profiler shows where each millisecond went.
@@ -151,7 +152,7 @@ Requires PostgreSQL 14+ and Node.js 24.11+ or Bun 1.4.4+.
 ```sh
 npm install symmetria pg && npm install -D symmetria-kit   # or: bun add symmetria && bun add -d symmetria-kit
 npx --package symmetria-kit symmetria init
-npx --package symmetria-kit symmetria pull schema.ts   # existing database → schema module
+npx --package symmetria-kit symmetria pull schema.ts   # existing database (Prisma too) → schema module
 ```
 
 ```ts

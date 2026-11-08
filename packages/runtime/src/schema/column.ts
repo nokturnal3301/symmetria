@@ -37,6 +37,8 @@ export type ColumnDefinition = {
   index?: boolean;
   default?: ColumnDefault;
   enumerationValues?: readonly string[];
+  /** SQL name set with `.named()`; otherwise the schema key decides it. */
+  sqlName?: string;
 };
 
 declare const COLUMN_METADATA: unique symbol;
@@ -71,6 +73,8 @@ export interface Column<Metadata extends ColumnMetadata = ColumnMetadata> {
       valueType: Branded<Metadata["valueType"], Name>;
     }
   >;
+  /** The column's SQL name when the key should not decide it, such as `"createdAt"`. */
+  named(sqlName: string): Column<Metadata>;
   default(
     value:
       | Metadata["valueType"]
@@ -170,6 +174,9 @@ const makeColumn = (
         notNull: definition.notNull,
         unique: false,
         primaryKey: false,
+        ...(definition.sqlName !== undefined
+          ? { sqlName: definition.sqlName }
+          : {}),
       },
       {},
       arrayCodec(definition.sqlType, codec ?? codecFor(definition.sqlType)),
@@ -179,6 +186,17 @@ const makeColumn = (
   for (const [name, transform] of Object.entries(extras)) {
     defineGetter(column, name, () => chain(transform(definition)));
   }
+
+  Object.defineProperty(column, "named", {
+    value: (sqlName: string) => {
+      if (typeof sqlName !== "string" || !sqlName) {
+        throw new Error("symmetria: named() expects the column's SQL name");
+      }
+
+      return chain({ ...definition, sqlName });
+    },
+    enumerable: false,
+  });
 
   Object.defineProperty(column, "default", {
     value: (value: unknown) => {
@@ -350,12 +368,48 @@ export const bytea = base("bytea") as Column<{
 /** IPv4 or IPv6 address as text, such as `10.0.0.1` or `::1/128`. */
 export const inet = base("inet") as StringColumn;
 
-export const timestamptz = base("timestamptz", {
+const nowDefault: Record<string, DefinitionTransform> = {
   now: (definition) => ({
     ...definition,
     default: { kind: "sql", sql: "now()" },
   }),
-}) as TimestampWithTimeZoneColumn;
+};
+
+/** A timestamp builder usable bare (`timestamptz`) or with fractional-second precision (`timestamptz(3)`). */
+const timestampBuilder = (sqlType: "timestamptz" | "timestamp") =>
+  makeColumn(
+    { sqlType, notNull: true, unique: false, primaryKey: false },
+    nowDefault,
+    undefined,
+    (precision?: number) => {
+      if (
+        precision !== undefined &&
+        (!Number.isInteger(precision) || precision < 0 || precision > 6)
+      ) {
+        throw new Error(
+          `symmetria: ${sqlType} precision must be an integer between 0 and 6`,
+        );
+      }
+
+      return base(
+        precision === undefined ? sqlType : `${sqlType}(${precision})`,
+        nowDefault,
+      );
+    },
+  );
+
+/** `timestamp with time zone`, read as a `Date`. */
+export type TimestamptzColumn = TimestampWithTimeZoneColumn &
+  ((precision?: number) => TimestampWithTimeZoneColumn);
+
+export const timestamptz = timestampBuilder("timestamptz") as TimestamptzColumn;
+
+/**
+ * `timestamp without time zone`, read and written as UTC `Date` values: the
+ * convention of Prisma, Drizzle and Rails, and what Bun.SQL already does.
+ * `timestamp(3)` sets millisecond precision, as Prisma declares it.
+ */
+export const timestamp = timestampBuilder("timestamp") as TimestamptzColumn;
 
 type VarcharMetadata = { valueType: string; notNull: true; hasDefault: false };
 /** `varchar` alone is PostgreSQL `character varying` without a limit; `varchar(255)` sets one. */
@@ -492,7 +546,12 @@ export const isColumn = (value: unknown): value is Column => {
   );
 };
 
-type NumericMetadata = { valueType: string; notNull: true; hasDefault: false };
+/** Decimal text (`"202.10"`), kept exact; see `Decimal`. */
+type NumericMetadata = {
+  valueType: `${number}`;
+  notNull: true;
+  hasDefault: false;
+};
 /** `numeric` alone is unconstrained; `numeric(10, 2)` fixes precision and scale. */
 export type NumericColumn = Column<NumericMetadata> &
   ((precision?: number, scale?: number) => Column<NumericMetadata>);

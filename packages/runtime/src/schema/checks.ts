@@ -6,7 +6,7 @@ import { quoteIdentifier } from "../query/compile";
 import { ddlExpressions } from "./ddl-expressions";
 import { readPredicate } from "../query/expressions";
 import { createScope } from "../query/select";
-import { snakeCase, type SchemaSnapshot } from "./assembly";
+import { sqlKey, type SchemaSnapshot } from "./assembly";
 import type { TableCheckCallback } from "./table";
 
 export type CheckSnapshot = {
@@ -56,7 +56,7 @@ export const applyChecks = (
     callback(createScope({ [tableName]: binding })[tableName]!),
   )) {
     quoteIdentifier(name);
-    const sqlName = `${table.sqlName}_${snakeCase(name)}_check`;
+    const sqlName = `${table.sqlName}_${sqlKey(name, snapshot.casing)}_check`;
     quoteIdentifier(sqlName);
 
     if (names.has(sqlName)) {

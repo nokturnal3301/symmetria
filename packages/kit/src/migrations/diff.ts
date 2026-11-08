@@ -110,13 +110,22 @@ const direction = (
     table: string;
     column: string;
     onDelete: string;
-  }): { table: string; column: string; onDelete: string } => {
+    onUpdate?: string;
+  }): {
+    table: string;
+    column: string;
+    onDelete: string;
+    onUpdate?: string;
+  } => {
     const table = tableNames[reference.table] ?? reference.table;
 
     return {
       table,
       column: renames.columns?.[table]?.[reference.column] ?? reference.column,
       onDelete: reference.onDelete,
+      ...(reference.onUpdate === undefined
+        ? {}
+        : { onUpdate: reference.onUpdate }),
     };
   };
 

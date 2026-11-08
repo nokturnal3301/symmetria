@@ -3,6 +3,7 @@
  */
 import { freeze } from "../plan/freeze";
 import {
+  bigintCodec,
   countCodec,
   booleanCodec,
   codecFor,
@@ -361,10 +362,53 @@ export const lead = <Value>(
 ): WindowExpression<Value | null, "lead"> =>
   relativeWindow("lead", expression, offset, fallback);
 
+/**
+ * A `numeric` value: decimal text such as `"202.10"`, kept exact. Plain strings
+ * are accepted wherever a decimal is written or compared.
+ */
+export type Decimal = `${number}`;
+
 type Comparable<Value> =
   | NonNullable<Value>
   | (bigint extends NonNullable<Value> ? number : never)
+  | (NonNullable<Value> extends Decimal ? string : never)
   | SelectedColumn<Value | null>;
+
+/** Values arithmetic works on: integers and floats, bigints and decimals. */
+type ArithmeticValue = number | bigint | Decimal;
+/** A number, bigint, decimal text or numeric column on the right of an operator. */
+type ArithmeticOperand =
+  | number
+  | bigint
+  | string
+  | SelectedColumn<ArithmeticValue | null>;
+type OperandValue<Operand> =
+  Operand extends SelectedColumn<infer Value>
+    ? Value
+    : Operand extends string
+      ? Decimal
+      : Operand;
+/** PostgreSQL's promotion: any decimal makes a decimal, then bigint, then number. */
+type Promoted<Left, Right> =
+  NonNullable<Left> extends Decimal
+    ? Decimal
+    : NonNullable<Right> extends Decimal
+      ? Decimal
+      : NonNullable<Left> extends bigint
+        ? bigint
+        : NonNullable<Right> extends bigint
+          ? bigint
+          : number;
+type ArithmeticResult<Left, Operand> =
+  | Promoted<Left, OperandValue<Operand>>
+  | (null extends Left ? null : never)
+  | (null extends OperandValue<Operand> ? null : never);
+type Arithmetic<Value, OutputName extends string, Name extends string> =
+  NonNullable<Value> extends ArithmeticValue
+    ? <const Operand extends ArithmeticOperand>(
+        value: Operand,
+      ) => QueryColumn<ArithmeticResult<Value, Operand>, OutputName>
+    : (requires: `${Name}() needs a number, bigint or numeric column`) => never;
 
 /** How the query text is parsed: PostgreSQL's web search syntax, plain words, a phrase, or raw tsquery syntax. */
 export type SearchMode = "websearch" | "plain" | "phrase" | "raw";
@@ -607,19 +651,21 @@ export type QueryColumn<Value, OutputName extends string> = SelectedColumn<
   ) => Predicate;
   readonly like: NonNullable<Value> extends string
     ? (pattern: string | SelectedColumn<string | null>) => Predicate
-    : never;
+    : (requires: "like() needs a text column") => never;
   readonly ilike: NonNullable<Value> extends string
     ? (pattern: string | SelectedColumn<string | null>) => Predicate
-    : never;
-  readonly plus: NonNullable<Value> extends number | bigint
-    ? (value: Comparable<Value>) => QueryColumn<Value, OutputName>
-    : never;
-  readonly minus: NonNullable<Value> extends number | bigint
-    ? (value: Comparable<Value>) => QueryColumn<Value, OutputName>
-    : never;
-  readonly multiply: NonNullable<Value> extends number | bigint
-    ? (value: Comparable<Value>) => QueryColumn<Value, OutputName>
-    : never;
+    : (requires: "ilike() needs a text column") => never;
+  /** `a + b`. Any decimal operand makes a decimal, then bigint, then number. */
+  readonly plus: Arithmetic<Value, OutputName, "plus">;
+  /** `a - b`, with the same promotion as plus(). */
+  readonly minus: Arithmetic<Value, OutputName, "minus">;
+  /** `a * b`, such as `price.multiply(quantity)` for a decimal line total. */
+  readonly multiply: Arithmetic<Value, OutputName, "multiply">;
+  /**
+   * `a / b`. Two integer operands divide as integers in PostgreSQL (`7 / 2` is
+   * `3`); a decimal or float operand keeps the fraction. Dividing by zero fails.
+   */
+  readonly divide: Arithmetic<Value, OutputName, "divide">;
   readonly ascending: Ordering;
   readonly descending: Ordering;
 };
@@ -1083,20 +1129,141 @@ const membership = (
   });
 };
 
+type NumericClass = "decimal" | "bigint" | "float" | "integer";
+
+/** How PostgreSQL types an arithmetic operand, from its SQL type or codec. */
+const numericClass = (expression: ExpressionDescription): NumericClass => {
+  const sqlType = expressionSqlType(expression);
+
+  if (expression.codec === numericCodec || sqlType.startsWith("numeric")) {
+    return "decimal";
+  }
+
+  if (expression.codec === bigintCodec || sqlType === "bigint") {
+    return "bigint";
+  }
+
+  return /^(real|double precision)$/.test(sqlType) ? "float" : "integer";
+};
+
+const castNode = (node: ValueNode, sqlType: string): ValueNode =>
+  freeze({ kind: "raw", parts: freeze(["(", node, `)::${sqlType}`]), sqlType });
+
+const decimalCodec: RuntimeCodec = freeze({
+  ...numericCodec,
+  sqlType: "numeric",
+});
+
+/**
+ * `left <operator> right` with PostgreSQL's numeric promotion made explicit: a
+ * decimal operand turns the other side into numeric, a bigint operand keeps
+ * bigint, and a fractional JavaScript number is sent as double precision, so
+ * `quantity.multiply("19.99")` and `quantity.multiply(1.5)` neither truncate
+ * nor fail to parse as integers.
+ */
 const arithmetic = (
   description: ExpressionDescription,
-  operator: "+" | "-" | "*",
+  operator: "+" | "-" | "*" | "/",
   value: unknown,
-): QueryColumn<unknown, string> =>
-  createExpression({
-    ...description,
+): QueryColumn<unknown, string> => {
+  if (value === undefined || value === null) {
+    throw new Error(
+      "symmetria: arithmetic needs a value; use coalesce() for NULL operands",
+    );
+  }
+
+  const left = numericClass(description);
+  const operand =
+    typeof value === "object" && COLUMN_EXPRESSION in value
+      ? readColumn(value as SelectedColumn)
+      : undefined;
+  const right: NumericClass = operand
+    ? numericClass(operand)
+    : typeof value === "string"
+      ? "decimal"
+      : typeof value === "bigint"
+        ? "bigint"
+        : typeof value === "number" && !Number.isInteger(value)
+          ? "float"
+          : left === "bigint" || left === "decimal"
+            ? left
+            : "integer";
+
+  if (
+    !operand &&
+    typeof value !== "number" &&
+    typeof value !== "bigint" &&
+    typeof value !== "string"
+  ) {
+    throw new Error(
+      "symmetria: arithmetic operands are numbers, bigints, decimal strings or numeric columns",
+    );
+  }
+
+  const result: NumericClass =
+    left === "decimal" || right === "decimal"
+      ? "decimal"
+      : left === "float" || right === "float"
+        ? "float"
+        : left === "bigint" || right === "bigint"
+          ? "bigint"
+          : "integer";
+  const leftNode =
+    result === "decimal" && left !== "decimal"
+      ? castNode(description.node, "numeric")
+      : description.node;
+  const rightNode = operand
+    ? result === "decimal" && right !== "decimal"
+      ? castNode(operand.node, "numeric")
+      : operand.node
+    : freeze({
+        kind: "parameter" as const,
+        value: cloneParameter(
+          right === "bigint"
+            ? bigintCodec.encode(value as bigint)
+            : typeof value === "number" && result === "decimal"
+              ? String(value)
+              : value,
+        ),
+        ...(right === "decimal" || result === "decimal"
+          ? { cast: "numeric" }
+          : right === "float"
+            ? { cast: "double precision" }
+            : right === "bigint" && left !== "bigint"
+              ? { cast: "bigint" }
+              : {}),
+      });
+  const sqlType =
+    result === "decimal"
+      ? "numeric"
+      : result === "float"
+        ? "double precision"
+        : result === "bigint"
+          ? "bigint"
+          : "integer";
+  const codec =
+    result === "decimal"
+      ? decimalCodec
+      : result === "bigint"
+        ? bigintCodec
+        : result === "float"
+          ? codecFor("double precision")
+          : left === "integer" && right === "integer"
+            ? description.codec
+            : undefined;
+
+  return createExpression({
+    outputName: description.outputName,
     node: freeze({
       kind: "binary",
-      left: description.node,
+      left: leftNode,
       operator,
-      right: valueNode(value, description.codec),
+      right: rightNode,
+      sqlType,
     }),
+    ...(codec ? { codec } : {}),
   });
+};
 
 /** Callable equality whose string properties are enum-member predicates. */
 const equality = (description: ExpressionDescription, negated: boolean) =>
@@ -1405,6 +1572,10 @@ class ColumnHandle {
   multiply(value: unknown) {
     return arithmetic(this[COLUMN_EXPRESSION], "*", value);
   }
+
+  divide(value: unknown) {
+    return arithmetic(this[COLUMN_EXPRESSION], "/", value);
+  }
 }
 
 export const createExpression = <
@@ -1418,21 +1589,25 @@ export const createExpression = <
     OutputName
   >;
 
-type OptionalPredicate = Predicate | undefined | null | false;
+/**
+ * Entries a predicate list skips: every value `cond && predicate` can produce
+ * when `cond` is falsy, so `[q && title.ilike(q)]` compiles for
+ * `q: string | undefined` and an empty string adds no filter.
+ */
+export type SkippedPredicate = undefined | null | false | "" | 0 | 0n;
+export type OptionalPredicate = Predicate | SkippedPredicate;
 
-const presentPredicates = (
-  conditions: readonly OptionalPredicate[],
+/** Falsy entries are skipped; anything else must be a predicate. */
+export const presentPredicates = (
+  conditions: readonly unknown[],
 ): readonly PredicateDescription[] =>
   freeze(
     conditions
-      .filter(
-        (condition): condition is Predicate =>
-          condition !== undefined && condition !== null && condition !== false,
-      )
-      .map(readPredicate),
+      .filter((condition) => !!condition)
+      .map((condition) => readPredicate(condition as Predicate)),
   );
 
-/** AND of the given predicates; `undefined`, `null` and `false` are skipped. Empty is TRUE. */
+/** AND of the given predicates; falsy entries (`undefined`, `null`, `false`, `""`, `0`) are skipped. Empty is TRUE. */
 export const and = (...conditions: OptionalPredicate[]): Predicate =>
   predicate({
     kind: "group",
@@ -1440,7 +1615,7 @@ export const and = (...conditions: OptionalPredicate[]): Predicate =>
     predicates: presentPredicates(conditions),
   });
 
-/** OR of the given predicates; `undefined`, `null` and `false` are skipped. Empty is FALSE. */
+/** OR of the given predicates; falsy entries are skipped like in and(). Empty is FALSE. */
 export const or = (...conditions: OptionalPredicate[]): Predicate =>
   predicate({
     kind: "group",
@@ -1480,7 +1655,7 @@ export const count = (
 
 export const sum = (
   expression: SelectedColumn<number | bigint | string | null>,
-): QueryColumn<string | null, "sum"> =>
+): QueryColumn<Decimal | null, "sum"> =>
   createExpression({
     node: freeze({
       kind: "aggregate",
@@ -1494,7 +1669,7 @@ export const sum = (
 
 export const average = (
   expression: SelectedColumn<number | bigint | string | null>,
-): QueryColumn<string | null, "average"> =>
+): QueryColumn<Decimal | null, "average"> =>
   createExpression({
     node: freeze({
       kind: "aggregate",

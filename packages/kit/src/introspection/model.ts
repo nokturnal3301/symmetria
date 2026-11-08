@@ -3,12 +3,18 @@
  * default each column gets, which foreign keys become relations, which tables are
  * junctions, plus a warning for everything the DSL cannot express faithfully.
  */
+import type { Casing } from "symmetria";
 import { INDEX_METHODS as RUNTIME_INDEX_METHODS } from "symmetria/internal";
 import { normalizeSqlType } from "../migrations/drift";
 import type { CatalogConstraint } from "../migrations/catalog";
 import type { IndexDetailRow, PullCatalog } from "./catalog";
 import {
   camelKey,
+  chooseCasing,
+  keyAllocator,
+  keyFor,
+  naturalKey,
+  referenceKey,
   conventionalNames,
   escapeTemplate,
   isReservedColumnKey,
@@ -26,6 +32,10 @@ export type PullWarningCode =
   | "constraint-name"
   | "foreign-key"
   | "unique-constraint"
+  | "unique-index"
+  | "view"
+  | "trigger"
+  | "migration-table"
   | "index"
   | "junction-index"
   | "check"
@@ -60,6 +70,7 @@ export type ColumnType =
         | "bool"
         | "uuid"
         | "timestamptz"
+        | "timestamp"
         | "date"
         | "time"
         | "interval"
@@ -67,6 +78,8 @@ export type ColumnType =
         | "inet"
         | "jsonb"
         | "tsvector";
+      /** Fractional-second precision of timestamp builders, `timestamp(3)`. */
+      precision?: number;
     }
   | { kind: "varchar"; length?: number }
   | { kind: "numeric"; precision?: number; scale?: number }
@@ -111,6 +124,7 @@ export type PulledReference = {
   unique: boolean;
   index: boolean;
   onDelete?: "cascade" | "setNull" | "noAction";
+  onUpdate?: "cascade" | "restrict";
   inverse?: string;
   comments: string[];
 };
@@ -164,6 +178,8 @@ export type PulledTable = {
 
 export type PulledSchema = {
   schemaName: string;
+  /** The naming rule that lets most tables and columns be declared without `.named()`. */
+  casing: Casing;
   tables: PulledTable[];
   /** Indexes whose SQL names do not follow `<table>_<key>_idx`, declared with their exact names. */
   schemaIndexes: { table: string; index: PulledIndex }[];
@@ -178,6 +194,9 @@ type CatalogColumn = PullCatalog["columns"][number];
 type TableFacts = {
   key: string;
   sqlName: string;
+  casing: Casing;
+  /** Scalar member key of every column, by SQL name. */
+  columnKeys: Map<string, string>;
   columns: CatalogColumn[];
   generated: Set<string>;
   constraints: CatalogConstraint[];
@@ -196,6 +215,9 @@ type PendingReference = {
   column?: string | undefined;
 };
 
+/** Prisma's migration history table: reported, never declared. */
+const PRISMA_MIGRATIONS = "_prisma_migrations";
+
 const ON_DELETE: Record<string, PulledReference["onDelete"]> = {
   c: "cascade",
   n: "setNull",
@@ -209,10 +231,6 @@ const columnIdentifier = (name: string) =>
 const customValueType = (sqlType: string): string => {
   if (/^(oid|money)$/.test(sqlType) || /^float\d$/.test(sqlType)) {
     return "number";
-  }
-
-  if (sqlType === "timestamp without time zone") {
-    return "Date";
   }
 
   if (sqlType === "json") {
@@ -255,11 +273,51 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
     column.enum_name ===
       conventionalNames.enumeration(column.table_name, column.column_name);
 
+  // Views, materialized views and triggers have no declaration; list each one.
+  for (const object of catalog.undeclared ?? []) {
+    warn({
+      code: object.kind === "trigger" ? "trigger" : "view",
+      table: object.table_name ?? object.name,
+      object: object.name,
+      message:
+        object.kind === "trigger"
+          ? `trigger "${object.name}" on "${object.table_name}" is not declared; the schema does not manage triggers, so migrations neither create nor drop it`
+          : `${object.kind} "${object.name}" is not declared; queries cannot reach it through the schema and migrations neither create nor drop it`,
+    });
+  }
+
   // -- pass 1: tables that can be declared, with their catalog facts ----------
   const facts = new Map<string, TableFacts>();
+  const declarable = catalog.tables.filter(
+    (table) =>
+      !catalog.details.find((entry) => entry.name === table.name)?.partition &&
+      table.name !== PRISMA_MIGRATIONS,
+  );
+  const casing = chooseCasing([
+    ...declarable.map((table) => table.name),
+    ...catalog.columns
+      .filter((column) =>
+        declarable.some((table) => table.name === column.table_name),
+      )
+      .map((column) => column.column_name),
+  ]);
+  const allocateTableKey = keyAllocator(isReservedTableKey);
 
   for (const table of catalog.tables) {
     const details = catalog.details.find((entry) => entry.name === table.name);
+
+    if (table.name === PRISMA_MIGRATIONS) {
+      skippedTables.push({
+        sqlName: table.name,
+        reason: "Prisma's migration history; Symmetria keeps its own",
+      });
+      warn({
+        code: "migration-table",
+        table: table.name,
+        message: `"${table.name}" is Prisma's migration history and is not declared; drop it once Symmetria manages the migrations`,
+      });
+      continue;
+    }
 
     if (details?.partition) {
       skippedTables.push({
@@ -274,20 +332,8 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       continue;
     }
 
-    const key = camelKey(table.name);
-
-    if (!key || isReservedTableKey(key)) {
-      skippedTables.push({
-        sqlName: table.name,
-        reason: "the name cannot be produced by a schema key",
-      });
-      warn({
-        code: "name",
-        table: table.name,
-        message: `"${table.name}" cannot be declared: table keys are camelCase and map to lowercase snake_case names`,
-      });
-      continue;
-    }
+    // Names the key cannot produce are declared with `.named()`.
+    const key = allocateTableKey(keyFor(table.name, casing));
 
     const layout = catalog.layout.filter(
       (entry) => entry.table_name === table.name,
@@ -313,9 +359,18 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       });
     }
 
+    const allocateColumnKey = keyAllocator();
+
     facts.set(table.name, {
       key,
       sqlName: table.name,
+      casing,
+      columnKeys: new Map(
+        columns.map((column) => [
+          column.column_name,
+          allocateColumnKey(keyFor(column.column_name, casing)),
+        ]),
+      ),
       columns,
       generated: new Set(
         layout
@@ -334,9 +389,7 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
 
   // -- pass 2: foreign keys that can become relations -------------------------
   for (const table of facts.values()) {
-    const columnKeys = new Set(
-      table.columns.map((column) => camelKey(column.column_name)),
-    );
+    const columnKeys = new Set(table.columnKeys.values());
 
     for (const constraint of table.constraints.filter(
       (entry) => entry.kind === "f",
@@ -355,8 +408,8 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
           return "references a table in another schema";
         }
 
-        if (constraint.on_update !== "a") {
-          return "ON UPDATE actions are not supported";
+        if (!["a", "c", "r"].includes(constraint.on_update)) {
+          return "ON UPDATE SET NULL / SET DEFAULT are not supported";
         }
 
         if (constraint.match !== "s") {
@@ -375,22 +428,27 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
           return "ON DELETE SET DEFAULT is not supported";
         }
 
-        // `<relation>_id` columns keep the convention; any other name becomes `.column("<name>")`.
-        const conventional =
-          columnName!.endsWith("_id") && columnName!.length > 3;
-        const key = camelKey(
-          conventional ? columnName!.slice(0, -3) : columnName!,
+        // `<relation>_id` (or `<relation>Id` when names are preserved) keeps the
+        // convention; any other name becomes `.column("<name>")`.
+        const { key, column: explicitColumn } = referenceKey(
+          columnName!,
+          casing,
         );
+        const conventional = explicitColumn === undefined;
 
-        if (!key || isReservedColumnKey(key)) {
+        if (isReservedColumnKey(key)) {
           return `"${columnName}" does not map to a relation key`;
         }
 
-        if (columnKeys.has(key) && key !== camelKey(columnName!)) {
+        if (columnKeys.has(key) && key !== table.columnKeys.get(columnName!)) {
           return `a column already uses the key "${key}"`;
         }
 
-        if (!conventional && columnKeys.has(`${key}Id`)) {
+        if (
+          !conventional &&
+          columnKeys.has(`${key}Id`) &&
+          `${key}Id` !== table.columnKeys.get(columnName!)
+        ) {
           return `a column already uses the key "${key}Id"`;
         }
 
@@ -438,7 +496,7 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
           constraint,
           key,
           targetSql: target.sqlName,
-          ...(isPrimary ? {} : { by: camelKey(referencedName!) }),
+          ...(isPrimary ? {} : { by: target.columnKeys.get(referencedName!)! }),
           ...(conventional ? {} : { column: columnName! }),
         });
 
@@ -572,7 +630,46 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       );
 
       if (!constraint) {
-        return { unique: false, comments: [] };
+        // Prisma enforces uniqueness with a unique index named like the
+        // constraint (`User_email_key`); the schema declares `.unique` and the
+        // fix turns the index into that constraint in place, without a rebuild.
+        // Other unique indexes keep their exact index declarations.
+        const expected = conventionalNames.unique(table.sqlName, columnName);
+        const uniqueIndex = table.indexes.find(
+          (entry) =>
+            entry.index_name === expected &&
+            entry.is_unique &&
+            entry.keys.length === 1 &&
+            entry.keys[0] === columnIdentifier(columnName) &&
+            entry.method === "btree" &&
+            entry.predicate === null &&
+            entry.included.length === 0 &&
+            !entry.nulls_not_distinct &&
+            entry.opclasses.every((opclass) => opclass === null) &&
+            entry.options.every((option) => option === 0) &&
+            !table.constraints.some(
+              (constraint) => constraint.name === entry.index_name,
+            ),
+        );
+
+        if (!uniqueIndex) {
+          return { unique: false, comments: [] };
+        }
+
+        consumedIndexes.add(uniqueIndex.index_name);
+        warn({
+          code: "unique-index",
+          table: table.sqlName,
+          column: columnName,
+          object: uniqueIndex.index_name,
+          message: `"${table.sqlName}.${columnName}" is unique through the index "${expected}", not a UNIQUE constraint of that name`,
+          fix: `ALTER TABLE ${quoteSql(table.sqlName)} ADD CONSTRAINT ${quoteSql(expected)} UNIQUE USING INDEX ${quoteSql(expected)};`,
+        });
+
+        return {
+          unique: true,
+          comments: [`unique index "${expected}" becomes a constraint`],
+        };
       }
 
       const comments: string[] = [];
@@ -630,7 +727,7 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       if (
         candidate &&
         candidate.index_name ===
-          conventionalNames.index(table.sqlName, columnName)
+          conventionalNames.columnIndex(table.sqlName, columnName)
       ) {
         consumedIndexes.add(candidate.index_name);
 
@@ -665,6 +762,12 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
           member.onDelete = onDelete;
         }
 
+        if (reference.constraint.on_update === "c") {
+          member.onUpdate = "cascade";
+        } else if (reference.constraint.on_update === "r") {
+          member.onUpdate = "restrict";
+        }
+
         const inverse = inverses.get(reference);
 
         if (inverse) {
@@ -694,22 +797,7 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
         continue;
       }
 
-      const key = camelKey(column.column_name);
-
-      if (!key) {
-        declared.skipped.push({
-          sqlName: column.column_name,
-          dataType: column.data_type,
-          reason: "the name cannot be produced by a column key",
-        });
-        warn({
-          code: "name",
-          table: table.sqlName,
-          column: column.column_name,
-          message: `"${table.sqlName}.${column.column_name}" cannot be declared: column keys are camelCase and map to lowercase snake_case names`,
-        });
-        continue;
-      }
+      const key = table.columnKeys.get(column.column_name)!;
 
       const member = columnMember(column, key, table, {
         ownsEnum,
@@ -741,7 +829,10 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
           entry.keys[0] === columnIdentifier(second.sqlName) ||
           entry.keys[0]?.startsWith(`${columnIdentifier(second.sqlName)} `),
       );
-      const expected = conventionalNames.index(table.sqlName, second.sqlName);
+      const expected = conventionalNames.columnIndex(
+        table.sqlName,
+        second.sqlName,
+      );
 
       if (leading && plainIndexOn(second.sqlName)?.index_name === expected) {
         consumedIndexes.add(expected);
@@ -880,6 +971,7 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
 
   return {
     schemaName: catalog.schemaName,
+    casing,
     tables,
     schemaIndexes,
     extensions: catalog.extensions.map((extension) => extension.name),
@@ -999,6 +1091,19 @@ const columnType = (
     return { type: { kind: "builder", name: builder }, array };
   }
 
+  const stamp = /^timestamp (with|without) time zone(?:\((\d)\))?$/.exec(base);
+
+  if (stamp) {
+    return {
+      type: {
+        kind: "builder",
+        name: stamp[1] === "with" ? "timestamptz" : "timestamp",
+        ...(stamp[2] ? { precision: Number(stamp[2]) } : {}),
+      },
+      array,
+    };
+  }
+
   const vectorType = /^vector(?:\((\d+)\))?$/.exec(base);
 
   if (vectorType && !array) {
@@ -1111,7 +1216,10 @@ const columnDefault = (
   }
 
   if (!array && type.kind === "builder") {
-    if (type.name === "timestamptz" && text === "now()") {
+    if (
+      (type.name === "timestamptz" || type.name === "timestamp") &&
+      text === "now()"
+    ) {
       return { kind: "now" };
     }
 
@@ -1337,7 +1445,10 @@ const checkMember = (
   const prefix = `${table.sqlName}_`;
   const conventional =
     constraint.name.startsWith(prefix) && constraint.name.endsWith(suffix)
-      ? camelKey(constraint.name.slice(prefix.length, -suffix.length))
+      ? naturalKey(
+          constraint.name.slice(prefix.length, -suffix.length),
+          table.casing,
+        )
       : undefined;
   let key = conventional;
 
@@ -1352,7 +1463,7 @@ const checkMember = (
           .replace(/_(\d)/g, "$1"),
       ) ??
       `check${pascal(String(table.constraints.indexOf(constraint) + 1))}`;
-    const expected = conventionalNames.check(table.sqlName, key);
+    const expected = conventionalNames.check(table.sqlName, key, table.casing);
     comments.push(`constraint "${constraint.name}" is named "${expected}"`);
     warn({
       code: "constraint-name",
@@ -1658,12 +1769,16 @@ const declareIndex = (
     !options.exact &&
     row.index_name.startsWith(prefix) &&
     row.index_name.endsWith(suffix)
-      ? camelKey(row.index_name.slice(prefix.length, -suffix.length))
+      ? naturalKey(
+          row.index_name.slice(prefix.length, -suffix.length),
+          table.casing,
+        )
       : undefined;
 
   if (
     derivedKey &&
-    conventionalNames.index(table.sqlName, derivedKey) === row.index_name &&
+    conventionalNames.index(table.sqlName, derivedKey, table.casing) ===
+      row.index_name &&
     !declared.indexes.some((entry) => entry.key === derivedKey)
   ) {
     tools.declare({ exact: false, index: { ...index, key: derivedKey } });
@@ -1671,7 +1786,10 @@ const declareIndex = (
     return;
   }
 
-  if (!/^[a-z_][a-z0-9_]*$/.test(row.index_name)) {
+  if (
+    table.casing !== "preserve" &&
+    !/^[a-z_][a-z0-9_]*$/.test(row.index_name)
+  ) {
     return skip(
       "its name contains characters the schema cannot produce; indexes are named <table>_<key>_idx or by a lowercase schema-level key",
     );

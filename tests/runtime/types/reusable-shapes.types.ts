@@ -5,6 +5,7 @@ import {
   bigint,
   oneOf,
   timestamptz,
+  type Decimal,
 } from "../../../packages/runtime/src";
 
 type AreEqual<Actual, Expected> = [Actual] extends [Expected]
@@ -44,8 +45,8 @@ type Result = Expect<
   AreEqual<
     Awaited<typeof query>,
     {
-      author: { name: string; total: string | null } | null;
-      editor: { name: string; total: string | null } | null;
+      author: { name: string; total: Decimal | null } | null;
+      editor: { name: string; total: Decimal | null } | null;
       label: "Draft" | "Published";
       optionalLabel: "Draft" | "Published" | null;
       views: bigint;
@@ -54,7 +55,7 @@ type Result = Expect<
 >;
 const alias = database.users.as("member")(card);
 type Alias = Expect<
-  AreEqual<Awaited<typeof alias>, { name: string; total: string | null }[]>
+  AreEqual<Awaited<typeof alias>, { name: string; total: Decimal | null }[]>
 >;
 const aggregates = database.users((user) => ({
   latest: user.posts.maximum((post) => post.createdAt),
@@ -64,7 +65,7 @@ const aggregates = database.users((user) => ({
 type Aggregates = Expect<
   AreEqual<
     Awaited<typeof aggregates>,
-    { latest: Date | null; smallest: bigint | null; average: string | null }[]
+    { latest: Date | null; smallest: bigint | null; average: Decimal | null }[]
   >
 >;
 

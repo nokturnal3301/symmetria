@@ -246,6 +246,9 @@ describe.skipIf(!url)("pull", () => {
       );
       expect(result.source).toContain("big: bigint.auto, // pull:");
       expect(result.source).toContain(
+        'camelCol: text.named("CamelCol").nullable,',
+      );
+      expect(result.source).toContain(
         "titleLower: index(sql<string>`lower(${posts.title})`.descending.nullsLast),",
       );
       expect(result.source).toContain(
@@ -286,7 +289,6 @@ describe.skipIf(!url)("pull", () => {
         "missing-constraint tags tags_label_key",
         "extra-constraint tags tags_label_unique",
         "identity-mismatch users.big GENERATED ALWAYS",
-        "extra-column users.CamelCol",
         "extra-enum mood",
       ]);
       expect(
@@ -301,7 +303,6 @@ describe.skipIf(!url)("pull", () => {
           "constraint-name",
           "serial",
           "identity-by-default",
-          "name",
           "enum",
         ].sort(),
       );
@@ -329,7 +330,6 @@ describe.skipIf(!url)("pull", () => {
       expect(remaining.map((finding) => String(finding.kind)).sort()).toEqual(
         [
           "extra-index", // "Posts_Odd_Name" cannot be named by the schema
-          "extra-column", // "CamelCol"
           "extra-enum", // shared enum "mood"
         ].sort(),
       );

@@ -13,6 +13,7 @@ import {
 } from "./column";
 import {
   assembleSchema,
+  type Casing,
   type ConditionRelationInput,
   type SchemaOverrides,
   type SchemaSnapshot,
@@ -163,7 +164,8 @@ export interface Link<
       Unique,
       InverseName,
       KeyValue,
-      Shape
+      Shape,
+      By
     >;
     readonly restrict: Link<
       TableName,
@@ -171,7 +173,8 @@ export interface Link<
       Unique,
       InverseName,
       KeyValue,
-      Shape
+      Shape,
+      By
     >;
     readonly noAction: Link<
       TableName,
@@ -179,7 +182,8 @@ export interface Link<
       Unique,
       InverseName,
       KeyValue,
-      Shape
+      Shape,
+      By
     >;
     readonly setNull: Link<
       TableName,
@@ -187,7 +191,38 @@ export interface Link<
       Unique,
       InverseName,
       KeyValue,
-      Shape
+      Shape,
+      By
+    >;
+  };
+  /** `ON UPDATE` action, for example `.onUpdate.cascade` as Prisma declares it. */
+  readonly onUpdate: {
+    readonly cascade: Link<
+      TableName,
+      Nullable,
+      Unique,
+      InverseName,
+      KeyValue,
+      Shape,
+      By
+    >;
+    readonly restrict: Link<
+      TableName,
+      Nullable,
+      Unique,
+      InverseName,
+      KeyValue,
+      Shape,
+      By
+    >;
+    readonly noAction: Link<
+      TableName,
+      Nullable,
+      Unique,
+      InverseName,
+      KeyValue,
+      Shape,
+      By
     >;
   };
 }
@@ -312,9 +347,14 @@ type ReferenceOptions<Reference> =
   Reference extends LinkMetadata<string, infer Options> ? Options : {};
 type ColumnMetadata<Definition> =
   Definition extends Column<infer Metadata> ? Metadata : never;
+// A conditional (not a plain union alias) so editors print the resolved value
+// type, such as `"cart" | "paid"`, instead of `ColumnValue<Column<…>>`.
 type ColumnValue<Definition> =
-  | ColumnMetadata<Definition>["valueType"]
-  | (ColumnMetadata<Definition>["notNull"] extends false ? null : never);
+  Definition extends Column<infer Metadata>
+    ? Metadata["notNull"] extends false
+      ? Metadata["valueType"] | null
+      : Metadata["valueType"]
+    : never;
 type PrimaryKeyValue<
   Definition extends SchemaDefinitions,
   TableName extends StringKeys<Definition>,
@@ -853,6 +893,13 @@ export type SchemaOptions<
   readonly driver?: Driver;
   /** PostgreSQL extensions the schema needs (for example `["vector"]`); migrations create them first. */
   readonly extensions?: readonly string[];
+  /**
+   * How keys become SQL names. `"snake_case"` (default): `createdAt` →
+   * `created_at`, `author` → `author_id`. `"preserve"`: keys are used as written,
+   * `author` → `authorId`, the convention of databases created by Prisma.
+   * `.named()` on a table or column overrides either rule.
+   */
+  readonly casing?: Casing;
   readonly indexes?: (
     scope: {
       readonly [TableName in keyof Rows]: Columns<Rows[TableName]>;
@@ -1002,6 +1049,29 @@ const createLink = (
           ),
         ),
     },
+    onUpdate: {
+      enumerable: true,
+      get: () =>
+        Object.freeze(
+          Object.defineProperties(
+            {},
+            {
+              cascade: {
+                enumerable: true,
+                get: () => withOptions({ onUpdate: "cascade" }),
+              },
+              restrict: {
+                enumerable: true,
+                get: () => withOptions({ onUpdate: "restrict" }),
+              },
+              noAction: {
+                enumerable: true,
+                get: () => withOptions({ onUpdate: "no action" }),
+              },
+            },
+          ),
+        ),
+    },
   });
 
   return Object.freeze(link) as Link<
@@ -1113,6 +1183,7 @@ const createSchema = <
   const tableIndexes = new Map<string, readonly TableIndexCallback[]>();
   const tableChecks = new Map<string, readonly TableCheckCallback[]>();
   const tableComputed = new Map<string, readonly ComputedCallback[]>();
+  const tableSqlNames = new Map<string, string>();
   const tableRelations = new Map<string, readonly TableRelationCallback[]>();
   const primaryKeys = new Map<string, readonly string[]>();
   const junctionTables = new Set<string>();
@@ -1145,6 +1216,10 @@ const createSchema = <
       tableIndexes.set(tableName, state.indexCallbacks);
       tableChecks.set(tableName, state.checkCallbacks);
       tableComputed.set(tableName, state.computedCallbacks);
+
+      if (state.named !== undefined) {
+        tableSqlNames.set(tableName, state.named);
+      }
       tableRelations.set(tableName, state.relationCallbacks);
 
       if (state.primaryKey) {
@@ -1348,6 +1423,11 @@ const createSchema = <
     tableHandles[tableName] = (
       isJunction ? junction(columns) : table(columns)
     ) as TableHandle<Record<string, ColumnInput>>;
+    const named = tableSqlNames.get(tableName);
+
+    if (named !== undefined) {
+      tableHandles[tableName] = tableHandles[tableName]!.named(named);
+    }
     const explicitKeys = primaryKeys.get(tableName)!;
 
     if (!isJunction && explicitKeys.length) {
@@ -1458,7 +1538,20 @@ const createSchema = <
     });
   }
 
-  const snapshot = assembleSchema(tableHandles, overrides, conditions);
+  if (
+    options.casing !== undefined &&
+    options.casing !== "snake_case" &&
+    options.casing !== "preserve"
+  ) {
+    throw new Error('symmetria: casing must be "snake_case" or "preserve"');
+  }
+
+  const snapshot = assembleSchema(
+    tableHandles,
+    overrides,
+    conditions,
+    options.casing,
+  );
 
   if (options.extensions?.length) {
     for (const extension of options.extensions) {

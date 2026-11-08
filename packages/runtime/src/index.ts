@@ -11,6 +11,7 @@ export {
   doublePrecision,
   date,
   time,
+  timestamp,
   interval,
   bytea,
   inet,
@@ -35,7 +36,12 @@ export {
 } from "./schema/column";
 
 export type { Infer, InferInsert, InferUpdate } from "./schema/infer";
-export { sqlState } from "./driver/errors";
+export {
+  sqlState,
+  databaseError,
+  type DatabaseError,
+  type DatabaseErrorKind,
+} from "./driver/errors";
 
 export {
   table,
@@ -50,12 +56,15 @@ export {
   type ColumnInput,
   type ReferenceFlags,
   type OnDeleteAction,
+  type OnUpdateAction,
   type ConditionRelation,
   type RelationTools,
 } from "./schema/table";
 
 export {
   snakeCase,
+  sqlKey,
+  type Casing,
   type SchemaSnapshot,
   type TableSnapshot,
   type ColumnSnapshot,
@@ -169,6 +178,8 @@ export {
   type WindowOptions,
   type WindowBoundary,
   type WindowExpression,
+  type Decimal,
+  type SkippedPredicate,
 } from "./query/expressions";
 
 export {

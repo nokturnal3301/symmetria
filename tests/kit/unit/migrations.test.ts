@@ -586,3 +586,29 @@ test("extensions, operator classes and storage options round-trip through snapsh
     /invalid migration snapshot/,
   );
 });
+
+test("changing ON UPDATE recreates the foreign key; keeping it changes nothing", () => {
+  const build = (cascade: boolean) => {
+    const users = table({ id: int.auto });
+
+    return schema({
+      users,
+      posts: table({
+        id: int.auto,
+        author: cascade ? users.onUpdate.cascade : users,
+      }),
+    }).$snapshot();
+  };
+
+  expect(diffSchemas(build(true), build(true)).up).toEqual([]);
+  expect(diffSchemas(build(false), build(true)).up).toEqual([
+    'ALTER TABLE "posts" DROP CONSTRAINT "posts_author_id_fkey"',
+    'ALTER TABLE "posts" ADD CONSTRAINT "posts_author_id_fkey" FOREIGN KEY ("author_id") REFERENCES "users" ("id") ON DELETE RESTRICT ON UPDATE CASCADE',
+  ]);
+  // NO ACTION stays out of snapshots, so earlier snapshots compare unchanged.
+  expect(
+    migrationSnapshot(build(false))
+      .tables.find((table) => table.name === "posts")!
+      .columns.find((column) => column.name === "author_id")!.references,
+  ).toEqual({ table: "users", column: "id", onDelete: "restrict" });
+});

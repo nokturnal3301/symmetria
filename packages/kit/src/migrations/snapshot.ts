@@ -17,7 +17,13 @@ export type MigrationColumn = {
   unique: boolean;
   identity: boolean;
   default?: string;
-  references?: { table: string; column: string; onDelete: string };
+  references?: {
+    table: string;
+    column: string;
+    onDelete: string;
+    /** Absent for PostgreSQL's default `no action`. */
+    onUpdate?: string;
+  };
 };
 export type MigrationTable = {
   name: string;
@@ -402,14 +408,16 @@ export const parseMigrationSnapshot = (input: unknown): MigrationSnapshot => {
         }
 
         if (
-          column.references &&
-          ![
-            "cascade",
-            "restrict",
-            "no action",
-            "set null",
-            "set default",
-          ].includes(column.references.onDelete)
+          (column.references &&
+            ![
+              "cascade",
+              "restrict",
+              "no action",
+              "set null",
+              "set default",
+            ].includes(column.references.onDelete)) ||
+          (column.references?.onUpdate !== undefined &&
+            !["cascade", "restrict"].includes(column.references.onUpdate))
         ) {
           return fail();
         }
@@ -432,6 +440,9 @@ export const parseMigrationSnapshot = (input: unknown): MigrationSnapshot => {
                   table: identifier(column.references.table),
                   column: identifier(column.references.column),
                   onDelete: column.references.onDelete,
+                  ...(column.references.onUpdate === undefined
+                    ? {}
+                    : { onUpdate: column.references.onUpdate }),
                 },
               }
             : {}),

@@ -284,7 +284,7 @@ test("decimal sums retain low digits across large additions, rescaling and cance
   driver.createTables(db);
 
   try {
-    for (const middle of ["2", "0.01"]) {
+    for (const middle of ["2", "0.01"] as const) {
       await db.rows.delete().all();
       await db.rows.insert(
         ["9007199254740991", middle, "-9007199254740991"].map((n, id) => ({

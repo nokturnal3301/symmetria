@@ -159,9 +159,9 @@ test("invalid references are reported with both sides", () => {
   expect(() =>
     schema({
       users,
-      posts: table({ id: int.auto, author: users.column("Author Email") }),
+      posts: table({ id: int.auto, author: users.column("x".repeat(64)) }),
     }),
-  ).toThrow(/column name "Author Email" must be a lowercase identifier/);
+  ).toThrow(/column name "x{64}" is not a valid SQL identifier: .*63 bytes/);
   expect(() =>
     schema({
       users,

@@ -20,6 +20,7 @@ import {
   type Infer,
   type InferInsert,
   type InferShape,
+  type Decimal,
 } from "../../../packages/runtime/src";
 import { vector } from "../../../packages/runtime/src/entries/vector";
 
@@ -254,7 +255,7 @@ const model = schema({
         owner: string;
         balance: bigint;
         note: string | null;
-        price: string;
+        price: Decimal;
         code: string;
       }
     >

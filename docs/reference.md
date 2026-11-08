@@ -90,6 +90,51 @@ declared in `.indexes()` is not enough. Nested inserts `connect` such a
 reference by the referenced value (`author: { connect: "ada@example.com" }`) or
 by a key object.
 
+`self` refers to the table being declared, with the same modifiers as any other
+reference: `parent: self.nullable.onDelete.cascade.inverse("children")` adds a
+`parentId` column, a `parent` relation and, through `.inverse()`, a `children`
+collection. A self-reference has no automatic reverse relation; name it with
+`.inverse()` when you need one. `.onUpdate.cascade`, `.onUpdate.restrict` and
+`.onUpdate.noAction` set the foreign key's `ON UPDATE` action (the default is
+PostgreSQL's `NO ACTION`); databases created by Prisma use `.onUpdate.cascade`.
+
+### SQL names
+
+Keys decide SQL names: by default `createdAt` becomes `created_at` and a
+reference `author` becomes `author_id`. Two tools cover databases that use other
+names, such as the PascalCase tables and camelCase columns Prisma creates:
+
+```ts
+const user = table({
+  id: int.auto,
+  email: text.unique,
+  createdAt: timestamp(3).default(sql`CURRENT_TIMESTAMP`),
+}).named("User");
+const post = table({
+  id: int.auto,
+  title: text,
+  author: user.index.onUpdate.cascade, // "authorId"
+  legacyCode: text.named("LEGACY_CODE").nullable,
+}).named("Post");
+
+export const appSchema = schema({ user, post }, { casing: "preserve" });
+await database.post((post) => ({
+  title: post.title,
+  author: post.author.email,
+}));
+// FROM "Post" AS "post" INNER JOIN "User" … ON "post"."authorId" = …
+```
+
+`schema(definitions, { casing: "preserve" })` keeps keys as written: `createdAt`
+stays `createdAt` and `author` becomes `authorId`. `.named("User")` on a table
+and `.named("LEGACY_CODE")` on a column set any SQL name, under either casing;
+`users.column("ownerID")` does the same for a foreign-key column. Constraint and
+index names follow the SQL names (`User_pkey`, `User_email_key`,
+`Post_authorId_fkey`, `Post_authorId_idx`), which are also Prisma's. Queries,
+writes and migrations use the SQL names; shapes and results keep the keys. Two
+tables or two columns that end up with the same SQL name are rejected when the
+schema is built.
+
 ### Relations without a foreign key
 
 Legacy and analytical tables often relate through plain columns. `.relations()`
@@ -158,9 +203,9 @@ omitted from writes. `smallint`, `real`, `doublePrecision`, `date`, `time`,
 that returns a column, or a non-column value is reported with the table and
 column name and a hint. `Infer<typeof db.users>` is the row type,
 `InferInsert<typeof db.users>` the insert input, `InferUpdate<typeof db.users>`
-the `update()` input and insert input and `InferShape<typeof card>` the row of a
-reusable shape or a built query; all three also accept standalone `table()`
-handles. `uuid.v4` works on PostgreSQL 14; `uuid.v7` needs PostgreSQL 18+.
+the `update()` input and `InferShape<typeof card>` the row of a reusable shape
+or a built query; all four also accept standalone `table()` handles. `uuid.v4`
+works on PostgreSQL 14; `uuid.v7` needs PostgreSQL 18+.
 
 ## SELECT
 
@@ -173,6 +218,10 @@ await database.users
   .byId(42)((user) => ({ name: user.name }))
   .maybeOne();
 ```
+
+`one()` throws when there is no row or more than one, `maybeOne()` when there is
+more than one. The error names the source and carries `code`:
+`SYMMETRIA_RECORD_NOT_FOUND` for no row, `SYMMETRIA_TOO_MANY_ROWS` for several.
 
 `byId()` starts a query on a table's primary key and selects all its columns,
 including computed fields. It accepts the key's value type, including branded
@@ -709,10 +758,12 @@ database.posts((post, { whereNotNull }) => ({
 Import `and` and `when` from `symmetria`. `when` skips only null/undefined;
 zero, false and empty strings are values. Empty AND is TRUE; empty OR is FALSE.
 Predicate lists in `where`, `having`, JOIN conditions, `and()`, `or()` and
-mutation `where()` skip `undefined`, `null` and `false` entries, so optional
-filters read
-`[q && title.ilike(q), minPrice !== undefined && price.atLeast(minPrice)]`
-without branching; a mutation list that filters down to nothing still means
+mutation `where()` skip falsy entries (`undefined`, `null`, `false`, `""`, `0`),
+which is every value `condition && predicate` can produce, so optional filters
+read `[q && title.ilike(q), minPrice !== undefined && price.atLeast(minPrice)]`
+without branching and type-check for `q: string | undefined`. An empty search
+string adds no filter; use `when()` or an explicit comparison when `0` or `""`
+is a real value; a mutation list that filters down to nothing still means
 `WHERE TRUE`, and a single `false` returned from a mutation callback is an error
 rather than "no filter". `whereNotNull()` adds a predicate and returns a
 narrowed expression.
@@ -1290,6 +1341,27 @@ run in the inner query before the outer aggregate. With grouping, `count()`
 counts groups and a value selector must be valid for the grouped query. For
 value aggregates, DISTINCT applies to the selected aggregate input expression.
 
+### Arithmetic
+
+```ts
+const totals = database.orderItems((item) => ({
+  total: item.quantity.multiply(item.unitPrice), // Decimal
+  withTax: item.unitPrice.multiply("1.2"), // Decimal
+  perKg: item.unitPrice.divide(item.weight), // Decimal
+  next: item.position.plus(1), // number
+}));
+```
+
+`plus`, `minus`, `multiply` and `divide` take a number, a bigint, decimal text
+or another numeric column. The result follows PostgreSQL's promotion, made
+explicit in the SQL: a decimal operand turns the other side into `numeric`
+(`int × numeric` is an exact `Decimal`), then `bigint`, then floats, then
+integers. A fractional JavaScript number is sent as `double precision` instead
+of failing to parse as an integer. Two integers divide as integers in PostgreSQL
+(`7 / 2` is `3`); divide by `"2"` or a decimal column to keep the fraction.
+Dividing by zero is a database error. On a text or date column these methods do
+not exist; the type error names the method and what it needs.
+
 ### Raw SQL expressions
 
 `sql<Value>` is a typed template escape hatch: interpolated values become
@@ -1342,10 +1414,16 @@ scope. Raw expressions inside a nested query block only that query's rewrite.
 
 ## Values and drivers
 
-- `bigint` → JavaScript `bigint`, `numeric(precision, scale)` → decimal
-  `string`. Writes and comparisons also accept safe integers for `bigint`
-  columns.
+- `bigint` → JavaScript `bigint`, `numeric(precision, scale)` → `Decimal`, exact
+  decimal text such as `"202.10"` (the type is `` `${number}` ``, so it is a
+  `string` everywhere one is expected). Writes, filters and prepared parameters
+  accept any string for decimal columns and safe integers for `bigint` columns.
+  `sum()` and `average()` return `Decimal | null`.
 - `jsonb<Value>()` → `Value`, `timestamptz` → `Date`.
+- `timestamp` (without time zone) → `Date`, read and written as UTC: the
+  convention of Prisma, Drizzle and Rails, independent of the server's and the
+  process's time zone, on both drivers. `timestamp(3)` and `timestamptz(3)` set
+  the fractional-second precision.
 - `smallint`, `real` and `doublePrecision` → `number` (`NaN` and `±Infinity`
   round-trip; `smallint.auto` is an identity column). `date` → `"YYYY-MM-DD"`
   text with no time-zone shift, `time` → `"HH:MM:SS"` text, `interval` →
@@ -1856,7 +1934,13 @@ type distinguishes a transaction from the pool-bound database, so passing
   serialization failure or deadlock (SQLSTATE 40001 / 40P01), waiting
   `retryDelayMs` with exponential growth and jitter between attempts (default 10
   ms); each attempt gets a fresh connection, so the callback must be safe to
-  repeat. `sqlState(error)` reads the SQLSTATE of a driver error.
+  repeat. `sqlState(error)` reads the SQLSTATE of a driver error, and
+  `databaseError(error)` describes it the same way on both drivers:
+  `{ kind, sqlState, message, table?, column?, constraint?, detail? }`, where
+  `kind` is `unique`, `foreign-key`, `not-null`, `check`, `exclusion`,
+  `serialization`, `deadlock` or `other`, and `undefined` means the failure did
+  not come from the server (for example a lost connection):
+  `if (databaseError(error)?.kind === "unique") …`.
 - Ordinary `$createIndexes()` is transactional; `concurrently: true` is rejected
   by both types and runtime in a transaction context.
 
@@ -1987,8 +2071,29 @@ appends a journal entry without changing the snapshot.
   parameters and access methods included), with dependency-aware creation and
   removal.
 - Explicit rename hints and directional `USING` conversions come from
-  `generate <name> --diff changes.json`; names in that file are physical SQL
-  names.
+  `generate <name> --diff changes.json` (also read by `diff` and `lint`). Names
+  in that file are SQL names; columns and conversions are keyed by the new table
+  name:
+
+  ```json
+  {
+    "renames": {
+      "tables": { "people": "users" },
+      "columns": { "users": { "full_name": "name" } }
+    },
+    "using": {
+      "users": {
+        "age": { "up": "\"age\"::integer", "down": "\"age\"::text" }
+      }
+    }
+  }
+  ```
+
+  A table rename keeps its constraints and indexes, renamed to the new
+  conventional names; a column rename does the same for the constraints on that
+  column. `using` supplies the `USING` expression for a type change in each
+  direction, so `rollback` can restore the previous type.
+
 - `migrate --to <id>` applies through a target; `rollback --steps 2` reverts the
   latest two applied migrations in reverse order.
 - `lint` inspects saved `up.sql` files and any ungenerated schema diff. It exits
@@ -2079,17 +2184,20 @@ export const appSchema = schema({
 });
 ```
 
-What maps directly: `integer` / `bigint` / `smallint` identities (`int.auto`,
-`bigint.auto`, `smallint.auto`), `now()`, `gen_random_uuid()` and `uuidv7()`
-defaults, literal defaults, `text`, `boolean`, `uuid`, `jsonb`, `timestamptz`,
+What maps directly: table and column names of any form (`pull` picks the
+`casing` that fits most names and adds `.named()` for the rest), `integer` /
+`bigint` / `smallint` identities (`int.auto`, `bigint.auto`, `smallint.auto`),
+`now()`, `gen_random_uuid()` and `uuidv7()` defaults, literal defaults, `text`,
+`boolean`, `uuid`, `jsonb`, `timestamptz` and `timestamp` with their precision,
 `varchar(n)`, `numeric`, `smallint`, `real`, `double precision`, `date`, `time`,
 `interval`, `bytea`, `inet`, arrays of those, enums owned by one column and
 named `<table>_<column>_enum`, single-column foreign keys that reference a
-single-column primary key or `UNIQUE` constraint (columns not named
-`<relation>_id` are declared with `.column("<name>")`, unique targets with
-`.by("<column>")`), junction tables whose primary key is exactly two such
-foreign keys, composite primary keys, single-column unique constraints,
-single-column btree indexes named `<table>_<column>_idx` and CHECK constraints.
+single-column primary key or `UNIQUE` constraint, with `ON UPDATE CASCADE` or
+`RESTRICT` (columns that do not follow the relation naming are declared with
+`.column("<name>")`, unique targets with `.by("<column>")`), junction tables
+whose primary key is exactly two such foreign keys, composite primary keys,
+single-column unique constraints, single-column btree indexes named
+`<table>_<column>_idx` and CHECK constraints.
 
 Everything else is approximated and listed, with a `// pull:` comment on the
 affected line and an entry in the command's review list (`warnings` in `--json`,
@@ -2101,16 +2209,33 @@ each with a `code` and often a `fix`):
 - Serial columns keep their `nextval()` default; a migration from the pulled
   schema will not create the sequence, so the fix converts them to identity.
 - `GENERATED BY DEFAULT` identities are declared as `GENERATED ALWAYS`.
-- Types without a builder (`money`, `timestamp without time zone`, ranges, …)
-  and enums that are shared or named differently go through `customType()` with
-  a passthrough codec, which hands over driver-native values.
-- Composite, deferrable, cross-schema or `ON UPDATE` foreign keys and foreign
-  keys to columns without a primary-key or `UNIQUE` constraint stay plain
-  columns.
+- Types without a builder (`money`, ranges, …) and enums that are shared or
+  named differently go through `customType()` with a passthrough codec, which
+  hands over driver-native values.
+- A column made unique by a unique index named like the constraint
+  (`User_email_key`, as Prisma does) is declared `.unique`; the fix
+  `ADD CONSTRAINT … UNIQUE USING INDEX …` turns the index into that constraint
+  in place, without rebuilding it.
+- Composite, deferrable or cross-schema foreign keys, `ON UPDATE SET NULL` /
+  `SET DEFAULT`, and foreign keys to columns without a primary-key or `UNIQUE`
+  constraint stay plain columns.
 - Multi-column unique constraints, exclusion constraints, expression and partial
   indexes, generated columns and partitions are reported but not declared.
-- Names that cannot be produced from a camelCase key (uppercase letters, double
-  or leading underscores) are left out as comments.
+- Views, materialized views and triggers are listed: the schema neither declares
+  nor manages them, so migrations leave them alone.
+- Prisma's `_prisma_migrations` history table is skipped and listed.
+
+#### Moving from Prisma
+
+Point `pull` at the database Prisma manages. The result declares
+`casing: "preserve"`, every table with `.named("User")`, `timestamp(3)` dates,
+`.onUpdate.cascade` relations and `.unique` columns, so queries run against the
+existing tables right away. `drift` then lists only what the warnings announced:
+each `User_email_key`-style unique index (fixed by the suggested
+`ADD CONSTRAINT … USING INDEX`), `SERIAL` ids (the fix converts them to identity
+columns, which keeps their values) and `_prisma_migrations`. Apply the fixes you
+accept, run `pull` again, then `generate initial` and `adopt` so Symmetria owns
+the migrations from there.
 
 After pulling, point the config at the module, run `drift` until only intended
 findings remain, then `generate initial` and `adopt`. Programmatically,

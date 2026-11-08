@@ -7,6 +7,7 @@ import {
   numeric,
   coalesce,
   prepare,
+  type Decimal,
 } from "../../../packages/runtime/src";
 import { testDatabase } from "../../support/postgres";
 
@@ -23,7 +24,7 @@ const model = schema({
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 const preciseValues = {
   scores: [9007199254740993n, -9007199254740995n],
-  amounts: ["123456789012345.1234567890", "-0.0000000001"],
+  amounts: ["123456789012345.1234567890", "-0.0000000001"] as Decimal[],
   labels: ['quoted"', "back\\slash"],
 };
 const expected = [

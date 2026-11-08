@@ -12,6 +12,8 @@ import {
   inet,
   int,
   text,
+  timestamp,
+  timestamptz,
 } from "../../../packages/runtime/src";
 import { codecFor } from "../../../packages/runtime/src/query/codecs";
 import { postgresArrayLiteral } from "../../../packages/runtime/src/query/compile/postgres/values";
@@ -115,4 +117,28 @@ test("type normalization treats time precision and aliases alike", () => {
   );
   expect(normalizeSqlType("double precision")).toBe("double precision");
   expect(normalizeSqlType("float8[]")).toBe("double precision[]");
+});
+
+test("timestamp builders take a precision and read zone-less values as UTC", () => {
+  expect(timestamp.definition.sqlType).toBe("timestamp");
+  expect(timestamp(3).definition.sqlType).toBe("timestamp(3)");
+  expect(timestamptz(6).now.definition).toMatchObject({
+    sqlType: "timestamptz(6)",
+    default: { kind: "sql", sql: "now()" },
+  });
+  expect(() => timestamp(7)).toThrow(/between 0 and 6/);
+
+  const codec = codecFor("timestamp(3)")!;
+  const instant = new Date("2024-01-31T12:00:00.123Z");
+
+  // Text from node-postgres, JSON from nested results, and a Bun Date all agree.
+  expect(codec.decode("2024-01-31 12:00:00.123")).toEqual(instant);
+  expect(codec.decode("2024-01-31T12:00:00.123")).toEqual(instant);
+  expect(codec.decode(instant)).toBe(instant);
+  expect(codec.encode(instant as never)).toBe("2024-01-31T12:00:00.123Z");
+  expect(() => codec.decode("infinity")).toThrow(/cannot represent/);
+  expect(codecFor("timestamptz(3)")!.encode(instant as never)).toBe(instant);
+  expect(normalizeSqlType("timestamp(3)")).toBe(
+    normalizeSqlType("timestamp(3) without time zone"),
+  );
 });

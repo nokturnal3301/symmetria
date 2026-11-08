@@ -17,7 +17,12 @@ export const constraintDrift = async (
     name: string;
     kind: string;
     columns?: string[];
-    reference?: { table: string; column: string; onDelete: string };
+    reference?: {
+      table: string;
+      column: string;
+      onDelete: string;
+      onUpdate?: string;
+    };
     expression?: string;
   }[] = [
     ...(table.primaryKey.length
@@ -103,7 +108,8 @@ export const constraintDrift = async (
           JSON.stringify(live.reference_columns) !==
             JSON.stringify([constraint.reference.column]) ||
           live.on_delete !== actions[constraint.reference.onDelete] ||
-          live.on_update !== "a" ||
+          live.on_update !==
+            actions[constraint.reference.onUpdate ?? "no action"] ||
           live.match !== "s")) ||
       (constraint.expression &&
         (!live.expression ||

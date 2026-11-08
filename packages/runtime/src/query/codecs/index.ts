@@ -166,6 +166,9 @@ export const arrayCodec = (
   ...(element ? { element } : {}),
 });
 
+/** A timestamp without zone as PostgreSQL prints it in text and JSON. */
+const LOCAL_TIMESTAMP = /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d(:\d\d(\.\d+)?)?$/;
+
 export const codecFor = (sqlType: string): RuntimeCodec | undefined => {
   if (sqlType.endsWith("[]")) {
     const elementType = sqlType.slice(0, -2);
@@ -210,15 +213,29 @@ export const codecFor = (sqlType: string): RuntimeCodec | undefined => {
     };
   }
 
-  if (sqlType === "timestamptz" || sqlType === "timestamp") {
+  const zoned = /^timestamptz(\(\d\))?$/.test(sqlType);
+
+  if (zoned || /^timestamp(\(\d\))?$/.test(sqlType)) {
     return {
-      encode: (value) => value,
+      // Without a time zone, values are UTC: a Date is sent as its ISO text,
+      // which PostgreSQL stores as that wall-clock time.
+      encode: zoned
+        ? (value) => value
+        : (value) =>
+            (value as unknown) instanceof Date
+              ? (value as unknown as Date).toISOString()
+              : value,
       decode: (value) => {
         if (value instanceof Date) {
           return value;
         }
 
-        const date = new Date(value as string);
+        const text = String(value);
+        const date = new Date(
+          !zoned && LOCAL_TIMESTAMP.test(text)
+            ? `${text.replace(" ", "T")}Z`
+            : text,
+        );
 
         // PostgreSQL's infinity and -infinity have no Date representation;
         // node-postgres hands them over as ±Infinity. Fail loudly instead of

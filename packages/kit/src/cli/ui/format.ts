@@ -19,7 +19,7 @@ const columnLabel = (column: MigrationColumn): string =>
     column.unique ? "unique" : "",
     column.default === undefined ? "" : `default ${column.default}`,
     column.references
-      ? `→ ${column.references.table}.${column.references.column} ON DELETE ${column.references.onDelete}`
+      ? `→ ${column.references.table}.${column.references.column} ON DELETE ${column.references.onDelete}${column.references.onUpdate ? ` ON UPDATE ${column.references.onUpdate}` : ""}`
       : "",
   ]
     .filter(Boolean)

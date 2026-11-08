@@ -24,6 +24,7 @@ import {
   table,
   index,
   type CompiledQuery,
+  type Decimal,
 } from "../../../packages/runtime/src";
 
 const model = schema({
@@ -58,12 +59,12 @@ test("INSERT compiles defaults, nullable omissions and heterogeneous bulk rows",
     ])
     .returning((posts) => [posts.id, posts.title]);
   expect(query.toSQL()).toEqual({
-    sql: 'INSERT INTO "posts" AS "posts"\n("title", "views", "metadata", "author_id") VALUES ($1, $2, $3::text::jsonb, $4), ($5, DEFAULT, DEFAULT, $6)\nRETURNING "posts"."id" AS "id", "posts"."title" AS "title"',
+    sql: 'INSERT INTO "posts" AS "posts"\n("title", "author_id", "views", "metadata") VALUES ($1, $2, $3, $4::text::jsonb), ($5, $6, DEFAULT, DEFAULT)\nRETURNING "posts"."id" AS "id", "posts"."title" AS "title"',
     parameters: [
       "first",
+      3,
       "9007199254740993",
       '{"tags":["sql"]}',
-      3,
       "second",
       3,
     ],
@@ -156,8 +157,8 @@ test("undefined write fields are omitted like undefined query options", () => {
       ])
       .toSQL(),
   ).toEqual({
-    sql: 'INSERT INTO "posts" AS "posts"\n("title", "views", "author_id") VALUES ($1, DEFAULT, $2), ($3, $4, $5)',
-    parameters: ["a", 1, "b", "2", 1],
+    sql: 'INSERT INTO "posts" AS "posts"\n("title", "author_id", "views") VALUES ($1, $2, DEFAULT), ($3, $4, $5)',
+    parameters: ["a", 1, "b", 1, "2"],
   });
   expect(
     model.users
@@ -1093,6 +1094,6 @@ const returned = model.users
 type ReturningMatches = Expect<
   AreEqual<
     Awaited<ReturnType<typeof returned.execute>>,
-    { id: number; balance: string }
+    { id: number; balance: Decimal }
   >
 >;

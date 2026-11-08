@@ -40,7 +40,7 @@ export const foreignKeySQL = (
 ): string => {
   const reference = column.references!;
 
-  return `ALTER TABLE ${quoteIdentifier(table.name)} ADD CONSTRAINT ${quoteIdentifier(objectName(table.name, column.name, "fkey"))} FOREIGN KEY (${quoteIdentifier(column.name)}) REFERENCES ${quoteIdentifier(reference.table)} (${quoteIdentifier(reference.column)}) ON DELETE ${reference.onDelete.toUpperCase()}`;
+  return `ALTER TABLE ${quoteIdentifier(table.name)} ADD CONSTRAINT ${quoteIdentifier(objectName(table.name, column.name, "fkey"))} FOREIGN KEY (${quoteIdentifier(column.name)}) REFERENCES ${quoteIdentifier(reference.table)} (${quoteIdentifier(reference.column)}) ON DELETE ${reference.onDelete.toUpperCase()}${reference.onUpdate ? ` ON UPDATE ${reference.onUpdate.toUpperCase()}` : ""}`;
 };
 
 export const tableSQL = (table: MigrationTable): string => {

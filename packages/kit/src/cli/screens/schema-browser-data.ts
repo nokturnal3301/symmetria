@@ -76,7 +76,7 @@ export const inspectEntries = (
             ? `Values: ${column.enumerationValues.join(" · ")}`
             : "",
           column.references
-            ? `→ ${column.references.table}.${column.references.column} · ON DELETE ${column.references.onDelete.toUpperCase()}\nEnter to follow this foreign key`
+            ? `→ ${column.references.table}.${column.references.column} · ON DELETE ${column.references.onDelete.toUpperCase()}${column.references.onUpdate ? ` · ON UPDATE ${column.references.onUpdate.toUpperCase()}` : ""}\nEnter to follow this foreign key`
             : "",
         ]
           .filter(Boolean)

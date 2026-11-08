@@ -54,6 +54,7 @@ type Table = {
 const catalog = (
   tables: Table[],
   enumerations: { name: string; values: string[] }[] = [],
+  undeclared: PullCatalog["undeclared"] = [],
 ): PullCatalog => {
   const constraints: CatalogConstraint[] = [];
   const constraint = (
@@ -132,6 +133,7 @@ const catalog = (
 
   return {
     schemaName: "public",
+    undeclared,
     tables: sorted.map((table) => ({ name: table.name })),
     details: sorted.map((table) => ({
       name: table.name,
@@ -714,12 +716,15 @@ describe("pull: tables and relations", () => {
       members(model, "logins")
         .filter((member) => member.kind === "column")
         .map((member) => member.key),
-    ).toEqual(["id", "userId", "editorId", "otherId"]);
+    ).toEqual(["id", "userId", "otherId"]);
     expect(reasons).toEqual([
       expect.stringContaining("differs from the referenced key"),
-      expect.stringContaining("ON UPDATE"),
       expect.stringContaining("deferrable"),
     ]);
+    // ON UPDATE CASCADE, Prisma's default, is declared.
+    expect(renderSchema(model)).toContain(
+      'editor: users.onDelete.noAction.onUpdate.cascade.inverse("loginsByEditor"),',
+    );
     expect(renderSchema(model)).toContain(
       'owner: users.column("owner").onDelete.noAction,',
     );
@@ -866,15 +871,17 @@ describe("pull: tables and relations", () => {
       ]),
     );
 
+    // Names a key cannot produce are declared with .named().
     expect(model.tables.map((table) => table.sqlName)).toEqual([
       "events",
       "loose",
+      "Measurements",
       "strict",
     ]);
     expect(model.skippedTables.map((table) => table.sqlName).sort()).toEqual([
-      "Measurements",
       "events_2026",
     ]);
+    expect(renderSchema(model)).toContain('.named("Measurements")');
     expect(members(model, "loose").map((member) => member.key)).toEqual([
       "label",
     ]);
@@ -883,9 +890,7 @@ describe("pull: tables and relations", () => {
     ).toHaveLength(1);
     expect(
       model.warnings.map((warning) => String(warning.code)).sort(),
-    ).toEqual(
-      ["name", "partition", "partition", "primary-key", "primary-key"].sort(),
-    );
+    ).toEqual(["partition", "partition", "primary-key", "primary-key"].sort());
   });
 
   test("indexes are declared with ordering, INCLUDE, predicates, methods and exact names", () => {
@@ -950,6 +955,7 @@ describe("pull: tables and relations", () => {
       "meta",
       "titlePattern",
       "codeUnique",
+      "odd",
     ]);
     expect(posts.indexes[0]).toMatchObject({
       keys: [
@@ -1000,7 +1006,7 @@ describe("pull: tables and relations", () => {
       model.warnings
         .filter((warning) => warning.code === "index")
         .map((warning) => warning.object),
-    ).toEqual(["Posts_Odd", "posts_odd_idx", "posts_hash_two_idx"]);
+    ).toEqual(["Posts_Odd", "posts_hash_two_idx"]);
     expect(
       model.warnings.find((warning) => warning.code === "unique-constraint")
         ?.fix,
@@ -1062,4 +1068,131 @@ describe("pull: tables and relations", () => {
         onDelete: "cascade",
       });
     }));
+
+  test("a Prisma database keeps its names, keys and timestamps", () => {
+    const model = buildPulledSchema(
+      catalog(
+        [
+          {
+            name: "_prisma_migrations",
+            primaryKey: ["id"],
+            columns: [{ name: "id", type: "character varying(36)" }],
+          },
+          {
+            name: "User",
+            primaryKey: { name: "User_pkey", columns: ["id"] },
+            columns: [
+              { name: "id", type: "integer", identity: "a" },
+              { name: "email", type: "text" },
+              {
+                name: "createdAt",
+                type: "timestamp(3) without time zone",
+                default: "CURRENT_TIMESTAMP",
+              },
+              { name: "updatedAt", type: "timestamp(3) without time zone" },
+            ],
+            indexes: [
+              { name: "User_email_key", keys: ["email"], is_unique: true },
+            ],
+          },
+          {
+            name: "Post",
+            primaryKey: { name: "Post_pkey", columns: ["id"] },
+            columns: [
+              { name: "id", type: "integer", identity: "a" },
+              { name: "authorId", type: "integer" },
+              { name: "viewCount", type: "integer", default: "0" },
+            ],
+            foreignKeys: [
+              {
+                name: "Post_authorId_fkey",
+                column: "authorId",
+                table: "User",
+                onDelete: "r",
+                onUpdate: "c",
+              },
+            ],
+            indexes: [{ name: "Post_authorId_idx", keys: ['"authorId"'] }],
+          },
+        ],
+        [],
+        [
+          {
+            kind: "view",
+            name: "PublishedPost",
+            table_name: null,
+            definition: "SELECT 1",
+          },
+          {
+            kind: "trigger",
+            name: "User_touch",
+            table_name: "User",
+            definition: "CREATE TRIGGER …",
+          },
+        ],
+      ),
+    );
+    const source = renderSchema(model);
+
+    expect(model.casing).toBe("preserve");
+    expect(model.tables.map((table) => [table.key, table.sqlName])).toEqual([
+      ["post", "Post"],
+      ["user", "User"],
+    ]);
+    expect(source).toContain('    casing: "preserve",');
+    expect(source).toContain('.named("User")');
+    expect(source).toContain(
+      "createdAt: timestamp(3).default(sql`CURRENT_TIMESTAMP`),",
+    );
+    expect(source).toContain("updatedAt: timestamp(3),");
+    expect(source).toContain(
+      'email: text.unique, // pull: unique index "User_email_key" becomes a constraint',
+    );
+    expect(source).toContain("author: user.index.onUpdate.cascade,");
+    expect(source).toContain("viewCount: int.default(0),");
+    expect(model.skippedTables).toEqual([
+      {
+        sqlName: "_prisma_migrations",
+        reason: "Prisma's migration history; Symmetria keeps its own",
+      },
+    ]);
+    expect(
+      model.warnings.map((warning) => [warning.code, warning.object ?? ""]),
+    ).toEqual([
+      ["view", "PublishedPost"],
+      ["trigger", "User_touch"],
+      ["migration-table", ""],
+      ["unique-index", "User_email_key"],
+    ]);
+    expect(
+      model.warnings.find((warning) => warning.code === "unique-index")?.fix,
+    ).toBe(
+      'ALTER TABLE "User" ADD CONSTRAINT "User_email_key" UNIQUE USING INDEX "User_email_key";',
+    );
+  });
+
+  test("mixed names fall back to .named() under either casing", () => {
+    const model = buildPulledSchema(
+      catalog([
+        {
+          name: "order_items",
+          primaryKey: ["id"],
+          columns: [
+            { name: "id", type: "integer", identity: "a" },
+            { name: "unit_price", type: "numeric(10,2)" },
+            { name: "LegacyCode", type: "text", nullable: true },
+            { name: "index", type: "integer" },
+          ],
+        },
+      ]),
+    );
+
+    expect(model.casing).toBe("snake_case");
+    expect(renderSchema(model)).toContain(
+      'legacyCode: text.named("LegacyCode").nullable,',
+    );
+    expect(renderSchema(model)).toContain("unitPrice: numeric(10, 2),");
+    // A key shared with a table method stays usable inside shape callbacks.
+    expect(renderSchema(model)).toContain("index: int,");
+  });
 });

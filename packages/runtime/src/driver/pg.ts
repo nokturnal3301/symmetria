@@ -17,11 +17,34 @@ export type PostgresOptions = Omit<PoolConfig, "types"> & {
 };
 export type { PostgresDriver } from "./pool";
 
+/** `2024-01-31 12:00:00.123` as UTC; infinity and BC dates stay text for the codec to report. */
+const utcTimestamp = (value: string): Date | string =>
+  /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(\.\d+)?$/.test(value)
+    ? new Date(`${value.replace(" ", "T")}Z`)
+    : value;
+
 // Per-pool parsers preserve integer precision without changing pg's global state.
 const parsers: NonNullable<PoolConfig["types"]> = {
   getTypeParser: (oid: number, format) => {
     if (oid === 20 && format !== "binary") {
       return BigInt;
+    }
+
+    // timestamp without time zone is UTC, as Bun.SQL reads it.
+    if (oid === 1114 && format !== "binary") {
+      return utcTimestamp;
+    }
+
+    if (oid === 1115 && format !== "binary") {
+      const parseArray = types.getTypeParser(
+        1009 as Parameters<typeof types.getTypeParser>[0],
+        "text",
+      ) as (value: string) => (string | null)[];
+
+      return (value: string) =>
+        parseArray(value).map((entry) =>
+          entry === null ? null : utcTimestamp(entry),
+        );
     }
 
     // date and interval stay text so both drivers agree; symmetria's codecs

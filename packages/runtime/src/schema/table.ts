@@ -9,7 +9,7 @@
  *   - a Column            → scalar column
  *   - a keyed schema link → FK + relation, including cyclic references
  *   - another table       → FK + relation (`author: users`)
- *   - table.nullable/.unique/.onDelete.* → FK with flags
+ *   - table.nullable, .unique, .onDelete.<action>, .onUpdate.<action> → FK with flags
  *   - a thunk `() => users` → lazy FK (cross-file cycles)
  *   - `self` (with the same chain as tables, e.g. `self.nullable.inverse("children")`) → self-reference
  */
@@ -41,11 +41,14 @@ export declare const TABLE_JUNCTION: unique symbol;
 export declare const TABLE_RELATIONS: unique symbol;
 
 export type OnDeleteAction = "cascade" | "restrict" | "set null" | "no action";
+/** `ON UPDATE` of a foreign key; PostgreSQL's default is `no action`. */
+export type OnUpdateAction = "cascade" | "restrict" | "no action";
 
 export type ReferenceFlags = {
   nullable?: boolean;
   unique?: boolean;
   onDelete?: OnDeleteAction;
+  onUpdate?: OnUpdateAction;
   index?: boolean;
   inverse?: string;
   /** Key of the referenced column when it is not the primary key (`users.by("email")`); must be unique. */
@@ -61,6 +64,8 @@ export type TableState = {
   readonly computedCallbacks: readonly ComputedCallback[];
   readonly relationCallbacks: readonly TableRelationCallback[];
   readonly primaryKey?: readonly string[];
+  /** SQL name set with `.named()`; otherwise the schema key decides it. */
+  readonly named?: string;
   /** Declared with junction(): both foreign keys form the primary key and expose M:N relations. */
   readonly junction: boolean;
   /** Assigned by the schema assembler; public schema() lowers declarations to fresh states. */
@@ -186,6 +191,12 @@ type OnDeleteChain<Columns, Flags extends ReferenceFlags> = {
   readonly noAction: ReferenceChain<Columns, Flags>;
 };
 
+type OnUpdateChain<Columns, Flags extends ReferenceFlags> = {
+  readonly cascade: ReferenceChain<Columns, Flags>;
+  readonly restrict: ReferenceChain<Columns, Flags>;
+  readonly noAction: ReferenceChain<Columns, Flags>;
+};
+
 /** Columns a reference may target: the primary key or a unique column. */
 export type ReferenceableColumnNames<Columns> = {
   [ColumnName in keyof Columns & string]: NonNullable<
@@ -207,6 +218,8 @@ type ReferenceChain<Columns, Flags extends ReferenceFlags> = ReferenceBuilder<
   readonly unique: ReferenceChain<Columns, Flags & { unique: true }>;
   readonly index: ReferenceChain<Columns, Flags & { index: true }>;
   readonly onDelete: OnDeleteChain<Columns, Flags>;
+  /** `ON UPDATE` action, for example `.onUpdate.cascade` as Prisma declares it. */
+  readonly onUpdate: OnUpdateChain<Columns, Flags>;
   readonly inverse: <const Name extends string>(
     name: Name,
   ) => ReferenceChain<Columns, Flags & { inverse: Name }>;
@@ -227,12 +240,19 @@ type SelfOnDeleteChain<Flags extends ReferenceFlags> = {
   readonly noAction: SelfChain<Flags>;
 };
 
+type SelfOnUpdateChain<Flags extends ReferenceFlags> = {
+  readonly cascade: SelfChain<Flags>;
+  readonly restrict: SelfChain<Flags>;
+  readonly noAction: SelfChain<Flags>;
+};
+
 /** The reference chain for `self`; every step stays a SelfReference so the target resolves to its own table. */
 type SelfChain<Flags extends ReferenceFlags> = SelfReference<Flags> & {
   readonly nullable: SelfChain<Flags & { nullable: true }>;
   readonly unique: SelfChain<Flags & { unique: true }>;
   readonly index: SelfChain<Flags & { index: true }>;
   readonly onDelete: SelfOnDeleteChain<Flags>;
+  readonly onUpdate: SelfOnUpdateChain<Flags>;
   readonly inverse: <const Name extends string>(
     name: Name,
   ) => SelfChain<Flags & { inverse: Name }>;
@@ -312,6 +332,8 @@ type ColumnReferences<Columns> = {
     | "inverse"
     | "computed"
     | "relations"
+    | "named"
+    | "onUpdate"
     | "by"
     | "column"
   >]: ColumnReference;
@@ -331,6 +353,11 @@ export type TableHandle<Columns> = Table<Columns> &
         }>;
       }
     >;
+    /**
+     * The table's SQL name when the schema key should not decide it, such as
+     * `"User"` for a table created by Prisma.
+     */
+    readonly named: (sqlName: string) => TableHandle<Columns>;
     readonly relations: <
       const Declarations extends Record<
         string,
@@ -390,6 +417,7 @@ export type TableHandle<Columns> = Table<Columns> &
     readonly nullable: ReferenceChain<Columns, { nullable: true }>;
     readonly unique: ReferenceChain<Columns, { unique: true }>;
     readonly onDelete: OnDeleteChain<Columns, {}>;
+    readonly onUpdate: OnUpdateChain<Columns, {}>;
     readonly inverse: <const Name extends string>(
       name: Name,
     ) => ReferenceChain<Columns, { inverse: Name }>;
@@ -452,6 +480,10 @@ const referenceChain = (
     get: () => onDeleteChain(target, flags),
     enumerable: false,
   });
+  Object.defineProperty(reference, "onUpdate", {
+    get: () => onUpdateChain(target, flags),
+    enumerable: false,
+  });
   Object.defineProperty(reference, "inverse", {
     value: (name: string) =>
       referenceChain(target, { ...flags, inverse: name }),
@@ -502,6 +534,27 @@ const onDeleteChain = (
   });
 };
 
+const ON_UPDATE_ACTIONS = new Map<string, OnUpdateAction>([
+  ["cascade", "cascade"],
+  ["restrict", "restrict"],
+  ["noAction", "no action"],
+]);
+
+const onUpdateChain = (
+  target: ReferenceInput["target"],
+  flags: ReferenceFlags,
+): Record<string, ReferenceInput> =>
+  new Proxy({} as Record<string, ReferenceInput>, {
+    get: (_target, key) => {
+      const action =
+        typeof key === "string" ? ON_UPDATE_ACTIONS.get(key) : undefined;
+
+      return action
+        ? referenceChain(target, { ...flags, onUpdate: action })
+        : undefined;
+    },
+  });
+
 /**
  * A binding over a table that is not assembled yet: references appear as
  * `${name}Id` columns. primaryKey() and relations() discovery run their
@@ -531,30 +584,40 @@ const REFERENCE_MODIFIERS = new Set([
   "unique",
   "index",
   "onDelete",
+  "onUpdate",
   "inverse",
   "by",
   "column",
 ]);
 
-const createTable = (
-  columns: Record<string, unknown>,
-  indexCallbacks: readonly TableIndexCallback[],
-  checkCallbacks: readonly TableCheckCallback[] = [],
-  primaryKey?: readonly string[],
-  computedCallbacks: readonly ComputedCallback[] = [],
-  junction = false,
-  relationCallbacks: readonly TableRelationCallback[] = [],
-): object => {
+/** The declaration part of a table's state; the assembler adds key and sqlName. */
+type TableInit = Omit<TableState, "key" | "sqlName">;
+
+const createTable = (init: TableInit): object => {
   const state: TableState = {
-    columns: Object.freeze({ ...columns }),
-    indexCallbacks: Object.freeze([...indexCallbacks]),
-    checkCallbacks: Object.freeze([...checkCallbacks]),
-    computedCallbacks: Object.freeze([...computedCallbacks]),
-    relationCallbacks: Object.freeze([...relationCallbacks]),
-    junction,
-    ...(primaryKey ? { primaryKey: Object.freeze([...primaryKey]) } : {}),
+    columns: Object.freeze({ ...init.columns }),
+    indexCallbacks: Object.freeze([...init.indexCallbacks]),
+    checkCallbacks: Object.freeze([...init.checkCallbacks]),
+    computedCallbacks: Object.freeze([...init.computedCallbacks]),
+    relationCallbacks: Object.freeze([...init.relationCallbacks]),
+    junction: init.junction,
+    ...(init.primaryKey
+      ? { primaryKey: Object.freeze([...init.primaryKey]) }
+      : {}),
+    ...(init.named !== undefined ? { named: init.named } : {}),
   };
   const target = { [TABLE]: state };
+  const next = (changes: Partial<TableInit>) =>
+    createTable({ ...state, ...changes });
+  const callbackMethod =
+    (name: string, add: (callback: never) => Partial<TableInit>) =>
+    (callback: never) => {
+      if (typeof callback !== "function") {
+        throw new Error(`symmetria: ${name}() expects a callback`);
+      }
+
+      return next(add(callback));
+    };
 
   return new Proxy(target, {
     get: (proxyTarget, key) => {
@@ -567,74 +630,39 @@ const createTable = (
       }
 
       if (key === "indexes") {
-        return (callback: TableIndexCallback) => {
-          if (typeof callback !== "function") {
-            throw new Error("symmetria: indexes() expects a callback");
-          }
-
-          return createTable(
-            state.columns,
-            [...state.indexCallbacks, callback],
-            state.checkCallbacks,
-            state.primaryKey,
-            state.computedCallbacks,
-            state.junction,
-            state.relationCallbacks,
-          );
-        };
+        return callbackMethod("indexes", (callback: TableIndexCallback) => ({
+          indexCallbacks: [...state.indexCallbacks, callback],
+        }));
       }
 
       if (key === "checks") {
-        return (callback: TableCheckCallback) => {
-          if (typeof callback !== "function") {
-            throw new Error("symmetria: checks() expects a callback");
-          }
-
-          return createTable(
-            state.columns,
-            state.indexCallbacks,
-            [...state.checkCallbacks, callback],
-            state.primaryKey,
-            state.computedCallbacks,
-            state.junction,
-            state.relationCallbacks,
-          );
-        };
+        return callbackMethod("checks", (callback: TableCheckCallback) => ({
+          checkCallbacks: [...state.checkCallbacks, callback],
+        }));
       }
 
       if (key === "computed") {
-        return (callback: ComputedCallback) => {
-          if (typeof callback !== "function") {
-            throw new Error("symmetria: computed() expects a callback");
-          }
-
-          return createTable(
-            state.columns,
-            state.indexCallbacks,
-            state.checkCallbacks,
-            state.primaryKey,
-            [...state.computedCallbacks, callback],
-            state.junction,
-            state.relationCallbacks,
-          );
-        };
+        return callbackMethod("computed", (callback: ComputedCallback) => ({
+          computedCallbacks: [...state.computedCallbacks, callback],
+        }));
       }
 
       if (key === "relations") {
-        return (callback: TableRelationCallback) => {
-          if (typeof callback !== "function") {
-            throw new Error("symmetria: relations() expects a callback");
+        return callbackMethod(
+          "relations",
+          (callback: TableRelationCallback) => ({
+            relationCallbacks: [...state.relationCallbacks, callback],
+          }),
+        );
+      }
+
+      if (key === "named") {
+        return (sqlName: string) => {
+          if (typeof sqlName !== "string" || !sqlName) {
+            throw new Error("symmetria: named() expects the table's SQL name");
           }
 
-          return createTable(
-            state.columns,
-            state.indexCallbacks,
-            state.checkCallbacks,
-            state.primaryKey,
-            state.computedCallbacks,
-            state.junction,
-            [...state.relationCallbacks, callback],
-          );
+          return next({ named: sqlName });
         };
       }
 
@@ -681,15 +709,7 @@ const createTable = (
             throw new Error("symmetria: duplicate primary-key column");
           }
 
-          return createTable(
-            state.columns,
-            state.indexCallbacks,
-            state.checkCallbacks,
-            names,
-            state.computedCallbacks,
-            state.junction,
-            state.relationCallbacks,
-          );
+          return next({ primaryKey: names });
         };
       }
 
@@ -697,6 +717,10 @@ const createTable = (
       if (REFERENCE_MODIFIERS.has(key)) {
         if (key === "onDelete") {
           return onDeleteChain(state, {});
+        }
+
+        if (key === "onUpdate") {
+          return onUpdateChain(state, {});
         }
 
         if (key === "inverse") {
@@ -733,6 +757,7 @@ const createTable = (
         key === "primaryKey" ||
         key === "computed" ||
         key === "relations" ||
+        key === "named" ||
         (typeof key === "string" && key in state.columns) ||
         Reflect.has(proxyTarget, key)
       );
@@ -746,7 +771,14 @@ export const table = <
 >(
   columns: ColumnDefinitions,
 ): TableHandle<ColumnDefinitions> =>
-  createTable(columns, []) as TableHandle<ColumnDefinitions>;
+  createTable({
+    columns,
+    indexCallbacks: [],
+    checkCallbacks: [],
+    computedCallbacks: [],
+    relationCallbacks: [],
+    junction: false,
+  }) as TableHandle<ColumnDefinitions>;
 
 /**
  * Explicit many-to-many link table: exactly two references form a composite primary
@@ -777,15 +809,14 @@ export const junction = <
     );
   }
 
-  return createTable(
+  return createTable({
     columns,
-    [],
-    [],
-    undefined,
-    [],
-    true,
-    [],
-  ) as JunctionHandle<ColumnDefinitions>;
+    indexCallbacks: [],
+    checkCallbacks: [],
+    computedCallbacks: [],
+    relationCallbacks: [],
+    junction: true,
+  }) as JunctionHandle<ColumnDefinitions>;
 };
 
 /** Self-reference marker: `parent: self.nullable.onDelete.cascade.inverse("children")`. */

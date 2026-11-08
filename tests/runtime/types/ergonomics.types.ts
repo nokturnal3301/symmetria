@@ -9,6 +9,7 @@ import {
   timestamptz,
   index,
   prepare,
+  type Decimal,
 } from "../../../packages/runtime/src";
 
 type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -63,8 +64,8 @@ type Grouped = Expect<
     Awaited<typeof grouped>,
     {
       name: string;
-      total: string | null;
-      average: string | null;
+      total: Decimal | null;
+      average: Decimal | null;
       last: Date | null;
       title: string | null;
     }[]

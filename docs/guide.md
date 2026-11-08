@@ -37,8 +37,10 @@ export const model = schema({ users, posts });
 column and an `author` relationship. `editor` is optional, so `editorId` can be
 `null`. The inverse name distinguishes a user's edited posts from authored
 posts. Existing databases rarely follow one convention: `users.by("email")`
-references a unique column instead of the primary key and
-`users.column("created_by")` keeps a legacy column name.
+references a unique column instead of the primary key,
+`users.column("created_by")` keeps a legacy column name, `.named("User")` sets
+any table or column name, and `schema(…, { casing: "preserve" })` keeps
+camelCase keys as SQL names, as databases created by Prisma use them.
 
 ```ts
 // database.ts

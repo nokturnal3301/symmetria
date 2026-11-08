@@ -3,6 +3,8 @@ import {
   COLUMN_EXPRESSION,
   type ExpressionValue,
   type Ordering,
+  type Decimal,
+  type SkippedPredicate,
   type Predicate,
   type QueryColumn,
   type ScalarQuery,
@@ -114,7 +116,7 @@ type AggregateFields<
       ? Key
       : never
     : Key]: QueryColumn<
-    Name extends "sum" | "average" ? string | null : Row[Key] | null,
+    Name extends "sum" | "average" ? Decimal | null : Row[Key] | null,
     Name
   >;
 };
@@ -203,13 +205,13 @@ type RelationQuery<
     selector: (
       columns: RelatedColumns<Rows, Relations, Target>,
     ) => SelectedColumn<number | bigint | string | null>,
-  ) => QueryColumn<string | null, "sum">) &
+  ) => QueryColumn<Decimal | null, "sum">) &
     AggregateFields<Rows[Target], "sum">;
   readonly average: ((
     selector: (
       columns: RelatedColumns<Rows, Relations, Target>,
     ) => SelectedColumn<number | bigint | string | null>,
-  ) => QueryColumn<string | null, "average">) &
+  ) => QueryColumn<Decimal | null, "average">) &
     AggregateFields<Rows[Target], "average">;
   readonly minimum: (<Value>(
     selector: (
@@ -380,7 +382,8 @@ export type ProjectionRow<Selection extends Projection> =
       };
 /** Query options; every value may also be a callback over the projection's source and tools. */
 /** A predicate list; `undefined`, `null` and `false` entries are skipped, so optional filters need no branching. */
-export type PredicateList = readonly (Predicate | undefined | null | false)[];
+/** Predicates combined with AND; falsy entries (`q && …` with an empty `q`) are skipped. */
+export type PredicateList = readonly (Predicate | SkippedPredicate)[];
 export type ShapeControls = {
   readonly where?: Predicate | PredicateList;
   readonly orderBy?: Ordering | readonly [Ordering, ...Ordering[]];

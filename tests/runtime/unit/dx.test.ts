@@ -51,7 +51,7 @@ test("numeric and varchar work bare and called", () => {
     model.posts
       .insert({ title: "x", authorId: 1, price: "1.50", code: "a" })
       .toSQL().parameters,
-  ).toEqual(["x", "1.50", "a", 1]);
+  ).toEqual(["x", 1, "1.50", "a"]);
 });
 
 test("a column builder passed without a call is explained", () => {

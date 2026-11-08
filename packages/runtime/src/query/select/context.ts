@@ -3,7 +3,6 @@ import { freeze } from "../plan/freeze";
 import type { TableSnapshot } from "../../schema/assembly";
 import { isSilentMember, unknownMember } from "./suggest";
 
-const memberNameCache = new WeakMap<TableSnapshot, readonly string[]>();
 import { booleanCodec } from "../codecs";
 import { quoteIdentifier } from "../compile";
 import { derivedBinding } from "../plan/derived";
@@ -43,6 +42,7 @@ import {
 import { applyShape } from "./shape";
 import { RELATION_SOURCE, type RuntimeScope } from "./types";
 
+const memberNameCache = new WeakMap<TableSnapshot, readonly string[]>();
 const aggregatePrototypes = new WeakMap<TableSnapshot, object>();
 
 export const createContext = (

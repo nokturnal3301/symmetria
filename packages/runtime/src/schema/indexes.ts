@@ -24,7 +24,7 @@ import type {
   QueryExecutor,
   TableBinding,
 } from "../query/plan/types";
-import { snakeCase, type SchemaSnapshot } from "./assembly";
+import { sqlKey, type SchemaSnapshot } from "./assembly";
 
 const INDEX_DEFINITION = Symbol("symmetria.index");
 const OPERATOR_CLASS = Symbol("symmetria.index.opclass");
@@ -271,8 +271,8 @@ export const applyIndexes = (
     quoteIdentifier(name);
     const sqlName =
       tableName === undefined
-        ? snakeCase(name)
-        : `${bindings[tableName]!.table.sqlName}_${snakeCase(name)}_idx`;
+        ? sqlKey(name, snapshot.casing)
+        : `${bindings[tableName]!.table.sqlName}_${sqlKey(name, snapshot.casing)}_idx`;
     quoteIdentifier(sqlName);
 
     if (names.has(sqlName)) {

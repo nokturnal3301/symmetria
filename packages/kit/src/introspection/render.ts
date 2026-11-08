@@ -2,6 +2,7 @@
  * Renders a pulled schema as TypeScript source in the keyed-callback schema() form,
  * importing only the builders it uses and marking approximations with `// pull:`.
  */
+import { sqlKey, type Casing } from "symmetria";
 import { escapeTemplate, quoteString } from "./names";
 import type {
   ColumnType,
@@ -54,6 +55,7 @@ const IMPORT_ORDER = [
   "table",
   "text",
   "time",
+  "timestamp",
   "timestamptz",
   "tsvector",
   "uuid",
@@ -65,7 +67,11 @@ const typeSource = (type: ColumnType, imports: Set<string>): string => {
     case "builder":
       imports.add(type.name);
 
-      return type.name === "jsonb" ? "jsonb<unknown>()" : type.name;
+      return type.name === "jsonb"
+        ? "jsonb<unknown>()"
+        : type.precision === undefined
+          ? type.name
+          : `${type.name}(${type.precision})`;
     case "varchar":
       imports.add("varchar");
 
@@ -95,11 +101,19 @@ const typeSource = (type: ColumnType, imports: Set<string>): string => {
   }
 };
 
-const columnSource = (column: PulledColumn, imports: Set<string>): string => {
+const columnSource = (
+  column: PulledColumn,
+  imports: Set<string>,
+  casing: Casing,
+): string => {
   let source = typeSource(column.type, imports);
 
   if (column.array) {
     source += ".array";
+  }
+
+  if (sqlKey(column.key, casing) !== column.sqlName) {
+    source += `.named(${quoteString(column.sqlName)})`;
   }
 
   switch (column.default?.kind) {
@@ -175,6 +189,10 @@ const referenceSource = (reference: PulledReference): string => {
     source += `.onDelete.${reference.onDelete}`;
   }
 
+  if (reference.onUpdate) {
+    source += `.onUpdate.${reference.onUpdate}`;
+  }
+
   if (reference.inverse) {
     source += `.inverse(${quoteString(reference.inverse)})`;
   }
@@ -185,8 +203,12 @@ const referenceSource = (reference: PulledReference): string => {
 const comment = (notes: readonly string[]): string =>
   notes.length ? ` // pull: ${notes.join("; ")}` : "";
 
-const memberLine = (member: PulledMember, imports: Set<string>): string =>
-  `${member.key}: ${member.kind === "column" ? columnSource(member, imports) : referenceSource(member)},${comment(member.comments)}`;
+const memberLine = (
+  member: PulledMember,
+  imports: Set<string>,
+  casing: Casing,
+): string =>
+  `${member.key}: ${member.kind === "column" ? columnSource(member, imports, casing) : referenceSource(member)},${comment(member.comments)}`;
 
 const keySource = (
   key: IndexKeySource,
@@ -261,7 +283,11 @@ const indexSource = (
   return source;
 };
 
-const tableSource = (table: PulledTable, imports: Set<string>): string[] => {
+const tableSource = (
+  table: PulledTable,
+  imports: Set<string>,
+  casing: Casing,
+): string[] => {
   const targets = [
     ...new Set(
       table.members
@@ -277,7 +303,9 @@ const tableSource = (table: PulledTable, imports: Set<string>): string[] => {
   imports.add(constructor);
   const body = [
     ...table.comments.map((note) => `${indent}// pull: ${note}`),
-    ...table.members.map((member) => `${indent}${memberLine(member, imports)}`),
+    ...table.members.map(
+      (member) => `${indent}${memberLine(member, imports, casing)}`,
+    ),
     ...table.skipped.map(
       (column) =>
         `${indent}// ${column.sqlName} ${column.dataType}: pull: ${column.reason}`,
@@ -285,6 +313,10 @@ const tableSource = (table: PulledTable, imports: Set<string>): string[] => {
   ];
   // Chain links are rendered as line arrays so outer indentation applies to every line.
   const chain: string[][] = [];
+
+  if (sqlKey(table.key, casing) !== table.sqlName) {
+    chain.push([`.named(${quoteString(table.sqlName)})`]);
+  }
 
   if (table.primaryKey) {
     chain.push([
@@ -354,7 +386,9 @@ export const renderSchema = (
   const exportName = options.exportName ?? "appSchema";
   const module = options.module ?? "symmetria";
   const imports = new Set<string>(["schema"]);
-  const tables = model.tables.flatMap((table) => tableSource(table, imports));
+  const tables = model.tables.flatMap((table) =>
+    tableSource(table, imports, model.casing),
+  );
   // Schema-level indexes contribute imports too, so render them before the import line.
   for (const { table, index } of model.schemaIndexes) {
     indexSource(index, table, imports);
@@ -373,6 +407,7 @@ export const renderSchema = (
       `      ${/^[a-z_][a-z0-9_]*$/i.test(index.key) ? index.key : quoteString(index.key)}: ${indexSource(index, table, imports)},${comment(index.comments)}`,
   );
   const optionLines = [
+    ...(model.casing === "preserve" ? [`    casing: "preserve",`] : []),
     ...(model.extensions.length
       ? [`    extensions: [${model.extensions.map(quoteString).join(", ")}],`]
       : []),

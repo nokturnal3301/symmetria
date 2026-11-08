@@ -26,12 +26,14 @@ import {
   tableState,
   type ColumnReference,
   type OnDeleteAction,
+  type OnUpdateAction,
   type ReferenceFlags,
   type ReferenceInput,
   type TableState,
   type Table,
 } from "./table";
 import { applyIndexes, index, type IndexSnapshot } from "./indexes";
+import { quoteIdentifier } from "../query/compile";
 import { applyChecks, type CheckSnapshot } from "./checks";
 
 export type ColumnSnapshot = {
@@ -43,7 +45,13 @@ export type ColumnSnapshot = {
   primaryKey: boolean;
   default?: ColumnDefault;
   enumerationValues?: readonly string[];
-  references?: { table: string; column: string; onDelete: OnDeleteAction };
+  references?: {
+    table: string;
+    column: string;
+    onDelete: OnDeleteAction;
+    /** Present only when it differs from PostgreSQL's default `no action`. */
+    onUpdate?: Exclude<OnUpdateAction, "no action">;
+  };
 };
 
 export type RelationSnapshot =
@@ -105,7 +113,20 @@ export type SchemaSnapshot = {
   tables: TableSnapshot[];
   /** Extensions the schema relies on, sorted; absent when none are declared. */
   extensions?: readonly string[];
+  /** `"preserve"` when keys are SQL names as written; absent for snake_case. */
+  casing?: "preserve";
 };
+
+/**
+ * How schema keys become SQL names: `"snake_case"` (default) turns `createdAt`
+ * into `created_at` and `author` into `author_id`; `"preserve"` keeps keys as
+ * written (`createdAt`, `authorId`), the convention of Prisma-created databases.
+ */
+export type Casing = "snake_case" | "preserve";
+
+/** The SQL name a key produces under a casing. */
+export const sqlKey = (key: string, casing?: Casing | "preserve"): string =>
+  casing === "preserve" ? key : snakeCase(key);
 
 export type SchemaOverrides<SchemaDefinition> = Partial<
   Record<keyof SchemaDefinition & string, Record<string, ColumnReference>>
@@ -149,6 +170,7 @@ type AnalyzedTable = {
 const referencedColumn = (
   table: AnalyzedTable,
   reference: ResolvedReference,
+  casing: Casing,
 ): NonNullable<ResolvedReference["targetColumn"]> => {
   const { by } = reference.flags;
 
@@ -181,7 +203,7 @@ const referencedColumn = (
 
   return {
     key: scalar.key,
-    sqlName: snakeCase(scalar.key),
+    sqlName: scalar.definition.sqlName ?? sqlKey(scalar.key, casing),
     definition: scalar.definition,
   };
 };
@@ -192,7 +214,15 @@ export const assembleSchema = <
   tables: SchemaDefinition,
   overrides: SchemaOverrides<SchemaDefinition> = {},
   conditions: SchemaConditions<SchemaDefinition> = {},
+  casing: Casing = "snake_case",
 ): SchemaSnapshot => {
+  const nameOf = (key: string, named?: string): string => {
+    const sqlName = named ?? sqlKey(key, casing);
+    quoteIdentifier(sqlName);
+
+    return sqlName;
+  };
+
   // -- pass 1: claim names, index states ------------------------------------
   const analyzedTables: AnalyzedTable[] = [];
   const tablesByState = new Map<TableState, AnalyzedTable>();
@@ -207,7 +237,7 @@ export const assembleSchema = <
     }
 
     state.key = key;
-    state.sqlName = snakeCase(key);
+    state.sqlName = nameOf(key, state.named);
     const analyzedTable: AnalyzedTable = {
       key,
       state,
@@ -218,6 +248,21 @@ export const assembleSchema = <
     };
     analyzedTables.push(analyzedTable);
     tablesByState.set(state, analyzedTable);
+  }
+
+  const tableSqlNames = new Map<string, string>();
+
+  for (const analyzedTable of analyzedTables) {
+    const sqlName = analyzedTable.state.sqlName!;
+    const previous = tableSqlNames.get(sqlName);
+
+    if (previous !== undefined) {
+      throw new Error(
+        `symmetria: tables "${previous}" and "${analyzedTable.key}" both map to SQL name "${sqlName}"; rename one or set it with .named()`,
+      );
+    }
+
+    tableSqlNames.set(sqlName, analyzedTable.key);
   }
 
   // -- pass 2: classify columns, resolve reference targets ------------------
@@ -346,7 +391,10 @@ export const assembleSchema = <
     if (primaryKeyColumn) {
       analyzedTable.primaryKey = {
         key: primaryKeyColumn.key,
-        sqlName: snakeCase(primaryKeyColumn.key),
+        sqlName: nameOf(
+          primaryKeyColumn.key,
+          primaryKeyColumn.definition.sqlName,
+        ),
         definition: primaryKeyColumn.definition,
       };
     }
@@ -611,7 +659,7 @@ export const assembleSchema = <
     (analyzedTable) => {
       const columns: ColumnSnapshot[] = analyzedTable.scalars.map((column) => ({
         name: column.key,
-        sqlName: snakeCase(column.key),
+        sqlName: nameOf(column.key, column.definition.sqlName),
         sqlType: column.definition.sqlType,
         notNull: column.definition.notNull,
         unique: column.definition.unique,
@@ -625,14 +673,19 @@ export const assembleSchema = <
       }));
 
       for (const reference of analyzedTable.references) {
-        const targetColumn = referencedColumn(analyzedTable, reference);
+        const targetColumn = referencedColumn(analyzedTable, reference, casing);
         reference.targetColumn = targetColumn;
         const sqlName =
-          reference.flags.column ?? `${snakeCase(reference.key)}_id`;
+          reference.flags.column ??
+          (casing === "preserve"
+            ? `${reference.key}Id`
+            : `${snakeCase(reference.key)}_id`);
 
-        if (!/^[a-z_][a-z0-9_]*$/.test(sqlName)) {
+        try {
+          quoteIdentifier(sqlName);
+        } catch (error) {
           throw new Error(
-            `symmetria: "${analyzedTable.key}.${reference.key}" column name "${sqlName}" must be a lowercase identifier`,
+            `symmetria: "${analyzedTable.key}.${reference.key}" column name "${sqlName}" is not a valid SQL identifier: ${(error as Error).message.replace(/^symmetria: /, "")}`,
           );
         }
 
@@ -647,9 +700,32 @@ export const assembleSchema = <
             table: reference.target.state.sqlName!,
             column: targetColumn.sqlName,
             onDelete: reference.flags.onDelete ?? "restrict",
+            ...(reference.flags.onUpdate &&
+            reference.flags.onUpdate !== "no action"
+              ? { onUpdate: reference.flags.onUpdate }
+              : {}),
           },
         });
       }
+
+      // CREATE TABLE lists columns in declaration order, references included.
+      const positions = new Map(
+        Object.keys(analyzedTable.state.columns).map((key, position) => [
+          key,
+          position,
+        ]),
+      );
+      const referenceKeys = new Map(
+        analyzedTable.references.map((reference) => [
+          `${reference.key}Id`,
+          reference.key,
+        ]),
+      );
+      const positionOf = (column: ColumnSnapshot) =>
+        positions.get(column.name) ??
+        positions.get(referenceKeys.get(column.name) ?? "") ??
+        Number.MAX_SAFE_INTEGER;
+      columns.sort((left, right) => positionOf(left) - positionOf(right));
 
       const sqlNames = new Set<string>();
 
@@ -678,7 +754,7 @@ export const assembleSchema = <
               primaryKey: analyzedTable.state.primaryKey.map(
                 (name) =>
                   columns.find((column) => column.name === name)?.sqlName ??
-                  snakeCase(name),
+                  nameOf(name),
               ),
             }
           : {}),
@@ -691,6 +767,7 @@ export const assembleSchema = <
     tables: [...tableSnapshots].sort((left, right) =>
       left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
     ),
+    ...(casing === "preserve" ? { casing: "preserve" as const } : {}),
   };
 
   for (const analyzedTable of analyzedTables) {

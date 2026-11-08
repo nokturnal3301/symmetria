@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.1.0 — 2026-11-09
+
+### Runtime (`symmetria`)
+
+- Any SQL names: `schema(…, { casing: "preserve" })` keeps keys as SQL names
+  (`createdAt`, `authorId`), `.named("User")` sets a table's name and
+  `.named("LEGACY_CODE")` a column's, and `.column()` accepts any identifier.
+  Constraint and index names follow the SQL names, which matches the names
+  Prisma creates. Tables or columns that would share a SQL name are rejected.
+- Columns are created in declaration order, foreign keys included, as the
+  documentation promised; snapshot hashes ignore column order, so no migration
+  results.
+- Foreign keys declare `ON UPDATE` with `.onUpdate.cascade`, `.restrict` or
+  `.noAction`.
+- `timestamp` (without time zone) with UTC semantics on both drivers, and a
+  precision for both timestamp builders: `timestamp(3)`, `timestamptz(3)`.
+- Exact arithmetic: `plus`, `minus`, `multiply` and the new `divide` accept
+  numbers, bigints, decimal text and other numeric columns and follow
+  PostgreSQL's promotion, with the casts in the SQL: `quantity.multiply(price)`
+  is a decimal, fractional numbers do not truncate. `numeric` values, `sum()`
+  and `average()` are typed `Decimal` (decimal text); writes, filters and
+  prepared parameters accept any string. On non-numeric columns the type error
+  names the method and what it needs.
+- Predicate lists skip every falsy entry, so `[q && title.ilike(q)]` type-checks
+  for `q: string | undefined` and an empty `q` adds no filter.
+- `databaseError(error)` describes server errors the same way on node-postgres
+  and Bun.SQL (`kind`, `sqlState`, `table`, `column`, `constraint`, `detail`).
+  `one()` and `maybeOne()` errors name the source and carry
+  `SYMMETRIA_RECORD_NOT_FOUND` or `SYMMETRIA_TOO_MANY_ROWS`.
+- Editors show the resolved value type of nullable columns and columns with
+  defaults (`"cart" | "paid"`) instead of `ColumnValue<Column<…>>`.
+
+### Kit (`symmetria-kit`)
+
+- `pull` declares tables and columns under any names, choosing the `casing` that
+  fits most of them and adding `.named()` for the rest, so PascalCase and
+  camelCase databases such as Prisma's no longer lose tables or columns.
+- `pull` declares `ON UPDATE CASCADE` / `RESTRICT` foreign keys, `timestamp(n)`
+  columns, and unique indexes named like constraints as `.unique` with an
+  `ADD CONSTRAINT … USING INDEX` fix; it lists views, materialized views and
+  triggers, and skips Prisma's `_prisma_migrations` with a warning.
+- DDL, diff and drift handle `ON UPDATE`.
+- The reference documents the `--diff` file format, `self`, SQL names and the
+  move from Prisma.
+
 ## 1.0.2 — 2026-11-08
 
 ### Runtime (`symmetria`)

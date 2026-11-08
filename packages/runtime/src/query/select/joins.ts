@@ -5,6 +5,7 @@ import {
   COLUMN_EXPRESSION,
   predicate,
   readColumn,
+  presentPredicates,
   readPredicate,
   type Predicate,
   type PredicateDescription,
@@ -318,18 +319,11 @@ type LocalJoin = (
   condition?: (columns: RuntimeScope[string]) => ShapePredicate,
 ) => RuntimeScope[string];
 
-/** Reads one predicate or a list; `undefined`, `null` and `false` entries are skipped. */
+/** Reads one predicate or a list; falsy entries (`undefined`, `null`, `false`, `""`, `0`) are skipped. */
 export const readShapePredicates = (
   value: ShapePredicate,
 ): readonly PredicateDescription[] =>
-  freeze(
-    (Array.isArray(value) ? value : [value])
-      .filter(
-        (entry): entry is Predicate =>
-          entry !== undefined && entry !== null && entry !== false,
-      )
-      .map(readPredicate),
-  );
+  presentPredicates(Array.isArray(value) ? value : [value]);
 
 const joinReference = (
   context: QueryContext,

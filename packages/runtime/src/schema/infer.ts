@@ -99,17 +99,22 @@ type ReferencedType<Columns, ColumnName extends keyof Columns> =
 // Write values
 // ---------------------------------------------------------------------------
 
-/** Writes accept safe integers wherever a column stores bigint, and plain arrays for vectors. */
+/** Writes accept safe integers wherever a column stores bigint, plain arrays for vectors and strings for decimals. */
 export type WriteValue<Value> = [NonNullable<Value>] extends [never]
   ? Value
   : NonNullable<Value> extends Vector
     ? Value | readonly number[]
-    :
-        | Value
-        | (bigint extends NonNullable<Value> ? number : never)
-        | (NonNullable<Value> extends readonly bigint[]
-            ? (bigint | number)[]
-            : never);
+    : NonNullable<Value> extends `${number}`
+      ? // Decimal columns read exact text and accept any string on write.
+        Value | string
+      : NonNullable<Value> extends readonly `${number}`[]
+        ? Value | readonly (string | null)[]
+        :
+            | Value
+            | (bigint extends NonNullable<Value> ? number : never)
+            | (NonNullable<Value> extends readonly bigint[]
+                ? (bigint | number)[]
+                : never);
 export type Writable<Shape> = {
   [PropertyName in keyof Shape]: WriteValue<Shape[PropertyName]>;
 } & {};

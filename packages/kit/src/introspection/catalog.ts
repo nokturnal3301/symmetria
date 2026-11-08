@@ -108,12 +108,42 @@ export const readIndexDetails = (options: CatalogOptions) =>
     ORDER BY relation.relname COLLATE "C", indexrelation.relname COLLATE "C"`,
   );
 
+/** Objects `pull` cannot declare but must report: views, materialized views and triggers. */
+export type UndeclaredObjectRow = {
+  kind: "view" | "materialized view" | "trigger";
+  name: string;
+  /** The table a trigger belongs to. */
+  table_name: string | null;
+  definition: string;
+};
+
+export const readUndeclaredObjects = (options: CatalogOptions) =>
+  query<UndeclaredObjectRow>(
+    options,
+    `SELECT * FROM (
+      SELECT CASE relation.relkind WHEN 'v' THEN 'view' ELSE 'materialized view' END AS kind,
+        relation.relname AS name, NULL::name AS table_name,
+        pg_get_viewdef(relation.oid, true) AS definition
+      FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE ${filter} AND relation.relkind IN ('v', 'm')
+        AND NOT EXISTS (SELECT 1 FROM pg_depend dependency
+          WHERE dependency.objid = relation.oid AND dependency.deptype = 'e')
+      UNION ALL
+      SELECT 'trigger', trigger.tgname, relation.relname, pg_get_triggerdef(trigger.oid, true)
+      FROM pg_trigger trigger JOIN pg_class relation ON relation.oid = trigger.tgrelid
+      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE ${filter} AND NOT trigger.tgisinternal
+    ) objects
+    ORDER BY kind, name COLLATE "C"`,
+  );
+
 export type PullCatalog = Awaited<ReturnType<typeof readCatalog>> & {
   schemaName: string;
   layout: ColumnLayoutRow[];
   details: TableDetailRow[];
   indexDetails: IndexDetailRow[];
   extensions: { name: string; schema: string }[];
+  undeclared: UndeclaredObjectRow[];
 };
 
 /** Everything `pull` needs in one round of queries. */
@@ -129,6 +159,7 @@ export const readPullCatalog = async (
   const details = await readTableDetails(options);
   const indexDetails = await readIndexDetails(options);
   const extensions = await readExtensions(options);
+  const undeclared = await readUndeclaredObjects(options);
 
   return {
     ...catalog,
@@ -137,5 +168,6 @@ export const readPullCatalog = async (
     details,
     indexDetails,
     extensions,
+    undeclared,
   };
 };

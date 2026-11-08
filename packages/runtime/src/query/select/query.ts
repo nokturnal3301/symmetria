@@ -37,7 +37,13 @@ import {
   shapeFrame,
   type QueryHandle,
 } from "./scope";
-import { countPlan, existsPlan, readCount, readExists } from "./terminal";
+import {
+  countPlan,
+  existsPlan,
+  readCount,
+  readExists,
+  rowCountError,
+} from "./terminal";
 
 /** Query handles share one prototype per database so methods stay cached. */
 let streamOrdinal = 0;
@@ -184,9 +190,7 @@ export const createQueryFactory = (
     const rows = (await executePlan(limitedPlan(state, 2), executor)).rows;
 
     if (rows.length > 1 || (required && !rows.length)) {
-      throw new Error(
-        `symmetria: expected ${required ? "exactly one" : "at most one"} row, received ${rows.length}`,
-      );
+      throw rowCountError(state, rows.length, required);
     }
 
     return rows[0] ?? null;

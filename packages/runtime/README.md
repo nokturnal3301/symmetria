@@ -288,6 +288,13 @@ UPDATE or DELETE without `where()` is refused unless `.all()` confirms it.
   `smallint`, `real`, `doublePrecision`, `date`, `time`, `interval`, `bytea` and
   `inet` as first-class builders.
 - Conditional upserts: `doUpdate(values, { where: (current, incoming) => … })`.
+- Any SQL names: `casing: "preserve"` for camelCase databases such as Prisma's,
+  `.named()` on tables and columns, `.onUpdate.cascade` foreign keys and
+  `timestamp(3)` columns read as UTC dates.
+- Exact arithmetic: `plus`, `minus`, `multiply` and `divide` follow PostgreSQL's
+  promotion, so `quantity.multiply(price)` is a `Decimal`.
+- `databaseError(error)` describes unique, foreign-key, not-null and check
+  violations the same way on both drivers; `one()` errors carry a code.
 - Arrays, full-text search with stored `tsvector` columns, weighted documents,
   ranking and headlines, pgvector embeddings with distance operators and HNSW
   indexes (`symmetria/vector`), typed JSON paths and Standard Schema JSON

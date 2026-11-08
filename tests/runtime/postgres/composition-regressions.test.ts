@@ -11,6 +11,7 @@ import {
   bool,
   timestamptz,
   prepare,
+  type Decimal,
 } from "../../../packages/runtime/src";
 
 test("cursor pages agree with database ordering for default and explicit null placement", async () => {
@@ -471,7 +472,7 @@ test("nested arrays decode JSON elements and preserve numeric array shapes", asy
   driver.createTables(database);
   const values = {
     objects: [{ name: "Ada" }, "plain text", null],
-    amounts: ["123456789012345.1234567890"],
+    amounts: ["123456789012345.1234567890"] as Decimal[],
     scores: [9007199254740993n],
   };
 
