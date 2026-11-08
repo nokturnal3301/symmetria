@@ -75,3 +75,37 @@ test("cached column handles are frozen even without SYMMETRIA_FREEZE", () => {
     prototype: true,
   });
 });
+
+test("count() and exists() on a bare scoped table or alias read the current scope", async () => {
+  let tenantId = 1;
+  const statements: { sql: string; parameters: readonly unknown[] }[] = [];
+  const database = schema(
+    { posts },
+    {
+      executor: async (query) => {
+        statements.push(query);
+
+        return query.sql.includes("COUNT(*)") ? [{ count: "0" }] : [];
+      },
+    },
+  );
+  const scoped = database.$scope({
+    posts: (post) => post.tenantId.is(tenantId),
+  });
+  const alias = scoped.posts.as("p");
+  const run = async () => {
+    statements.length = 0;
+    await scoped.posts.count();
+    await scoped.posts.exists();
+    await alias.count();
+    await alias.exists();
+    await scoped.posts({ where: (post) => post.id.above(0) }).count();
+
+    return statements.map((statement) => statement.parameters[0]);
+  };
+
+  expect(await run()).toEqual([1, 1, 1, 1, 1]);
+  tenantId = 2;
+  expect(await run()).toEqual([2, 2, 2, 2, 2]);
+  expect(statements[2]!.sql).toContain('FROM "posts" AS "p"');
+});

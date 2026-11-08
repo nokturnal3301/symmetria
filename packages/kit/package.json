@@ -1,6 +1,6 @@
 {
   "name": "symmetria-kit",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "PostgreSQL migrations, schema browser and live query profiler for Node.js and Bun.",
   "homepage": "https://github.com/nokturnal3301/symmetria#readme",
   "repository": {
@@ -29,7 +29,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "symmetria": "./dist/cli.js"
+    "symmetria": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -41,7 +41,7 @@
     "prepack": "bun run build"
   },
   "peerDependencies": {
-    "symmetria": "1.0.1"
+    "symmetria": "1.0.2"
   },
   "dependencies": {
     "pg": "^8.23.1",

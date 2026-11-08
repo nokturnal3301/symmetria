@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.2 — 2026-11-08
+
+### Runtime (`symmetria`)
+
+- `count()` and `exists()` called directly on a scoped table or a bare alias
+  (`scoped.posts.count()`, `scoped.posts.as("p").exists()`) evaluate the
+  `$scope()` callbacks again, like every other query; they used the values
+  captured when the database was scoped, so a changed tenant id counted and
+  checked the previous tenant's rows.
+
+### Kit (`symmetria-kit`)
+
+- The `bin` entry is written in the form npm publishes, so publishing no longer
+  warns about it.
+
 ## 1.0.1 — 2026-11-08
 
 ### Runtime (`symmetria`)

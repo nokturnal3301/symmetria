@@ -19,21 +19,21 @@
     },
     "packages/kit": {
       "name": "symmetria-kit",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "bin": {
-        "symmetria": "./dist/cli.js",
+        "symmetria": "dist/cli.js",
       },
       "dependencies": {
         "pg": "^8.23.1",
         "string-width": "^8.1.0",
       },
       "peerDependencies": {
-        "symmetria": "1.0.1",
+        "symmetria": "1.0.2",
       },
     },
     "packages/runtime": {
       "name": "symmetria",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "peerDependencies": {
         "pg": "^8.0.0",
       },
