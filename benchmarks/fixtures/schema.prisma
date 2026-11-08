@@ -1,0 +1,53 @@
+generator client {
+  provider        = "prisma-client"
+  output          = "../.cache/prisma"
+  previewFeatures = ["relationJoins"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id      Int    @id @default(autoincrement())
+  email   String @unique
+  name    String
+  posts   Post[] @relation("author")
+  edited  Post[] @relation("editor")
+
+  @@map("users")
+}
+
+model Post {
+  id        Int       @id @default(autoincrement())
+  slug      String    @unique
+  title     String
+  authorId  Int       @map("author_id")
+  author    User      @relation("author", fields: [authorId], references: [id])
+  editorId  Int?      @map("editor_id")
+  editor    User?     @relation("editor", fields: [editorId], references: [id])
+  state     String    @default("draft")
+  views     BigInt    @default(0)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  tags      PostTag[]
+
+  @@map("posts")
+}
+
+model Tag {
+  id    Int       @id @default(autoincrement())
+  label String    @unique
+  posts PostTag[]
+
+  @@map("tags")
+}
+
+model PostTag {
+  postId Int  @map("post_id")
+  tagId  Int  @map("tag_id")
+  post   Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tag    Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, tagId])
+  @@map("post_tags")
+}

@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:16.10-bookworm@sha256:38471f330eb885e04de130b768d6db4e10469e2311879c7e5c699f6d2d8a1c74
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - max_connections=64
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - track_io_timing=on
+      - -c
+      - jit=off
+    cpus: 2
+    mem_limit: 2g
+    shm_size: 512m
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U bench -d postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  runner:
+    build:
+      context: ../..
+      dockerfile: benchmarks/docker/Dockerfile
+    cpus: 2
+    mem_limit: 2g
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BENCH_ADMIN_URL: postgres://bench:bench@postgres:5432/postgres
+      BENCH_PASSES: ${BENCH_PASSES:-3}
+      BENCH_SEQ_MS: ${BENCH_SEQ_MS:-2000}
+      BENCH_CONC_MS: ${BENCH_CONC_MS:-2000}
+      BENCH_MIN_SAMPLES: ${BENCH_MIN_SAMPLES:-100}
+      BENCH_HOST_PROVENANCE: ${BENCH_HOST_PROVENANCE:-null}
+    volumes:
+      - ../.cache/runs:/artifacts
+volumes:
+  database:

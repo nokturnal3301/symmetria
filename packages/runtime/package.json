@@ -1,0 +1,79 @@
+{
+  "name": "symmetria",
+  "version": "1.0.0",
+  "description": "Type-safe, SQL-first PostgreSQL query builder for Node.js and Bun.",
+  "homepage": "https://github.com/nokturnal3301/symmetria#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nokturnal3301/symmetria.git",
+    "directory": "packages/runtime"
+  },
+  "bugs": {
+    "url": "https://github.com/nokturnal3301/symmetria/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./driver": {
+      "types": "./dist/driver.d.ts",
+      "default": "./dist/driver.js"
+    },
+    "./bun": {
+      "types": "./dist/bun.d.ts",
+      "default": "./dist/bun.js"
+    },
+    "./pg": {
+      "types": "./dist/pg.d.ts",
+      "default": "./dist/pg.js"
+    },
+    "./vector": {
+      "types": "./dist/vector.d.ts",
+      "default": "./dist/vector.js"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "default": "./dist/internal.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun run --cwd ../.. build:runtime",
+    "prepack": "bun run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "peerDependencies": {
+    "pg": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "sql",
+    "query-builder",
+    "orm",
+    "typesafe",
+    "typescript",
+    "bun"
+  ],
+  "author": "Mikhail Demidoff <demidoff.mikhail@gmail.com>",
+  "license": "MIT"
+}
