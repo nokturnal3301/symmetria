@@ -1,6 +1,7 @@
 /**
  * PostgreSQL renderer: dialect-specific SQL for casts, JSON aggregation, arrays and operators.
  */
+import { freeze } from "../../plan/freeze";
 import { postgresArrayLiteral } from "./values";
 import {
   searchHeadlineSql,
@@ -137,5 +138,5 @@ export const postgresRenderer: PostgresRenderer = {
   nullsDefault: (direction) => (direction === "ASC" ? "LAST" : "FIRST"),
 };
 
-Object.freeze(postgresRenderer.textCast);
-Object.freeze(postgresRenderer);
+freeze(postgresRenderer.textCast);
+freeze(postgresRenderer);

@@ -246,3 +246,117 @@ test("declaration mistakes are reported with the table and relation", () => {
     /relations\(\) expects a callback/,
   );
 });
+
+test("relation names never shadow columns and predicates see the two tables only", () => {
+  const accounts = table({ id: int.auto, name: text.unique, posts: int });
+  expect(() =>
+    schema({
+      accounts,
+      articles: table({ id: int.auto, writer: text }).relations(
+        (article, { to }) => ({
+          author: to(accounts)
+            .one((account) => account.name.is(article.writer))
+            .inverse("posts"),
+        }),
+      ),
+    }),
+  ).toThrow(
+    /relation "accounts\.posts" .* clashes with a column of the same name/,
+  );
+  // Automatic reverse names that a column shadows are left out instead.
+  expect(
+    schema({ accounts, posts: table({ id: int.auto, author: accounts }) })
+      .$snapshot()
+      .tables.find((table) => table.name === "accounts")!
+      .relations.map((relation) => relation.name),
+  ).toEqual([]);
+
+  const sloppy = schema({
+    users,
+    notes: table({ id: int.auto, owner: text, author: users }).relations(
+      (note, { to }) => ({
+        byTypo: to(users).one((user) =>
+          (note as never as { ownr: typeof note.owner }).ownr.is(user.name),
+        ),
+        byTargetTypo: to(users).one((user) =>
+          note.owner.is((user as never as { nmae: typeof user.name }).nmae),
+        ),
+        byPath: to(users).one((user) =>
+          (
+            note as never as { author: { name: typeof note.owner } }
+          ).author.name.is(user.name),
+        ),
+      }),
+    ),
+  });
+  expect(() => sloppy.notes((note) => ({ name: note.byTypo.name }))).toThrow(
+    /"notes\.ownr" is not a column of "notes" \(did you mean "owner"\?\); relations\(\) predicates use columns of "notes" only/,
+  );
+  expect(() =>
+    sloppy.notes((note) => ({ name: note.byTargetTypo.name })),
+  ).toThrow(
+    /"users\.nmae" is not a column of "users" \(did you mean "name"\?\)/,
+  );
+  expect(() => sloppy.notes((note) => ({ name: note.byPath.name }))).toThrow(
+    /"notes\.author" is a relation; relations\(\) predicates use columns of "notes" only/,
+  );
+  expect(() =>
+    schema({
+      users,
+      posts: table({ id: int.auto, title: text }).relations((post, { to }) => ({
+        author: to(users.by("name") as never).one((user: typeof post) =>
+          user.title.is(post.title),
+        ),
+      })),
+    }),
+  ).toThrow(/to\(\) expects a table, not a reference chain/);
+
+  // A third table's column leaks into the predicate through a closure.
+  let leaked: { body: never } | undefined;
+  const leaky = schema({
+    users,
+    comments,
+    posts: table({ id: int.auto, title: text }).relations((post, { to }) => ({
+      author: to(users).one((user) => user.name.is(leaked!.body)),
+    })),
+  });
+  leaky.comments((comment) => {
+    leaked = comment as never;
+
+    return { id: comment.id };
+  });
+  expect(() => leaky.posts((post) => ({ name: post.author.name }))).toThrow(
+    /relation "posts\.author" may only compare columns of "posts" and "users"/,
+  );
+});
+
+test("write callbacks and scopes report relation paths instead of failing on undefined", () => {
+  const writes = schema({
+    users,
+    posts: table({ id: int.auto, title: text, author: users }),
+  });
+  const loose = (value: unknown) => value as Record<string, any>;
+
+  expect(() =>
+    writes.posts.update((post) => ({ title: loose(post).author.name })).all(),
+  ).toThrow(
+    /"posts\.author" is a relation; update values use columns of "posts" only/,
+  );
+  expect(() =>
+    writes.posts
+      .insert({ title: "x", authorId: 1 })
+      .returning((post) => ({ name: loose(post).author.name })),
+  ).toThrow(
+    /"posts\.author" is a relation; RETURNING use columns of "posts" only/,
+  );
+  expect(() =>
+    writes
+      .$scope({ posts: (post) => loose(post).author.name.is("Ada") })
+      .posts((post) => ({ id: post.id })),
+  ).toThrow(
+    /"posts\.author" is a relation; \$scope\(\) predicates use columns/,
+  );
+  expect(() =>
+    writes.posts((post) => ({ flag: post.id.is(1) }) as never),
+  ).toThrow(/"flag" is a predicate, not a value/);
+});

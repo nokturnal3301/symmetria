@@ -1,4 +1,5 @@
 /** applyShape(): evaluates one projection callback with its options into a plan. */
+import { freeze } from "../plan/freeze";
 import {
   readColumn,
   type Ordering,
@@ -111,11 +112,11 @@ export const applyShape = (
     assertActive();
     const expression = readColumn(column);
     validateNode(expression.node, context.bindings());
-    context.plan = Object.freeze({
+    context.plan = freeze({
       ...context.plan,
-      predicates: Object.freeze([
+      predicates: freeze([
         ...context.plan.predicates,
-        Object.freeze({
+        freeze({
           kind: "nullCheck" as const,
           value: expression.node,
           negated: true,
@@ -232,7 +233,7 @@ export const applyShape = (
         const clause = name === "where" ? "predicates" : "having";
 
         if (value !== undefined && value !== null && value !== false) {
-          plan[clause] = Object.freeze([
+          plan[clause] = freeze([
             ...plan[clause],
             ...readShapePredicates(value as ShapePredicate),
           ]);
@@ -242,7 +243,7 @@ export const applyShape = (
       }
       case "orderBy": {
         if (value !== undefined) {
-          plan.ordering = Object.freeze([
+          plan.ordering = freeze([
             ...plan.ordering,
             ...readOrdering(value as Ordering, context.bindings()),
           ]);
@@ -260,7 +261,7 @@ export const applyShape = (
           grouping.forEach((expression) =>
             validateNode(expression.node, context.bindings()),
           );
-          plan.grouping = Object.freeze([...plan.grouping, ...grouping]);
+          plan.grouping = freeze([...plan.grouping, ...grouping]);
         }
 
         break;
@@ -300,5 +301,5 @@ export const applyShape = (
     plan.selection = readSelection(fields, context.bindings());
   }
 
-  return Object.freeze(plan);
+  return freeze(plan);
 };

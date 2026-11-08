@@ -58,9 +58,24 @@ export const createCompilation = (
   selectSql,
 });
 
+const quotedIdentifiers = new Map<string, string>();
+
 export const quoteIdentifier = (identifier: string): string => {
+  const cached = quotedIdentifiers.get(identifier);
+
+  if (cached !== undefined) {
+    return cached;
+  }
+
   if (identifier.length <= 63 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
-    return `"${identifier}"`;
+    const quoted = `"${identifier}"`;
+
+    // Schema names and aliases form a small set; user-supplied names stay bounded.
+    if (quotedIdentifiers.size < 4096) {
+      quotedIdentifiers.set(identifier, quoted);
+    }
+
+    return quoted;
   }
 
   if (!identifier.length || identifier.includes("\0")) {

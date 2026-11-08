@@ -1583,6 +1583,10 @@ await tenant.users((user) => ({ posts: user.posts.count() }));
 await tenant.posts.delete().where((posts) => posts.id.is(7));
 ```
 
+Scope callbacks, UPDATE values and RETURNING callbacks see the table's columns
+only; a relation path there is reported as such. Filter through relations in
+`where()`, which compiles to a primary-key subquery.
+
 `$scope()` returns a database with the same type whose reads, updates and
 deletes of the scoped tables carry the predicate: root queries, `byId()`, unique
 lookups, shape projections, relation paths, explicit joins (in `ON`), nested
@@ -1594,7 +1598,9 @@ of updating it. Nested `connect` only finds rows inside the scope and
 `connectOrCreate` fails the same way for an existing row outside it. Scopes
 compose: a scoped database can be scoped again and the predicates are ANDed.
 Transactions inherit the scope, and `transaction.$scope()` narrows it further
-inside the callback. Scope callbacks see the table's own columns.
+inside the callback. Scope callbacks see the table's own columns and run each
+time a query or write is built, so they may read a value that changes, such as
+the current tenant.
 
 ## Computed fields, enums and JSON
 

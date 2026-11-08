@@ -1,4 +1,5 @@
 /** JSON field and row codecs, matching PostgreSQL JSON projections. */
+import { freeze } from "../plan/freeze";
 import { createRowDecoder, encodeValue, type RuntimeCodec } from ".";
 
 export const encodeJsonField = (
@@ -37,10 +38,7 @@ export const jsonRowCodec = (
   // Queries are built far more often than executed; generate the decoder on first use.
   let rowDecoder: ReturnType<typeof createRowDecoder> | undefined;
 
-  const decodeRow = (row: Record<string, unknown>): Record<string, unknown> =>
-    (rowDecoder ??= createRowDecoder(selection))(row);
-
-  return Object.freeze({
+  return freeze({
     parameterCast: "jsonb",
     encode: (value: unknown) => {
       const encodeRow = (row: Record<string, unknown>) =>
@@ -57,9 +55,12 @@ export const jsonRowCodec = (
           : encodeRow(value as Record<string, unknown>),
       );
     },
-    decode: (value: unknown) =>
-      many
-        ? (value as Record<string, unknown>[]).map(decodeRow)
-        : decodeRow(value as Record<string, unknown>),
+    decode: (value: unknown) => {
+      const decode = (rowDecoder ??= createRowDecoder(selection));
+
+      return many
+        ? (value as Record<string, unknown>[]).map(decode)
+        : decode(value as Record<string, unknown>);
+    },
   });
 };

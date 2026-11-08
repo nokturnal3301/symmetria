@@ -1,4 +1,5 @@
 /** JOIN construction: relation JOINs, explicit sources and the local join helpers of a shape. */
+import { freeze } from "../plan/freeze";
 import type { PredicateList } from "./types";
 import {
   COLUMN_EXPRESSION,
@@ -20,6 +21,7 @@ import {
 } from "../plan/types";
 import { shapeExpressions } from "./projections";
 import { createScope, validatePredicate } from "./scope";
+import { columnsOnly } from "./suggest";
 import {
   CONDITION,
   conditionRelations,
@@ -48,9 +50,9 @@ export const columnNode = (
     );
   }
 
-  return Object.freeze({
+  return freeze({
     kind: "column",
-    description: Object.freeze({ binding, column }),
+    description: freeze({ binding, column }),
   });
 };
 
@@ -90,7 +92,7 @@ export const joinRelation = (
   const joins = [...state.joins];
 
   const equals = (left: ValueNode, right: ValueNode): PredicateDescription =>
-    Object.freeze({ kind: "comparison", left, operator: "=", right });
+    freeze({ kind: "comparison", left, operator: "=", right });
 
   const addJoin = (
     binding: TableBinding,
@@ -99,17 +101,17 @@ export const joinRelation = (
     const scope = registry.scopePredicates(binding);
 
     joins.push(
-      Object.freeze({
+      freeze({
         kind,
         binding,
         ...(binding === target
-          ? { relation: Object.freeze({ from: source, name: relationName }) }
+          ? { relation: freeze({ from: source, name: relationName }) }
           : {}),
         condition: scope.length
-          ? Object.freeze({
+          ? freeze({
               kind: "group",
               operator: "AND",
-              predicates: Object.freeze([comparison, ...scope]),
+              predicates: freeze([comparison, ...scope]),
             })
           : comparison,
       }),
@@ -144,9 +146,15 @@ export const joinRelation = (
       [declaring.alias]: declaring,
       [other.alias]: other,
     });
+    const strict = (binding: TableBinding) =>
+      columnsOnly(
+        binding.table,
+        scope[binding.alias]!,
+        "relations() predicates",
+      );
     const declared = declaredConditions(
       conditionRelations.get(declaring.table) ?? [],
-      scope[declaring.alias]!,
+      strict(declaring),
       declaring.table.name,
     );
     const entry = declared[name];
@@ -157,13 +165,19 @@ export const joinRelation = (
       );
     }
 
-    const condition = readPredicate(
-      entry[CONDITION].predicate(scope[other.alias]!),
-    );
-    validatePredicate(condition, {
-      [source.alias]: source,
-      [target.alias]: target,
-    });
+    const condition = readPredicate(entry[CONDITION].predicate(strict(other)));
+
+    try {
+      validatePredicate(condition, {
+        [source.alias]: source,
+        [target.alias]: target,
+      });
+    } catch (error) {
+      throw new Error(
+        `symmetria: relation "${declaring.table.name}.${name}" may only compare columns of "${source.table.name}" and "${target.table.name}" (${(error as Error).message.replace(/^symmetria: /, "")})`,
+      );
+    }
+
     addJoin(target, condition);
   } else if (relation.kind === "through") {
     const reservedAliases = new Set([
@@ -203,10 +217,10 @@ export const joinRelation = (
     addJoin(target, equals(foreignKey, reference(foreignKey, target)));
   }
 
-  return Object.freeze({
+  return freeze({
     ...state,
-    joins: Object.freeze(joins),
-    bindings: Object.freeze({ ...state.bindings, [alias]: target }),
+    joins: freeze(joins),
+    bindings: freeze({ ...state.bindings, [alias]: target }),
   });
 };
 
@@ -236,7 +250,7 @@ const joinSource = (
     throw new Error("symmetria: an explicit join requires an ON callback");
   }
 
-  const binding = Object.freeze({ ...source });
+  const binding = freeze({ ...source });
   const scope = registry.scopePredicates(binding);
   const joinCondition = condition
     ? readPredicate(
@@ -253,34 +267,34 @@ const joinSource = (
     throw new Error(`symmetria: duplicate query alias "${source.alias}"`);
   }
 
-  const bindings = Object.freeze({
+  const bindings = freeze({
     ...current.bindings,
     [binding.alias]: binding,
   });
-  const description: JoinDescription = Object.freeze({
+  const description: JoinDescription = freeze({
     kind,
     binding,
     ...(joinCondition
       ? {
           condition: scope.length
-            ? Object.freeze({
+            ? freeze({
                 kind: "group" as const,
                 operator: "AND" as const,
-                predicates: Object.freeze([joinCondition, ...scope]),
+                predicates: freeze([joinCondition, ...scope]),
               })
             : joinCondition,
         }
       : {}),
   });
 
-  return Object.freeze({
+  return freeze({
     ...current,
     bindings,
-    joins: Object.freeze([...current.joins, description]),
+    joins: freeze([...current.joins, description]),
     predicates:
       joinCondition || !scope.length
         ? current.predicates
-        : Object.freeze([...current.predicates, ...scope]),
+        : freeze([...current.predicates, ...scope]),
   });
 };
 
@@ -308,7 +322,7 @@ type LocalJoin = (
 export const readShapePredicates = (
   value: ShapePredicate,
 ): readonly PredicateDescription[] =>
-  Object.freeze(
+  freeze(
     (Array.isArray(value) ? value : [value])
       .filter(
         (entry): entry is Predicate =>
@@ -458,7 +472,7 @@ export const localJoin = (
               })
           : undefined,
         context,
-        Object.freeze({ ...source, alias }),
+        freeze({ ...source, alias }),
       );
     } finally {
       context.reservedAliases.delete(alias);
@@ -499,13 +513,13 @@ export const localJoin = (
     });
     const last = joined.joins.at(-1)!;
 
-    context.plan = Object.freeze({
+    context.plan = freeze({
       ...joined,
-      joins: Object.freeze([
+      joins: freeze([
         ...joined.joins.slice(0, -1),
-        Object.freeze({
+        freeze({
           ...last,
-          relation: Object.freeze({
+          relation: freeze({
             from: relation.owner,
             name: relation.relation,
           }),

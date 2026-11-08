@@ -1,6 +1,7 @@
 /**
  * `prepare()`: named-parameter queries compiled once and executed with typed values.
  */
+import { freeze } from "../plan/freeze";
 import {
   COLUMN_CODEC,
   isColumn,
@@ -126,7 +127,7 @@ export const prepare = <
       const codec = column[COLUMN_CODEC] ?? codecFor(column.definition.sqlType);
       const expression = createExpression({
         outputName: name,
-        node: Object.freeze({
+        node: freeze({
           kind: "placeholder",
           name,
           scope,
@@ -139,7 +140,7 @@ export const prepare = <
 
       return [
         name,
-        Object.freeze(
+        freeze(
           Object.defineProperty(Object.create(expression), NAMED_PARAMETER, {
             value: true,
           }),
@@ -148,7 +149,7 @@ export const prepare = <
     }),
   );
   const query = factory(
-    Object.freeze(parameters) as unknown as Parameters<typeof factory>[0],
+    freeze(parameters) as unknown as Parameters<typeof factory>[0],
   );
 
   if (!query || !(PREPARE_QUERY in query)) {

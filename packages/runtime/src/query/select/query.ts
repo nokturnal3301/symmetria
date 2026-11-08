@@ -1,4 +1,5 @@
 /** Query handles: the shared prototype of every query and the callable that extends it. */
+import { freeze } from "../plan/freeze";
 import { createExpression } from "../expressions";
 import {
   compilePlan,
@@ -33,6 +34,7 @@ import {
   limitedPlan,
   initialPlan,
   resultRows,
+  shapeFrame,
   type QueryHandle,
 } from "./scope";
 import { countPlan, existsPlan, readCount, readExists } from "./terminal";
@@ -111,12 +113,20 @@ async function* streamRows(
     }
 
     if (failed) {
-      finished.reject(failure);
-    } else {
-      finished.resolve();
+      // Acquisition can fail before the hold callback starts waiting on finished.
+      if (execute) {
+        finished.reject(failure);
+      } else {
+        finished.resolve();
+      }
+
+      await held.catch(() => {});
+      throw failure;
     }
 
-    await held.catch(() => {});
+    finished.resolve();
+    // A failed CLOSE or COMMIT must not look like successful iteration.
+    await held;
   }
 }
 
@@ -135,9 +145,17 @@ export const createQueryFactory = (
       return state;
     }
 
-    const root = Object.freeze({ ...state.root });
+    // Inside a shape callback the same table needs its own occurrence; at the top
+    // level the table's root binding (and its cached column handles) is reused.
+    if (shapeFrame.bindings) {
+      const root = freeze({ ...state.root });
 
-    return allowScopedAlias ? registry.scopedPlan(root) : initialPlan(root);
+      return allowScopedAlias ? registry.scopedPlan(root) : initialPlan(root);
+    }
+
+    return allowScopedAlias
+      ? registry.scopedPlan(state.root)
+      : initialPlan(state.root);
   };
 
   const single = async (
@@ -159,18 +177,26 @@ export const createQueryFactory = (
     return rows[0] ?? null;
   };
 
+  // Top-level queries share their table's root binding, so a query placed inside
+  // another one gets its own occurrence; one per query object keeps repeated
+  // embeds of the same query consistent.
+  const embedded = (state: QueryHandle[typeof QUERY_STATE]): SelectPlan =>
+    state.sharedRoot
+      ? (state.embedded ??= queryOccurrence(state.plan))
+      : state.plan;
+
   /** Every query is a callable whose methods live on one shared prototype. */
   const queryPrototype: object = Object.freeze(
     Object.create(
       Function.prototype,
       boundMethodDescriptors({
         get [QUERY_PLAN](): SelectPlan {
-          return (this as unknown as QueryHandle)[QUERY_STATE].plan;
+          return embedded((this as unknown as QueryHandle)[QUERY_STATE]);
         },
         get [TABLE_SOURCE](): SourceDescription {
           const state = (this as unknown as QueryHandle)[QUERY_STATE];
 
-          return (state.source ??= Object.freeze({
+          return (state.source ??= freeze({
             binding: state.plan.root,
             schema: registry.snapshot,
           }));
@@ -193,13 +219,13 @@ export const createQueryFactory = (
             throw new Error("symmetria: materialized must be a boolean");
           }
 
-          const derived = derivedBinding(state, name);
+          const derived = derivedBinding(embedded(this[QUERY_STATE]), name);
           const { derived: _query, ...binding } = derived;
-          const identity = Object.freeze({});
-          const definition: CommonTableExpression = Object.freeze({
+          const identity = freeze({});
+          const definition: CommonTableExpression = freeze({
             name,
             identity,
-            query: state,
+            query: embedded(this[QUERY_STATE]),
             ...(options.materialized === undefined
               ? {}
               : { materialized: options.materialized }),
@@ -207,7 +233,7 @@ export const createQueryFactory = (
 
           return createQuery(
             initialPlan(
-              Object.freeze({
+              freeze({
                 ...binding,
                 cte: definition,
                 cteReference: { name, identity },
@@ -238,10 +264,10 @@ export const createQueryFactory = (
             throw new Error("symmetria: unionAll must be a boolean");
           }
 
-          const derived = derivedBinding(state, name);
+          const derived = derivedBinding(embedded(this[QUERY_STATE]), name);
           const { derived: _query, ...binding } = derived;
-          const identity = Object.freeze({});
-          const reference = Object.freeze({
+          const identity = freeze({});
+          const reference = freeze({
             ...binding,
             cteReference: { name, identity },
           });
@@ -263,16 +289,16 @@ export const createQueryFactory = (
             );
           }
 
-          const definition: CommonTableExpression = Object.freeze({
+          const definition: CommonTableExpression = freeze({
             name,
             identity,
-            query: state,
+            query: embedded(this[QUERY_STATE]),
             recursive,
             unionAll: options.unionAll ?? true,
           });
 
           return createQuery(
-            initialPlan(Object.freeze({ ...reference, cte: definition })),
+            initialPlan(freeze({ ...reference, cte: definition })),
             false,
             true,
           );
@@ -283,7 +309,7 @@ export const createQueryFactory = (
 
           if (state.selection.length) {
             return createQuery(
-              initialPlan(derivedBinding(state, name)),
+              initialPlan(derivedBinding(embedded(this[QUERY_STATE]), name)),
               false,
               true,
             );
@@ -305,7 +331,7 @@ export const createQueryFactory = (
             );
           }
 
-          const binding = Object.freeze({
+          const binding = freeze({
             ...state.root,
             alias: name,
             explicitAlias: true,
@@ -327,9 +353,11 @@ export const createQueryFactory = (
             throw new Error("symmetria: scalar() requires one selected column");
           }
 
+          const query = embedded(this[QUERY_STATE]);
+
           return createExpression({
-            ...state.selection[0]!,
-            node: Object.freeze({ kind: "subquery", query: state }),
+            ...query.selection[0]!,
+            node: freeze({ kind: "subquery", query }),
             outputName: "scalar",
           });
         },
@@ -469,11 +497,13 @@ export const createQueryFactory = (
     allowScopedAlias = false,
     freshSource = false,
     prototype = queryPrototype,
+    sharedRoot = false,
   ): object => {
     const query = ((
       callback: ShapeCallback | Record<string, unknown>,
       options?: Record<string, unknown>,
     ) => {
+      const shared = freshSource && !shapeFrame.bindings;
       const current = freshSource
         ? startPlan(state, allowScopedAlias, freshSource)
         : queryOccurrence(state);
@@ -485,11 +515,15 @@ export const createQueryFactory = (
           callback,
           options,
         ),
+        false,
+        false,
+        queryPrototype,
+        shared,
       );
     }) as unknown as QueryHandle;
     Object.setPrototypeOf(query, prototype);
     Object.defineProperty(query, QUERY_STATE, {
-      value: { plan: state, allowScopedAlias, freshSource },
+      value: { plan: state, allowScopedAlias, freshSource, sharedRoot },
     });
     Object.freeze(query);
 

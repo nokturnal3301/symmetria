@@ -1,7 +1,7 @@
 {
   "name": "symmetria-workspace",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Type-safe, SQL-first PostgreSQL query builder for Node.js and Bun.",
   "homepage": "https://github.com/nokturnal3301/symmetria#readme",
   "repository": {
@@ -30,7 +30,7 @@
   ],
   "scripts": {
     "test": "bun run test:unit && bun run test:cli && bun run test:types",
-    "test:unit": "bun test tests/runtime/unit tests/kit/unit",
+    "test:unit": "SYMMETRIA_FREEZE=1 bun test tests/runtime/unit tests/kit/unit",
     "test:cli": "bun test tests/kit/cli",
     "test:types": "tsc -p tests/tsconfig.json",
     "test:integration": "bun tests/support/run-postgres.ts",

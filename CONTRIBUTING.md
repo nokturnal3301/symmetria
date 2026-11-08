@@ -35,6 +35,8 @@ bun run build:runtime   # Runtime only
 bun run build:kit       # Runtime, then Kit
 bun run build:watch     # Rebuild both packages on changes
 bun run test:types      # Compile-only API contracts
+# Unit tests run with SYMMETRIA_FREEZE=1, which freezes every query plan record
+# so an accidental mutation fails loudly; production skips the freeze for speed.
 bun run format:check    # Biome formatting and unused-code lint, Prettier for Markdown/YAML
 bun run test:packages   # Build, pack and install into a fresh application
 bun run pack            # Keep npm tarballs in .build/packages/

@@ -1,4 +1,5 @@
 /** Per-schema table registry: snapshots, codecs and $scope() predicates for bindings. */
+import { freeze } from "../plan/freeze";
 import type { SchemaSnapshot, TableSnapshot } from "../../schema/assembly";
 import { codecFor, codecMap, type SchemaCodecs } from "../codecs";
 import { quoteIdentifier } from "../compile";
@@ -9,6 +10,7 @@ import {
 } from "../expressions";
 import type { SelectPlan, TableBinding } from "../plan/types";
 import { EMPTY, createScope, initialPlan } from "./scope";
+import { columnsOnly } from "./suggest";
 import type { RuntimeScope } from "./types";
 
 export type TableScopes = Readonly<
@@ -56,17 +58,23 @@ export const createTableRegistry = (
       return EMPTY;
     }
 
-    const columns = createScope({ [binding.alias]: binding })[binding.alias]!;
+    const columns = columnsOnly(
+      binding.table,
+      createScope({ [binding.alias]: binding })[binding.alias]!,
+      "$scope() predicates",
+    );
 
     return [readPredicate(scope(columns))];
   };
 
+  // Scope callbacks may read changing values (a tenant id), so they run every
+  // time a query starts instead of being cached.
   const scopedPlan = (binding: TableBinding): SelectPlan => {
     const plan = initialPlan(binding);
     const predicates = scopePredicates(binding);
 
     return predicates.length
-      ? Object.freeze({ ...plan, predicates: Object.freeze(predicates) })
+      ? freeze({ ...plan, predicates: freeze(predicates) })
       : plan;
   };
 
@@ -81,7 +89,7 @@ export const createTableRegistry = (
     let resolvedCodecs = tableCodecs.get(tableName);
 
     if (!resolvedCodecs) {
-      resolvedCodecs = Object.freeze(
+      resolvedCodecs = freeze(
         codecMap(
           Object.fromEntries(
             table.columns.flatMap((column) => {
@@ -96,7 +104,7 @@ export const createTableRegistry = (
       tableCodecs.set(tableName, resolvedCodecs);
     }
 
-    return Object.freeze({
+    return freeze({
       table,
       alias,
       codecs: resolvedCodecs,

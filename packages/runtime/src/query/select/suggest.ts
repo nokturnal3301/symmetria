@@ -76,3 +76,38 @@ export const unknownMember = (
     `symmetria: "${table.name}.${property}" is not a column or relation of "${table.name}"${suggestion ? ` (did you mean "${suggestion}"?)` : ""}. Available ${available}`,
   );
 };
+
+/**
+ * A column scope that reports unknown members and relation names instead of
+ * yielding undefined: for callbacks that see columns only (relation predicates,
+ * UPDATE assignments, RETURNING, $scope).
+ */
+export const columnsOnly = <Scope extends object>(
+  table: TableSnapshot,
+  columns: Scope,
+  where: string,
+): Scope =>
+  new Proxy(columns, {
+    get: (target, property, receiver) => {
+      if (
+        typeof property !== "string" ||
+        Object.hasOwn(target, property) ||
+        isSilentMember(property)
+      ) {
+        return Reflect.get(target, property, receiver);
+      }
+
+      if (table.relations.some((relation) => relation.name === property)) {
+        throw new Error(
+          `symmetria: "${table.name}.${property}" is a relation; ${where} use columns of "${table.name}" only`,
+        );
+      }
+
+      const names = Object.keys(target);
+      const suggestion = closestName(property, names);
+
+      throw new Error(
+        `symmetria: "${table.name}.${property}" is not a column of "${table.name}"${suggestion ? ` (did you mean "${suggestion}"?)` : ""}; ${where} use columns of "${table.name}" only. Available columns: ${names.join(", ")}`,
+      );
+    },
+  });

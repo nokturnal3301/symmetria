@@ -1,6 +1,7 @@
 /**
  * Expression nodes and their fluent API: columns, predicates, orderings, parameters, window functions and raw SQL.
  */
+import { freeze } from "../plan/freeze";
 import {
   countCodec,
   booleanCodec,
@@ -238,7 +239,7 @@ export const over = <Value, Name extends string>(
       );
     }
 
-    return Object.freeze({ ...value });
+    return freeze({ ...value });
   };
 
   const rows = options.rows?.map(boundary) as
@@ -257,13 +258,13 @@ export const over = <Value, Name extends string>(
   return createExpression<Value, Name>({
     ...description,
     outputName: expression[COLUMN_EXPRESSION].outputName,
-    node: Object.freeze({
+    node: freeze({
       kind: "window",
       expression: description.node,
-      partitionBy: Object.freeze(
+      partitionBy: freeze(
         (options.partitionBy ?? []).map((column) => readColumn(column).node),
       ),
-      orderBy: Object.freeze(
+      orderBy: freeze(
         ordering.map((entry: Ordering) => {
           if (!entry || !(ORDERING_EXPRESSION in entry)) {
             throw new Error(
@@ -274,7 +275,7 @@ export const over = <Value, Name extends string>(
           return entry[ORDERING_EXPRESSION];
         }),
       ),
-      ...(rows ? { rows: Object.freeze(rows) } : {}),
+      ...(rows ? { rows: freeze(rows) } : {}),
     }),
   });
 };
@@ -282,7 +283,7 @@ export const over = <Value, Name extends string>(
 const windowFunction = <Value, Name extends string>(
   expression: QueryColumn<Value, Name>,
 ): WindowExpression<Value, Name> =>
-  Object.freeze(
+  freeze(
     Object.assign(Object.create(expression), {
       over: (options?: WindowOptions) => over(expression, options),
     }),
@@ -702,7 +703,10 @@ export interface Ordering {
 }
 
 export const predicate = (description: PredicateDescription): Predicate =>
-  Object.freeze({ [PREDICATE_EXPRESSION]: Object.freeze(description) });
+  freeze({ [PREDICATE_EXPRESSION]: freeze(description) });
+
+export const isPredicate = (value: unknown): value is Predicate =>
+  typeof value === "object" && value !== null && PREDICATE_EXPRESSION in value;
 
 export const readPredicate = (value: Predicate): PredicateDescription => {
   if (!value || typeof value !== "object" || !(PREDICATE_EXPRESSION in value)) {
@@ -727,7 +731,7 @@ export const valueNode = (value: unknown, codec?: RuntimeCodec): ValueNode => {
     const node = (value as SelectedColumn)[COLUMN_EXPRESSION].node;
 
     return node.kind === "placeholder" && codec
-      ? Object.freeze({ ...node, codec })
+      ? freeze({ ...node, codec })
       : node;
   }
 
@@ -735,7 +739,7 @@ export const valueNode = (value: unknown, codec?: RuntimeCodec): ValueNode => {
     throw new Error("symmetria: undefined is not a SQL value");
   }
 
-  return Object.freeze({
+  return freeze({
     kind: "parameter",
     value: cloneParameter(encodeValue(value, codec)),
     ...(codec?.parameterCast ? { cast: codec.parameterCast } : {}),
@@ -755,7 +759,7 @@ class OrderingHandle {
   readonly [ORDERING_EXPRESSION]: OrderingDescription;
 
   constructor(description: OrderingDescription) {
-    this[ORDERING_EXPRESSION] = Object.freeze(description);
+    this[ORDERING_EXPRESSION] = freeze(description);
   }
 
   get nullsFirst(): Ordering {
@@ -768,7 +772,7 @@ class OrderingHandle {
 }
 
 const ordering = (description: OrderingDescription): Ordering =>
-  Object.freeze(new OrderingHandle(description)) as unknown as Ordering;
+  freeze(new OrderingHandle(description)) as unknown as Ordering;
 
 const searchLanguage = (language = "simple"): string => {
   if (!/^[a-z][a-z0-9_]*$/.test(language)) {
@@ -828,7 +832,7 @@ const rankOptions = (options: SearchRankOptions) => {
   return {
     ...(weights
       ? {
-          weights: Object.freeze([...weights]) as unknown as readonly [
+          weights: freeze([...weights]) as unknown as readonly [
             number,
             number,
             number,
@@ -884,7 +888,7 @@ const headlineOptions = (
     result[key] = value;
   }
 
-  return Object.freeze(result) as SearchHeadlineText;
+  return freeze(result) as SearchHeadlineText;
 };
 
 const matchExpression = (
@@ -996,11 +1000,11 @@ const matchExpression = (
 
     const node = valueNode(result, parameterCodec);
 
-    return Object.freeze({
+    return freeze({
       when: valueNode(name, description.codec),
       then:
         node.kind === "parameter" && sqlType !== "derived" && sqlType !== "enum"
-          ? Object.freeze({ ...node, cast: sqlType })
+          ? freeze({ ...node, cast: sqlType })
           : node,
     });
   });
@@ -1008,10 +1012,10 @@ const matchExpression = (
   return createExpression({
     outputName: description.outputName,
     ...(codec ? { codec } : {}),
-    node: Object.freeze({
+    node: freeze({
       kind: "case",
       value: description.node,
-      branches: Object.freeze(values),
+      branches: freeze(values),
       sqlType,
     }),
   });
@@ -1074,9 +1078,7 @@ const membership = (
   return predicate({
     kind: "membership",
     value: description.node,
-    values: Object.freeze(
-      values.map((value) => valueNode(value, description.codec)),
-    ),
+    values: freeze(values.map((value) => valueNode(value, description.codec))),
     negated,
   });
 };
@@ -1088,7 +1090,7 @@ const arithmetic = (
 ): QueryColumn<unknown, string> =>
   createExpression({
     ...description,
-    node: Object.freeze({
+    node: freeze({
       kind: "binary",
       left: description.node,
       operator,
@@ -1129,7 +1131,7 @@ class ColumnHandle {
   readonly [HANDLE_MEMO]: HandleMemo;
 
   constructor(description: ExpressionDescription) {
-    this[COLUMN_EXPRESSION] = Object.freeze(description);
+    this[COLUMN_EXPRESSION] = freeze(description);
     this[HANDLE_MEMO] = {};
   }
 
@@ -1235,7 +1237,7 @@ class ColumnHandle {
 
     return createExpression<number, string>({
       outputName: description.outputName,
-      node: Object.freeze({
+      node: freeze({
         kind: "arrayLength",
         value: description.node,
         ...(!expressionSqlType(description).endsWith("[]")
@@ -1267,7 +1269,7 @@ class ColumnHandle {
   searchRank(query: unknown, options: SearchRankOptions = {}) {
     return createExpression<number, "searchRank">({
       outputName: "searchRank",
-      node: Object.freeze({
+      node: freeze({
         kind: "searchRank",
         value: this[COLUMN_EXPRESSION].node,
         query: valueNode(query),
@@ -1289,7 +1291,7 @@ class ColumnHandle {
 
     return createExpression<string | null, "searchHeadline">({
       outputName: "searchHeadline",
-      node: Object.freeze({
+      node: freeze({
         kind: "searchHeadline",
         value: description.node,
         query: valueNode(query),
@@ -1311,7 +1313,7 @@ class ColumnHandle {
 
     return createExpression<number, string>({
       outputName: name,
-      node: Object.freeze({
+      node: freeze({
         kind: "binary",
         left: description.node,
         operator,
@@ -1411,7 +1413,7 @@ export const createExpression = <
 >(
   description: ExpressionDescription<OutputName>,
 ): QueryColumn<Value, OutputName> =>
-  Object.freeze(new ColumnHandle(description)) as unknown as QueryColumn<
+  freeze(new ColumnHandle(description)) as unknown as QueryColumn<
     Value,
     OutputName
   >;
@@ -1421,7 +1423,7 @@ type OptionalPredicate = Predicate | undefined | null | false;
 const presentPredicates = (
   conditions: readonly OptionalPredicate[],
 ): readonly PredicateDescription[] =>
-  Object.freeze(
+  freeze(
     conditions
       .filter(
         (condition): condition is Predicate =>
@@ -1467,7 +1469,7 @@ export const count = (
   expression?: SelectedColumn,
 ): QueryColumn<number, "count"> =>
   createExpression({
-    node: Object.freeze({
+    node: freeze({
       kind: "aggregate",
       name: "COUNT",
       ...(expression ? { value: readColumn(expression).node } : {}),
@@ -1480,7 +1482,7 @@ export const sum = (
   expression: SelectedColumn<number | bigint | string | null>,
 ): QueryColumn<string | null, "sum"> =>
   createExpression({
-    node: Object.freeze({
+    node: freeze({
       kind: "aggregate",
       name: "SUM",
       value: readColumn(expression).node,
@@ -1494,7 +1496,7 @@ export const average = (
   expression: SelectedColumn<number | bigint | string | null>,
 ): QueryColumn<string | null, "average"> =>
   createExpression({
-    node: Object.freeze({
+    node: freeze({
       kind: "aggregate",
       name: "AVG",
       value: readColumn(expression).node,
@@ -1511,7 +1513,7 @@ export const minimum = <Value>(
 
   return createExpression({
     ...description,
-    node: Object.freeze({
+    node: freeze({
       kind: "aggregate",
       name: "MIN",
       value: description.node,
@@ -1527,7 +1529,7 @@ export const maximum = <Value>(
 
   return createExpression({
     ...description,
-    node: Object.freeze({
+    node: freeze({
       kind: "aggregate",
       name: "MAX",
       value: description.node,
@@ -1544,9 +1546,9 @@ export const coalesce = <Value>(
 
   return createExpression({
     ...description,
-    node: Object.freeze({
+    node: freeze({
       kind: "coalesce",
-      values: Object.freeze([
+      values: freeze([
         description.node,
         valueNode(fallback, description.codec),
       ]),
@@ -1574,7 +1576,7 @@ export const searchDocument = (
   const add = (part: unknown, weight?: SearchWeight) => {
     for (const entry of Array.isArray(part) ? part : [part]) {
       collected.push(
-        Object.freeze({
+        freeze({
           value: readColumn(entry as SelectedColumn).node,
           ...(weight ? { weight } : {}),
         }),
@@ -1608,9 +1610,9 @@ export const searchDocument = (
 
   return createExpression<TsVector, "searchDocument">({
     outputName: "searchDocument",
-    node: Object.freeze({
+    node: freeze({
       kind: "tsvector",
-      parts: Object.freeze(collected),
+      parts: freeze(collected),
       language: searchLanguage(options.language),
     }),
   });
@@ -1663,12 +1665,12 @@ const sqlTemplate = <Value>(
     }
   });
 
-  return Object.freeze(
+  return freeze(
     new SqlHandle(
       {
-        node: Object.freeze({
+        node: freeze({
           kind: "raw",
-          parts: Object.freeze(parts),
+          parts: freeze(parts),
           ...(sqlType ? { sqlType } : {}),
         }),
         outputName: "expression",

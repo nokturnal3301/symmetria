@@ -1,3 +1,4 @@
+import { freeze } from "./freeze";
 import type {
   ExpressionDescription,
   PredicateDescription,
@@ -8,14 +9,13 @@ import type { OrderingDescription, SelectPlan, TableBinding } from "./types";
 const remap = <Value>(
   values: readonly Value[],
   visit: (value: Value) => Value,
-): readonly Value[] =>
-  values.length ? Object.freeze(values.map(visit)) : values;
+): readonly Value[] => (values.length ? freeze(values.map(visit)) : values);
 
 /** Give a reusable query new local sources, retaining its correlated ancestors. */
 export const queryOccurrence = (source: SelectPlan): SelectPlan => {
   const replacements = new Map<TableBinding, TableBinding>(
     [source.root, ...source.joins.map((join) => join.binding)].map(
-      (binding) => [binding, Object.freeze({ ...binding })],
+      (binding) => [binding, freeze({ ...binding })],
     ),
   );
 
@@ -32,12 +32,12 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
       return existing;
     }
 
-    const rebound = Object.freeze({
+    const rebound = freeze({
       ...original,
       derived: query(original.derived),
       ...(original.projection
         ? {
-            projection: Object.freeze(
+            projection: freeze(
               Object.fromEntries(
                 Object.entries(original.projection).map(([name, selected]) => [
                   name,
@@ -58,13 +58,11 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
   ): ExpressionDescription => {
     const node = value(original.node);
 
-    return node === original.node
-      ? original
-      : Object.freeze({ ...original, node });
+    return node === original.node ? original : freeze({ ...original, node });
   };
 
   const ordering = (original: OrderingDescription): OrderingDescription =>
-    Object.freeze({ ...original, expression: expression(original.expression) });
+    freeze({ ...original, expression: expression(original.expression) });
 
   const value = (original: ValueNode): ValueNode => {
     switch (original.kind) {
@@ -75,9 +73,9 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
           return original;
         }
 
-        return Object.freeze({
+        return freeze({
           ...original,
-          description: Object.freeze({
+          description: freeze({
             ...original.description,
             binding: rebound,
           }),
@@ -87,31 +85,31 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
       case "placeholder":
         return original;
       case "raw":
-        return Object.freeze({
+        return freeze({
           ...original,
-          parts: Object.freeze(
+          parts: freeze(
             original.parts.map((part) =>
               typeof part === "string" ? part : value(part),
             ),
           ),
         });
       case "binary":
-        return Object.freeze({
+        return freeze({
           ...original,
           left: value(original.left),
           right: value(original.right),
         });
       case "aggregate":
         return original.value
-          ? Object.freeze({ ...original, value: value(original.value) })
+          ? freeze({ ...original, value: value(original.value) })
           : original;
       case "case":
-        return Object.freeze({
+        return freeze({
           ...original,
           value: value(original.value),
-          branches: Object.freeze(
+          branches: freeze(
             original.branches.map((branch) =>
-              Object.freeze({
+              freeze({
                 when: value(branch.when),
                 then: value(branch.then),
               }),
@@ -120,50 +118,50 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
         });
       case "coalesce":
       case "tuple":
-        return Object.freeze({
+        return freeze({
           ...original,
-          values: Object.freeze(original.values.map(value)),
+          values: freeze(original.values.map(value)),
         });
       case "relativeWindow":
-        return Object.freeze({
+        return freeze({
           ...original,
           value: value(original.value),
           offset: value(original.offset),
           ...(original.fallback ? { fallback: value(original.fallback) } : {}),
         });
       case "window":
-        return Object.freeze({
+        return freeze({
           ...original,
           expression: value(original.expression),
-          partitionBy: Object.freeze(original.partitionBy.map(value)),
-          orderBy: Object.freeze(original.orderBy.map(ordering)),
+          partitionBy: freeze(original.partitionBy.map(value)),
+          orderBy: freeze(original.orderBy.map(ordering)),
         });
       case "subquery":
       case "rowCount":
       case "jsonRows":
-        return Object.freeze({ ...original, query: query(original.query) });
+        return freeze({ ...original, query: query(original.query) });
       case "jsonObject":
-        return Object.freeze({
+        return freeze({
           ...original,
-          selection: Object.freeze(original.selection.map(expression)),
+          selection: freeze(original.selection.map(expression)),
         });
       case "jsonPath":
       case "arrayLength":
       case "arrayIndex":
-        return Object.freeze({ ...original, value: value(original.value) });
+        return freeze({ ...original, value: value(original.value) });
       case "searchRank":
       case "searchHeadline":
-        return Object.freeze({
+        return freeze({
           ...original,
           value: value(original.value),
           query: value(original.query),
         });
       case "tsvector":
-        return Object.freeze({
+        return freeze({
           ...original,
-          parts: Object.freeze(
+          parts: freeze(
             original.parts.map((part) =>
-              Object.freeze({ ...part, value: value(part.value) }),
+              freeze({ ...part, value: value(part.value) }),
             ),
           ),
         });
@@ -173,61 +171,61 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
   const predicate = (original: PredicateDescription): PredicateDescription => {
     switch (original.kind) {
       case "comparison":
-        return Object.freeze({
+        return freeze({
           ...original,
           left: value(original.left),
           right: value(original.right),
         });
       case "search":
-        return Object.freeze({
+        return freeze({
           ...original,
           value: value(original.value),
           query: value(original.query),
         });
       case "has":
-        return Object.freeze({
+        return freeze({
           ...original,
           value: value(original.value),
           element: value(original.element),
         });
       case "nullCheck":
-        return Object.freeze({ ...original, value: value(original.value) });
+        return freeze({ ...original, value: value(original.value) });
       case "group":
-        return Object.freeze({
+        return freeze({
           ...original,
-          predicates: Object.freeze(original.predicates.map(predicate)),
+          predicates: freeze(original.predicates.map(predicate)),
         });
       case "not":
       case "notTrue":
-        return Object.freeze({
+        return freeze({
           ...original,
           predicate: predicate(original.predicate),
         });
       case "membership":
-        return Object.freeze({
+        return freeze({
           ...original,
           value: value(original.value),
           values: Array.isArray(original.values)
-            ? Object.freeze(original.values.map(value))
+            ? freeze(original.values.map(value))
             : query(original.values as SelectPlan),
         });
       case "between":
-        return Object.freeze({
+        return freeze({
           ...original,
           value: value(original.value),
           lower: value(original.lower),
           upper: value(original.upper),
         });
       case "exists":
-        return Object.freeze({ ...original, query: query(original.query) });
+        return freeze({ ...original, query: query(original.query) });
     }
   };
 
   const query = (original: SelectPlan): SelectPlan =>
-    Object.freeze({
+    freeze({
       ...original,
       root: binding(original.root),
-      bindings: Object.freeze(
+      bindings: freeze(
         Object.fromEntries(
           Object.entries(original.bindings).map(([name, original]) => [
             name,
@@ -236,13 +234,13 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
         ),
       ),
       joins: remap(original.joins, (join) =>
-        Object.freeze({
+        freeze({
           ...join,
           binding: binding(join.binding),
           ...(join.condition ? { condition: predicate(join.condition) } : {}),
           ...(join.relation
             ? {
-                relation: Object.freeze({
+                relation: freeze({
                   ...join.relation,
                   from: binding(join.relation.from),
                 }),

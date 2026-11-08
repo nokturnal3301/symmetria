@@ -3,6 +3,7 @@
  * `exists()` over any SELECT plan, selected or not. Derived plans are cached per
  * source plan so compiled SQL and row decoders stay cached too.
  */
+import { freeze } from "../plan/freeze";
 import { count, readColumn } from "../expressions";
 import { derivedBinding } from "../plan/derived";
 import type { SelectPlan } from "../plan/types";
@@ -58,18 +59,18 @@ export const countPlan = (plan: SelectPlan): SelectPlan => {
     plan.distinct;
 
   derived = counted
-    ? Object.freeze({
+    ? freeze({
         ...initialPlan(
           derivedBinding(
-            Object.freeze({ ...plan, selection: innerSelection(plan) }),
+            freeze({ ...plan, selection: innerSelection(plan) }),
             "__symmetria_count",
           ),
         ),
-        selection: Object.freeze([readColumn(count())]),
+        selection: freeze([readColumn(count())]),
       })
-    : Object.freeze({
+    : freeze({
         ...withoutLocking(plan),
-        selection: Object.freeze([readColumn(count())]),
+        selection: freeze([readColumn(count())]),
         ordering: EMPTY,
       });
   countPlans.set(plan, derived);
@@ -99,12 +100,12 @@ export const existsPlan = (
     existsPlans.set(plan, variants);
   }
 
-  return (variants[allowPlaceholderLimit ? 1 : 0] ??= Object.freeze(
+  return (variants[allowPlaceholderLimit ? 1 : 0] ??= freeze(
     parameterized
       ? {
           ...initialPlan(
             derivedBinding(
-              Object.freeze({
+              freeze({
                 ...withoutLocking(plan),
                 selection: innerSelection(plan),
               }),

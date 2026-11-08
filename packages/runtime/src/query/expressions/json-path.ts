@@ -1,6 +1,7 @@
 /**
  * JSON path expressions: typed access into jsonb columns with the matching codecs.
  */
+import { freeze } from "../plan/freeze";
 import { booleanCodec, decodeValue, type RuntimeCodec } from "../codecs";
 import { encodeJsonField, jsonRowCodec } from "../codecs/json";
 import type { ExpressionDescription } from ".";
@@ -103,10 +104,10 @@ export const jsonPathDescription = (
 
     current = {
       outputName: description.outputName,
-      node: Object.freeze({
+      node: freeze({
         kind: "jsonPath",
         value: current.node,
-        path: Object.freeze([key]),
+        path: freeze([key]),
         ...(target ? { target } : {}),
         ...(scalarType ? { scalarType } : {}),
       }),

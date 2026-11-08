@@ -183,3 +183,20 @@ test("invalid references are reported with both sides", () => {
     }),
   ).toThrow(/references "tenants\.code", which must be a unique column/);
 });
+
+test("automatic indexes on custom key columns are named after the SQL column", () => {
+  const indexed = schema({
+    users,
+    posts: table({
+      id: int.auto,
+      author: users.by("email").column("author_email").index,
+      editor: users.index.nullable.inverse("edited"),
+    }),
+  });
+  const names = indexed
+    .$snapshot()
+    .tables.find((table) => table.name === "posts")!
+    .indexes!.map((entry) => entry.sqlName);
+
+  expect(names).toEqual(["posts_author_email_idx", "posts_editor_id_idx"]);
+});

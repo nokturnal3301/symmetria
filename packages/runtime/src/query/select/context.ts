@@ -1,4 +1,5 @@
 /** createContext(): column views with relation navigation, nested shapes, aggregates and quantifiers. */
+import { freeze } from "../plan/freeze";
 import type { TableSnapshot } from "../../schema/assembly";
 import { isSilentMember, unknownMember } from "./suggest";
 
@@ -64,10 +65,10 @@ export const createContext = (
       if (bindings.length === 1) {
         const [name, binding] = bindings[0]!;
 
-        return Object.freeze({ [name]: columnsFor(binding) });
+        return freeze({ [name]: columnsFor(binding) });
       }
 
-      return Object.freeze(
+      return freeze(
         Object.defineProperties(
           {},
           Object.fromEntries(
@@ -91,7 +92,7 @@ export const createContext = (
         previousOuter = outer;
         previousLocal = local;
         merged = Object.keys(outer).length
-          ? Object.freeze(mergeBindings(outer, local))
+          ? freeze(mergeBindings(outer, local))
           : local;
       }
 
@@ -124,7 +125,7 @@ export const createContext = (
 
     if (!names) {
       const source = registry.bindingFor(table.name, table.name);
-      names = Object.freeze(
+      names = freeze(
         Object.keys(createScope({ [source.alias]: source })[source.alias]!),
       );
       memberNameCache.set(table, names);
@@ -197,16 +198,16 @@ export const createContext = (
           const first = joined.joins[0]!;
           related = joined.bindings[alias]!;
 
-          base = Object.freeze({
+          base = freeze({
             ...initialPlan(first.binding),
-            bindings: Object.freeze(
+            bindings: freeze(
               Object.fromEntries(
                 joined.joins.map((join) => [join.binding.alias, join.binding]),
               ),
             ),
-            joins: Object.freeze(joined.joins.slice(1)),
+            joins: freeze(joined.joins.slice(1)),
             // first.condition already carries the related table's scope from addJoin.
-            predicates: Object.freeze([first.condition!]),
+            predicates: freeze([first.condition!]),
           });
 
           return base;
@@ -288,9 +289,9 @@ export const createContext = (
             if (callback) {
               const { nested, result } = evaluate(callback);
               const description = readPredicate(result);
-              query = Object.freeze({
+              query = freeze({
                 ...nested.plan,
-                predicates: Object.freeze([
+                predicates: freeze([
                   ...nested.plan.predicates,
                   mode === "every"
                     ? { kind: "notTrue" as const, predicate: description }
@@ -301,9 +302,9 @@ export const createContext = (
 
             return predicate({
               kind: "exists",
-              query: Object.freeze({
+              query: freeze({
                 ...query,
-                ordering: Object.freeze([]),
+                ordering: freeze([]),
                 selection: presentSelection,
               }),
               negated: mode !== "some",
@@ -327,11 +328,9 @@ export const createContext = (
 
             const source = wrapped
               ? derivedBinding(
-                  Object.freeze({
+                  freeze({
                     ...query,
-                    selection: Object.freeze([
-                      { ...expression, outputName: "value" },
-                    ]),
+                    selection: freeze([{ ...expression, outputName: "value" }]),
                   }),
                   "__symmetria_aggregate",
                 )
@@ -348,12 +347,12 @@ export const createContext = (
 
             return createExpression({
               ...selected,
-              node: Object.freeze({
+              node: freeze({
                 kind: "subquery",
-                query: Object.freeze({
+                query: freeze({
                   ...(source ? initialPlan(source) : query),
-                  ordering: Object.freeze([]),
-                  selection: Object.freeze([selected]),
+                  ordering: freeze([]),
+                  selection: freeze([selected]),
                 }),
               }),
             });
@@ -431,14 +430,14 @@ export const createContext = (
 
               return createExpression({
                 outputName: selectedAlias,
-                node: Object.freeze({ kind: "jsonRows", query, many }),
+                node: freeze({ kind: "jsonRows", query, many }),
                 codec: jsonRowCodec(query.selection, many),
               });
             },
             {
               ...(!filtered
                 ? {
-                    [RELATION_SOURCE]: Object.freeze({
+                    [RELATION_SOURCE]: freeze({
                       from: binding.alias,
                       relation: property,
                       target: relation.target,
@@ -465,11 +464,11 @@ export const createContext = (
 
                 return createExpression({
                   ...readColumn(count()),
-                  node: Object.freeze({
+                  node: freeze({
                     kind: counted ? "rowCount" : "subquery",
-                    query: Object.freeze({
+                    query: freeze({
                       ...query,
-                      ...(counted ? {} : { ordering: Object.freeze([]) }),
+                      ...(counted ? {} : { ordering: freeze([]) }),
                       selection: counted
                         ? query.distinct
                           ? query.grouping.length
@@ -481,7 +480,7 @@ export const createContext = (
                                 query.bindings,
                               )
                           : presentSelection
-                        : Object.freeze([readColumn(count())]),
+                        : freeze([readColumn(count())]),
                     }),
                   }),
                 });
@@ -500,14 +499,14 @@ export const createContext = (
                 createExpression({
                   outputName: "exists",
                   codec: booleanCodec,
-                  node: Object.freeze({
+                  node: freeze({
                     kind: "raw",
                     sqlType: "boolean",
-                    parts: Object.freeze([
+                    parts: freeze([
                       "EXISTS ",
                       {
                         kind: "subquery" as const,
-                        query: Object.freeze({
+                        query: freeze({
                           ...current(),
                           selection: presentSelection,
                         }),

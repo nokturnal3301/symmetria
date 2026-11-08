@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.0.1 — 2026-11-08
+
+### Runtime (`symmetria`)
+
+- Query building is about 40% cheaper and point lookups twice as cheap: plan
+  records are frozen only under `SYMMETRIA_FREEZE=1` (the unit suite runs with
+  it), top-level queries reuse their table's root binding and column handles,
+  and quoted identifiers are cached. Shared objects that reach application code
+  (column handles, query and aggregate prototypes, shape tools) stay frozen. A
+  column handle taken from one plain query of a table is now accepted in another
+  plain query of the same table; other aliases, transactions and scoped
+  databases still reject it.
+- `$scope()` callbacks run each time a query or write is built: `update()`,
+  `delete()` and upserts of a scoped database read the scope's current values
+  instead of the ones captured when `$scope()` was called.
+- Streaming closes its cursor and ends the transaction without hiding the
+  original error: a failing `CLOSE` or `COMMIT`, a failed rollback and a
+  connection that cannot be acquired are reported as such.
+- Nested JSON results prepare their row decoder once per result instead of
+  checking it for every row.
+- Relation names that a column would shadow: explicitly chosen names
+  (`.inverse()`, overrides, `relations()`) are rejected when the schema is
+  built; automatic reverse and many-to-many names are left out instead of being
+  silently unreachable.
+- `relations()` predicates, UPDATE values, RETURNING and `$scope()` callbacks
+  see columns only and report unknown columns and relation paths with the table,
+  the member and a suggestion instead of failing on `undefined`; a predicate
+  that compares a third table names the relation and both tables; `to()`
+  explains that it expects a table rather than a reference chain; selecting a
+  predicate explains that predicates are not values.
+- Automatic indexes on `.column()` keys are named after the SQL column, like the
+  foreign-key constraint (`posts_author_email_idx`).
+
 ## 1.0.0 — 2026-11-08
 
 First stable release of `symmetria` and `symmetria-kit`.

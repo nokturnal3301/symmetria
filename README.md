@@ -243,7 +243,7 @@ await db.posts.byId(42).update(({ views }) => ({ views: views.plus(1n) }));
 await db.users.by
   .email("ada@example.com")
   .update({ name: "Ada Lovelace" })
-  .returning(userCard);
+  .returning(({ id, name }) => ({ id, name }));
 ```
 
 Typed `RETURNING`, upserts, atomic nested inserts, bulk chunking, savepoints,

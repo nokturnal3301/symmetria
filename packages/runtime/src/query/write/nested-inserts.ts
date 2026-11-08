@@ -1,6 +1,7 @@
 /**
  * Nested inserts: writes a parent row and its related rows in one transaction, resolving generated keys.
  */
+import { freeze } from "../plan/freeze";
 import { cloneParameter, type SchemaCodecs } from "../codecs";
 import { quoteIdentifier } from "../compile";
 import {
@@ -51,7 +52,9 @@ const uniqueKeys = (table: TableSnapshot): string[][] => {
   const primary = table.columns
     .filter((column) => column.primaryKey)
     .map((column) => column.name);
+
   const keys = primary.length ? [primary] : [];
+
   keys.push(
     ...table.columns
       .filter((column) => column.unique)
@@ -105,7 +108,7 @@ const copyInput = (value: unknown, ancestors = new Set<object>()): unknown => {
       );
   ancestors.delete(value);
 
-  return Object.freeze(result);
+  return freeze(result);
 };
 
 /** Write payloads treat `undefined` as an omitted field or operation. */
@@ -283,7 +286,7 @@ export const createNestedInsert = (
     );
     ancestors.delete(value);
 
-    return Object.freeze(result);
+    return freeze(result);
   };
 
   const values = (Array.isArray(input) ? input : [input]).map((row) =>
@@ -652,7 +655,7 @@ export const createNestedInsert = (
         return Array.isArray(input) ? results : results[0];
       });
 
-    return Object.freeze({
+    return freeze({
       returning: (next: Selector) => build(next),
       execute,
       then: (

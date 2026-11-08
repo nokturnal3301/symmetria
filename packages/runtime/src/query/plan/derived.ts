@@ -1,12 +1,13 @@
 /**
  * Builds the table binding for a derived source (subquery or CTE) from its plan.
  */
+import { freeze } from "./freeze";
 import { expressionSqlType } from "./metadata";
 import { codecMap } from "../codecs";
 import type { SelectPlan, TableBinding } from "./types";
 
 export const derivedBinding = (plan: SelectPlan, alias: string): TableBinding =>
-  Object.freeze({
+  freeze({
     table: {
       name: alias,
       sqlName: alias,
@@ -23,13 +24,13 @@ export const derivedBinding = (plan: SelectPlan, alias: string): TableBinding =>
     },
     alias,
     derived: plan,
-    projection: Object.freeze(
+    projection: freeze(
       Object.fromEntries(
         plan.selection.map((expression) => [expression.outputName, expression]),
       ),
     ),
 
-    codecs: Object.freeze(
+    codecs: freeze(
       codecMap(
         Object.fromEntries(
           plan.selection.flatMap((expression) =>

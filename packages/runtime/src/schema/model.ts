@@ -1392,6 +1392,12 @@ const createSchema = <
       return target[LINK].target;
     }
 
+    if (isReferenceInput(target)) {
+      throw new Error(
+        `symmetria: relation "${tableName}.${relationName}": to() expects a table, not a reference chain; write to(<table>) and compare the key column in the predicate`,
+      );
+    }
+
     const resolved =
       typeof target === "function"
         ? resolveThunk(tableName, relationName, target as () => unknown)

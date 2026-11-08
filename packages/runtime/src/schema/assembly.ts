@@ -359,8 +359,35 @@ export const assembleSchema = <
   );
   const namedRelations = new Set<string>(); // `${sourceKey}.${foreignKey}` edges already named via overrides
 
+  const columnNames = new Map(
+    analyzedTables.map((analyzedTable) => [
+      analyzedTable.key,
+      new Set([
+        ...analyzedTable.scalars.map((column) => column.key),
+        ...analyzedTable.references.map((reference) => `${reference.key}Id`),
+      ]),
+    ]),
+  );
+
   const addRelation = (tableKey: string, relation: RelationEntry) => {
     const list = relations.get(tableKey)!;
+
+    // A column of the same name would shadow the relation in every shape:
+    // names the user chose are rejected, automatic reverse and M:N names are
+    // left out (they were unreachable anyway) and can be named with .inverse().
+    if (columnNames.get(tableKey)?.has(relation.name)) {
+      if (
+        relation.origin.startsWith("reverse of ") ||
+        relation.origin.startsWith("M:N through ")
+      ) {
+        return;
+      }
+
+      throw new Error(
+        `symmetria: relation "${tableKey}.${relation.name}" (${relation.origin}) clashes with a column of the same name; rename the column or name the relation with .inverse()`,
+      );
+    }
+
     const clash = list.find(
       (existingRelation) => existingRelation.name === relation.name,
     );
@@ -675,7 +702,7 @@ export const assembleSchema = <
             !column.definition.unique &&
             !(column.definition.primaryKey && analyzedTable.primaryKey),
         )
-        .map((column) => column.key),
+        .map((column) => ({ column: column.key, key: column.key })),
       ...analyzedTable.references
         .filter(
           (reference, position) =>
@@ -688,7 +715,11 @@ export const assembleSchema = <
             // A junction's composite primary key already leads with its first foreign key.
             !(analyzedTable.isJunction && position === 0),
         )
-        .map((reference) => `${reference.key}Id`),
+        .map((reference) => ({
+          column: `${reference.key}Id`,
+          // The index is named after the SQL column, like the foreign key constraint.
+          key: reference.flags.column ?? `${reference.key}Id`,
+        })),
     ];
 
     if (
@@ -734,9 +765,9 @@ export const assembleSchema = <
         { [analyzedTable.key]: codecs },
         (scope) =>
           Object.fromEntries(
-            indexedColumns.map((name) => [
-              name,
-              index(scope[analyzedTable.key]![name]!),
+            indexedColumns.map(({ column, key }) => [
+              key,
+              index(scope[analyzedTable.key]![column]!),
             ]),
           ),
         analyzedTable.key,

@@ -1,4 +1,5 @@
 /** createQueryTables(): one callable per table with lookups, shapes and mutations. */
+import { freeze } from "../plan/freeze";
 import type { ColumnSnapshot, SchemaSnapshot } from "../../schema/assembly";
 import { computedFields } from "../../schema/computed";
 import type { SchemaCodecs } from "../codecs";
@@ -29,6 +30,7 @@ import {
   createScope,
   initialPlan,
   type QueryHandle,
+  shapeFrame,
 } from "./scope";
 import type { RuntimeScope } from "./types";
 
@@ -54,9 +56,9 @@ export const createQueryTables = (
   return Object.fromEntries(
     snapshot.tables.map((table) => {
       const root = registry.bindingFor(table.name, table.name);
-      const mutationOptions: MutationOptions = Object.freeze({
+      const mutationOptions: MutationOptions = freeze({
         ...(atomic ? { atomic } : {}),
-        scope: registry.scopePredicates(root),
+        scope: () => registry.scopePredicates(root),
         context: (plan: SelectPlan) => createContext(registry, plan),
       });
       const lookupPrototype = Object.freeze(
@@ -73,7 +75,7 @@ export const createQueryTables = (
 
               return createMutation("update", plan.root, values, executor, {
                 ...mutationOptions,
-                scope: plan.predicates,
+                scope: () => plan.predicates,
               });
             },
             delete(this: QueryHandle) {
@@ -81,7 +83,7 @@ export const createQueryTables = (
 
               return createMutation("delete", plan.root, {}, executor, {
                 ...mutationOptions,
-                scope: plan.predicates,
+                scope: () => plan.predicates,
               });
             },
           }),
@@ -96,7 +98,7 @@ export const createQueryTables = (
         keys: readonly ColumnSnapshot[],
         values: readonly unknown[],
       ): object => {
-        const binding = Object.freeze({ ...root });
+        const binding = shapeFrame.bindings ? freeze({ ...root }) : root;
 
         if (registry.scopes[table.name] || computedFields.get(table)?.length) {
           const columns = createScope({ [binding.alias]: binding })[
@@ -104,9 +106,9 @@ export const createQueryTables = (
           ]!;
 
           return createQuery(
-            Object.freeze({
+            freeze({
               ...initialPlan(binding),
-              predicates: Object.freeze([
+              predicates: freeze([
                 ...registry.scopePredicates(binding),
                 ...keys.map((column, position) =>
                   readPredicate(
@@ -114,18 +116,19 @@ export const createQueryTables = (
                   ),
                 ),
               ]),
-              selection: Object.freeze(Object.values(columns).map(readColumn)),
+              selection: freeze(Object.values(columns).map(readColumn)),
             }),
             false,
             false,
             lookupPrototype,
+            binding === root,
           );
         }
 
         const columnNode = (column: ColumnSnapshot): ValueNode =>
-          Object.freeze({
+          freeze({
             kind: "column",
-            description: Object.freeze({ binding, column }),
+            description: freeze({ binding, column }),
           });
 
         const predicates = keys.map(
@@ -135,7 +138,7 @@ export const createQueryTables = (
               binding.codecs[column.name],
             );
 
-            return Object.freeze({
+            return freeze({
               kind: "comparison",
               left: columnNode(column),
               operator: "=",
@@ -149,7 +152,7 @@ export const createQueryTables = (
         const selection = table.columns.map((column): ExpressionDescription => {
           const codec = binding.codecs[column.name];
 
-          return Object.freeze({
+          return freeze({
             node: columnNode(column),
             outputName: column.name,
             ...(codec ? { codec } : {}),
@@ -157,14 +160,15 @@ export const createQueryTables = (
         });
 
         return createQuery(
-          Object.freeze({
+          freeze({
             ...initialPlan(binding),
-            predicates: Object.freeze(predicates),
-            selection: Object.freeze(selection),
+            predicates: freeze(predicates),
+            selection: freeze(selection),
           }),
           false,
           false,
           lookupPrototype,
+          binding === root,
         );
       };
 
@@ -244,7 +248,7 @@ export const createQueryTables = (
               );
             }
 
-            return Object.freeze(
+            return freeze(
               Object.assign(
                 (columns: RuntimeScope[string], tools: unknown) =>
                   callback(columns, tools as Parameters<ShapeCallback>[1]),
@@ -252,7 +256,7 @@ export const createQueryTables = (
               ),
             );
           },
-          by: Object.freeze(
+          by: freeze(
             Object.fromEntries(
               [...uniqueKeys].map(([name, columns]) => [
                 name,

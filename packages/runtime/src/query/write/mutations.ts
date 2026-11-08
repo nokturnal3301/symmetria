@@ -2,6 +2,7 @@
  * Table mutation builders: insert, update, delete and upsert with RETURNING; whole-table UPDATE/DELETE
  * must be confirmed with all().
  */
+import { freeze } from "../plan/freeze";
 import type { PredicateList } from "../select/types";
 import {
   compilePlan,
@@ -16,6 +17,7 @@ import {
   type ReusableShape,
 } from "../select/projections";
 import { validatePredicate } from "../select/scope";
+import { columnsOnly } from "../select/suggest";
 import {
   PREPARE_QUERY,
   preparePlan,
@@ -87,7 +89,8 @@ const PARAMETER_LIMIT = 65535;
 /** Hooks a table's query machinery hands to its mutations: $scope() filters and relation-path contexts. */
 export type MutationOptions = {
   readonly atomic?: AtomicRunner;
-  readonly scope?: readonly PredicateDescription[];
+  /** `$scope()` predicates, evaluated each time a write is built. */
+  readonly scope?: () => readonly PredicateDescription[];
   readonly context?: (plan: SelectPlan) => {
     readonly plan: SelectPlan;
     readonly scope: () => RuntimeScope;
@@ -296,13 +299,13 @@ export const createMutation = (
   options: MutationOptions = {},
 ): object => {
   const profile = executorProfiling(executor);
-  const bindings = Object.freeze({ [root.alias]: root });
+  const bindings = freeze({ [root.alias]: root });
   const scope = createScope(bindings);
 
   const columnNode = (column: ColumnSnapshot): ValueNode =>
-    Object.freeze({
+    freeze({
       kind: "column",
-      description: Object.freeze({ binding: root, column }),
+      description: freeze({ binding: root, column }),
     });
 
   /**
@@ -338,24 +341,24 @@ export const createMutation = (
       );
     }
 
-    const subquery: SelectPlan = Object.freeze({
+    const subquery: SelectPlan = freeze({
       ...context.plan,
-      selection: Object.freeze(
+      selection: freeze(
         keys.map((column) =>
-          Object.freeze({ outputName: column.name, node: columnNode(column) }),
+          freeze({ outputName: column.name, node: columnNode(column) }),
         ),
       ),
-      predicates: Object.freeze([...context.plan.predicates, description]),
+      predicates: freeze([...context.plan.predicates, description]),
     });
     const value: ValueNode =
       keys.length === 1
         ? columnNode(keys[0]!)
-        : Object.freeze({
+        : freeze({
             kind: "tuple",
-            values: Object.freeze(keys.map(columnNode)),
+            values: freeze(keys.map(columnNode)),
           });
 
-    return Object.freeze({
+    return freeze({
       kind: "membership",
       value,
       values: subquery,
@@ -445,11 +448,19 @@ export const createMutation = (
       throw new Error("symmetria: update() requires at least one value");
     }
 
-    return Object.freeze(result);
+    return freeze(result);
   };
 
   const resolved =
-    typeof input === "function" ? input(scope[root.alias]!) : input;
+    typeof input === "function"
+      ? input(
+          columnsOnly(
+            root.table,
+            scope[root.alias]!,
+            `${kind === "insert" ? "insert" : "update"} values`,
+          ),
+        )
+      : input;
   const rows = Array.isArray(resolved) ? resolved : [resolved];
   const single = kind === "insert" && !Array.isArray(resolved);
 
@@ -457,20 +468,18 @@ export const createMutation = (
     throw new Error("symmetria: update() requires at least one value");
   }
 
-  const initial: MutationPlan = Object.freeze({
+  const initial: MutationPlan = freeze({
     kind,
     root,
     bindings,
-    values: Object.freeze(
+    values: freeze(
       kind === "delete"
         ? []
         : rows.map((row) => readValues(row, kind === "insert")),
     ),
     atomicValues,
-    predicates: Object.freeze(
-      kind === "insert" ? [] : [...(options.scope ?? [])],
-    ),
-    selection: Object.freeze([]),
+    predicates: freeze(kind === "insert" ? [] : [...(options.scope?.() ?? [])]),
+    selection: freeze([]),
     ...(single ? { single: true as const } : {}),
   });
 
@@ -510,7 +519,7 @@ export const createMutation = (
       const plans: MutationPlan[] = [];
 
       const split = (values: MutationPlan["values"]): void => {
-        const chunk: MutationPlan = Object.freeze({ ...state, values });
+        const chunk: MutationPlan = freeze({ ...state, values });
 
         if (values.length > 1 && compiled(chunk).parameters.length > limit) {
           const middle = Math.ceil(values.length / 2);
@@ -591,19 +600,19 @@ export const createMutation = (
 
     const execute = () => executeUsing();
 
-    const builder = Object.freeze({
+    const builder = freeze({
       returning: (
         selector: (
           row: RuntimeScope[string],
         ) => readonly SelectedColumn[] | ProjectionObject,
       ) =>
         build(
-          Object.freeze({
+          freeze({
             ...state,
             selection: readSelection(
               returningProjection(
                 selector as never,
-                scope[root.alias]!,
+                columnsOnly(root.table, scope[root.alias]!, "RETURNING"),
                 root.table,
               ),
               bindings,
@@ -620,12 +629,9 @@ export const createMutation = (
         }
 
         return build(
-          Object.freeze({
+          freeze({
             ...state,
-            predicates: Object.freeze([
-              ...state.predicates,
-              wherePredicate(callback),
-            ]),
+            predicates: freeze([...state.predicates, wherePredicate(callback)]),
           }),
         );
       },
@@ -634,7 +640,7 @@ export const createMutation = (
           throw new Error("symmetria: all() applies to UPDATE and DELETE");
         }
 
-        return build(Object.freeze({ ...state, unrestricted: true as const }));
+        return build(freeze({ ...state, unrestricted: true as const }));
       },
       onConflict: (...names: string[]) => {
         if (kind !== "insert") {
@@ -659,15 +665,15 @@ export const createMutation = (
           throw new Error("symmetria: duplicate conflict columns");
         }
 
-        return Object.freeze({
+        return freeze({
           doNothing: () =>
             build(
-              Object.freeze({
+              freeze({
                 ...state,
-                conflict: Object.freeze({
-                  columns: Object.freeze(columns),
+                conflict: freeze({
+                  columns: freeze(columns),
                   action: "nothing",
-                  values: Object.freeze({}),
+                  values: freeze({}),
                 }),
               }),
             ),
@@ -723,7 +729,8 @@ export const createMutation = (
               );
             }
 
-            const excluded = Object.freeze({ ...root, alias: "excluded" });
+            const conflictScopePredicates = options.scope?.() ?? [];
+            const excluded = freeze({ ...root, alias: "excluded" });
             const conflictScope = createScope({ ...bindings, excluded });
             const condition = where
               ? (() => {
@@ -745,15 +752,15 @@ export const createMutation = (
               : undefined;
 
             return build(
-              Object.freeze({
+              freeze({
                 ...state,
-                conflict: Object.freeze({
-                  columns: Object.freeze(columns),
+                conflict: freeze({
+                  columns: freeze(columns),
                   action: "update",
                   excluded,
                   ...(condition ? { condition } : {}),
-                  ...(options.scope?.length
-                    ? { predicates: Object.freeze([...options.scope]) }
+                  ...(conflictScopePredicates.length
+                    ? { predicates: freeze([...conflictScopePredicates]) }
                     : {}),
                   values: readValues(
                     typeof values === "string"

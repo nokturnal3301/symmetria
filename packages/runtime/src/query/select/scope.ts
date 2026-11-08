@@ -1,4 +1,5 @@
 /** Runtime scopes and plan helpers shared by every query module. */
+import { freeze } from "../plan/freeze";
 import { computedFields } from "../../schema/computed";
 import { quoteIdentifier } from "../compile";
 import { jsonRowCodec } from "../codecs/json";
@@ -6,6 +7,7 @@ import {
   COLUMN_EXPRESSION,
   ORDERING_EXPRESSION,
   createExpression,
+  isPredicate,
   readColumn,
   type ExpressionDescription,
   type Ordering,
@@ -37,6 +39,10 @@ type QueryState = {
   readonly allowScopedAlias: boolean;
   readonly freshSource: boolean;
   source?: SourceDescription;
+  /** Built at the top level on the table's shared root binding, so embedding it needs a fresh occurrence. */
+  readonly sharedRoot: boolean;
+  /** The plan with its own source bindings, for use inside another query (subquery, derived table, CTE). */
+  embedded?: SelectPlan;
 };
 export type QueryHandle = ((callback: never) => object) & {
   readonly [QUERY_STATE]: QueryState;
@@ -51,7 +57,7 @@ export const limitedPlan = (state: SelectPlan, limit: 1 | 2): SelectPlan => {
     limitedPlans.set(state, derived);
   }
 
-  return (derived[limit] ??= Object.freeze({
+  return (derived[limit] ??= freeze({
     ...state,
     limit:
       typeof state.limit === "number" ? Math.min(state.limit, limit) : limit,
@@ -90,17 +96,21 @@ export const bindingScope = (
           column.name,
           {
             enumerable: true,
+            // Handles are cached and shared by every query of the binding, so
+            // they are frozen for real, once.
             get: () =>
-              (expression ??= createExpression({
-                node: Object.freeze({
-                  kind: "column",
-                  description: Object.freeze({ binding, column }),
+              (expression ??= Object.freeze(
+                createExpression({
+                  node: freeze({
+                    kind: "column",
+                    description: freeze({ binding, column }),
+                  }),
+                  outputName: column.name,
+                  ...(binding.codecs[column.name]
+                    ? { codec: binding.codecs[column.name] }
+                    : {}),
                 }),
-                outputName: column.name,
-                ...(binding.codecs[column.name]
-                  ? { codec: binding.codecs[column.name] }
-                  : {}),
-              })),
+              )),
           },
         ];
       }),
@@ -109,7 +119,7 @@ export const bindingScope = (
 
   for (const callback of computedFields.get(binding.table) ?? []) {
     for (const [name, selected] of Object.entries(
-      callback(Object.freeze({ ...columns })),
+      callback(freeze({ ...columns })),
     )) {
       quoteIdentifier(name);
 
@@ -119,13 +129,16 @@ export const bindingScope = (
 
       const description = readColumn(selected);
       validateNode(description.node, bindings);
-      columns[name] = createExpression({
-        ...description,
-        outputName: name,
-      });
+      columns[name] = Object.freeze(
+        createExpression({
+          ...description,
+          outputName: name,
+        }),
+      );
     }
   }
 
+  // Column handles reach user callbacks; the scope is cached per binding, so a real freeze is cheap.
   const result = Object.freeze(columns);
   bindingColumns.set(binding, result);
 
@@ -133,7 +146,7 @@ export const bindingScope = (
 };
 
 export const createScope = (bindings: SelectPlan["bindings"]): RuntimeScope =>
-  Object.freeze(
+  freeze(
     Object.fromEntries(
       Object.entries(bindings).map(([aliasName, binding]) => [
         aliasName,
@@ -261,7 +274,7 @@ export const readSelection = (
       throw new Error("symmetria: a projection requires at least one field");
     }
 
-    return Object.freeze(
+    return freeze(
       entries.map(([name, selected]) => {
         quoteIdentifier(name);
 
@@ -271,6 +284,12 @@ export const readSelection = (
         ) {
           throw new Error(
             "symmetria: selected fields must be SQL expressions, objects or selected queries",
+          );
+        }
+
+        if (isPredicate(selected)) {
+          throw new Error(
+            `symmetria: "${name}" is a predicate, not a value; select a boolean with sql<boolean>\`…\` or use it in where`,
           );
         }
 
@@ -293,9 +312,9 @@ export const readSelection = (
             );
           }
 
-          return Object.freeze({
+          return freeze({
             outputName: name,
-            node: Object.freeze({
+            node: freeze({
               kind: "jsonRows" as const,
               query,
               many: true,
@@ -310,14 +329,14 @@ export const readSelection = (
 
           return description.outputName === name && Object.isFrozen(description)
             ? description
-            : Object.freeze({ ...description, outputName: name });
+            : freeze({ ...description, outputName: name });
         }
 
         const selection = readSelection(selected as ProjectionObject, bindings);
 
-        return Object.freeze({
+        return freeze({
           outputName: name,
-          node: Object.freeze({ kind: "jsonObject" as const, selection }),
+          node: freeze({ kind: "jsonObject" as const, selection }),
           codec: jsonRowCodec(selection),
         });
       }),
@@ -330,7 +349,7 @@ export const readSelection = (
 
   const names = new Set<string>();
 
-  return Object.freeze(
+  return freeze(
     (expressions as readonly SelectedColumn[]).map((expression) => {
       const description = readColumn(expression);
       quoteIdentifier(description.outputName);
@@ -362,7 +381,7 @@ export const countValue = (
       );
     }
 
-    return Object.freeze({ ...node, count: true });
+    return freeze({ ...node, count: true });
   }
 
   if (!Number.isSafeInteger(count) || count < 0) {
@@ -378,10 +397,10 @@ const noBindings: SelectPlan["bindings"] = Object.freeze({});
 export const emptyBindings = () => noBindings;
 
 export const initialPlan = (root: TableBinding): SelectPlan =>
-  Object.freeze({
+  freeze({
     kind: "select",
     root,
-    bindings: Object.freeze({ [root.alias]: root }),
+    bindings: freeze({ [root.alias]: root }),
     joins: EMPTY,
     selection: EMPTY,
     predicates: EMPTY,
@@ -442,12 +461,12 @@ export const lockPlan = (
     throw new Error("symmetria: row locks require existing query aliases");
   }
 
-  return Object.freeze({
+  return freeze({
     ...state,
-    locking: Object.freeze({
+    locking: freeze({
       ...options,
       mode,
-      ...(options.of ? { of: Object.freeze([...options.of]) } : {}),
+      ...(options.of ? { of: freeze([...options.of]) } : {}),
     }),
   });
 };

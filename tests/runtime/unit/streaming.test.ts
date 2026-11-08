@@ -170,3 +170,106 @@ test("stream() validates its size and needs a transactional driver", () => {
     database.users((user) => ({ id: user.id })).stream({ size: 0 }),
   ).toThrow(/positive integer/);
 });
+
+for (const phase of ["close", "commit"] as const) {
+  for (const early of [false, true]) {
+    test(`stream() propagates ${phase} failure on ${early ? "early exit" : "completion"}`, async () => {
+      const failure = new Error(`${phase} failed`);
+      const events: string[] = [];
+      const connection: TransactionDriver = {
+        execute: async ({ sql }) => {
+          if (sql.startsWith("CLOSE") && phase === "close") {
+            throw failure;
+          }
+
+          return sql.startsWith("FETCH") ? [{ id: 1 }] : [];
+        },
+        transaction: async (callback) => callback(connection),
+      };
+      const driver: Driver = {
+        execute: connection.execute,
+        close: async () => {},
+        transaction: async (callback) => {
+          try {
+            const result = await callback(connection);
+            events.push("commit");
+
+            if (phase === "commit") {
+              throw failure;
+            }
+
+            return result;
+          } catch (error) {
+            events.push("rollback");
+            throw error;
+          }
+        },
+      };
+      const db = schema({ users: { id: int } }, { driver });
+      const consume = async () => {
+        for await (const _row of db.users(({ id }) => ({ id })).stream()) {
+          if (early) {
+            break;
+          }
+        }
+      };
+
+      await expect(consume()).rejects.toBe(failure);
+      expect(events.at(-1)).toBe("rollback");
+    });
+  }
+}
+
+test("stream() preserves a fetch failure when rollback also fails", async () => {
+  const failure = new Error("fetch failed");
+  const connection: TransactionDriver = {
+    execute: async ({ sql }) => {
+      if (sql.startsWith("FETCH")) {
+        throw failure;
+      }
+
+      return [];
+    },
+    transaction: async (callback) => callback(connection),
+  };
+  const driver: Driver = {
+    execute: connection.execute,
+    close: async () => {},
+    transaction: async (callback) => {
+      try {
+        return await callback(connection);
+      } catch {
+        throw new Error("rollback failed");
+      }
+    },
+  };
+  const db = schema({ users: { id: int } }, { driver });
+
+  await expect(async () => {
+    for await (const _row of db.users(({ id }) => ({ id })).stream()) {
+      // The FETCH never returns a row.
+    }
+  }).toThrow(failure);
+});
+
+test("stream() propagates connection acquisition failure", async () => {
+  const failure = new Error("pool unavailable");
+  const db = schema(
+    { users: { id: int } },
+    {
+      driver: {
+        execute: async () => [],
+        close: async () => {},
+        transaction: async () => {
+          throw failure;
+        },
+      },
+    },
+  );
+
+  await expect(async () => {
+    for await (const _row of db.users(({ id }) => ({ id })).stream()) {
+      // No connection was acquired.
+    }
+  }).toThrow(failure);
+});

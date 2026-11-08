@@ -256,7 +256,9 @@ test("inferred JOINs reject foreign scopes, non-FK expressions and filtered rela
     users: { id: int, name: text, manager: self.nullable },
   });
   let escaped: QueryColumn<number | null, "managerId">;
-  database.users((user) => {
+  // Plain queries of one table share its root binding; a differently aliased
+  // source is a foreign scope.
+  database.users.as("people")((user) => {
     escaped = user.managerId;
 
     return { id: user.id };
