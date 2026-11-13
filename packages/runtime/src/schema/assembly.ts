@@ -45,6 +45,10 @@ export type ColumnSnapshot = {
   primaryKey: boolean;
   default?: ColumnDefault;
   enumerationValues?: readonly string[];
+  /** The enum's PostgreSQL type name when declared with `typeName()`. */
+  enumerationName?: string;
+  /** Non-default collation declared with `.collate()`. */
+  collation?: string;
   references?: {
     table: string;
     column: string;
@@ -670,6 +674,12 @@ export const assembleSchema = <
         ...(column.definition.enumerationValues !== undefined
           ? { enumerationValues: column.definition.enumerationValues }
           : {}),
+        ...(column.definition.enumerationName !== undefined
+          ? { enumerationName: column.definition.enumerationName }
+          : {}),
+        ...(column.definition.collation !== undefined
+          ? { collation: column.definition.collation }
+          : {}),
       }));
 
       for (const reference of analyzedTable.references) {
@@ -689,10 +699,14 @@ export const assembleSchema = <
           );
         }
 
+        // A foreign-key column takes the referenced key's type and collation.
         columns.push({
           name: `${reference.key}Id`,
           sqlName,
           sqlType: targetColumn.definition.sqlType,
+          ...(targetColumn.definition.collation !== undefined
+            ? { collation: targetColumn.definition.collation }
+            : {}),
           notNull: reference.flags.nullable !== true,
           unique: reference.flags.unique === true,
           primaryKey: analyzedTable.keys.includes(`${reference.key}Id`),
@@ -762,6 +776,41 @@ export const assembleSchema = <
     },
   );
 
+  // Columns that name the same enum type share it, so their labels must agree.
+  const namedEnumerations = new Map<
+    string,
+    { column: string; values: readonly string[] }
+  >();
+
+  for (const table of tableSnapshots) {
+    for (const column of table.columns) {
+      if (column.enumerationName === undefined) {
+        continue;
+      }
+
+      const location = `${table.name}.${column.name}`;
+      const values = column.enumerationValues ?? [];
+      const declared = namedEnumerations.get(column.enumerationName);
+
+      if (!declared) {
+        namedEnumerations.set(column.enumerationName, {
+          column: location,
+          values,
+        });
+        continue;
+      }
+
+      if (JSON.stringify(declared.values) !== JSON.stringify(values)) {
+        const labels = (list: readonly string[]) =>
+          list.map((value) => JSON.stringify(value)).join(", ");
+
+        throw new Error(
+          `symmetria: enum type "${column.enumerationName}" has different labels on "${declared.column}" (${labels(declared.values)}) and "${location}" (${labels(values)}); columns sharing a type need the same labels in the same order`,
+        );
+      }
+    }
+  }
+
   // Codepoint sort — locale-independent, so snapshot diffs are stable everywhere.
   const snapshot: SchemaSnapshot = {
     tables: [...tableSnapshots].sort((left, right) =>
@@ -779,7 +828,7 @@ export const assembleSchema = <
             !column.definition.unique &&
             !(column.definition.primaryKey && analyzedTable.primaryKey),
         )
-        .map((column) => ({ column: column.key, key: column.key })),
+        .map((column) => column.key),
       ...analyzedTable.references
         .filter(
           (reference, position) =>
@@ -792,11 +841,7 @@ export const assembleSchema = <
             // A junction's composite primary key already leads with its first foreign key.
             !(analyzedTable.isJunction && position === 0),
         )
-        .map((reference) => ({
-          column: `${reference.key}Id`,
-          // The index is named after the SQL column, like the foreign key constraint.
-          key: reference.flags.column ?? `${reference.key}Id`,
-        })),
+        .map((reference) => `${reference.key}Id`),
     ];
 
     if (
@@ -836,18 +881,20 @@ export const assembleSchema = <
       );
     }
 
+    // Automatic indexes are named after the SQL column, like foreign key constraints.
     if (indexedColumns.length) {
       applyIndexes(
         snapshot,
         { [analyzedTable.key]: codecs },
         (scope) =>
           Object.fromEntries(
-            indexedColumns.map(({ column, key }) => [
-              key,
+            indexedColumns.map((column) => [
+              column,
               index(scope[analyzedTable.key]![column]!),
             ]),
           ),
         analyzedTable.key,
+        true,
       );
     }
 

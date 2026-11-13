@@ -7,8 +7,13 @@ import {
   type SkippedPredicate,
   type Predicate,
   type QueryColumn,
+  type RowColumnTraits,
   type ScalarQuery,
   type SelectedColumn,
+  type Summable,
+  type SummableValue,
+  type TraitedRow,
+  type TraitsOf,
   type Parameter,
 } from "../expressions";
 import type {
@@ -52,6 +57,7 @@ export type RootScope<Rows extends SchemaRows, RootTable extends string> = {
     root: true;
   };
 };
+/** Query columns of a row: values a read returns, computed and compared as the row's traits say. */
 export type Columns<
   Row extends Record<string, unknown>,
   Nullable extends boolean = false,
@@ -59,7 +65,8 @@ export type Columns<
 > = {
   readonly [ColumnName in StringKeys<Row>]: QueryColumn<
     Row[ColumnName] | (Nullable extends true ? null : never),
-    ColumnName
+    ColumnName,
+    RowColumnTraits<Row, ColumnName>
   > & {
     readonly [COLUMN_ORIGIN]: {
       readonly alias: Alias;
@@ -112,13 +119,12 @@ type AggregateFields<
   Name extends "sum" | "average" | "minimum" | "maximum",
 > = {
   readonly [Key in keyof Row & string as Name extends "sum" | "average"
-    ? NonNullable<Row[Key]> extends number | bigint | string
-      ? Key
-      : never
-    : Key]: QueryColumn<
-    Name extends "sum" | "average" ? Decimal | null : Row[Key] | null,
-    Name
-  >;
+    ? false extends SummableValue<Row[Key]>
+      ? never
+      : Key
+    : Key]: Name extends "sum" | "average"
+    ? QueryColumn<Decimal | null, Name>
+    : QueryColumn<Row[Key] | null, Name, RowColumnTraits<Row, Key>>;
 };
 type RelationQuery<
   Rows extends SchemaRows,
@@ -162,7 +168,8 @@ type RelationQuery<
     Many extends true
       ? ProjectionRow<ShapeSelection<Shape>>[]
       : ProjectionRow<ShapeSelection<Shape>> | null,
-    Alias
+    Alias,
+    ProjectionTraits<ShapeSelection<Shape>>
   >;
   <
     const Shape extends Record<string, unknown>,
@@ -198,32 +205,41 @@ type RelationQuery<
         Many extends true
           ? ProjectionRow<ShapeSelection<Shape>>[]
           : ProjectionRow<ShapeSelection<Shape>> | null,
-        Alias
+        Alias,
+        ProjectionTraits<ShapeSelection<Shape>>
       >;
   readonly count: () => QueryColumn<number, "count">;
-  readonly sum: ((
+  readonly sum: (<
+    Expression extends SelectedColumn<number | bigint | Decimal | null>,
+  >(
     selector: (
       columns: RelatedColumns<Rows, Relations, Target>,
-    ) => SelectedColumn<number | bigint | string | null>,
+    ) => Expression & Summable<Expression>,
   ) => QueryColumn<Decimal | null, "sum">) &
     AggregateFields<Rows[Target], "sum">;
-  readonly average: ((
+  readonly average: (<
+    Expression extends SelectedColumn<number | bigint | Decimal | null>,
+  >(
     selector: (
       columns: RelatedColumns<Rows, Relations, Target>,
-    ) => SelectedColumn<number | bigint | string | null>,
+    ) => Expression & Summable<Expression>,
   ) => QueryColumn<Decimal | null, "average">) &
     AggregateFields<Rows[Target], "average">;
-  readonly minimum: (<Value>(
-    selector: (
-      columns: RelatedColumns<Rows, Relations, Target>,
-    ) => SelectedColumn<Value>,
-  ) => QueryColumn<Value | null, "minimum">) &
+  readonly minimum: (<Expression extends SelectedColumn>(
+    selector: (columns: RelatedColumns<Rows, Relations, Target>) => Expression,
+  ) => QueryColumn<
+    ExpressionValue<Expression> | null,
+    "minimum",
+    TraitsOf<Expression>
+  >) &
     AggregateFields<Rows[Target], "minimum">;
-  readonly maximum: (<Value>(
-    selector: (
-      columns: RelatedColumns<Rows, Relations, Target>,
-    ) => SelectedColumn<Value>,
-  ) => QueryColumn<Value | null, "maximum">) &
+  readonly maximum: (<Expression extends SelectedColumn>(
+    selector: (columns: RelatedColumns<Rows, Relations, Target>) => Expression,
+  ) => QueryColumn<
+    ExpressionValue<Expression> | null,
+    "maximum",
+    TraitsOf<Expression>
+  >) &
     AggregateFields<Rows[Target], "maximum">;
   readonly exists: () => QueryColumn<boolean, "exists">;
 } & (Paginated extends true
@@ -359,6 +375,7 @@ type RootRow<Scope extends QueryScope> = {
     : never;
 }[keyof Scope];
 declare const QUERY_RESULT: unique symbol;
+declare const QUERY_TRAITS: unique symbol;
 type NestedQuery = QueryReference & {
   readonly [QUERY_RESULT]: Record<string, unknown>;
 };
@@ -366,6 +383,52 @@ export type ProjectionObject = {
   readonly [name: string]: SelectedColumn | ProjectionObject | NestedQuery;
 };
 export type Projection = ColumnSelection | ProjectionObject;
+/**
+ * The traits of a projection field: a column's, or a nested result's fields.
+ * A projection known only by its index signature has none, which also ends
+ * the recursion through `ProjectionObject`.
+ */
+type FieldTraits<Field> = Field extends SelectedColumn
+  ? TraitsOf<Field>
+  : Field extends { readonly [QUERY_TRAITS]: infer Traits }
+    ? Traits
+    : Field extends ProjectionObject
+      ? string extends keyof Field
+        ? {}
+        : ProjectionTraits<Field>
+      : {};
+/**
+ * The traits of a projection's fields that have any, so a derived table or CTE
+ * built from it computes and compares its columns like their sources.
+ */
+type SelectionTraits<Selection extends Projection> =
+  Selection extends readonly SelectedColumn[]
+    ? {
+        [Expression in Selection[number] as keyof TraitsOf<Expression> extends never
+          ? never
+          : Expression[typeof COLUMN_EXPRESSION]["outputName"]]: TraitsOf<Expression>;
+      }
+    : {
+        [Name in keyof Selection as keyof FieldTraits<
+          Selection[Name]
+        > extends never
+          ? never
+          : Name]: FieldTraits<Selection[Name]>;
+      };
+/**
+ * A nested result's traits (a relation, a selected query, a nested object in a
+ * CTE): the JSON holds every field in its stored form, and a path reads each
+ * field with its codec, so jsonb(schema) fields stay input-typed inside it.
+ */
+type ProjectionTraits<Selection extends Projection> =
+  keyof SelectionTraits<Selection> extends never
+    ? {}
+    : { readonly fields: SelectionTraits<Selection> };
+/** The row a derived table or CTE of a projection has. */
+type DerivedRow<Selection extends Projection> = TraitedRow<
+  ProjectionRow<Selection>,
+  SelectionTraits<Selection>
+>;
 export type ProjectionRow<Selection extends Projection> =
   Selection extends readonly SelectedColumn[]
     ? {
@@ -482,9 +545,14 @@ export type ShapeTools<
   Relations extends SchemaRelations,
 > = ShapeJoins<Rows, Relations> &
   typeof shapeExpressions & {
-    readonly whereNotNull: <Value, Name extends string>(
-      column: QueryColumn<Value, Name>,
-    ) => QueryColumn<NonNullable<Value>, Name>;
+    /** Adds `IS NOT NULL` (for JSON, not JSON null either) and returns the column typed non-null. */
+    readonly whereNotNull: <Expression extends SelectedColumn>(
+      column: Expression,
+    ) => QueryColumn<
+      NonNullable<ExpressionValue<Expression>>,
+      Expression[typeof COLUMN_EXPRESSION]["outputName"],
+      TraitsOf<Expression>
+    >;
   };
 type SingleSelectedColumn<Selection> = Selection extends readonly [
   SelectedColumn,
@@ -557,6 +625,7 @@ export type Query<
   ? QueryReference &
       Preparable<ProjectionRow<Selection>[]> & {
         readonly [QUERY_RESULT]: ProjectionRow<Selection>;
+        readonly [QUERY_TRAITS]: ProjectionTraits<Selection>;
         readonly prepare: () => PreparedQuery<ProjectionRow<Selection>[]>;
         readonly toSQL: () => CompiledQuery;
         readonly execute: () => Promise<ProjectionRow<Selection>[]>;
@@ -590,26 +659,27 @@ export type Query<
         }) => AsyncIterable<ProjectionRow<Selection>>;
         readonly as: <const AliasName extends string>(
           name: AliasName,
-        ) => DerivedQuery<Rows, Relations, ProjectionRow<Selection>, AliasName>;
+        ) => DerivedQuery<Rows, Relations, DerivedRow<Selection>, AliasName>;
         readonly cte: <const Name extends string>(
           name: Name,
           options?: { materialized?: boolean },
-        ) => DerivedQuery<Rows, Relations, ProjectionRow<Selection>, Name>;
+        ) => DerivedQuery<Rows, Relations, DerivedRow<Selection>, Name>;
         readonly recursive: <const Name extends string>(
           name: Name,
           step: (
-            self: DerivedQuery<Rows, Relations, ProjectionRow<Selection>, Name>,
+            self: DerivedQuery<Rows, Relations, DerivedRow<Selection>, Name>,
           ) => QueryReference & {
             execute: () => Promise<ProjectionRow<Selection>[]>;
           },
           options?: { unionAll?: boolean },
-        ) => DerivedQuery<Rows, Relations, ProjectionRow<Selection>, Name>;
+        ) => DerivedQuery<Rows, Relations, DerivedRow<Selection>, Name>;
       } & ([SingleSelectedColumn<Selection>] extends [never]
         ? {}
         : ScalarQuery<ExpressionValue<SingleSelectedColumn<Selection>>> & {
             readonly scalar: () => QueryColumn<
               ExpressionValue<SingleSelectedColumn<Selection>> | null,
-              "scalar"
+              "scalar",
+              TraitsOf<SingleSelectedColumn<Selection>>
             >;
           })
   : {

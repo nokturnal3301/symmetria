@@ -132,7 +132,7 @@ export const choose = (
         `${options.header ? `\u001b[${headerHeight + 2};1H` : `\u001b[${renderedLines}A\r`}\u001b[J\u001b[?25h`,
       );
       process.stdout.write(
-        `  ${style(choice === undefined ? "○" : "◆", "accent")} ${choice === undefined ? style("Closed", "muted") : choices[choice]}\n\n`,
+        `  ${fitLine(`${style(choice === undefined ? "○" : "◆", "accent")} ${choice === undefined ? style("Closed", "muted") : choices[choice]}`, terminalWidth())}\n\n`,
       );
       resolve(choice);
     };
@@ -265,7 +265,7 @@ export const view = (
       process.stdout.write(
         [
           "\u001b[H\u001b[2J",
-          `  ${brand()} ${style(`/ ${title}`, "muted")}\n\n`,
+          `  ${fitLine(`${brand()} ${style(`/ ${title}`, "muted")}`)}\n\n`,
           page.join("\n"),
           `\u001b[${Math.max(1, (process.stdout.rows || 24) - 1)};1H  ${style(fitLine(footer), "muted")}`,
         ].join(""),

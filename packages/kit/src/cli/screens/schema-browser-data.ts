@@ -2,6 +2,7 @@
  * Data model behind the schema browser: tabs, searchable entries, table matching and SQL highlighting.
  */
 import type { ColumnSnapshot, SchemaSnapshot, TableSnapshot } from "symmetria";
+import { IDENTITY_BY_DEFAULT, isIdentityDefault } from "symmetria/internal";
 import {
   enumerationSQL,
   foreignKeySQL,
@@ -9,6 +10,7 @@ import {
   tableSQL,
 } from "../../migrations/ddl";
 import { migrationSnapshot } from "../../migrations/snapshot";
+import { columnTypeLabel } from "../ui/format";
 import { theme } from "../ui/style";
 
 export const inspectTabs = [
@@ -50,12 +52,14 @@ export const inspectEntries = (
   if (tab === "Columns") {
     return table.columns.map((column) => {
       const defaultValue = defaultLabel(column);
-      const identity =
-        column.default?.kind === "sql" && column.default.sql === "identity";
+      const identity = isIdentityDefault(column.default);
+      const byDefault =
+        column.default?.kind === "sql" &&
+        column.default.sql === IDENTITY_BY_DEFAULT;
 
       return {
         name: column.name,
-        kind: column.sqlType,
+        kind: columnTypeLabel(column),
         badges: [
           column.primaryKey || table.primaryKey?.includes(column.sqlName)
             ? "PK"
@@ -66,11 +70,11 @@ export const inspectEntries = (
           identity ? "AUTO" : defaultValue === undefined ? "" : "DEFAULT",
         ].filter(Boolean),
         description: [
-          `${table.sqlName}.${column.sqlName} · ${column.sqlType} · ${column.notNull ? "NOT NULL" : "NULLABLE"}`,
+          `${table.sqlName}.${column.sqlName} · ${columnTypeLabel(column)} · ${column.notNull ? "NOT NULL" : "NULLABLE"}`,
           defaultValue === undefined
             ? ""
             : identity
-              ? "GENERATED ALWAYS AS IDENTITY"
+              ? `GENERATED ${byDefault ? "BY DEFAULT" : "ALWAYS"} AS IDENTITY`
               : `Default: ${defaultValue}`,
           column.enumerationValues
             ? `Values: ${column.enumerationValues.join(" · ")}`

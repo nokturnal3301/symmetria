@@ -61,6 +61,12 @@ bun run check:release
 verification. See [tests](tests/README.md) for each suite's scope and
 [building and publishing](docs/publishing.md) for package details.
 
+Changes to drivers, catalog queries (`drift`, `pull`, `verify`) or migrations
+should pass on every supported PostgreSQL major version, 14 through 18, and, for
+drivers and migrations, through PgBouncer in transaction mode. The
+[tests README](tests/README.md#postgresql-versions-and-pgbouncer) has the
+commands.
+
 ## Making a change
 
 - Keep each pull request focused and explain the behavior it changes.

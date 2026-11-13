@@ -7,6 +7,7 @@ import type {
   TableSnapshot,
 } from "../../schema/assembly";
 import type { RuntimeCodec } from "../codecs";
+import type { DeferredError } from "../codecs/deferred";
 import type {
   ExpressionDescription,
   PredicateDescription,
@@ -137,6 +138,8 @@ export type SelectPlan = {
   readonly limit?: number | PlaceholderNode;
   readonly offset?: number | PlaceholderNode;
   readonly locking?: RowLockOptions & { readonly mode: "UPDATE" | "SHARE" };
+  /** A data error found while building; compiling the plan throws it. */
+  readonly failure?: DeferredError;
 };
 
 type ConflictDescription = {
@@ -146,8 +149,6 @@ type ConflictDescription = {
   readonly action: "nothing" | "update";
   readonly values: Readonly<Record<string, ValueNode | typeof DEFAULT_VALUE>>;
   readonly excluded?: TableBinding;
-  /** `$scope()` predicates on the target row: a conflict outside the scope updates nothing. */
-  readonly predicates?: readonly PredicateDescription[];
 };
 
 export type MutationPlan = {
@@ -162,10 +163,18 @@ export type MutationPlan = {
   readonly predicates: readonly PredicateDescription[];
   readonly selection: readonly ExpressionDescription[];
   readonly conflict?: ConflictDescription;
+  /**
+   * `$scope()` predicates every written row must satisfy, checked in the
+   * statement; an upsert also checks the conflicting row before updating it.
+   * Absent on unscoped tables and on DELETE.
+   */
+  readonly checks?: readonly PredicateDescription[];
   /** A single-object INSERT returns one row instead of an array. */
   readonly single?: true;
   /** `all()` confirmed that an UPDATE or DELETE without predicates is intended. */
   readonly unrestricted?: true;
+  /** A data error found while building; compiling the plan throws it. */
+  readonly failure?: DeferredError;
 };
 
 export interface QueryReference {

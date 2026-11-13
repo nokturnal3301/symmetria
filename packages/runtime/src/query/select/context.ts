@@ -16,6 +16,7 @@ import {
   readColumn,
   readPredicate,
   sum,
+  type Decimal,
   type Predicate,
   type SelectedColumn,
 } from "../expressions";
@@ -313,7 +314,7 @@ export const createContext = (
 
           const aggregate = (
             operation: (
-              column: SelectedColumn<number | bigint | string | null>,
+              column: SelectedColumn<number | bigint | Decimal | null>,
             ) => SelectedColumn,
             callback: (columns: RuntimeScope[string]) => SelectedColumn,
           ) => {
@@ -341,7 +342,7 @@ export const createContext = (
                 (source
                   ? createScope({ [source.alias]: source })[source.alias]!
                       .value!
-                  : result) as SelectedColumn<number | bigint | string | null>,
+                  : result) as SelectedColumn<number | bigint | Decimal | null>,
               ),
             );
 

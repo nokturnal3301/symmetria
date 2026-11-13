@@ -1,4 +1,4 @@
-import { profileScreen } from "../screens/profiler";
+import { profileScreen, profilerHttpError } from "../screens/profiler";
 import type { CliContext } from "../context";
 
 /** `profile`: the live profiler screen, or its JSON feed when not interactive. */
@@ -22,8 +22,8 @@ export const profile = async (context: CliContext): Promise<void> => {
   });
 
   if (!response.ok) {
-    throw new Error(`symmetria: profiler returned HTTP ${response.status}`);
+    throw new Error(profilerHttpError(response.status));
   }
 
-  output(JSON.stringify(await response.json(), null, 2));
+  output(JSON.stringify({ requests: await response.json() }, null, 2));
 };

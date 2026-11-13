@@ -7,7 +7,12 @@ import type {
   SelectPlan,
   TableBinding,
 } from "../plan/types";
-import type { PlaceholderNode, ValueNode } from "../expressions";
+import type {
+  PlaceholderNode,
+  PredicateDescription,
+  ScopePredicate,
+  ValueNode,
+} from "../expressions";
 import type { PostgresRenderer, RenderContext } from "./postgres/types";
 
 export type Bindings = Readonly<Record<string, TableBinding>>;
@@ -17,12 +22,28 @@ type ExpressionCache = {
   jsonOutput: boolean;
 }[];
 
+/** Where one $scope() filter landed in a compiled statement. */
+export type ScopeSlot = {
+  readonly description: ScopePredicate;
+  readonly bindings: Bindings;
+  readonly aliases: ReadonlyMap<TableBinding, string>;
+  /** Its parameters are `parameters[start..end)`. */
+  readonly start: number;
+  readonly end: number;
+  readonly sql: string;
+};
+
 /** Everything one compilation shares between its render functions. */
 export type Compilation = {
   readonly plan: SelectPlan | MutationPlan;
   readonly renderer: PostgresRenderer;
   readonly placeholder: ((node: PlaceholderNode) => unknown) | undefined;
   readonly parameters: unknown[];
+  /** $scope() results to render instead of the ones from build time. */
+  readonly scopeValues:
+    | ReadonlyMap<ScopePredicate, PredicateDescription>
+    | undefined;
+  scopes: ScopeSlot[] | undefined;
   readonly commonTables: Map<string, CommonTableExpression>;
   readonly visiting: Set<object>;
   readonly references: Map<object, string>;
@@ -44,11 +65,14 @@ export const createCompilation = (
   renderer: PostgresRenderer,
   placeholder: ((node: PlaceholderNode) => unknown) | undefined,
   selectSql: Compilation["selectSql"],
+  scopeValues?: Compilation["scopeValues"],
 ): Compilation => ({
   plan,
   renderer,
   placeholder,
   parameters: [],
+  scopeValues,
+  scopes: undefined,
   commonTables: new Map(),
   visiting: new Set(),
   references: new Map(),

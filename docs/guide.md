@@ -230,17 +230,32 @@ transaction handle. Throwing rolls back the work. See
 [writes](reference.md#insert-update-delete) and
 [transactions](reference.md#transactions) for updates, conflicts and savepoints.
 
+A mistake in the query itself, such as an unknown column, throws where the query
+is built. A problem with the values, such as `null` for a required column or
+`1.5` for an `int`, rejects the promise when the write runs, before anything is
+sent, so `.catch()` and `try { await … }` handle request data in one place (see
+[when errors surface](reference.md#when-errors-surface)).
+
 ## 6. Keep large values exact at the JSON boundary
 
 Bigint writes and comparisons accept safe JavaScript integers: `views.above(10)`
 and `{ views: 42 }` work. Schema defaults use bigint literals, such as
 `bigint.default(0n)`. Use bigint literals for larger inputs too, such as
-`9007199254740993n`. Unsafe integer `number` inputs are rejected.
+`9007199254740993n`. An unsafe integer `number` input rejects the query when it
+runs.
 
 Results remain JavaScript `bigint`; decimal `numeric()` values are strings. For
 PostgreSQL integer-range values, `int` gives ordinary `number` results. Choose
 the storage type for the domain rather than converting large results to `number`
 and losing precision.
+
+Arithmetic stays exact the same way, and its result type is what PostgreSQL
+returns. `quantity.multiply(price)` and `quantity.divide(2)` are decimal strings
+(division never drops the fraction); `quantity.quotient(2)` is the whole-number
+part, a `number`. A fraction next to an integer column is written as text,
+`quantity.multiply("1.5")`; `quantity.multiply(1.5)` rejects the query like
+`1.5` written to an `int`. `real` and `doublePrecision` columns stay floats (see
+[arithmetic](reference.md#arithmetic)).
 
 JSON has no bigint type. A response can encode these values as decimal strings:
 
@@ -280,7 +295,9 @@ const posts = table({ id: int.auto, title: text, authorName: text }).relations(
 
 `post.author.name`, nested `post.author(...)` and `innerJoin(post.author)` then
 work like any other relation; the to-one side is always optional because no key
-guarantees a match. Nothing is added to the database or to migrations.
+guarantees a match. When several users share the name, `one()` takes the first
+match by the target's primary key, so a post never appears twice. Nothing is
+added to the database or to migrations.
 
 Large results do not have to fit in memory:
 `for await (const row of query.stream({ size: 1000 }))` reads through a
@@ -294,7 +311,8 @@ function signature needs them.
 
 - [Runnable examples](../examples/README.md) for complete programs.
 - [Reusable shapes](reference.md#reusable-projections) for shared projections.
-- [Scopes](reference.md#scoped-databases) for tenant and visibility filters.
+- [Scopes](reference.md#scoped-databases) for tenant and visibility filters that
+  also check every row a scoped write leaves behind.
 - [Full-text search](reference.md#full-text-search),
   [vectors](reference.md#vectors-pgvector) and
   [relations without a foreign key](reference.md#relations-without-a-foreign-key).

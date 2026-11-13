@@ -46,6 +46,11 @@ export const selectSql = (
   jsonValues = false,
   jsonOutput = false,
 ): string => {
+  // A data error found while building this query or one it embeds.
+  if (query.failure) {
+    throw query.failure.error;
+  }
+
   if (
     !query.joins.length &&
     !Object.keys(outerBindings).length &&

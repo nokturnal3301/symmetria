@@ -11,6 +11,7 @@ import {
   index,
   sql,
 } from "../../../packages/runtime/src";
+import { normalizeResult } from "../../../packages/runtime/src/entries/internal";
 import { detectDrift } from "../../../packages/kit/src";
 import { testDatabase } from "../../support/postgres";
 
@@ -92,6 +93,53 @@ describe.skipIf(!databaseUrl)("PostgreSQL drift definitions", () => {
           { kind: "index-mismatch", table: "records" },
         ]);
       }
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("a NOT VALID NOT NULL constraint (PostgreSQL 18+) counts as nullable", async () => {
+    const model = schema({ records: table({ id: int, note: text }) });
+    const fixture = await testDatabase({ url: databaseUrl!, schema: model });
+    const run = (sql: string) =>
+      fixture.driver.execute({ sql, parameters: [] });
+
+    try {
+      const { rows } = normalizeResult(await run("SHOW server_version_num"));
+      const drift = () =>
+        detectDrift({
+          execute: fixture.driver.execute,
+          snapshot: model.$snapshot(),
+          schemaName: fixture.namespace,
+        });
+      expect(await drift()).toEqual([]);
+
+      // Older servers have no NOT VALID form; their NOT NULL is always enforced.
+      if (Number(rows[0]!.server_version_num) < 180000) {
+        return;
+      }
+
+      // attnotnull stays true, yet rows written before the constraint may hold NULL.
+      await run("ALTER TABLE records ALTER COLUMN note DROP NOT NULL");
+      await run("INSERT INTO records (id, note) VALUES (1, NULL)");
+      await run(
+        "ALTER TABLE records ADD CONSTRAINT records_note_not_null NOT NULL note NOT VALID",
+      );
+      expect(await drift()).toEqual([
+        {
+          kind: "nullability-mismatch",
+          table: "records",
+          column: "note",
+          expected: "NOT NULL",
+          actual: "NULL",
+        },
+      ]);
+
+      await run("UPDATE records SET note = '' WHERE note IS NULL");
+      await run(
+        "ALTER TABLE records VALIDATE CONSTRAINT records_note_not_null",
+      );
+      expect(await drift()).toEqual([]);
     } finally {
       await fixture.close();
     }

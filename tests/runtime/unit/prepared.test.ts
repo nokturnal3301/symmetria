@@ -132,13 +132,13 @@ test("prepared mutations encode JSON, Dates and custom values without retaining 
   expect(compiled.sql).toContain("::text::jsonb");
   expect(compiled.parameters).toEqual([
     '{"tags":["sql"]}',
-    new Date("2026-01-01"),
+    "2026-01-01T00:00:00.000Z",
     "123",
   ]);
   values.details.tags.push("bun");
   values.createdAt.setUTCFullYear(2027);
   expect(compiled.parameters[0]).toBe('{"tags":["sql"]}');
-  expect(compiled.parameters[1]).toEqual(new Date("2026-01-01"));
+  expect(compiled.parameters[1]).toBe("2026-01-01T00:00:00.000Z");
   expect(await insert.execute(values)).toEqual({
     id: 1,
     amount: { cents: 123n },

@@ -7,7 +7,13 @@ import { emitKeypressEvents } from "node:readline";
 import { inspect, stripVTControlCharacters } from "node:util";
 import type { QueryInspectionController } from "symmetria/internal";
 import { highlightSQL } from "./schema-browser-data";
-import { fitLine, supportsColor, theme, wrapLines } from "../ui/style";
+import {
+  fitLine,
+  numberedLines,
+  supportsColor,
+  theme,
+  wrapLines,
+} from "../ui/style";
 import { withScreen } from "../ui/terminal";
 
 const tabs = ["SQL", "Parameters", "Results", "Explain"] as const;
@@ -28,6 +34,28 @@ export const inspectValue = (value: unknown, expanded = false): string =>
       getters: false,
     }),
   );
+
+/**
+ * Plan lines wrapped to `width` under their tree gutter: a long relation or
+ * index name continues indented below its node instead of at the margin.
+ */
+export const wrapExplainLines = (
+  lines: readonly string[],
+  width: number,
+): string[] =>
+  lines.flatMap((line) => {
+    const gutter = /^[ │├╰─]*/.exec(line)![0];
+    const indent = `${gutter.replace(/├─ /g, "│  ").replace(/╰─ /g, "   ")}  `;
+
+    if (stringWidth(indent) > width / 2) {
+      return wrapLines(line, width);
+    }
+
+    return wrapLines(
+      line.slice(gutter.length),
+      width - stringWidth(indent),
+    ).map((row, index) => `${index ? indent : gutter}${row}`);
+  });
 
 export const explainLines = (
   plan: readonly Record<string, unknown>[],
@@ -225,12 +253,10 @@ export const inspectQueryScreen = async (
               ),
             ];
           } else if (tab === "SQL") {
-            lines = wrapLines(
+            lines = numberedLines(
               highlightSQL(terminalText(report.sql), color),
               innerWidth - 5,
-            ).map(
-              (line, index) =>
-                `${style(String(index + 1).padStart(3), "muted")}  ${line}`,
+              (label) => style(label, "muted"),
             );
           } else if (tab === "Parameters") {
             lines = report.parameters.flatMap((value, index) => [
@@ -249,12 +275,15 @@ export const inspectQueryScreen = async (
             }
           } else if (tab === "Explain") {
             lines = report.explanation
-              ? wrapLines(
-                  expanded
-                    ? inspectValue(report.explanation.plan, true)
-                    : explainLines(report.explanation.plan).join("\n"),
-                  innerWidth,
-                )
+              ? expanded
+                ? wrapLines(
+                    inspectValue(report.explanation.plan, true),
+                    innerWidth,
+                  )
+                : wrapExplainLines(
+                    explainLines(report.explanation.plan),
+                    innerWidth,
+                  )
               : ["No plan loaded"];
 
             if (report.explanation) {

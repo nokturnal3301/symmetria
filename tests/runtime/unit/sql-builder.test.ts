@@ -26,6 +26,7 @@ import {
   type CompiledQuery,
   type Decimal,
 } from "../../../packages/runtime/src";
+import { expectDataError } from "../../support/data-errors";
 
 const model = schema({
   users: {
@@ -113,7 +114,7 @@ test("upsert exposes the excluded row only to DO UPDATE", () => {
 test("raw SQL operands keep their own precedence", () => {
   const totals = schema({
     n: table({ id: int.auto, a: int, b: int })
-      .computed((n) => ({ total: sql<number>`${n.a} + ${n.b}` }))
+      .computed((n) => ({ total: sql.of(int)`${n.a} + ${n.b}` }))
       .checks((n) => ({ capped: sql<number>`${n.a} + ${n.b}`.atMost(10) }))
       .indexes((n) => ({
         small: index(n.a).where(sql<number>`${n.a} - ${n.b}`.below(0)),
@@ -145,7 +146,7 @@ test("raw SQL operands keep their own precedence", () => {
   expect(snapshot?.indexes?.[0]?.where).toBe('("a" - "b") < 0');
 });
 
-test("undefined write fields are omitted like undefined query options", () => {
+test("undefined write fields are omitted like undefined query options", async () => {
   expect(
     model.users.insert({ name: "Ada", visits: undefined }).toSQL(),
   ).toEqual(model.users.insert({ name: "Ada" }).toSQL());
@@ -176,11 +177,14 @@ test("undefined write fields are omitted like undefined query options", () => {
       .doUpdate({ visits: 1, active: undefined })
       .toSQL().sql,
   ).toEndWith('DO UPDATE SET "visits" = $2');
-  // @ts-expect-error title is required even when spelled as undefined
-  expect(() => model.posts.insert({ title: undefined, authorId: 1 })).toThrow(
+  // Missing values are data errors: they fail the write when it runs.
+  await expectDataError(
+    // @ts-expect-error title is required even when spelled as undefined
+    () => model.posts.insert({ title: undefined, authorId: 1 }),
     /missing required column "posts.title"/,
   );
-  expect(() => model.users.update({ visits: undefined })).toThrow(
+  await expectDataError(
+    () => model.users.update({ visits: undefined }).all(),
     /at least one/,
   );
   // @ts-expect-error unknown keys fail even when undefined
@@ -189,16 +193,26 @@ test("undefined write fields are omitted like undefined query options", () => {
   );
 });
 
-test("write validation catches missing values, unknown columns and generated identities", () => {
-  // @ts-expect-error title is required
-  expect(() => model.posts.insert({ authorId: 1 })).toThrow(/missing required/);
-  // @ts-expect-error generated identity cannot be assigned
-  expect(() => model.users.insert({ id: 1, name: "Ada" })).toThrow(
+test("write validation catches missing values, unknown columns and generated identities", async () => {
+  await expectDataError(
+    // @ts-expect-error title is required
+    () => model.posts.insert({ authorId: 1 }),
+    /missing required/,
+  );
+  await expectDataError(
+    // @ts-expect-error generated identity cannot be assigned
+    () => model.users.insert({ id: 1, name: "Ada" }),
     /generated always/,
   );
+  // Unknown columns are about the query's shape and throw where it is built,
+  // even after a data error.
   // @ts-expect-error unknown column
   expect(() => model.users.update({ missing: 1 })).toThrow(/unknown column/);
-  expect(() => model.users.update({})).toThrow(/at least one/);
+  expect(() =>
+    // @ts-expect-error unknown column
+    model.users.insert({ name: null as never, missing: 1 }),
+  ).toThrow(/unknown column/);
+  await expectDataError(() => model.users.update({}).all(), /at least one/);
   expect(() => model.users.insert([]).toSQL()).toThrow(/no-op/);
   expect(() =>
     model.users
@@ -576,9 +590,10 @@ test("bigint columns accept safe integers and DO NOTHING resolves a single inser
     model.posts.insert({ title: "n", authorId: 1, views: 7 }).toSQL()
       .parameters,
   ).toContain("7");
-  expect(() =>
-    model.posts.insert({ title: "n", authorId: 1, views: 1.5 }),
-  ).toThrow(/safe integers/);
+  await expectDataError(
+    () => model.posts.insert({ title: "n", authorId: 1, views: 1.5 }),
+    /safe integers/,
+  );
   const local = schema(
     { events: { id: int.auto, value: bigint } },
     { executor: async () => [] },
@@ -689,35 +704,91 @@ test("$scope filters reads, writes, paths, joins and collections of scoped table
     sql: 'DELETE FROM "posts" AS "posts"\nWHERE "posts"."author_id" = $1',
     parameters: [7],
   });
+  // Every row a scoped write leaves behind is checked in the statement: a row
+  // outside the scope fails the cast, which aborts the statement.
+  // The failing text names the check and the table for the error.
+  const check = (
+    failure: "insert" | "update" | "conflict",
+    parameter: number,
+  ) =>
+    `CASE WHEN "posts"."author_id" = $${parameter} THEN TRUE ELSE ('SYMMETRIA_OUT_OF_SCOPE:${failure}:posts:' || "posts".tableoid)::boolean END`;
   expect(
     tenant.posts
       .update({ title: "x" })
       .where((posts) => posts.id.is(1))
-      .toSQL().parameters,
-  ).toEqual(["x", 7, 1]);
+      .toSQL(),
+  ).toEqual({
+    sql: `UPDATE "posts" AS "posts" SET "title" = $1\nWHERE "posts"."author_id" = $2 AND "posts"."id" = $3\nRETURNING ${check("update", 4)} AS "__symmetria_scope"`,
+    parameters: ["x", 7, 1, 7],
+  });
+  // A lookup's key restricts the update; only the scope is checked.
+  expect(tenant.posts.byId(1).update({ title: "x" }).toSQL()).toEqual({
+    sql: `UPDATE "posts" AS "posts" SET "title" = $1\nWHERE "posts"."author_id" = $2 AND "posts"."id" = $3\nRETURNING ${check("update", 4)} AS "__symmetria_scope"`,
+    parameters: ["x", 7, 1, 7],
+  });
   expect(
-    tenant.posts.insert({ title: "x", authorId: 1 }).toSQL().sql,
-  ).not.toContain("WHERE");
-  // An upsert never rewrites a conflicting row outside the scope.
+    tenant.posts
+      .insert([
+        { title: "x", authorId: 7 },
+        { title: "y", authorId: 7 },
+      ])
+      .returning((posts) => ({ id: posts.id }))
+      .toSQL(),
+  ).toEqual({
+    sql: `INSERT INTO "posts" AS "posts"\n("title", "author_id") VALUES ($1, $2), ($3, $4)\nRETURNING "posts"."id" AS "id", ${check("insert", 5)} AS "__symmetria_scope"`,
+    parameters: ["x", 7, "y", 7, 7],
+  });
+  // An upsert never rewrites a conflicting row outside the scope, and the
+  // inserted or updated row must stay inside it.
   expect(
     tenant.posts
       .insert({ title: "x", authorId: 1 })
       .onConflict("id")
       .doUpdate("title")
       .toSQL(),
-  ).toMatchObject({
-    sql: expect.stringContaining(
-      'ON CONFLICT ("id") DO UPDATE SET "title" = "excluded"."title"\nWHERE "posts"."author_id" = $3',
-    ),
-    parameters: ["x", 1, 7],
+  ).toEqual({
+    sql: `INSERT INTO "posts" AS "posts"\n("title", "author_id") VALUES ($1, $2)\nON CONFLICT ("id") DO UPDATE SET "title" = "excluded"."title"\nWHERE ${check("conflict", 3)}\nRETURNING ${check("insert", 4)} AS "__symmetria_scope"`,
+    parameters: ["x", 1, 7, 7],
   });
+  // A false condition skips a conflicting row inside the scope; a row outside
+  // it fails the statement before the condition is evaluated.
+  expect(
+    tenant.posts
+      .insert({ title: "x", authorId: 7 })
+      .onConflict("id")
+      .doUpdate(
+        { title: "y" },
+        { where: (current, incoming) => incoming.views.above(current.views) },
+      )
+      .toSQL().sql,
+  ).toContain(
+    `WHERE CASE WHEN "posts"."author_id" = $4 THEN "excluded"."views" > "posts"."views" ELSE ('SYMMETRIA_OUT_OF_SCOPE:conflict:posts:' || "posts".tableoid)::boolean END\nRETURNING ${check("insert", 5)} AS "__symmetria_scope"`,
+  );
   expect(
     tenant.posts
       .insert({ title: "x", authorId: 1 })
       .onConflict("id")
       .doNothing()
       .toSQL().sql,
-  ).not.toContain("WHERE");
+  ).toBe(
+    `INSERT INTO "posts" AS "posts"\n("title", "author_id") VALUES ($1, $2)\nON CONFLICT ("id") DO NOTHING\nRETURNING ${check("insert", 3)} AS "__symmetria_scope"`,
+  );
+  // Unscoped writes keep their SQL: no checks and no RETURNING.
+  expect(model.posts.insert({ title: "x", authorId: 1 }).toSQL().sql).toBe(
+    'INSERT INTO "posts" AS "posts"\n("title", "author_id") VALUES ($1, $2)',
+  );
+  expect(
+    model.posts
+      .insert({ title: "x", authorId: 7 })
+      .onConflict("id")
+      .doUpdate(
+        { title: "y" },
+        { where: (current, incoming) => incoming.views.above(current.views) },
+      )
+      .toSQL().sql,
+  ).toEndWith(
+    'DO UPDATE SET "title" = $3\nWHERE "excluded"."views" > "posts"."views"',
+  );
 
   // Relation subqueries carry the scope once, inside their correlation.
   for (const query of [
@@ -877,12 +948,14 @@ test("jsonb(schema) validates writes and reads through a Standard Schema", async
     { users: { id: int.auto, settings: jsonb(settings) } },
     { executor: async () => [{ id: 1, settings: { theme: "DARK" } }] },
   );
+  // Writes are validated but stored as given; the transform runs on read only.
   expect(
     local.users.insert({ settings: { theme: "Dark" } }).toSQL().parameters,
-  ).toEqual(['{"theme":"dark"}']);
-  expect(() =>
-    local.users.insert({ settings: { theme: 42 } as never }),
-  ).toThrow(/theme: theme must be a string/);
+  ).toEqual(['{"theme":"Dark"}']);
+  await expectDataError(
+    () => local.users.insert({ settings: { theme: 42 } as never }),
+    /theme: theme must be a string/,
+  );
   expect(await local.users((users) => ({ settings: users.settings }))).toEqual([
     { settings: { theme: "dark" } },
   ]);
@@ -893,13 +966,15 @@ test("jsonb(schema) validates writes and reads through a Standard Schema", async
       validate: async () => ({ value: {} }),
     },
   };
-  expect(() =>
-    schema({
-      users: { id: int.auto, settings: jsonb(asynchronous) },
-    }).users.insert({
-      settings: {},
-    }),
-  ).toThrow(/synchronously/);
+  await expectDataError(
+    () =>
+      schema({
+        users: { id: int.auto, settings: jsonb(asynchronous) },
+      }).users.insert({
+        settings: {},
+      }),
+    /synchronously/,
+  );
   expect(() => jsonb({} as never)).toThrow(/Standard Schema/);
 });
 
@@ -956,7 +1031,8 @@ test("array columns encode PostgreSQL literals with casts and expose has/contain
   expect(() => oneOf("a", "b").array).toThrow(/scalar, non-enum/);
   expect(() => int.auto.array).toThrow(/identity/);
   expect(() => text.array.array).toThrow(/scalar, non-enum/);
-  expect(() => local.items.insert({ title: "t", tags: "a" as never })).toThrow(
+  await expectDataError(
+    () => local.items.insert({ title: "t", tags: "a" as never }),
     /accept arrays/,
   );
 });
@@ -1000,14 +1076,10 @@ test("mutable input values and compiled parameters cannot mutate a query", () =>
   metadata.tags.push("changed");
   createdAt.setUTCFullYear(2000);
   const first = query.toSQL();
-  const compiledDate = first.parameters.find(
-    (parameter) => parameter instanceof Date,
-  ) as Date;
-  compiledDate.setUTCFullYear(2001);
+  first.parameters.fill("changed");
   expect(query.toSQL().parameters).toContain('{"tags":["original"]}');
-  expect(query.toSQL().parameters).toContainEqual(
-    new Date("2026-01-01T00:00:00Z"),
-  );
+  // timestamptz values are bound as UTC ISO text, captured when the query was built.
+  expect(query.toSQL().parameters).toContain("2026-01-01T00:00:00.000Z");
 });
 
 const inferred = model.posts((posts, { leftJoin }) => {
@@ -1097,3 +1169,92 @@ type ReturningMatches = Expect<
     { id: number; balance: Decimal }
   >
 >;
+
+test("JSON values convert for LIKE, arithmetic and sums, and order for MIN/MAX", () => {
+  const local = schema({
+    documents: {
+      id: int.auto,
+      meta: jsonb<{ theme: string; size: number }>(),
+      label: jsonb<string | null>(),
+    },
+  });
+  const { sql: text } = local
+    .documents(
+      (document) => ({
+        next: document.meta.path("size").plus(1),
+        total: sum(document.meta.path("size")),
+      }),
+      { where: (document) => document.meta.path("theme").like("d%") },
+    )
+    .toSQL();
+
+  // The JSON value enters as its text (`#>> '{}'`), cast for arithmetic and sums.
+  expect(text).toContain(
+    `("documents"."meta" #> ARRAY[$1::text]) #>> '{}')))::double precision) + $2::text::double precision) AS "next"`,
+  );
+  expect(text).toContain(
+    `SUM(((((\"documents\".\"meta\" #> ARRAY[$3::text]) #>> '{}')))::numeric)::numeric AS "total"`,
+  );
+  expect(text).toEndWith(
+    `WHERE ((("documents"."meta" #> ARRAY[$4::text]) #>> '{}')) LIKE $5`,
+  );
+  // jsonb has no MIN or MAX: the first element of MIN(ARRAY[...]) orders as jsonb.
+  expect(
+    local
+      .documents((document) => ({
+        smallest: minimum(document.meta.path("size")),
+      }))
+      .toSQL().sql,
+  ).toBe(
+    `SELECT (MIN(ARRAY[("documents"."meta" #> ARRAY[$1::text])]) FILTER (WHERE ("documents"."meta" #> ARRAY[$1::text]) <> 'null'::jsonb))[1] AS "smallest"\nFROM "documents" AS "documents"`,
+  );
+
+  // A non-nullable jsonb column stores JS null as the JSON value null.
+  expect(
+    local.documents
+      .insert({ meta: { theme: "a", size: 1 }, label: null })
+      .toSQL().parameters,
+  ).toEqual(['{"theme":"a","size":1}', "null"]);
+  expect(
+    local
+      .documents((document) => ({ id: document.id }), {
+        where: (document) => document.label.is(null),
+      })
+      .toSQL().sql,
+  ).toEndWith(
+    `WHERE ("documents"."label" IS NULL OR "documents"."label" = ('null'::jsonb))`,
+  );
+});
+
+test("duplicate DO UPDATE conflict keys and table-named CTEs fail before SQL runs", async () => {
+  const local = schema({
+    counters: { id: int.auto, code: int.unique, label: text },
+  });
+
+  await expectDataError(
+    () =>
+      local.counters
+        .insert([
+          { code: 1, label: "a" },
+          { code: 2, label: "b" },
+          { code: 1, label: "c" },
+        ])
+        .onConflict("code")
+        .doUpdate("label"),
+    /rows 1 and 3 of the upsert on "counters" share a conflict key/,
+    "SYMMETRIA_DUPLICATE_CONFLICT_KEY",
+  );
+  expect(
+    local.counters
+      .insert([
+        { code: 1, label: "a" },
+        { code: 1, label: "c" },
+      ])
+      .onConflict("code")
+      .doNothing()
+      .toSQL().parameters,
+  ).toEqual([1, "a", 1, "c"]);
+  expect(() =>
+    local.counters((counter) => ({ id: counter.id })).cte("counters"),
+  ).toThrow(/CTE "counters" has the SQL name of table "counters"/);
+});

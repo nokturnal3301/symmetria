@@ -14,17 +14,22 @@ import {
   timestamptz,
   prepare,
   createProfiler,
+  databaseError,
 } from "../../../packages/runtime/dist/index.js";
 import { postgres as pg } from "../../../packages/runtime/dist/pg.js";
 import { testDatabase } from "../../../packages/kit/dist/testing.js";
 
 const url = process.env.SYMMETRIA_TEST_DATABASE_URL;
+// Through a transaction-pooling PgBouncer, Bun.SQL needs unnamed statements
+// and tests of session state (pids, SET, temporary tables, locks) do not apply.
+const pooled = process.env.SYMMETRIA_TEST_TRANSACTION_POOLING === "1";
 const adapters = [["pg", pg]];
 
 if (typeof Bun !== "undefined") {
+  const { postgres } = await import("../../../packages/runtime/dist/bun.js");
   adapters.push([
     "Bun.SQL",
-    (await import("../../../packages/runtime/dist/bun.js")).postgres,
+    pooled ? (options) => postgres({ ...options, prepare: false }) : postgres,
   ]);
 }
 
@@ -193,7 +198,7 @@ for (const [name, driver] of adapters) {
   });
 
   test(`${name}: pinned sessions and cancellation retain connection ownership`, {
-    skip: !url,
+    skip: !url || pooled,
   }, async () => {
     const pool = driver({ url, max: 1 });
 
@@ -300,7 +305,7 @@ for (const [name, driver] of adapters) {
   });
 
   test(`${name}: statement errors preserve sessions and disconnected clients recover`, {
-    skip: !url,
+    skip: !url || pooled,
   }, async () => {
     const pool = driver({ url, max: 1 });
     const admin = pg(url);
@@ -348,6 +353,182 @@ for (const [name, driver] of adapters) {
     } finally {
       await pool.close();
       await admin.close();
+    }
+  });
+
+  test(`${name}: a connection killed mid-query is discarded and reported as a connection error`, {
+    skip: !url,
+  }, async () => {
+    const pool = driver({ url, max: 1 });
+    const admin = pg(url);
+
+    try {
+      const { pid } = (
+        await pool.execute({
+          sql: "SELECT pg_backend_pid() AS pid",
+          parameters: [],
+        })
+      ).rows[0];
+      const running = pool
+        .execute({ sql: "SELECT pg_sleep(5)", parameters: [] })
+        .then(
+          () => undefined,
+          (error) => error,
+        );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await admin.execute({
+        sql: "SELECT pg_terminate_backend($1)",
+        parameters: [pid],
+      });
+      assert.equal(databaseError(await running)?.kind, "connection");
+
+      for (const value of [1, 2, 3]) {
+        assert.deepEqual(
+          (
+            await pool.execute({
+              sql: "SELECT $1::integer AS value",
+              parameters: [value],
+            })
+          ).rows,
+          [{ value }],
+        );
+      }
+    } finally {
+      await pool.close();
+      await admin.close();
+    }
+  });
+
+  test(`${name}: a session's connection is closed afterwards, with its settings, locks and transaction`, {
+    skip: !url || pooled,
+  }, async () => {
+    const pool = driver({ url, max: 1 });
+    const admin = pg(url);
+    const lock = 1937339000 + Math.floor(Math.random() * 1000);
+    const gone = async (pid) => {
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const { rows } = await admin.execute({
+          sql: "SELECT count(*)::integer AS backends, (SELECT count(*)::integer FROM pg_locks WHERE locktype = 'advisory' AND objid = $2) AS locks FROM pg_stat_activity WHERE pid = $1",
+          parameters: [pid, lock],
+        });
+
+        if (rows[0].backends === 0 && rows[0].locks === 0) {
+          return true;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      return false;
+    };
+
+    try {
+      const pid = await pool.session(async (session) => {
+        await session.execute({
+          sql: "SET search_path TO nowhere",
+          parameters: [],
+        });
+        await session.execute({
+          sql: "SELECT pg_advisory_lock($1)",
+          parameters: [lock],
+        });
+        await session.execute({
+          sql: "CREATE TEMP TABLE session_state (id integer)",
+          parameters: [],
+        });
+        await session.execute({ sql: "BEGIN", parameters: [] });
+
+        return (
+          await session.execute({
+            sql: "SELECT pg_backend_pid() AS pid",
+            parameters: [],
+          })
+        ).rows[0].pid;
+      });
+      assert.equal(await gone(pid), true);
+      const { rows } = await pool.execute({
+        sql: "SELECT current_setting('search_path') AS path, to_regclass('session_state') AS temporary, now() = statement_timestamp() AS autocommit",
+        parameters: [],
+      });
+      assert.deepEqual(rows, [
+        { path: '"$user", public', temporary: null, autocommit: true },
+      ]);
+
+      let failed;
+      await assert.rejects(
+        pool.session(async (session) => {
+          failed = (
+            await session.execute({
+              sql: "SELECT pg_backend_pid() AS pid",
+              parameters: [],
+            })
+          ).rows[0].pid;
+          await session.execute({ sql: "BEGIN", parameters: [] });
+          throw new Error("failed session");
+        }),
+        /failed session/,
+      );
+      assert.equal(await gone(failed), true);
+    } finally {
+      await pool.close();
+      await admin.close();
+    }
+  });
+
+  test(`${name}: concurrent transaction statements run one at a time`, {
+    skip: !url,
+  }, async () => {
+    const pool = driver({ url, max: 1 });
+    const warnings = [];
+    const onWarning = (warning) => warnings.push(warning.message);
+    process.on("warning", onWarning);
+
+    try {
+      const values = await pool.transaction((tx) =>
+        Promise.all(
+          [1, 2, 3, 4].map((value) =>
+            tx.execute({
+              sql: "SELECT $1::integer AS value, pg_sleep(0.01)::text AS slept",
+              parameters: [value],
+            }),
+          ),
+        ),
+      );
+      assert.deepEqual(
+        values.map(({ rows }) => rows[0].value),
+        [1, 2, 3, 4],
+      );
+      const select = (driver, value) =>
+        driver.execute({
+          sql: "SELECT $1::integer AS value",
+          parameters: [value],
+        });
+      // Parent statements wait for a concurrent savepoint; inside its callback
+      // the parent is rejected, since it would wait for the savepoint itself.
+      const nested = await pool.transaction(async (tx) => {
+        const [inner, outer] = await Promise.all([
+          tx.transaction(async (savepoint) => {
+            await assert.rejects(
+              async () => select(tx, 0),
+              /await the nested transaction/,
+            );
+
+            return (await select(savepoint, 5)).rows[0].value;
+          }),
+          select(tx, 6),
+        ]);
+
+        return [inner, outer.rows[0].value];
+      });
+      assert.deepEqual(nested, [5, 6]);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.deepEqual(
+        warnings.filter((message) => message.includes("client.query()")),
+        [],
+      );
+    } finally {
+      process.off("warning", onWarning);
+      await pool.close();
     }
   });
 }

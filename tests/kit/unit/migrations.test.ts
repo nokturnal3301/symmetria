@@ -12,6 +12,9 @@ import {
   index,
   customType,
   operatorClass,
+  bool,
+  sql,
+  varchar,
 } from "../../../packages/runtime/src";
 import { vector } from "../../../packages/runtime/src/entries/vector";
 import {
@@ -26,6 +29,7 @@ import {
   normalizeSqlType,
 } from "../../../packages/kit/src";
 import { splitMigrationSQL } from "../../../packages/kit/src/migrations/sql";
+import { expressionKey } from "../../../packages/kit/src/migrations/expressions";
 import { objectName } from "../../../packages/kit/src/migrations/snapshot";
 
 test("migration snapshots normalize physical names, defaults and ordering without losing bigint or Date", () => {
@@ -426,7 +430,6 @@ test("lintMigration flags destructive, blocking and cautionary changes with advi
     "blocking users.email",
     "blocking users.nickname",
     "blocking users.score",
-    "caution articles",
     "caution users.age",
     "caution users.slug",
     "caution users",
@@ -611,4 +614,321 @@ test("changing ON UPDATE recreates the foreign key; keeping it changes nothing",
       .tables.find((table) => table.name === "posts")!
       .columns.find((column) => column.name === "author_id")!.references,
   ).toEqual({ table: "users", column: "id", onDelete: "restrict" });
+});
+
+test("a named enum shared by several columns is one type that changes and renames in place", () => {
+  const build = (name: string, labels: [string, ...string[]]) => {
+    const role = oneOf(...labels).typeName(name);
+
+    return schema({
+      users: { id: int.auto, role: role.default("USER") },
+      invites: { id: int.auto, role },
+    }).$snapshot();
+  };
+
+  const created = createSchemaSQL(build("Role", ["USER", "ADMIN"])).map(
+    (statement) => statement.sql,
+  );
+  expect(created.filter((sql) => sql.startsWith("CREATE TYPE"))).toEqual([
+    "CREATE TYPE \"Role\" AS ENUM (E'USER', E'ADMIN')",
+  ]);
+  expect(
+    migrationSnapshot(build("Role", ["USER", "ADMIN"])).enumerations,
+  ).toEqual([{ name: "Role", values: ["USER", "ADMIN"] }]);
+
+  // A label nothing in the migration uses is added in place.
+  expect(
+    diffSchemas(
+      build("Role", ["USER", "ADMIN"]),
+      build("Role", ["USER", "EDITOR", "ADMIN"]),
+    ).up,
+  ).toEqual(["ALTER TYPE \"Role\" ADD VALUE E'EDITOR' BEFORE E'ADMIN'"]);
+
+  // Removing or reordering labels rebuilds the type once for both columns.
+  const reordered = diffSchemas(
+    build("Role", ["USER", "ADMIN"]),
+    build("Role", ["ADMIN", "USER"]),
+  ).up;
+  expect(reordered.filter((sql) => sql.startsWith("CREATE TYPE"))).toEqual([
+    "CREATE TYPE \"Role\" AS ENUM (E'ADMIN', E'USER')",
+  ]);
+  expect(reordered.filter((sql) => / TYPE "Role" USING /.test(sql))).toEqual([
+    'ALTER TABLE "invites" ALTER COLUMN "role" TYPE "Role" USING "role"::text::"Role"',
+    'ALTER TABLE "users" ALTER COLUMN "role" TYPE "Role" USING "role"::text::"Role"',
+  ]);
+
+  // A new name with the same labels and columns is a rename, not a rebuild.
+  const renamed = diffSchemas(
+    build("Role", ["USER", "ADMIN"]),
+    build("UserRole", ["USER", "ADMIN"]),
+  );
+  expect(renamed.up).toEqual(['ALTER TYPE "Role" RENAME TO "UserRole"']);
+  expect(renamed.down).toEqual(['ALTER TYPE "UserRole" RENAME TO "Role"']);
+  // The rename rewrites nothing, so lint has nothing to report.
+  expect(lintMigration(renamed)).toEqual([]);
+
+  // A derived name follows its table.
+  const version = (name: "accounts" | "members") =>
+    schema({ [name]: { id: int.auto, state: oneOf("on", "off") } }).$snapshot();
+  expect(
+    diffSchemas(version("accounts"), version("members"), {
+      renames: { tables: { accounts: "members" } },
+    }).up,
+  ).toContain(
+    'ALTER TYPE "accounts_state_enum" RENAME TO "members_state_enum"',
+  );
+
+  // Two columns cannot share a derived name, and a named type needs one label list.
+  expect(() =>
+    migrationSnapshot({
+      tables: [
+        {
+          name: "a",
+          sqlName: "a",
+          junction: false,
+          relations: [],
+          columns: [
+            {
+              name: "role",
+              sqlName: "role",
+              sqlType: "enum",
+              notNull: true,
+              unique: false,
+              primaryKey: false,
+              enumerationValues: ["x"],
+              enumerationName: "Role",
+            },
+            {
+              name: "kind",
+              sqlName: "kind",
+              sqlType: "enum",
+              notNull: true,
+              unique: false,
+              primaryKey: false,
+              enumerationValues: ["y"],
+              enumerationName: "Role",
+            },
+          ],
+        },
+      ],
+    }),
+  ).toThrow(/enum type "Role" is declared with different labels/);
+});
+
+test("collations are part of the column type and change with ALTER COLUMN TYPE", () => {
+  const build = (collation?: string) =>
+    schema({
+      codes: {
+        id: int.auto,
+        code: collation ? text.collate(collation).unique : text.unique,
+      },
+    }).$snapshot();
+
+  expect(
+    createSchemaSQL(build("C")).map((statement) => statement.sql)[0],
+  ).toContain('"code" text COLLATE "C" NOT NULL');
+  expect(diffSchemas(build("C"), build("C")).up).toEqual([]);
+
+  const plan = diffSchemas(build(), build("C"));
+  expect(plan.up).toContain(
+    'ALTER TABLE "codes" ALTER COLUMN "code" TYPE text COLLATE "C" USING "code"::text COLLATE "C"',
+  );
+  expect(plan.down).toContain(
+    'ALTER TABLE "codes" ALTER COLUMN "code" TYPE text USING "code"::text',
+  );
+  expect(
+    migrationSnapshot(build("C")).tables[0]!.columns.find(
+      (column) => column.name === "code",
+    ),
+  ).toMatchObject({ collation: "C" });
+  // Snapshots without collations keep their hashes.
+  expect(snapshotHash(migrationSnapshot(build()))).toBe(
+    snapshotHash(parseMigrationSnapshot(migrationSnapshot(build()))),
+  );
+});
+
+test("identity generation changes in place between ALWAYS and BY DEFAULT", () => {
+  const build = (byDefault: boolean) =>
+    schema({
+      items: { id: byDefault ? int.auto.byDefault : int.auto, label: text },
+    }).$snapshot();
+
+  expect(
+    createSchemaSQL(build(true)).map((statement) => statement.sql)[0],
+  ).toContain('"id" integer GENERATED BY DEFAULT AS IDENTITY NOT NULL');
+  expect(migrationSnapshot(build(true)).tables[0]!.columns[0]).toMatchObject({
+    identity: true,
+    identityByDefault: true,
+  });
+  expect(diffSchemas(build(false), build(true))).toMatchObject({
+    up: ['ALTER TABLE "items" ALTER COLUMN "id" SET GENERATED BY DEFAULT'],
+    down: ['ALTER TABLE "items" ALTER COLUMN "id" SET GENERATED ALWAYS'],
+  });
+
+  const plain = schema({ items: { id: int, label: text } }).$snapshot();
+  expect(diffSchemas(plain, build(true)).up).toEqual([
+    'ALTER TABLE "items" ALTER COLUMN "id" ADD GENERATED BY DEFAULT AS IDENTITY',
+    'SELECT setval(pg_get_serial_sequence(E\'"items"\', E\'id\'), GREATEST(COALESCE(MAX("id"), 0), 0) + 1, false) FROM "items"',
+  ]);
+});
+
+test("checks and partial indexes accept boolean expressions without = true", () => {
+  const model = schema({
+    products: table({
+      id: int.auto,
+      price: int,
+      active: bool,
+      deletedAt: timestamptz.nullable,
+    })
+      .checks((products) => ({
+        positive: sql<boolean>`${products.price} > 0`,
+        compared: sql<boolean>`${products.price} < 1000`.is(true),
+      }))
+      .indexes((products) => ({
+        live: index(products.price).where(
+          sql<boolean>`${products.deletedAt} IS NULL`,
+        ),
+        enabled: index(products.price).where(products.active),
+      })),
+  });
+  const table_ = model.$snapshot().tables[0]!;
+
+  expect(table_.checks).toEqual([
+    {
+      name: "positive",
+      sqlName: "products_positive_check",
+      expression: '"price" > 0',
+    },
+    {
+      name: "compared",
+      sqlName: "products_compared_check",
+      expression: '("price" < 1000) = TRUE',
+    },
+  ]);
+  expect(
+    Object.fromEntries(
+      table_.indexes!.map((entry) => [entry.name, entry.where]),
+    ),
+  ).toEqual({ live: '"deleted_at" IS NULL', enabled: '"active"' });
+});
+
+test("expression keys ignore rendering and keep meaning", () => {
+  const types = new Map([
+    ["score", "integer"],
+    ["label", "varchar(10)"],
+    ["code", "text"],
+    ["active", "boolean"],
+  ]);
+  const same = (left: string, right: string) =>
+    expect(expressionKey(left, types)).toBe(expressionKey(right, types));
+  const different = (left: string, right: string) =>
+    expect(expressionKey(left, types)).not.toBe(expressionKey(right, types));
+
+  same('"score" > -100', "(score > '-100'::integer)");
+  same('"score" BETWEEN 1 AND 10', "((score >= 1) AND (score <= 10))");
+  same('NOT ("score" BETWEEN 1 AND 10)', "((score < 1) OR (score > 10))");
+  same(
+    `"label" IN (E'a', E'b')`,
+    "((label)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[]))",
+  );
+  same(`"label" NOT IN (E'a')`, "((label)::text <> 'a'::text)");
+  same(`"code" LIKE E'a%'`, "(code ~~ 'a%'::text)");
+  same(`NOT ("code" ILIKE E'%b')`, "(code !~~* '%b'::text)");
+  same('"active" = TRUE', "active");
+  same('"active" = FALSE', "(NOT active)");
+  same('NOT ("label" IS NULL)', "(label IS NOT NULL)");
+  same('0 < "score"', "(score > 0)");
+  same(
+    '("score" > 0 AND ("score" < 5 OR "code" <> E\'x\'))',
+    "((score > 0) AND ((score < 5) OR (code <> 'x'::text)))",
+  );
+  same('length("label") > 0', "(length((label)::text) > 0)");
+  same("/* note */ score   >  0 -- trailing", "score > 0");
+
+  different('"score" > 0', '"score" >= 0');
+  different(`"code" = E'007'`, `"code" = E'7'`);
+  different(`"code" LIKE E'a%'`, `"code" ILIKE E'a%'`);
+  different('"score" / 2 > 1', '"score"::numeric / 2 > 1');
+  different(`"label" IN (E'a', E'b')`, `"label" IN (E'a', E'c')`);
+  // A cast to text of a column that is not text keeps its meaning, and so
+  // does a real literal, which compares in single precision.
+  different(`"score"::text = E'1'`, `"score" = E'1'`);
+  different('"ratio" < 0.1::text::real', '"ratio" < 0.1');
+  same('"ratio" < 0.1::text::real', "(ratio < ((0.1)::text)::real)");
+  // SQL the parser does not model is compared as text.
+  same("x SIMILAR TO 'a'", "x  SIMILAR TO 'a'");
+});
+
+test("checks, predicates and computed keys written either way need no migration", () => {
+  const build = (raw: boolean) =>
+    schema({
+      items: table({
+        id: int.auto,
+        score: int,
+        label: varchar(10).nullable,
+        active: bool,
+        state: oneOf("open", "closed"),
+      })
+        .checks((items) =>
+          raw
+            ? {
+                score: sql<boolean>`(${items.score} > '-100'::integer)`,
+                range: sql<boolean>`((${items.score} >= 1) AND (${items.score} <= 10))`,
+                label: sql<boolean>`((${items.label})::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[]))`,
+                active: sql<boolean>`(${items.active} = true)`,
+              }
+            : {
+                score: items.score.above(-100),
+                range: items.score.between(1, 10),
+                label: items.label.in(["a", "b"]),
+                active: items.active,
+              },
+        )
+        .indexes((items) => ({
+          live: index(items.score).where(
+            raw
+              ? sql<boolean>`${items.state} = 'open'::items_state_enum`
+              : items.state.is("open"),
+          ),
+          next: index(
+            (raw ? sql<number>`(${items.score} + 1)` : items.score.plus(1))
+              .descending,
+          ),
+        })),
+    });
+  const dsl = migrationSnapshot(build(false).$snapshot());
+  const raw = migrationSnapshot(build(true).$snapshot());
+
+  expect(diffSchemas(dsl, raw)).toMatchObject({ up: [], down: [] });
+  expect(diffSchemas(raw, dsl)).toMatchObject({ up: [], down: [] });
+
+  // A real change is still a migration, in checks and in predicates.
+  const changed = migrationSnapshot(
+    schema({
+      items: table({
+        id: int.auto,
+        score: int,
+        label: varchar(10).nullable,
+        active: bool,
+        state: oneOf("open", "closed"),
+      })
+        .checks((items) => ({
+          score: items.score.above(-99),
+          range: items.score.between(1, 10),
+          label: items.label.in(["a", "b"]),
+          active: items.active,
+        }))
+        .indexes((items) => ({
+          live: index(items.score).where(items.state.is("closed")),
+          next: index(items.score.plus(1).descending),
+        })),
+    }).$snapshot(),
+  );
+
+  expect(diffSchemas(raw, changed).up).toEqual([
+    'DROP INDEX "items_live_idx"',
+    'ALTER TABLE "items" DROP CONSTRAINT "items_score_check"',
+    'ALTER TABLE "items" ADD CONSTRAINT "items_score_check" CHECK ("score" > -99)',
+    `CREATE INDEX "items_live_idx" ON "items" USING btree ("score") WHERE "state" = E'closed'`,
+  ]);
 });

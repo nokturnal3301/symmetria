@@ -16,6 +16,7 @@ const documents = table({
   id: int.auto,
   content: text,
   embedding: vector(3),
+  optional: vector(3).nullable,
 }).indexes((documents) => ({
   embedding: index(operatorClass(documents.embedding, "vector_cosine_ops"))
     .using("hnsw")
@@ -70,6 +71,18 @@ describe.skipIf(!available)("pgvector on PostgreSQL", () => {
     expect([...rows[0]!.embedding]).toEqual([1, 0, 0]);
     expect(typeof rows[2]!.embedding[0]).toBe("number");
     expect(rows[2]!.embedding[0]).toBeCloseTo(0.7, 5);
+  });
+
+  test("a NULL embedding has a NULL distance, as its type says", async () => {
+    const rows = await database.documents(
+      (doc) => ({
+        distance: doc.optional.l2Distance([1, 0, 0]),
+        reverse: doc.embedding.cosineDistance(doc.optional),
+      }),
+      { orderBy: (doc) => doc.id.ascending },
+    );
+
+    expect(rows[0]).toEqual({ distance: null, reverse: null });
   });
 
   test("nearest neighbours order by distance with plausible values", async () => {
@@ -141,27 +154,23 @@ describe.skipIf(!available)("pgvector on PostgreSQL", () => {
       })
       .toSQL();
 
-    await isolated.driver.execute({
-      sql: "SET enable_seqscan = off",
-      parameters: [],
-    });
+    // SET LOCAL keeps the planner setting on this transaction's connection.
+    const plan = await isolated.driver.transaction(async (transaction) => {
+      await transaction.execute({
+        sql: "SET LOCAL enable_seqscan = off",
+        parameters: [],
+      });
 
-    try {
-      const plan = rowsOf(
-        await isolated.driver.execute({
+      return rowsOf(
+        await transaction.execute({
           sql: `EXPLAIN ${compiled.sql}`,
           parameters: [...compiled.parameters],
         }),
       )
         .map((row) => String(row["QUERY PLAN"]))
         .join("\n");
+    });
 
-      expect(plan).toContain("documents_embedding_idx");
-    } finally {
-      await isolated.driver.execute({
-        sql: "RESET enable_seqscan",
-        parameters: [],
-      });
-    }
+    expect(plan).toContain("documents_embedding_idx");
   });
 });

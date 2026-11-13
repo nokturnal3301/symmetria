@@ -224,9 +224,10 @@ const totals = database.users(({ name, posts }) => ({
 Plain columns aggregate through properties (`posts.sum.views`); expressions use
 the callback form. Filters and pagination select input rows before aggregation.
 `sum` / `average` return decimal strings or `null`; `minimum` / `maximum`
-preserve the column's value type and codec, plus `null`. Empty or all-NULL value
-inputs produce `null`; `count()` returns `0` and `exists()` returns `false` for
-empty inputs.
+preserve the column's value type and codec, plus `null`, and order JSON values
+as jsonb does (numbers numerically), booleans, `uuid` and `bytea` too. Empty or
+all-NULL value inputs produce `null`; `count()` returns `0` and `exists()`
+returns `false` for empty inputs.
 
 ## Enum mappings
 
@@ -283,18 +284,28 @@ UPDATE or DELETE without `where()` is refused unless `.all()` confirms it.
   iteration; `count()` and `exists()` on any table or filtered source.
 - Transactions, nested savepoints, isolation options and row locks.
 - `Transaction<typeof database>` for schema-specific transaction helpers.
-- `$scope()` filters for reads, updates and deletes, including related tables.
+- `$scope()` filters for reads, updates and deletes, including related tables,
+  and checks every row a scoped insert, upsert or update writes, like row-level
+  security's `WITH CHECK` (`SYMMETRIA_OUT_OF_SCOPE`); reused and prepared
+  queries bind the current tenant at every execution.
 - Bigint, decimal-string, Date and custom codecs, including nested JSON results;
   `smallint`, `real`, `doublePrecision`, `date`, `time`, `interval`, `bytea` and
   `inet` as first-class builders.
 - Conditional upserts: `doUpdate(values, { where: (current, incoming) => … })`.
 - Any SQL names: `casing: "preserve"` for camelCase databases such as Prisma's,
   `.named()` on tables and columns, `.onUpdate.cascade` foreign keys and
-  `timestamp(3)` columns read as UTC dates.
-- Exact arithmetic: `plus`, `minus`, `multiply` and `divide` follow PostgreSQL's
-  promotion, so `quantity.multiply(price)` is a `Decimal`.
+  `timestamp(3)` columns read as UTC dates; enum types named and shared with
+  `oneOf(...).typeName("Role")`, collations with `text.collate("C")`,
+  `int.auto.byDefault` identities that also accept explicit ids, and derived
+  names over 63 bytes shortened with a hash.
+- Exact arithmetic typed as PostgreSQL computes it: `quantity.multiply(price)`
+  and `quantity.divide(2)` are `Decimal` (division never truncates),
+  `quantity.quotient(2)` is integer division, `real` columns stay floats.
 - `databaseError(error)` describes unique, foreign-key, not-null and check
-  violations the same way on both drivers; `one()` errors carry a code.
+  violations and lost connections the same way on both drivers; `one()` errors
+  carry a code. Invalid values (out-of-range numbers, invalid `jsonb(schema)`
+  input, `null` for NOT NULL columns) reject the query's promise when it runs;
+  mistakes in the query's shape throw where it is built.
 - Arrays, full-text search with stored `tsvector` columns, weighted documents,
   ranking and headlines, pgvector embeddings with distance operators and HNSW
   indexes (`symmetria/vector`), typed JSON paths and Standard Schema JSON
@@ -343,16 +354,26 @@ const database = createDatabase({
 });
 ```
 
-`symmetria/driver` re-exports `symmetria/pg`. Install `pg` when using either;
+`symmetria/driver` re-exports `symmetria/pg`. Install `pg` when using either
+(Symmetria declares the pool options itself, so `@types/pg` is not needed);
 `symmetria/bun` needs no external database driver. Each accepts a URL or its
 underlying pool options plus `url` and `profiler`.
 
-Both adapters return `{ rows, affectedRows }`, preserve bigint/numeric
-precision, support nested transactions and pinned sessions, and drain accepted
-operations on close. Session settings belong to a connection: use
-`driver.session()` for multi-statement workflows. For isolated PostgreSQL test
-schemas, use `testDatabase()` from `symmetria-kit/testing`, optionally passing a
-`driver` factory.
+Both adapters return `{ rows, affectedRows }`, read values the same way,
+preserve bigint/numeric precision, support nested transactions and pinned
+sessions, and drain accepted operations on close. Operations on a transaction or
+session run one at a time in call order. Session settings belong to a
+connection: use `driver.session()` for multi-statement workflows; its connection
+is closed afterwards, so its settings, locks and temporary tables never reach
+other queries. For isolated PostgreSQL test schemas, use `testDatabase()` from
+`symmetria-kit/testing`, optionally passing a `driver` factory.
+
+Behind a transaction-mode pooler such as PgBouncer, queries, transactions,
+streams and prepared queries work on both adapters; pass `prepare: false` to
+`symmetria/bun` unless the pooler tracks named statements (PgBouncer 1.21+ with
+`max_prepared_statements`), and set `search_path` on the role rather than in the
+URL. `driver.session()` cannot pin a server connection there. See
+[transaction pooling](https://github.com/nokturnal3301/symmetria/blob/main/docs/reference.md#transaction-pooling-pgbouncer).
 
 ## License
 

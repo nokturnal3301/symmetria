@@ -56,12 +56,49 @@ export default defineMigrationConfig({
 | `repair <id>`      | Verify and resolve an incomplete migration                          |
 | `recover`          | Recover files after a crashed generator                             |
 
-Use `--help` for options. `--json` produces machine-readable output;
-`--no-interactive` disables prompts. `diff --sql` prints SQL. Config paths
-resolve relative to the config file. SQL lives in `migrations/<id>/`; metadata
-lives in `migrations/meta/snapshot.json` and `migrations/meta/migration.json`.
-Commit SQL and both JSON files together. `diff` compares snapshots, not live DB
-drift.
+| Flag                           | Commands                                     | Purpose                                                      |
+| ------------------------------ | -------------------------------------------- | ------------------------------------------------------------ |
+| `--config <file>`              | all                                          | Config module (default `symmetria.config.ts`)                |
+| `--dir <directory>`            | all with a project                           | Migrations directory, relative to the working directory      |
+| `--database-url <url>`         | database commands, `pull`, `lint`            | Connection; overrides `databaseUrl` and `DATABASE_URL`       |
+| `--json`                       | all                                          | One JSON object on stdout, `{"error": …}` on failure         |
+| `--sql`                        | `diff`                                       | Print executable SQL                                         |
+| `--diff <file.json>`           | `generate`, `diff`, `lint`                   | Rename hints and `USING` conversions                         |
+| `--empty`                      | `generate`                                   | An empty, editable SQL migration                             |
+| `--allow-destructive`          | `generate`                                   | Permit drops and narrowing type changes (`allowDestructive`) |
+| `--transaction <mode>`         | `generate`                                   | `batch` (default), `each` or `none` (`transaction`)          |
+| `--online`                     | `generate`, `diff`, `lint`                   | Concurrent indexes and phased validation (`online`)          |
+| `--allow-custom-sql`           | `squash`                                     | Drop SQL that generate did not write (`allowCustomSQL`)      |
+| `--pending`                    | `lint`                                       | Only migrations pending in the database                      |
+| `--strict`                     | `lint`, `drift`                              | Exit with code 1 for any finding                             |
+| `--to <id>`                    | `migrate`, `adopt`                           | Apply up to, or adopt through, a migration (`to`)            |
+| `--steps <n>`                  | `rollback`                                   | Number of migrations to revert (`steps`)                     |
+| `--plan`                       | `migrate`, `rollback`                        | Show SQL and transaction groups without running them         |
+| `--action <action>`            | `repair`                                     | `retry` or `complete` (`action`)                             |
+| `--verify-url <url>`           | `verify`, `adopt`, `repair`                  | Server for disposable databases (`verificationDatabaseUrl`)  |
+| `--ignore-table <name>`        | `pull`, `drift`, `adopt`, `repair`, `verify` | Leave an undeclared table out, repeatable (`ignoreTables`)   |
+| `--advisory-lock-timeout <ms>` | commands that run migrations                 | Migration lock wait (`advisoryLockTimeoutMs`, default 10000) |
+| `--lock-timeout <ms>`          | commands that run migrations                 | DDL lock wait (`lockTimeoutMs`, default 5000; 0 disables)    |
+| `--statement-timeout <ms>`     | commands that run migrations                 | Statement duration (`statementTimeoutMs`, default 600000)    |
+| `--force`                      | `pull`, `graph`                              | Overwrite the written file                                   |
+| `--compact`                    | `graph`                                      | Entities and relations without column lists                  |
+| `--relations`                  | `inspect`                                    | Start on, or list, the relations                             |
+| `--profile-url <url>`          | `profile`                                    | Profiler endpoint (default `http://127.0.0.1:7331`)          |
+| `--profile-token <token>`      | `profile`                                    | Profiler token (default `SYMMETRIA_PROFILE_TOKEN`)           |
+| `--no-interactive`             | all                                          | No dashboard, schema browser or rename questions             |
+| `--no-color`, `--no-animation` | all                                          | Plain output; no logo or spinner animation                   |
+| `--help`, `-h`                 | all                                          | Show the commands and flags                                  |
+
+`--help` prints the same list. A flag of particular commands (`--sql`, `--plan`,
+`--to`, `--ignore-table`, …) is refused by the others; connection, directory,
+timeout and display flags are accepted everywhere. The names in parentheses are
+the matching config and API options. With `--json`, every command prints one
+JSON object: the result, with lists under a key (`findings`, `migrations`,
+`steps`, `tables`, `requests`), or `{"error": {"message": …}}` with exit code 1.
+Ctrl-C exits with 130 and SIGTERM with 143. Config paths resolve relative to the
+config file. SQL lives in `migrations/<id>/`; metadata lives in
+`migrations/meta/snapshot.json` and `migrations/meta/migration.json`. Commit SQL
+and both JSON files together. `diff` compares snapshots, not live DB drift.
 
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="https://raw.githubusercontent.com/nokturnal3301/symmetria/main/docs/assets/kit-schema.png">
@@ -110,32 +147,47 @@ erDiagram
 
 `symmetria pull` reads the connection's `current_schema()` and writes a schema
 module in the Symmetria DSL: tables and columns under any names (with
-`casing: "preserve"` and `.named()` where needed), defaults, identities, enums,
-foreign keys as relations (including `ON UPDATE CASCADE`, keys to unique columns
-and columns not named `*_id`, through `.by()` and `.column()`), junction tables,
-primary keys, unique columns, indexes (including expression, partial, `INCLUDE`
-and non-btree indexes) and CHECK constraints. A database created by Prisma pulls
-as is; `drift` then lists only what the warnings announced.
+`casing: "preserve"` and `.named()` where needed), defaults, identities
+(`GENERATED BY DEFAULT` as `.auto.byDefault`), collations, enums under their own
+names (`oneOf(...).typeName("Role")`, shared by several columns too), foreign
+keys as relations (including `ON UPDATE CASCADE`, keys to unique columns and
+columns not named `*_id`, through `.by()` and `.column()`), junction tables,
+primary keys, unique columns, indexes (including expression, partial, ordered,
+`INCLUDE`, collated, `WITH (…)` and non-btree indexes) and CHECK constraints.
+Conditions are predicates where the DSL can write them as PostgreSQL stored them
+(`users.score.between(1, 10)`,
+`and(users.status.is("active"), users.deletedAt.is(null))`), and `sql` text
+otherwise. A schema written with the DSL, migrated and pulled back needs no
+migration: `diff` and `generate` compare conditions in a normalized form, so
+`above(-100)` and `> '-100'::integer` are the same check. Pulling a database
+built from a pulled schema gives back the same schema. A database created by
+Prisma pulls as is, and the Prisma client keeps working next to Symmetria;
+`drift` then lists only what the warnings announced.
 
 ```sh
 symmetria pull src/database/schema.ts --database-url "$DATABASE_URL"
 ```
 
 Everything the DSL cannot express is kept as close as possible and listed for
-review: constraints with non-conventional names (with the `RENAME CONSTRAINT`
-that fixes them), serial columns, `GENERATED BY DEFAULT` identities, types
-without a builder such as `money` (declared through `customType()`), enums
-shared by several columns, multi-column unique constraints (declared as unique
-indexes), unique indexes that stand in for constraints (with the
-`ADD CONSTRAINT … USING INDEX` that converts them), composite or deferrable
-foreign keys, indexes with operator classes, and the views, materialized views
-and triggers the schema does not manage. The same list is in `--json` output
-under `warnings`, each with a `code` and, when one exists, a `fix`. The file is
-never overwritten without `--force`.
+review: constraints with non-conventional names, Prisma's `_AB_pkey` junction
+keys included (with the `RENAME CONSTRAINT` that fixes them), serial columns
+(with a fix that makes them `BY DEFAULT` identities continuing after the
+existing rows and drops the old sequence), types without a builder such as
+`money` (declared through `customType()`), multi-column unique constraints
+(declared as unique indexes), unique indexes that stand in for constraints (with
+the `ADD CONSTRAINT … USING INDEX` that converts them), composite or deferrable
+foreign keys, and the views, materialized views and triggers the schema does not
+manage. The same list is in `--json` output under `warnings`, each with a `code`
+and, when one exists, a `fix`. The file is never overwritten without `--force`.
 
 Then point `symmetria.config.ts` at the module, run `drift` until the remaining
 findings are intended, generate the first migration with `generate initial` and
-record it on the existing database with `adopt`.
+record it on the existing database with `adopt`. Tables Symmetria should not
+manage (another service's, PostGIS `spatial_ref_sys`) go in `ignoreTables` in
+the config or `--ignore-table <name>`; `pull`, `drift`, `adopt`, `repair` and
+`verify` leave them out (a table the schema declares is still compared), and the
+CLI always leaves Prisma's `_prisma_migrations` out of the comparisons, so it
+can stay until Prisma no longer deploys.
 
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="https://raw.githubusercontent.com/nokturnal3301/symmetria/main/docs/assets/migration-safety.png">
@@ -145,13 +197,28 @@ record it on the existing database with `adopt`.
 ## Deployment controls
 
 - `generate` requires explicit rename hints or `--allow-destructive` for dropped
-  tables/columns. Declared column order is preserved; snapshot hashes are
+  tables/columns and for type changes that narrow existing values (a shorter
+  `varchar`, fewer decimal places). A shorter string type is altered without a
+  truncating cast, so PostgreSQL refuses values that do not fit instead of
+  cutting them. Declared column order is preserved; snapshot hashes are
   order-independent.
 - `lint` checks actual `up.sql` even after generation and fails for destructive
-  or blocking findings. `--strict` also fails for cautionary findings;
-  `--pending` selects unapplied migrations using database history.
+  or blocking findings, reviewing every action of an `ALTER TABLE` and ignoring
+  comments and strings. `CHECK` and foreign keys added without `NOT VALID` are
+  blocking. `--strict` also fails for cautionary findings; `--pending` selects
+  unapplied migrations using database history.
 - `migrate --plan --json` shows SQL and transaction groups. `batch` is the
-  atomic default; `generate --transaction each|none` opts into other boundaries.
+  atomic default; a migration that adds enum labels commits before the next one
+  so that it can use them, with every driver, including custom drivers that only
+  run whole transactions. `generate --transaction each|none` opts into other
+  boundaries; `none` needs a driver with sessions.
+- Run migrations over a direct or session-pooled connection. Through a
+  transaction-mode pooler (PgBouncer `pool_mode = transaction`), which a session
+  lock cannot protect, the runner notices and locks each transaction with
+  `pg_advisory_xact_lock` instead, and refuses `none` migrations before anything
+  runs.
+- `squash` refuses to drop SQL that generate did not write (seeds, views, edited
+  `up.sql`) and lists it; `--allow-custom-sql` confirms.
 - `--online` generates concurrent indexes, phased constraint validation and
   additive enum changes with commit boundaries. Incomplete nontransactional work
   persists in the journal and requires explicit `repair`.
@@ -160,7 +227,8 @@ record it on the existing database with `adopt`.
   statement-level events.
 - `drift` checks defaults, identities, PK/FK/UNIQUE/CHECK definitions, FK
   actions, enums, indexes and validation state. `adopt` verifies the live schema
-  before rewriting history.
+  before rewriting history, and asks for `--to` when data-only migrations make
+  the baseline ambiguous.
 - `verify --verify-url "$VERIFY_DATABASE_URL"` uses real disposable PostgreSQL
   databases; the connection needs `CREATEDB`. Config/API hooks add
   representative rows and assert data invariants during upgrade, rollback and
@@ -187,7 +255,7 @@ Enable `createProfiler()` in the application, pass it to
 `profiler.fetch(handler)`, and call `await profiler.serve()`.
 `symmetria profile` connects to `http://127.0.0.1:7331`; `--profile-url`
 overrides it. Enter opens a request/query, `e` estimates a plan, `a` explicitly
-runs ANALYZE, Escape goes back and `q` exits.
+runs ANALYZE (both shown as a plan tree), Escape goes back and `q` exits.
 
 The loopback endpoint checks Host and browser origin and requires the server's
 token on every request. Export `SYMMETRIA_PROFILE_TOKEN` for both the
@@ -215,10 +283,10 @@ Exports: `defineMigrationConfig`, `migrationSnapshot`, `parseMigrationSnapshot`,
 `generateMigration`, `loadMigrations`, `loadMigrationState`, `squashMigrations`,
 `lintMigration`, `lintMigrationSQL`, `detectDrift`, `verifyMigrations`,
 `recoverMigrationFiles`, `pullSchema`, their formatting helpers, and `migrator`
-with their associated types. `pullSchema({ execute })` returns the generated
-source, the declared tables and the review warnings without touching the file
-system. `loadMigrationState` returns `{ migrations, snapshot }`; only the
-current schema snapshot is stored. Generated and squashed migrations include
+with their associated types. `pullSchema({ execute, ignoreTables })` returns the
+generated source, the declared tables and the review warnings without touching
+the file system. `loadMigrationState` returns `{ migrations, snapshot }`; only
+the current schema snapshot is stored. Generated and squashed migrations include
 their new snapshot.
 
 ```ts

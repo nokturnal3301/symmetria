@@ -76,6 +76,20 @@ database.$transaction(async (transaction) => {
 // @ts-expect-error transaction inference requires a database transaction API
 type InvalidContext = Transaction<{ users: unknown }>;
 
+// The callback may return a query (an awaitable) instead of a promise.
+{
+  const rows = await database.$transaction((transaction) =>
+    transaction.posts((post) => ({ title: post.title })),
+  );
+  type Rows = Assert<Equal<typeof rows, { title: string }[]>>;
+  const count = await database.$transaction((transaction) =>
+    transaction.$transaction((savepoint) => savepoint.posts.count()),
+  );
+  type Count = Assert<Equal<typeof count, number>>;
+  // @ts-expect-error the callback must return an awaitable
+  await database.$transaction(() => 1);
+}
+
 {
   const model = schema({ records: { id: int, name: text } });
   model.$transaction(async (transaction) => {

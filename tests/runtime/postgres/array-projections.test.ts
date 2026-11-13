@@ -31,12 +31,6 @@ const expected = [
   { id: 1, ...preciseValues },
   { id: 2, scores: [], amounts: [], labels: [] },
   { id: 3, scores: null, amounts: null, labels: [] },
-  {
-    id: 4,
-    scores: [9007199254740997n, null],
-    amounts: ["987654321098765.9876543210", null],
-    labels: [],
-  },
 ];
 
 describe.skipIf(!databaseUrl)("precision-preserving array projections", () => {
@@ -60,13 +54,6 @@ describe.skipIf(!databaseUrl)("precision-preserving array projections", () => {
       { id: 2, parentId: 1, scores: [], amounts: [], labels: [] },
       { id: 3, parentId: 1, scores: null, amounts: null, labels: [] },
     ]);
-    // Database-native NULL elements can also arrive from outside the typed API.
-    await isolated.driver.execute({
-      sql: `INSERT INTO items (id, parent_id, scores, amounts, labels)
-        VALUES (4, 1, ARRAY[9007199254740997::bigint, NULL],
-          ARRAY[987654321098765.9876543210::numeric, NULL], ARRAY[]::text[])`,
-      parameters: [],
-    });
   });
 
   afterAll(async () => {
@@ -166,5 +153,48 @@ describe.skipIf(!databaseUrl)("precision-preserving array projections", () => {
         },
       },
     ]);
+  });
+
+  test("NULL elements written outside the typed API fail loudly instead of breaking the element type", async () => {
+    // `bigint.array` reads as `bigint[]`, so a NULL element cannot be returned as one.
+    await isolated.driver.execute({
+      sql: `INSERT INTO items (id, parent_id, scores, amounts, labels)
+        VALUES (4, 2, ARRAY[9007199254740997::bigint, NULL],
+          ARRAY[987654321098765.9876543210::numeric, NULL], ARRAY[]::text[])`,
+      parameters: [],
+    });
+
+    try {
+      const nullElement =
+        /bigint\[\] value from the database contains a NULL element/;
+      await expect(
+        database
+          .items((items) => ({ scores: items.scores }), {
+            where: (items) => items.id.is(4),
+          })
+          .execute(),
+      ).rejects.toThrow(nullElement);
+      await expect(
+        database
+          .parents((parents) => ({
+            items: parents.items((items) => ({ scores: items.scores })),
+          }))
+          .execute(),
+      ).rejects.toThrow(nullElement);
+      // SQL can drop them before they reach the codec.
+      expect(
+        await database.items(
+          (items, { sql }) => ({
+            scores: sql.of(bigint.array)`array_remove(${items.scores}, NULL)`,
+          }),
+          { where: (items) => items.id.is(4) },
+        ),
+      ).toEqual([{ scores: [9007199254740997n] }]);
+    } finally {
+      await isolated.driver.execute({
+        sql: "DELETE FROM items WHERE id = 4",
+        parameters: [],
+      });
+    }
   });
 });

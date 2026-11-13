@@ -57,6 +57,12 @@ const shareable = (node: AggregateQuery): boolean => {
       );
     }
 
+    if ("kind" in value && value.kind === "scope") {
+      return deterministic(
+        (value as Extract<PredicateDescription, { kind: "scope" }>).predicate,
+      );
+    }
+
     if (
       "kind" in value &&
       [
@@ -90,9 +96,10 @@ export const sharedAggregates = (query: SelectPlan): SharedAggregate[] => {
     query.locking ||
     query.predicates.every(
       (predicate) =>
-        predicate.kind === "comparison" &&
-        atomicValue(predicate.left) &&
-        atomicValue(predicate.right),
+        predicate.kind === "scope" ||
+        (predicate.kind === "comparison" &&
+          atomicValue(predicate.left) &&
+          atomicValue(predicate.right)),
     )
   ) {
     return [];
@@ -160,6 +167,8 @@ export const sharedAggregates = (query: SelectPlan): SharedAggregate[] => {
         return;
       }
 
+      // $scope() filters are re-rendered per execution, so nothing inside
+      // them may be shared with another clause.
       if (
         [
           "column",
@@ -169,6 +178,7 @@ export const sharedAggregates = (query: SelectPlan): SharedAggregate[] => {
           "jsonRows",
           "exists",
           "raw",
+          "scope",
         ].includes(node.kind)
       ) {
         return;

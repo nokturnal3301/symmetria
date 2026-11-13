@@ -2,7 +2,12 @@
  * Plain-text formatters for CLI output: diffs, schemas, status, dashboard, created files, execution logs and help.
  */
 import type { PullWarning } from "../../introspection/model";
-import type { SchemaSnapshot } from "symmetria";
+import type { ColumnSnapshot, SchemaSnapshot, TableSnapshot } from "symmetria";
+import {
+  IDENTITY_BY_DEFAULT,
+  indexClausesSQL,
+  isIdentityDefault,
+} from "symmetria/internal";
 import type { MigrationPlan, MigrationStatus, RenameHints } from "../../index";
 import { canonicalJSON, type MigrationColumn } from "../../migrations/snapshot";
 import { heading, panel, theme, fitLine, terminalWidth } from "./style";
@@ -11,11 +16,16 @@ import stringWidth from "string-width";
 const equal = (left: unknown, right: unknown): boolean =>
   canonicalJSON(left ?? null) === canonicalJSON(right ?? null);
 
+/** Every attribute a migration can change, so a modified column shows what changed. */
 const columnLabel = (column: MigrationColumn): string =>
   [
-    column.sqlType,
+    `${column.enumeration ? `enum ${column.enumeration}` : column.sqlType}${column.collation ? ` collate "${column.collation}"` : ""}`,
     column.notNull ? "" : "nullable",
-    column.identity ? "identity" : "",
+    column.identity
+      ? column.identityByDefault
+        ? "identity by default"
+        : "identity"
+      : "",
     column.unique ? "unique" : "",
     column.default === undefined ? "" : `default ${column.default}`,
     column.references
@@ -152,21 +162,65 @@ export const formatDiff = (
     output.push("");
   }
 
+  // A type whose columns moved to a new name is renamed (ALTER TYPE … RENAME TO).
+  const renamedEnumerations = new Map<string, string>();
+
+  for (const table of plan.after.tables) {
+    for (const column of table.columns) {
+      const old = previous
+        .get(
+          Object.entries(renames.tables ?? {}).find(
+            ([, target]) => target === table.name,
+          )?.[0] ?? table.name,
+        )
+        ?.columns.find(
+          (candidate) =>
+            candidate.name ===
+            (Object.entries(renames.columns?.[table.name] ?? {}).find(
+              ([, target]) => target === column.name,
+            )?.[0] ?? column.name),
+        );
+
+      if (
+        old?.enumeration &&
+        column.enumeration &&
+        old.enumeration !== column.enumeration &&
+        !plan.after.enumerations.some(
+          (entry) => entry.name === old.enumeration,
+        ) &&
+        !plan.before.enumerations.some(
+          (entry) => entry.name === column.enumeration,
+        )
+      ) {
+        renamedEnumerations.set(old.enumeration, column.enumeration);
+      }
+    }
+  }
+
+  const renamedTo = new Set(renamedEnumerations.values());
+
   for (const name of new Set(
     [...plan.before.enumerations, ...plan.after.enumerations].map(
       (entry) => entry.name,
     ),
   )) {
+    if (renamedTo.has(name)) {
+      continue;
+    }
+
+    const target = renamedEnumerations.get(name) ?? name;
     const before = plan.before.enumerations.find(
       (entry) => entry.name === name,
     );
-    const after = plan.after.enumerations.find((entry) => entry.name === name);
+    const after = plan.after.enumerations.find(
+      (entry) => entry.name === target,
+    );
 
-    if (!equal(before, after)) {
+    if (!equal(before?.values, after?.values) || target !== name) {
       output.push(
         marker(
           before ? (after ? "~" : "-") : "+",
-          `enum ${name}: ${(before?.values ?? []).join(" | ")} → ${(after?.values ?? []).join(" | ")}`,
+          `enum ${target === name ? name : `${name} → ${target}`}: ${(before?.values ?? []).join(" | ")} → ${(after?.values ?? []).join(" | ")}`,
         ),
       );
     }
@@ -185,6 +239,33 @@ export const formatDiff = (
   return output.join("\n");
 };
 
+/** A column's type as declared: a named enum's type and a non-default collation included. */
+export const columnTypeLabel = (column: ColumnSnapshot): string =>
+  [
+    column.enumerationName
+      ? `enum "${column.enumerationName}"`
+      : column.sqlType,
+    column.collation ? `collate "${column.collation}"` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+/** `default …`, or the identity generation instead of the marker it is stored as. */
+const columnDefaultLabel = (column: ColumnSnapshot): string => {
+  if (!column.default) {
+    return "";
+  }
+
+  if (isIdentityDefault(column.default)) {
+    return column.default.kind === "sql" &&
+      column.default.sql === IDENTITY_BY_DEFAULT
+      ? "identity by default"
+      : "identity";
+  }
+
+  return `default ${column.default.kind === "sql" ? column.default.sql : JSON.stringify(column.default.value, (_name, value) => (typeof value === "bigint" ? String(value) : value))}`;
+};
+
 export const formatSchema = (
   snapshot: SchemaSnapshot,
   name?: string,
@@ -201,6 +282,16 @@ export const formatSchema = (
   if (name && !tables.length) {
     throw new Error(`symmetria: unknown table "${name}"`);
   }
+
+  // Column names line up within a table; a name over 31 characters runs
+  // past the column instead of widening every other row.
+  const nameWidth = (table: TableSnapshot) =>
+    Math.max(
+      20,
+      ...table.columns
+        .map((column) => column.name.length + 1)
+        .filter((width) => width <= 32),
+    );
 
   if (relationsOnly) {
     return (
@@ -228,7 +319,7 @@ export const formatSchema = (
             : `  ${table.name}${table.name === table.sqlName ? "" : ` (${table.sqlName})`}`,
           ...table.columns.map(
             (column, position) =>
-              `  ${style(position === table.columns.length - 1 ? "└─" : "├─", "border")} ${style(column.name.padEnd(20), column.primaryKey ? "strong" : "accent")} ${[style(column.sqlType, "violet"), column.primaryKey ? style("primary key", "warning") : "", column.unique ? style("unique", "success") : "", column.notNull ? "" : style("nullable", "muted"), column.references ? style(`→ ${column.references.table}.${column.references.column}`, "accent") : "", column.default ? style(`default ${column.default.kind === "sql" ? column.default.sql : JSON.stringify(column.default.value, (_name, value) => (typeof value === "bigint" ? String(value) : value))}`, "muted") : ""].filter(Boolean).join(style(" · ", "border"))}`,
+              `  ${style(position === table.columns.length - 1 ? "└─" : "├─", "border")} ${style(column.name.padEnd(nameWidth(table)), column.primaryKey ? "strong" : "accent")} ${[style(columnTypeLabel(column), "violet"), column.primaryKey ? style("primary key", "warning") : "", column.unique ? style("unique", "success") : "", column.notNull ? "" : style("nullable", "muted"), column.references ? style(`→ ${column.references.table}.${column.references.column}`, "accent") : "", column.default ? style(columnDefaultLabel(column), "muted") : ""].filter(Boolean).join(style(" · ", "border"))}`,
           ),
           ...(table.relations.length
             ? [
@@ -246,7 +337,8 @@ export const formatSchema = (
                 `  ${style("Indexes", "violet")}`,
                 ...table.indexes.map(
                   (index) =>
-                    `    ${style(index.sqlName, "accent")}  ${style(`${index.unique ? "UNIQUE " : ""}${index.method}`, "success")} (${index.keys.join(", ")})`,
+                    // Key operator classes, INCLUDE, WITH and WHERE, as in the DDL.
+                    `    ${style(index.sqlName, "accent")}  ${style(`${index.unique ? "UNIQUE " : ""}${index.method}`, "success")} ${indexClausesSQL(index)}`,
                 ),
               ]
             : []),
@@ -318,11 +410,11 @@ export const formatDashboard = (
   const separator = style("  ·  ", "border");
   const address = `${style("●", details.connection === "connected" ? "connected" : details.connection === "unavailable" ? "danger" : "muted")} ${details.address}`;
 
-  if (process.stdout.rows && process.stdout.rows < 16) {
-    return `  ${brand(frame)}\n  ${address}`;
-  }
-
   const width = terminalWidth();
+
+  if (process.stdout.rows && process.stdout.rows < 16) {
+    return `  ${fitLine(brand(frame), width)}\n  ${fitLine(address, width)}`;
+  }
 
   if (width >= 72) {
     const cardWidth = Math.floor((width - 4) / 3);

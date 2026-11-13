@@ -226,6 +226,15 @@ export const loadProject = async (context: CliContext): Promise<Project> => {
   );
   const verificationDatabaseUrl =
     values["verify-url"] ?? config.verificationDatabaseUrl;
+  // Prisma's history table is never part of an application schema, and adopt
+  // must work while it still exists; declared tables are compared regardless.
+  const ignoreTables = [
+    ...new Set([
+      "_prisma_migrations",
+      ...(config.ignoreTables ?? []),
+      ...(values["ignore-table"] ?? []),
+    ]),
+  ];
 
   return {
     configPath,
@@ -240,6 +249,7 @@ export const loadProject = async (context: CliContext): Promise<Project> => {
         : {}),
       ...(config.metadataTable ? { metadataTable: config.metadataTable } : {}),
       ...(verificationDatabaseUrl ? { verificationDatabaseUrl } : {}),
+      ignoreTables,
       ...timeouts,
       ...(config.onEvent ? { onEvent: config.onEvent } : {}),
     },
@@ -264,7 +274,9 @@ export const withDatabase = async <Result>(
   operation: (driver: PostgresDriver, signal: AbortSignal) => Promise<Result>,
 ): Promise<Result> => {
   if (!project.databaseUrl) {
-    throw new Error("symmetria: configure databaseUrl or DATABASE_URL");
+    throw new Error(
+      "symmetria: no database: set databaseUrl in the config, DATABASE_URL or --database-url",
+    );
   }
 
   const driver = postgres(project.databaseUrl);

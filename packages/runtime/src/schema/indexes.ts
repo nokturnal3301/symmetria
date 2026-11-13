@@ -6,6 +6,7 @@ import { quoteIdentifier } from "../query/compile";
 import { ddlExpressions } from "./ddl-expressions";
 import {
   ORDERING_EXPRESSION,
+  isPredicate,
   readColumn,
   readPredicate,
   type Ordering,
@@ -14,6 +15,7 @@ import {
   type SelectedColumn,
   type ValueNode,
 } from "../query/expressions";
+import { objectName } from "./naming";
 import {
   createScope,
   type RuntimeScope,
@@ -64,12 +66,40 @@ export interface OperatorClassKey<Name extends string = string> {
 }
 type IndexKey = SelectedColumn | Ordering | OperatorClassKey;
 export type IndexStorageOptions = Readonly<Record<string, string | number>>;
+
+/**
+ * A condition in a CHECK constraint or partial-index WHERE clause: a predicate such
+ * as `price.above(0)`, or a boolean expression such as ``sql<boolean>`${price} > 0` ``,
+ * which is written as it is rather than compared with `= true`.
+ */
+export type SchemaCondition = Predicate | SelectedColumn<boolean | null>;
+
+/** A schema condition as SQL: predicates through `predicateSQL`, boolean expressions as their own SQL. */
+export type ConditionDescription =
+  | { readonly kind: "predicate"; readonly predicate: PredicateDescription }
+  | { readonly kind: "expression"; readonly node: ValueNode };
+
+export const readCondition = (
+  condition: SchemaCondition,
+): ConditionDescription =>
+  isPredicate(condition)
+    ? { kind: "predicate", predicate: readPredicate(condition) }
+    : { kind: "expression", node: readColumn(condition).node };
+
+export const conditionSQL = (
+  condition: ConditionDescription,
+  expressions: ReturnType<typeof ddlExpressions>,
+): string =>
+  condition.kind === "predicate"
+    ? expressions.predicateSQL(condition.predicate)
+    : expressions.valueSQL(condition.node);
+
 type IndexDescription = {
   readonly keys: readonly IndexKey[];
   readonly unique: boolean;
   readonly method: IndexMethod;
   readonly include: readonly SelectedColumn[];
-  readonly where?: PredicateDescription;
+  readonly where?: ConditionDescription;
   readonly with?: IndexStorageOptions;
 };
 
@@ -145,8 +175,9 @@ export interface IndexDefinition<
     first: SelectedColumn,
     ...columns: SelectedColumn[]
   ) => IndexDefinition<ColumnNames, Unique, Complete>;
+  /** A partial index: a predicate, or a boolean expression such as ``sql<boolean>`${posts.deletedAt} IS NULL` ``. */
   readonly where: (
-    predicate: Predicate,
+    condition: SchemaCondition,
   ) => IndexDefinition<ColumnNames, Unique, false>;
   /** Storage parameters: `index(...).using("hnsw").with({ m: 16, ef_construction: 64 })`. */
   readonly with: (
@@ -192,8 +223,8 @@ const defineIndex = (description: IndexDescription): IndexDefinition => {
         ...description,
         include: Object.freeze([first, ...columns]),
       }),
-    where: (condition: Predicate) =>
-      defineIndex({ ...description, where: readPredicate(condition) }),
+    where: (condition: SchemaCondition) =>
+      defineIndex({ ...description, where: readCondition(condition) }),
   };
   Object.defineProperty(result, "unique", {
     get: () => defineIndex({ ...description, unique: true }),
@@ -225,11 +256,18 @@ export const index = <const Keys extends readonly [IndexKey, ...IndexKey[]]>(
   }) as IndexDefinition<KeyName<Keys[number]>, false, true>;
 };
 
+/**
+ * Adds the indexes a callback returns to the snapshot. Schema-level keys are exact
+ * SQL names; a table's keys derive `<table>_<key>_idx`, and automatic indexes
+ * (`columnIndexes`) are keyed by column and named after its SQL name. Derived
+ * names over 63 bytes are shortened with a hash, as constraint names are.
+ */
 export const applyIndexes = (
   snapshot: SchemaSnapshot,
   codecs: SchemaCodecs,
   callback: (scope: RuntimeScope) => Record<string, IndexDefinition>,
   tableName?: string,
+  columnIndexes = false,
 ): void => {
   const bindings: Record<string, TableBinding> = Object.fromEntries(
     snapshot.tables
@@ -269,10 +307,17 @@ export const applyIndexes = (
     }
 
     quoteIdentifier(name);
-    const sqlName =
-      tableName === undefined
-        ? sqlKey(name, snapshot.casing)
-        : `${bindings[tableName]!.table.sqlName}_${sqlKey(name, snapshot.casing)}_idx`;
+    const table =
+      tableName === undefined ? undefined : bindings[tableName]!.table;
+    const sqlName = !table
+      ? sqlKey(name, snapshot.casing)
+      : objectName(
+          table.sqlName,
+          columnIndexes
+            ? table.columns.find((column) => column.name === name)!.sqlName
+            : sqlKey(name, snapshot.casing),
+          "idx",
+        );
     quoteIdentifier(sqlName);
 
     if (names.has(sqlName)) {
@@ -305,8 +350,8 @@ export const applyIndexes = (
       return quoteIdentifier(column.sqlName);
     };
 
-    const { valueSQL: valueSql, predicateSQL: predicateSql } =
-      ddlExpressions(columnSql);
+    const expressions = ddlExpressions(columnSql);
+    const valueSql = expressions.valueSQL;
 
     if (description.unique && description.method !== "btree") {
       throw new Error("symmetria: unique indexes require btree");
@@ -382,7 +427,7 @@ export const applyIndexes = (
     }
 
     const where = description.where
-      ? predicateSql(description.where)
+      ? conditionSQL(description.where, expressions)
       : undefined;
     const indexSnapshot: IndexSnapshot = Object.freeze({
       name,

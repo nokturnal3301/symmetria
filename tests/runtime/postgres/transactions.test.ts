@@ -18,20 +18,14 @@ import {
   sql,
   IsolationLevel,
 } from "../../../packages/runtime/src";
-import { postgres, type Driver } from "../../support/postgres";
+import { postgres, searchPathURL, type Driver } from "../../support/postgres";
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("indexes and transactions on PostgreSQL", () => {
-  const driver = postgres({
-    url: databaseUrl ?? "postgres://localhost/postgres",
-    max: 1,
-  });
-  const observerDriver = postgres({
-    url: databaseUrl ?? "postgres://localhost/postgres",
-    max: 1,
-  });
   const namespace = `symmetria_atomic_${crypto.randomUUID().replaceAll("-", "")}`;
+  const driver = postgres({ url: searchPathURL(namespace), max: 1 });
+  const observerDriver = postgres({ url: searchPathURL(namespace), max: 1 });
 
   const connect = (connection: Driver) =>
     schema(
@@ -85,11 +79,6 @@ describe.skipIf(!databaseUrl)("indexes and transactions on PostgreSQL", () => {
 
   beforeAll(async () => {
     await run(`CREATE SCHEMA "${namespace}"`);
-    await run(`SET search_path TO "${namespace}"`);
-    await observerDriver.execute({
-      sql: `SET search_path TO "${namespace}"`,
-      parameters: [],
-    });
     await run(
       "CREATE TABLE accounts (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, owner text NOT NULL, email text NOT NULL, active boolean NOT NULL DEFAULT true, balance bigint NOT NULL DEFAULT 0, metadata jsonb)",
     );
@@ -530,61 +519,137 @@ describe.skipIf(!databaseUrl)("indexes and transactions on PostgreSQL", () => {
         unfinished = transaction.accounts
           .update({ balance: 0n })
           .where((accounts) => accounts.id.is(1))
-          .execute();
+          .execute()
+          .then(
+            () => "updated",
+            (error: Error) => error.message,
+          );
       }),
     ).rejects.toThrow(/await all transaction operations/);
-    await unfinished;
+    // The update ran, but the transaction rolled it back: it must not look successful.
+    expect(await unfinished).toBe(
+      "symmetria: the transaction ended before this operation was awaited; it was rolled back",
+    );
     expect(await balances()).toEqual([{ balance: 100n }, { balance: 50n }]);
   });
 
-  test("a savepoint excludes concurrent parent queries and sibling savepoints", async () => {
+  test("an open stream at callback exit fails the transaction instead of committing it", async () => {
+    let rows: AsyncIterator<unknown> | undefined;
+    await expect(
+      model.$transaction(async (transaction) => {
+        await transaction.accounts
+          .update({ balance: 0n })
+          .where((accounts) => accounts.id.is(1))
+          .execute();
+        rows = transaction
+          .accounts((accounts) => ({ id: accounts.id }))
+          .stream({ size: 1 })
+          [Symbol.asyncIterator]();
+        await rows.next();
+      }),
+    ).rejects.toThrow(/finish or break out of every stream\(\)/);
+    await expect(rows!.next()).rejects.toThrow(/context is closed/);
+    expect(await balances()).toEqual([{ balance: 100n }, { balance: 50n }]);
+  });
+
+  test("a savepoint queues concurrent parent queries and sibling savepoints until it ends", async () => {
     await model.$transaction(async (transaction) => {
-      const gate = Promise.withResolvers<void>();
+      const order: string[] = [];
       const nested = transaction.$transaction(async (savepoint) => {
-        await gate.promise;
         await savepoint.accounts
           .update({ balance: 80n })
           .where((accounts) => accounts.id.is(1))
           .execute();
-      });
-
-      try {
+        // The parent waits for this savepoint, so using it here could never finish.
         await expect(
           transaction.accounts((accounts) => ({ id: accounts.id })).execute(),
         ).rejects.toThrow(/await the nested transaction/);
         await expect(transaction.$transaction(async () => 1)).rejects.toThrow(
           /await the nested transaction/,
         );
-      } finally {
-        gate.resolve();
-        await nested;
-      }
+        order.push("savepoint");
+      });
+      const parent = transaction
+        .accounts((accounts) => ({ balance: accounts.balance }), {
+          where: (accounts) => accounts.id.is(1),
+        })
+        .first();
+      const sibling = transaction.$transaction(async (savepoint) => {
+        order.push("sibling");
+
+        return savepoint
+          .accounts((accounts) => ({ balance: accounts.balance }), {
+            where: (accounts) => accounts.id.is(1),
+          })
+          .first();
+      });
+
+      expect(await Promise.all([parent, sibling, nested])).toEqual([
+        { balance: 80n },
+        { balance: 80n },
+        undefined,
+      ]);
+      expect(order).toEqual(["savepoint", "sibling"]);
     });
     expect((await balances())[0]?.balance).toBe(80n);
   });
 
-  test("savepoints require already-issued parent queries to finish", async () => {
+  test("savepoints wait for already-issued parent queries", async () => {
     await model.$transaction(async (transaction) => {
       const pending = transaction.accounts
         .update({ balance: 90n })
         .where((accounts) => accounts.id.is(1))
         .execute();
-      await expect(transaction.$transaction(async () => 1)).rejects.toThrow(
-        /await pending queries/,
+      const balance = await transaction.$transaction(async (savepoint) =>
+        savepoint
+          .accounts(
+            (accounts) => ({
+              balance: accounts.balance,
+            }),
+            { where: (accounts) => accounts.id.is(1) },
+          )
+          .first(),
       );
-      await pending;
-      await transaction.$transaction(async (savepoint) => {
-        expect(
-          await savepoint
-            .accounts(
-              (accounts) => ({
-                balance: accounts.balance,
-              }),
-              { where: (accounts) => accounts.id.is(1) },
-            )
-            .first(),
-        ).toEqual({ balance: 90n });
-      });
+      expect(balance).toEqual({ balance: 90n });
+      expect(await pending).toEqual({ affectedRows: 1 });
     });
+  });
+
+  test("concurrent statements, bulk inserts and nested inserts share one transaction", async () => {
+    const rows = Array.from({ length: 70_000 }, (_, index) => ({
+      owner: `bulk ${index}`,
+      email: `bulk${index}@example.test`,
+      active: false,
+    }));
+    const [first, second, count] = await model.$transaction(
+      async (transaction) =>
+        Promise.all([
+          transaction.accounts.insert(rows.slice(0, 35_000)).execute(),
+          transaction.accounts.insert(rows.slice(35_000)).execute(),
+          transaction.accounts.count(),
+          transaction.accounts.insert({
+            owner: "Nested",
+            email: "nested@example.test",
+            entries: { create: [{ externalId: "e1" }, { externalId: "e2" }] },
+          }),
+        ]),
+    );
+    expect([first, second]).toEqual([
+      { affectedRows: 35_000 },
+      { affectedRows: 35_000 },
+    ]);
+    expect(count).toBeGreaterThanOrEqual(2);
+    expect(
+      await model
+        .accounts((accounts) => ({ id: accounts.id }), {
+          where: (accounts) => accounts.active.is(false),
+        })
+        .count(),
+    ).toBe(70_000);
+    expect(
+      await model.entries((entries) => ({ externalId: entries.externalId }), {
+        orderBy: (entries) => entries.externalId.ascending,
+      }),
+    ).toEqual([{ externalId: "e1" }, { externalId: "e2" }]);
   });
 });

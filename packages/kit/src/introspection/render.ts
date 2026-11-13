@@ -8,6 +8,7 @@ import type {
   ColumnType,
   IndexKeySource,
   PulledColumn,
+  PulledCondition,
   PulledIndex,
   PulledMember,
   PulledReference,
@@ -33,6 +34,7 @@ const passthrough = <Value>() => ({
 });`;
 
 const IMPORT_ORDER = [
+  "and",
   "bigint",
   "bool",
   "bytea",
@@ -45,9 +47,11 @@ const IMPORT_ORDER = [
   "interval",
   "jsonb",
   "junction",
+  "not",
   "numeric",
   "oneOf",
   "operatorClass",
+  "or",
   "real",
   "schema",
   "smallint",
@@ -89,7 +93,7 @@ const typeSource = (type: ColumnType, imports: Set<string>): string => {
     case "enum":
       imports.add("oneOf");
 
-      return `oneOf(${type.values.map(quoteString).join(", ")})`;
+      return `oneOf(${type.values.map(quoteString).join(", ")})${type.name === undefined ? "" : `.typeName(${quoteString(type.name)})`}`;
     case "vector":
       imports.add("vector");
 
@@ -108,6 +112,10 @@ const columnSource = (
 ): string => {
   let source = typeSource(column.type, imports);
 
+  if (column.collation !== undefined) {
+    source += `.collate(${quoteString(column.collation)})`;
+  }
+
   if (column.array) {
     source += ".array";
   }
@@ -118,7 +126,7 @@ const columnSource = (
 
   switch (column.default?.kind) {
     case "auto":
-      source += ".auto";
+      source += column.default.byDefault ? ".auto.byDefault" : ".auto";
       break;
     case "now":
       source += ".now";
@@ -162,8 +170,11 @@ const columnSource = (
   return source;
 };
 
-const referenceSource = (reference: PulledReference): string => {
-  let source = reference.target;
+const referenceSource = (
+  reference: PulledReference,
+  bindings: ReadonlyMap<string, string>,
+): string => {
+  let source = bindings.get(reference.target) ?? reference.target;
 
   if (reference.by) {
     source += `.by(${quoteString(reference.by)})`;
@@ -207,8 +218,22 @@ const memberLine = (
   member: PulledMember,
   imports: Set<string>,
   casing: Casing,
+  bindings: ReadonlyMap<string, string>,
 ): string =>
-  `${member.key}: ${member.kind === "column" ? columnSource(member, imports, casing) : referenceSource(member)},${comment(member.comments)}`;
+  `${member.key}: ${member.kind === "column" ? columnSource(member, imports, casing) : referenceSource(member, bindings)},${comment(member.comments)}`;
+
+/** `{ users, date: dateTable }`: tables destructured by key under their bindings. */
+const destructure = (
+  keys: readonly string[],
+  bindings: ReadonlyMap<string, string>,
+): string =>
+  `{ ${keys
+    .map((key) => {
+      const binding = bindings.get(key) ?? key;
+
+      return binding === key ? key : `${key}: ${binding}`;
+    })
+    .join(", ")} }`;
 
 const keySource = (
   key: IndexKeySource,
@@ -218,7 +243,9 @@ const keySource = (
   let source =
     key.kind === "column"
       ? `${tableKey}.${key.source}`
-      : `sql<string>\`${key.source}\``;
+      : key.kind === "value"
+        ? key.source
+        : `sql<string>\`${key.source}\``;
 
   if (key.descending) {
     source += ".descending";
@@ -247,6 +274,27 @@ const storageSource = (options: Record<string, string | number>): string =>
     )
     .join(", ")} }`;
 
+/**
+ * A CHECK or WHERE condition: a predicate as it is, or a boolean `sql`
+ * expression, which is a condition by itself (`.is(true)` would add `= true`).
+ */
+const conditionSource = (
+  condition: PulledCondition,
+  imports: Set<string>,
+): string => {
+  if (condition.kind === "predicate") {
+    for (const name of condition.imports) {
+      imports.add(name);
+    }
+
+    return condition.source;
+  }
+
+  imports.add("sql");
+
+  return `sql<boolean>\`${condition.template}\``;
+};
+
 const indexSource = (
   index: PulledIndex,
   tableKey: string,
@@ -254,7 +302,7 @@ const indexSource = (
 ): string => {
   imports.add("index");
 
-  if (index.keys.some((key) => key.kind === "expression") || index.where) {
+  if (index.keys.some((key) => key.kind === "expression")) {
     imports.add("sql");
   }
 
@@ -277,7 +325,7 @@ const indexSource = (
   }
 
   if (index.where) {
-    source += `.where(sql<boolean>\`${index.where}\`.is(true))`;
+    source += `.where(${conditionSource(index.where, imports)})`;
   }
 
   return source;
@@ -287,6 +335,7 @@ const tableSource = (
   table: PulledTable,
   imports: Set<string>,
   casing: Casing,
+  bindings: ReadonlyMap<string, string>,
 ): string[] => {
   const targets = [
     ...new Set(
@@ -304,7 +353,7 @@ const tableSource = (
   const body = [
     ...table.comments.map((note) => `${indent}// pull: ${note}`),
     ...table.members.map(
-      (member) => `${indent}${memberLine(member, imports, casing)}`,
+      (member) => `${indent}${memberLine(member, imports, casing, bindings)}`,
     ),
     ...table.skipped.map(
       (column) =>
@@ -320,28 +369,27 @@ const tableSource = (
 
   if (table.primaryKey) {
     chain.push([
-      `.primaryKey((${table.key}) => [${table.primaryKey.map((key) => `${table.key}.${key}`).join(", ")}])`,
+      `.primaryKey((${table.binding}) => [${table.primaryKey.map((key) => `${table.binding}.${key}`).join(", ")}])`,
     ]);
   }
 
   if (table.indexes.length) {
     chain.push([
-      `.indexes((${table.key}) => ({`,
+      `.indexes((${table.binding}) => ({`,
       ...table.indexes.map(
         (index) =>
-          `  ${index.key}: ${indexSource(index, table.key, imports)},${comment(index.comments)}`,
+          `  ${index.key}: ${indexSource(index, table.binding, imports)},${comment(index.comments)}`,
       ),
       "}))",
     ]);
   }
 
   if (table.checks.length) {
-    imports.add("sql");
     chain.push([
-      `.checks((${table.key}) => ({`,
+      `.checks((${table.binding}) => ({`,
       ...table.checks.map(
         (check) =>
-          `  ${check.key}: sql<boolean>\`${check.expression}\`.is(true),${comment(check.comments)}`,
+          `  ${check.key}: ${conditionSource(check.condition, imports)},${comment(check.comments)}`,
       ),
       "}))",
     ]);
@@ -364,7 +412,7 @@ const tableSource = (
   }
 
   return [
-    `  ${table.key}: ({ ${targets.join(", ")} }) =>`,
+    `  ${table.key}: (${destructure(targets, bindings)}) =>`,
     `    ${constructor}({`,
     ...body,
     ...closing,
@@ -386,12 +434,15 @@ export const renderSchema = (
   const exportName = options.exportName ?? "appSchema";
   const module = options.module ?? "symmetria";
   const imports = new Set<string>(["schema"]);
+  const bindings = new Map(
+    model.tables.map((table) => [table.key, table.binding]),
+  );
   const tables = model.tables.flatMap((table) =>
-    tableSource(table, imports, model.casing),
+    tableSource(table, imports, model.casing, bindings),
   );
   // Schema-level indexes contribute imports too, so render them before the import line.
-  for (const { table, index } of model.schemaIndexes) {
-    indexSource(index, table, imports);
+  for (const { binding, index } of model.schemaIndexes) {
+    indexSource(index, binding, imports);
   }
   const passthrough = model.tables.some((table) =>
     table.members.some(
@@ -403,8 +454,8 @@ export const renderSchema = (
     "Lines marked `pull:` are approximations; the command lists every warning.",
   ];
   const schemaIndexLines = model.schemaIndexes.map(
-    ({ table, index }) =>
-      `      ${/^[a-z_][a-z0-9_]*$/i.test(index.key) ? index.key : quoteString(index.key)}: ${indexSource(index, table, imports)},${comment(index.comments)}`,
+    ({ binding, index }) =>
+      `      ${/^[a-z_][a-z0-9_]*$/i.test(index.key) ? index.key : quoteString(index.key)}: ${indexSource(index, binding, imports)},${comment(index.comments)}`,
   );
   const optionLines = [
     ...(model.casing === "preserve" ? [`    casing: "preserve",`] : []),
@@ -413,7 +464,7 @@ export const renderSchema = (
       : []),
     ...(schemaIndexLines.length
       ? [
-          `    indexes: ({ ${[...new Set(model.schemaIndexes.map((entry) => entry.table))].sort().join(", ")} }) => ({`,
+          `    indexes: (${destructure([...new Set(model.schemaIndexes.map((entry) => entry.table))].sort(), bindings)}) => ({`,
           ...schemaIndexLines,
           "    }),",
         ]

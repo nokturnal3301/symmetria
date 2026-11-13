@@ -7,7 +7,7 @@ import { postgres, type Driver } from "symmetria/driver";
 import { quoteIdentifier } from "symmetria/internal";
 import { readCatalog } from "./catalog";
 import { canonicalJSON } from "./snapshot";
-import { detectDrift, formatDriftFindings } from "./drift";
+import { detectDrift, formatDriftFindings, undeclaredTables } from "./drift";
 import { executeSQL, type ExecutionOptions } from "./execution";
 import { loadMigrationState, type MigrationState } from "./files";
 import { migrator } from "./runner";
@@ -24,6 +24,11 @@ export type VerifyOptions = ExecutionOptions & {
   schemaName?: string;
   metadataSchema?: string;
   metadataTable?: string;
+  /**
+   * Undeclared tables (other tools, extensions such as PostGIS) left out of
+   * catalog comparisons; tables the latest snapshot declares are compared.
+   */
+  ignoreTables?: readonly string[];
   beforeMigration?: (context: VerificationContext) => Promise<void>;
   afterMigration?: (context: VerificationContext) => Promise<void>;
 };
@@ -46,8 +51,14 @@ const disposableDatabase = async <Result>(
     created = true;
     const address = new URL(url);
     address.pathname = `/${name}`;
-    address.searchParams.delete("options");
-    driver = postgres({ url: address.toString(), max: 1 });
+    // Migrations run in sessions, whose connections are closed afterwards, so
+    // every connection takes the search_path from its startup options. The
+    // second connection answers the migrator's transaction-pooling check.
+    address.searchParams.set(
+      "options",
+      `-c search_path=${quoteIdentifier(schemaName).replace(/[\\\s]/g, "\\$&")}`,
+    );
+    driver = postgres({ url: address.toString(), max: 2 });
 
     if (schemaName !== "public") {
       await executeSQL(
@@ -55,12 +66,6 @@ const disposableDatabase = async <Result>(
         `CREATE SCHEMA ${quoteIdentifier(schemaName)}`,
       );
     }
-
-    await executeSQL(
-      driver.execute,
-      "SELECT set_config('search_path', $1, false)",
-      [quoteIdentifier(schemaName)],
-    );
 
     return await callback(driver);
   } finally {
@@ -138,13 +143,18 @@ export const verifyBoundary = async (
     directory: string;
     metadataSchema?: string;
     metadataTable?: string;
+    ignoreTables?: readonly string[];
   },
 ): Promise<void> => {
   const schemaName = String(
     (await executeSQL(options.execute, "SELECT current_schema() AS name"))
       .rows[0]!.name,
   );
-  const actual = await readCatalog({ ...options, schemaName });
+  const ignoreTables = undeclaredTables(
+    options.ignoreTables,
+    options.state.snapshot,
+  );
+  const actual = await readCatalog({ ...options, schemaName, ignoreTables });
   await disposableDatabase(options.url, schemaName, async (driver) => {
     if (options.target >= 0) {
       await migrator({ ...options, driver }).migrate({
@@ -156,6 +166,7 @@ export const verifyBoundary = async (
       ...options,
       execute: driver.execute,
       schemaName,
+      ignoreTables,
     });
     catalogMatches(
       expected,
@@ -171,6 +182,7 @@ export const verifyMigrations = async (
 ): Promise<{ migrations: string[]; verified: true }> => {
   const state = await loadMigrationState(options.directory);
   const schemaName = options.schemaName ?? "public";
+  const ignoreTables = undeclaredTables(options.ignoreTables, state.snapshot);
 
   const assertLatest = async (driver: Driver) => {
     const findings = await detectDrift({
@@ -195,7 +207,12 @@ export const verifyMigrations = async (
     const runner = migrator({ ...options, driver });
 
     const catalog = () =>
-      readCatalog({ ...options, execute: driver.execute, schemaName });
+      readCatalog({
+        ...options,
+        execute: driver.execute,
+        schemaName,
+        ignoreTables,
+      });
 
     for (const migration of state.migrations) {
       const before = await catalog();

@@ -2,6 +2,7 @@
  * Terminal styling primitives: colour detection, theme, width fitting, panels, headings, errors and wrapping.
  */
 import stringWidth from "string-width";
+import { stripVTControlCharacters } from "node:util";
 
 export const supportsColor = (): boolean =>
   !!process.stdout.isTTY &&
@@ -188,4 +189,26 @@ export const wrapLines = (text: string, width = terminalWidth()): string[] => {
   }
 
   return lines;
+};
+
+/**
+ * Wraps highlighted code with a line-number gutter. Numbers follow the source
+ * lines: the rows a long line wraps onto get an empty gutter.
+ */
+export const numberedLines = (
+  code: string,
+  width: number,
+  gutter: (label: string) => string,
+): string[] => {
+  const labels = stripVTControlCharacters(code)
+    .split("\n")
+    .flatMap((line, index) =>
+      wrapLines(line, width).map((_row, part) =>
+        part ? "" : String(index + 1),
+      ),
+    );
+
+  return wrapLines(code, width).map(
+    (row, index) => `${gutter((labels[index] ?? "").padStart(3))}  ${row}`,
+  );
 };

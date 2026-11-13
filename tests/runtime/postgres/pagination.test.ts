@@ -22,7 +22,7 @@ import {
   customType,
   type PageCursor,
 } from "../../../packages/runtime/src";
-import { postgres } from "../../support/postgres";
+import { postgres, searchPathURL } from "../../support/postgres";
 import { createSchemaSQL } from "../../../packages/kit/src";
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
@@ -30,11 +30,8 @@ const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 describe.skipIf(!databaseUrl)(
   "modular schema and query conveniences on PostgreSQL",
   () => {
-    const driver = postgres({
-      url: databaseUrl ?? "postgres://localhost/postgres",
-      max: 1,
-    });
     const namespace = `symmetria_magic_${crypto.randomUUID().replaceAll("-", "")}`;
+    const driver = postgres({ url: searchPathURL(namespace), max: 1 });
     const authors = table({
       id: int.auto,
       email: text.unique,
@@ -65,7 +62,6 @@ describe.skipIf(!databaseUrl)(
 
     beforeAll(async () => {
       await run(`CREATE SCHEMA "${namespace}"`);
-      await run(`SET search_path TO "${namespace}"`);
 
       for (const query of createSchemaSQL(appSchema.$snapshot())) {
         await driver.execute(query);

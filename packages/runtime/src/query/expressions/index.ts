@@ -19,6 +19,7 @@ import {
   type OrderingDescription,
   type QueryReference,
   type SelectPlan,
+  type TableBinding,
 } from "../plan/types";
 import { expressionSource, expressionSqlType } from "../plan/metadata";
 import {
@@ -29,6 +30,8 @@ import {
 import {
   COLUMN_CODEC,
   type Column,
+  type IsDecimalText,
+  type MetadataTraits,
   type TsVector,
   type Vector,
 } from "../../schema/column";
@@ -46,15 +49,82 @@ export type PlaceholderNode = {
   readonly sqlType: string;
   readonly codec?: RuntimeCodec;
   readonly count?: boolean;
+  /** A prepared root LIMIT under first()/one(): binds the smaller of the value and this cap. */
+  readonly cap?: number;
 };
 
-export type Parameter<Value, Name extends string = string> = QueryColumn<
+export type Parameter<
   Value,
-  Name
-> & { readonly [NAMED_PARAMETER]: true };
+  Name extends string = string,
+  Traits = {},
+> = QueryColumn<Value, Name, Traits> & { readonly [NAMED_PARAMETER]: true };
 
 declare const COLUMN_VALUE: unique symbol;
+declare const COLUMN_TRAITS: unique symbol;
+declare const ROW_TRAITS: unique symbol;
 declare const SCALAR_VALUE: unique symbol;
+
+/**
+ * What a query column knows about its SQL side beyond the value a read returns.
+ * `stored` is what a jsonb(schema) column keeps and compares: the schema's
+ * input (without null; nullability follows the value). `numeric` says how the
+ * value computes: `"float"` in double precision (real and double precision
+ * columns, numbers inside nested results), `"json"` as a JSON value (numbers in
+ * double precision, paths stay JSON) and `"raw"` for a `sql<Value>` template,
+ * whose SQL type is unknown. Other numbers compute as integers. `fields` holds
+ * the traits of a nested result's fields (a relation, a nested object in a CTE),
+ * so paths into it and comparisons with it use each field's stored form.
+ */
+export type ColumnTraits = {
+  readonly stored?: unknown;
+  readonly numeric?: "float" | "json" | "raw";
+  readonly fields?: { readonly [name: string]: ColumnTraits };
+};
+type FloatTraits = { readonly numeric: "float" };
+
+/** The traits of a column or expression; `{}` when it has none. */
+export type TraitsOf<Expression> = Expression extends {
+  readonly [COLUMN_TRAITS]: infer Traits;
+}
+  ? Traits
+  : {};
+
+/** What the SQL side holds and compares: a jsonb(schema)'s input, otherwise the value a read returns. */
+export type StoredValue<Value, Traits> = Traits extends {
+  readonly stored: infer Stored;
+}
+  ? Stored | (null extends Value ? null : never)
+  : Traits extends { readonly fields: infer Fields }
+    ? StoredFields<Value, Fields>
+    : Value;
+/** A nested result as its JSON holds it: each field in its stored form. */
+type StoredFields<Value, Fields> = Value extends readonly (infer Row)[]
+  ? StoredFields<Row, Fields>[]
+  : Value extends object
+    ? {
+        [Name in keyof Value]: Name extends keyof Fields
+          ? StoredValue<Value[Name], Fields[Name]>
+          : Value[Name];
+      }
+    : Value;
+
+/**
+ * A row type with the traits of its columns under a symbol, so query columns
+ * built from it compute and compare like the SQL columns while the row's own
+ * fields stay the values a read returns. Rows without traits are unchanged.
+ */
+export type TraitedRow<Row, Traits> = keyof Traits extends never
+  ? Row
+  : Row & { readonly [ROW_TRAITS]?: Traits };
+
+/** The traits a traited row records for one of its columns. */
+export type RowColumnTraits<Row, Name> = Row extends {
+  readonly [ROW_TRAITS]?: infer Traits;
+}
+  ? Name extends keyof NonNullable<Traits>
+    ? NonNullable<Traits>[Name]
+    : {}
+  : {};
 
 export type ValueNode =
   | PlaceholderNode
@@ -80,9 +150,21 @@ export type ValueNode =
     }
   | {
       readonly kind: "aggregate";
-      readonly name: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+      readonly name:
+        | "COUNT"
+        | "SUM"
+        | "AVG"
+        | "MIN"
+        | "MAX"
+        | "BOOL_AND"
+        | "BOOL_OR";
       readonly value?: ValueNode;
       readonly numeric?: boolean;
+      /**
+       * MIN/MAX of a type without them: the first element of `MIN(ARRAY[value])`,
+       * skipping NULL, and for `"json"` JSON null as well.
+       */
+      readonly element?: "value" | "json";
     }
   | { readonly kind: "coalesce"; readonly values: readonly ValueNode[] }
   | {
@@ -195,17 +277,26 @@ export type WindowOptions = {
   readonly rows?: readonly [WindowBoundary, WindowBoundary];
 };
 
-export type WindowExpression<Value, Name extends string> = QueryColumn<
+export type WindowExpression<
   Value,
-  Name
-> & {
-  readonly over: (options?: WindowOptions) => QueryColumn<Value, Name>;
+  Name extends string,
+  Traits = {},
+> = QueryColumn<Value, Name, Traits> & {
+  readonly over: (options?: WindowOptions) => QueryColumn<Value, Name, Traits>;
 };
 
-export const over = <Value, Name extends string>(
-  expression: SelectedColumn<Value, Name>,
+/** The output name of a selected column or expression. */
+type OutputNameOf<Expression extends SelectedColumn> =
+  Expression[typeof COLUMN_EXPRESSION]["outputName"];
+
+export const over = <Expression extends SelectedColumn>(
+  expression: Expression,
   options: WindowOptions = {},
-): QueryColumn<Value, Name> => {
+): QueryColumn<
+  ExpressionValue<Expression>,
+  OutputNameOf<Expression>,
+  TraitsOf<Expression>
+> => {
   const description = readColumn(expression);
   const ordering = options.orderBy
     ? Array.isArray(options.orderBy)
@@ -256,7 +347,7 @@ export const over = <Value, Name extends string>(
     throw new Error("symmetria: invalid window frame bounds");
   }
 
-  return createExpression<Value, Name>({
+  return createExpression({
     ...description,
     outputName: expression[COLUMN_EXPRESSION].outputName,
     node: freeze({
@@ -281,14 +372,14 @@ export const over = <Value, Name extends string>(
   });
 };
 
-const windowFunction = <Value, Name extends string>(
-  expression: QueryColumn<Value, Name>,
-): WindowExpression<Value, Name> =>
+const windowFunction = <Value, Name extends string, Traits = {}>(
+  expression: QueryColumn<Value, Name, Traits>,
+): WindowExpression<Value, Name, Traits> =>
   freeze(
     Object.assign(Object.create(expression), {
       over: (options?: WindowOptions) => over(expression, options),
     }),
-  ) as WindowExpression<Value, Name>;
+  ) as WindowExpression<Value, Name, Traits>;
 
 export const rowNumber = (): WindowExpression<number, "rowNumber"> =>
   windowFunction(
@@ -317,12 +408,19 @@ export const denseRank = (): WindowExpression<number, "denseRank"> =>
     }),
   );
 
-const relativeWindow = <Value, Name extends "lag" | "lead">(
+const relativeWindow = <
+  Expression extends SelectedColumn,
+  Name extends "lag" | "lead",
+>(
   name: Name,
-  expression: SelectedColumn<Value>,
+  expression: Expression,
   offset: number,
-  fallback?: Value,
-): WindowExpression<Value | null, Name> => {
+  fallback: unknown,
+): WindowExpression<
+  ExpressionValue<Expression> | null,
+  Name,
+  TraitsOf<Expression>
+> => {
   if (!Number.isSafeInteger(offset) || offset < 0) {
     throw new Error(
       "symmetria: lag/lead offset must be a nonnegative safe integer",
@@ -348,19 +446,27 @@ const relativeWindow = <Value, Name extends "lag" | "lead">(
   );
 };
 
-export const lag = <Value>(
-  expression: SelectedColumn<Value>,
+/** The value of the row `offset` rows before; `fallback` (stored like the column) where there is none. */
+export const lag = <Expression extends SelectedColumn>(
+  expression: Expression,
   offset = 1,
-  fallback?: Value,
-): WindowExpression<Value | null, "lag"> =>
-  relativeWindow("lag", expression, offset, fallback);
+  fallback?: Literal<StoredOf<Expression>>,
+): WindowExpression<
+  ExpressionValue<Expression> | null,
+  "lag",
+  TraitsOf<Expression>
+> => relativeWindow("lag", expression, offset, fallback);
 
-export const lead = <Value>(
-  expression: SelectedColumn<Value>,
+/** The value of the row `offset` rows after; `fallback` (stored like the column) where there is none. */
+export const lead = <Expression extends SelectedColumn>(
+  expression: Expression,
   offset = 1,
-  fallback?: Value,
-): WindowExpression<Value | null, "lead"> =>
-  relativeWindow("lead", expression, offset, fallback);
+  fallback?: Literal<StoredOf<Expression>>,
+): WindowExpression<
+  ExpressionValue<Expression> | null,
+  "lead",
+  TraitsOf<Expression>
+> => relativeWindow("lead", expression, offset, fallback);
 
 /**
  * A `numeric` value: decimal text such as `"202.10"`, kept exact. Plain strings
@@ -368,46 +474,144 @@ export const lead = <Value>(
  */
 export type Decimal = `${number}`;
 
-type Comparable<Value> =
-  | NonNullable<Value>
-  | (bigint extends NonNullable<Value> ? number : never)
-  | (NonNullable<Value> extends Decimal ? string : never)
+/**
+ * A value to compare with: the stored form, safe integers for bigint and any
+ * string for decimals (as their codecs accept), or a column of either type.
+ */
+type Comparable<Stored, Value = Stored> =
+  | Literal<Stored>
+  | SelectedColumn<Stored | null>
   | SelectedColumn<Value | null>;
+/**
+ * A literal a column's codec encodes: its stored form, safe integers for
+ * bigint, any string for decimals (not for enum labels that look numeric).
+ */
+type Literal<Stored> =
+  | NonNullable<Stored>
+  | (bigint extends NonNullable<Stored> ? number : never)
+  | (IsDecimalText<NonNullable<Stored>> extends true ? string : never);
+/** The stored form of an expression's value. */
+type StoredOf<Expression> = StoredValue<
+  ExpressionValue<Expression>,
+  TraitsOf<Expression>
+>;
 
 /** Values arithmetic works on: integers and floats, bigints and decimals. */
 type ArithmeticValue = number | bigint | Decimal;
+/** Whether arithmetic works on a value: numbers, bigints and decimal text, not text that looks numeric. */
+type Computable<Value> =
+  NonNullable<Value> extends number | bigint
+    ? true
+    : IsDecimalText<NonNullable<Value>>;
+/** Whether each member of a value is summable: null, numbers, bigints and decimal text. */
+export type SummableValue<Value> = Value extends null
+  ? true
+  : Value extends number | bigint
+    ? true
+    : IsDecimalText<Value>;
+/** sum() and average() add numbers, bigints and decimals; enum labels such as "1" are text. */
+export type Summable<Expression> =
+  Expression extends SelectedColumn<infer Value>
+    ? false extends SummableValue<Value>
+      ? "sum() and average() need a number, bigint or numeric expression"
+      : unknown
+    : unknown;
 /** A number, bigint, decimal text or numeric column on the right of an operator. */
 type ArithmeticOperand =
   | number
   | bigint
   | string
   | SelectedColumn<ArithmeticValue | null>;
-type OperandValue<Operand> =
+/**
+ * How a value computes in arithmetic: an exact decimal, a 64-bit integer, a
+ * 32-bit integer or a double. JSON values and float columns compute as doubles.
+ */
+type NumericKind<Value, Traits> = Traits extends {
+  readonly numeric: "json";
+}
+  ? "float"
+  : IsDecimalText<NonNullable<Value>> extends true
+    ? "decimal"
+    : NonNullable<Value> extends bigint
+      ? "bigint"
+      : Traits extends FloatTraits
+        ? "float"
+        : "integer";
+/** A JavaScript number takes the other side's kind; decimal text is a decimal. */
+type OperandKind<Operand, Left> =
   Operand extends SelectedColumn<infer Value>
-    ? Value
+    ? NumericKind<Value, TraitsOf<Operand>>
     : Operand extends string
-      ? Decimal
-      : Operand;
-/** PostgreSQL's promotion: any decimal makes a decimal, then bigint, then number. */
-type Promoted<Left, Right> =
-  NonNullable<Left> extends Decimal
-    ? Decimal
-    : NonNullable<Right> extends Decimal
-      ? Decimal
-      : NonNullable<Left> extends bigint
-        ? bigint
-        : NonNullable<Right> extends bigint
-          ? bigint
-          : number;
-type ArithmeticResult<Left, Operand> =
-  | Promoted<Left, OperandValue<Operand>>
-  | (null extends Left ? null : never)
-  | (null extends OperandValue<Operand> ? null : never);
-type Arithmetic<Value, OutputName extends string, Name extends string> =
-  NonNullable<Value> extends ArithmeticValue
+      ? "decimal"
+      : Operand extends bigint
+        ? "bigint"
+        : Left;
+/** PostgreSQL's promotion: a decimal makes a decimal, then floats, then bigint. */
+type Promoted<Kinds> = "decimal" extends Kinds
+  ? "decimal"
+  : "float" extends Kinds
+    ? "float"
+    : "bigint" extends Kinds
+      ? "bigint"
+      : "integer";
+type Operation = "plus" | "minus" | "multiply" | "divide" | "quotient";
+/** divide() never truncates: integers and bigints divide as exact decimals. */
+type ResultKind<Kind, Name extends Operation> = Name extends "divide"
+  ? Kind extends "float"
+    ? "float"
+    : "decimal"
+  : Kind;
+type KindValue<Kind> = Kind extends "decimal"
+  ? Decimal
+  : Kind extends "bigint"
+    ? bigint
+    : number;
+type ArithmeticColumn<
+  Stored,
+  Traits,
+  Operand,
+  OutputName extends string,
+  Name extends Operation,
+> =
+  ResultKind<
+    Promoted<
+      | NumericKind<Stored, Traits>
+      | OperandKind<Operand, NumericKind<Stored, Traits>>
+    >,
+    Name
+  > extends infer Kind
+    ? QueryColumn<
+        KindValue<Kind> | NullWhen<Stored> | NullWhen<OperandOf<Operand>>,
+        OutputName,
+        Kind extends "float" ? FloatTraits : {}
+      >
+    : never;
+/**
+ * A `sql<Value>` template's SQL type is unknown, so arithmetic cannot type it;
+ * a text column (an enum labelled "1") is no number.
+ */
+type TypedOperand<Operand> = Operand extends {
+  readonly [COLUMN_TRAITS]: { readonly numeric: "raw" };
+}
+  ? "a raw sql template needs a SQL type: write it as sql.of(column)"
+  : Operand extends SelectedColumn<infer Value>
+    ? Computable<Value> extends true
+      ? unknown
+      : "an operand needs a number, bigint or numeric column"
+    : unknown;
+type Arithmetic<
+  Stored,
+  Traits,
+  OutputName extends string,
+  Name extends Operation,
+> = Traits extends { readonly numeric: "raw" }
+  ? (
+      requires: `${Name}() needs a SQL type: write raw SQL as sql.of(column)`,
+    ) => never
+  : Computable<Stored> extends true
     ? <const Operand extends ArithmeticOperand>(
-        value: Operand,
-      ) => QueryColumn<ArithmeticResult<Value, Operand>, OutputName>
+        value: Operand & TypedOperand<Operand>,
+      ) => ArithmeticColumn<Stored, Traits, Operand, OutputName, Name>
     : (requires: `${Name}() needs a number, bigint or numeric column`) => never;
 
 /** How the query text is parsed: PostgreSQL's web search syntax, plain words, a phrase, or raw tsquery syntax. */
@@ -461,8 +665,10 @@ type EnumerationPredicates<Value> =
     ? {}
     : { readonly [Name in Extract<NonNullable<Value>, string>]: Predicate };
 
-type Equality<Value> = ((value: Comparable<Value> | null) => Predicate) &
-  EnumerationPredicates<Value>;
+type Equality<Stored, Value> = ((
+  value: Comparable<Stored, Value> | null,
+) => Predicate) &
+  EnumerationPredicates<Stored>;
 
 type MatchBranch =
   | string
@@ -473,8 +679,46 @@ type MatchBranch =
   | null
   | SelectedColumn;
 
-type MatchValue<Branch> =
-  Branch extends SelectedColumn<infer Value> ? Value : Branch;
+/**
+ * Literal branches take the SQL type of the column branches and decode as
+ * those columns do (`0` next to a bigint column reads `0n`); literals alone
+ * keep their own type.
+ */
+type MatchValue<Branch> = [Extract<Branch, SelectedColumn>] extends [never]
+  ? Branch
+  : ExpressionValue<Extract<Branch, SelectedColumn>> | Extract<Branch, null>;
+type LiteralKind<Branch> = Branch extends string
+  ? "string"
+  : Branch extends number
+    ? "number"
+    : Branch extends bigint
+      ? "bigint"
+      : Branch extends boolean
+        ? "boolean"
+        : Branch extends Date
+          ? "Date"
+          : never;
+type IsUnion<Member, All = Member> = Member extends All
+  ? [All] extends [Member]
+    ? false
+    : true
+  : never;
+/** Without a column branch, the literals must share one JavaScript type (null aside). */
+type MatchLiterals<Branch> = [Extract<Branch, SelectedColumn>] extends [never]
+  ? true extends IsUnion<LiteralKind<Branch>>
+    ? { readonly "match() literal branches need one type": never }
+    : unknown
+  : unknown;
+
+/**
+ * A CASE takes the SQL type of its column branches; number literals alone are
+ * double precision.
+ */
+type MatchTraits<Branch> = [Extract<Branch, SelectedColumn>] extends [never]
+  ? [Extract<Branch, number>] extends [never]
+    ? {}
+    : FloatTraits
+  : TraitsOf<Extract<Branch, SelectedColumn>>;
 
 type JsonKey<Value> =
   NonNullable<Value> extends readonly unknown[]
@@ -513,6 +757,80 @@ type ValidPath<
     : never
   : readonly [];
 
+/** A path into JSON: the stored JSON value at the path. */
+type JsonPathColumn<
+  Stored,
+  Traits,
+  Path extends readonly (string | number)[],
+  OutputName extends string,
+> = QueryColumn<
+  Exclude<PathValue<Stored, Path>, undefined> | null,
+  OutputName,
+  PathTraits<Traits, PathValue<Stored, Path>>
+>;
+/** One step into a nested result: a row of a collection, or a field. */
+type StepValue<Value, Key> =
+  NonNullable<Value> extends readonly (infer Row)[]
+    ? Key extends number
+      ? Row
+      : never
+    : Key extends keyof NonNullable<Value>
+      ? NonNullable<Value>[Key]
+      : never;
+type StepTraits<Value, Traits, Fields, Key> =
+  NonNullable<Value> extends readonly unknown[]
+    ? Traits
+    : Key extends keyof Fields
+      ? Fields[Key]
+      : {};
+/**
+ * A path into a nested result reads each field with its codec and traits: a
+ * jsonb(schema) field reads its output and compares its input, like the
+ * column; inside the field, the path reads the stored JSON.
+ */
+type PathColumn<
+  Value,
+  Traits,
+  Path extends readonly (string | number)[],
+  OutputName extends string,
+> = Path extends readonly [
+  infer Key,
+  ...infer Rest extends readonly (string | number)[],
+]
+  ? Traits extends { readonly fields: infer Fields }
+    ? PathColumn<
+        StepValue<Value, Key>,
+        StepTraits<Value, Traits, Fields, Key>,
+        Rest,
+        OutputName
+      >
+    : JsonPathColumn<StoredValue<Value, Traits>, Traits, Path, OutputName>
+  : QueryColumn<
+      Exclude<Value, undefined> | null,
+      OutputName,
+      NonNullable<Value> extends number
+        ? Traits extends { readonly numeric: "json" }
+          ? Traits
+          : FloatTraits
+        : Traits
+    >;
+
+/**
+ * A number reached with a path computes as double precision. Inside JSON (a
+ * jsonb column or raw SQL) every number does, and deeper paths stay JSON; a
+ * nested result's bigint and decimal fields keep their SQL types.
+ */
+type PathTraits<Traits, Value> =
+  NonNullable<Value> extends number
+    ? FloatTraits
+    : Traits extends { readonly numeric: "json" | "raw" }
+      ? NonNullable<Value> extends object | bigint
+        ? { readonly numeric: "json" }
+        : IsDecimalText<NonNullable<Value>> extends true
+          ? { readonly numeric: "json" }
+          : {}
+      : {};
+
 /** pgvector distance operators: Euclidean, cosine, negative inner product and taxicab. */
 export type VectorOperator = "<->" | "<=>" | "<#>" | "<+>";
 
@@ -523,53 +841,77 @@ export type VectorQuery<Value> =
   | SelectedColumn<Vector | null>
   | SelectedColumn<Value | null>;
 
+/** `null` when a value can be null: strict SQL functions and operators return NULL then. */
+type NullWhen<Value> = null extends Value ? null : never;
+/** The value a column, expression or literal operand stands for. */
+type OperandOf<Operand> =
+  Operand extends SelectedColumn<infer Value> ? Value : Operand;
+
 type Distance<Value, Name extends string> =
   NonNullable<Value> extends Vector
-    ? (query: VectorQuery<Value>) => QueryColumn<number, Name>
+    ? <const Query extends VectorQuery<Value>>(
+        query: Query,
+      ) => QueryColumn<
+        number | NullWhen<Value> | NullWhen<OperandOf<Query>>,
+        Name,
+        FloatTraits
+      >
     : never;
 
-export type QueryColumn<Value, OutputName extends string> = SelectedColumn<
+/** A full-text query: text, or a text column or expression. */
+type SearchQuery = string | SelectedColumn<string | null>;
+
+/**
+ * A column or SQL expression: selected for a `Value`, compared, filtered and
+ * computed in its stored SQL form (see `ColumnTraits`).
+ */
+export type QueryColumn<
   Value,
-  OutputName
-> & {
-  readonly path: NonNullable<Value> extends Vector
+  OutputName extends string,
+  Traits = {},
+> = SelectedColumn<Value, OutputName> & {
+  readonly [COLUMN_TRAITS]: Traits;
+} & ColumnMethods<Value, OutputName, Traits, StoredValue<Value, Traits>>;
+
+type ColumnMethods<Value, OutputName extends string, Traits, Stored> = {
+  readonly path: NonNullable<Stored> extends Vector
     ? never
     : <const Path extends readonly [string | number, ...(string | number)[]]>(
-        ...path: Path & ValidPath<Value, Path>
-      ) => QueryColumn<
-        Exclude<PathValue<Value, Path>, undefined> | null,
-        OutputName
-      >;
-  readonly contains: NonNullable<Value> extends Vector
+        ...path: Path & ValidPath<Stored, Path>
+      ) => PathColumn<Value, Traits, Path, OutputName>;
+  readonly contains: NonNullable<Stored> extends Vector
     ? never
-    : NonNullable<Value> extends object
+    : NonNullable<Stored> extends object
       ? (
-          value: JsonSubset<NonNullable<Value>> | SelectedColumn<Value>,
+          value:
+            | JsonSubset<NonNullable<Stored>>
+            | SelectedColumn<Stored>
+            | SelectedColumn<Value>,
         ) => Predicate
       : never;
   /** `$1 = ANY(column)` for array columns. */
-  readonly has: NonNullable<Value> extends Vector
+  readonly has: NonNullable<Stored> extends Vector
     ? never
-    : NonNullable<Value> extends readonly (infer Element)[]
-      ? (
-          value:
-            | Element
-            | (bigint extends Element ? number : never)
-            | SelectedColumn<Element | null>,
-        ) => Predicate
+    : NonNullable<Stored> extends readonly (infer Element)[]
+      ? (value: Literal<Element> | SelectedColumn<Element | null>) => Predicate
       : never;
   /** `column && $1`: the arrays share at least one element. */
-  readonly overlaps: NonNullable<Value> extends Vector
+  readonly overlaps: NonNullable<Stored> extends Vector
     ? never
-    : NonNullable<Value> extends readonly unknown[]
-      ? (values: NonNullable<Value> | SelectedColumn<Value>) => Predicate
+    : NonNullable<Stored> extends readonly unknown[]
+      ? (
+          values:
+            | NonNullable<Stored>
+            | SelectedColumn<Stored>
+            | SelectedColumn<Value>,
+        ) => Predicate
       : never;
   /** `cardinality(column)` of an array column. */
-  readonly length: NonNullable<Value> extends Vector
+  readonly length: NonNullable<Stored> extends Vector
     ? never
-    : NonNullable<Value> extends readonly unknown[]
+    : NonNullable<Stored> extends readonly unknown[]
       ? () => QueryColumn<
-          number | (null extends Value ? null : never),
+          number | (null extends Stored ? null : never),
           OutputName
         >
       : never;
@@ -582,90 +924,107 @@ export type QueryColumn<Value, OutputName extends string> = SelectedColumn<
   /** `column <+> query`: taxicab (L1) distance; pgvector 0.7+. */
   readonly l1Distance: Distance<Value, "l1Distance">;
   /** Full-text match: `to_tsvector(language, column) @@ websearch_to_tsquery(language, query)`; a tsvector is matched directly. */
-  readonly search: NonNullable<Value> extends string
-    ? (
-        query: string | SelectedColumn<string | null>,
-        options?: SearchOptions,
-      ) => Predicate
+  readonly search: NonNullable<Stored> extends string
+    ? (query: SearchQuery, options?: SearchOptions) => Predicate
     : never;
-  /** `ts_rank(...)` (or `ts_rank_cd`) for ordering full-text matches. */
-  readonly searchRank: NonNullable<Value> extends string
-    ? (
-        query: string | SelectedColumn<string | null>,
+  /** `ts_rank(...)` (or `ts_rank_cd`) for ordering full-text matches; NULL text or query ranks NULL. */
+  readonly searchRank: NonNullable<Stored> extends string
+    ? <const Query extends SearchQuery>(
+        query: Query,
         options?: SearchRankOptions,
-      ) => QueryColumn<number, "searchRank">
+      ) => QueryColumn<
+        number | NullWhen<Stored> | NullWhen<OperandOf<Query>>,
+        "searchRank",
+        FloatTraits
+      >
     : never;
   /** `ts_headline(...)`: the text with matches highlighted; text columns only. */
-  readonly searchHeadline: NonNullable<Value> extends string
-    ? NonNullable<Value> extends TsVector
+  readonly searchHeadline: NonNullable<Stored> extends string
+    ? NonNullable<Stored> extends TsVector
       ? never
-      : (
-          query: string | SelectedColumn<string | null>,
+      : <const Query extends SearchQuery>(
+          query: Query,
           options?: SearchHeadlineOptions,
         ) => QueryColumn<
-          string | (null extends Value ? null : never),
+          string | NullWhen<Stored> | NullWhen<OperandOf<Query>>,
           "searchHeadline"
         >
     : never;
   /** `is(value)` compiles to `=`, `is(null)` to `IS NULL`; enum members are also properties. */
-  readonly is: Equality<Value>;
+  readonly is: Equality<Stored, Value>;
   /** `isNot(value)` compiles to `<>`, `isNot(null)` to `IS NOT NULL`. */
-  readonly isNot: Equality<Value>;
+  readonly isNot: Equality<Stored, Value>;
   /** Exhaustive enum mapping to a SQL CASE; a NULL input produces NULL. */
-  readonly match: NonNullable<Value> extends string
-    ? string extends NonNullable<Value>
+  readonly match: NonNullable<Stored> extends string
+    ? string extends NonNullable<Stored>
       ? never
       : <
           const Branches extends Record<
-            Extract<NonNullable<Value>, string>,
+            Extract<NonNullable<Stored>, string>,
             MatchBranch
           >,
         >(
           branches: Branches &
-            Record<Exclude<keyof Branches, NonNullable<Value>>, never>,
+            Record<Exclude<keyof Branches, NonNullable<Stored>>, never> &
+            MatchLiterals<Branches[keyof Branches]>,
         ) => QueryColumn<
-          | MatchValue<Branches[keyof Branches]>
-          | (null extends Value ? null : never),
-          OutputName
+          MatchValue<Branches[keyof Branches]> | NullWhen<Stored>,
+          OutputName,
+          MatchTraits<Branches[keyof Branches]>
         >
     : never;
   readonly as: <const AliasName extends string>(
     name: AliasName,
-  ) => QueryColumn<Value, AliasName>;
-  readonly above: (value: Comparable<Value>) => Predicate;
-  readonly atLeast: (value: Comparable<Value>) => Predicate;
-  readonly below: (value: Comparable<Value>) => Predicate;
-  readonly atMost: (value: Comparable<Value>) => Predicate;
+  ) => QueryColumn<Value, AliasName, Traits>;
+  readonly above: (value: Comparable<Stored, Value>) => Predicate;
+  readonly atLeast: (value: Comparable<Stored, Value>) => Predicate;
+  readonly below: (value: Comparable<Stored, Value>) => Predicate;
+  readonly atMost: (value: Comparable<Stored, Value>) => Predicate;
   readonly isDistinctFrom: (
-    value: Value | null | SelectedColumn<Value | null>,
+    value: Comparable<Stored, Value> | null,
   ) => Predicate;
+  /** A subquery may select a nullable column; its NULLs never match. */
   readonly in: (
-    values: readonly Comparable<Value>[] | ScalarQuery<Value>,
+    values:
+      | readonly Comparable<Stored, Value>[]
+      | ScalarQuery<Stored | null>
+      | ScalarQuery<Value | null>,
   ) => Predicate;
+  /** As in SQL, `NOT IN` a subquery that returns a NULL matches no row. */
   readonly notIn: (
-    values: readonly Comparable<Value>[] | ScalarQuery<Value>,
+    values:
+      | readonly Comparable<Stored, Value>[]
+      | ScalarQuery<Stored | null>
+      | ScalarQuery<Value | null>,
   ) => Predicate;
   readonly between: (
-    lower: Comparable<Value>,
-    upper: Comparable<Value>,
+    lower: Comparable<Stored, Value>,
+    upper: Comparable<Stored, Value>,
   ) => Predicate;
-  readonly like: NonNullable<Value> extends string
+  readonly like: NonNullable<Stored> extends string
     ? (pattern: string | SelectedColumn<string | null>) => Predicate
     : (requires: "like() needs a text column") => never;
-  readonly ilike: NonNullable<Value> extends string
+  readonly ilike: NonNullable<Stored> extends string
     ? (pattern: string | SelectedColumn<string | null>) => Predicate
     : (requires: "ilike() needs a text column") => never;
-  /** `a + b`. Any decimal operand makes a decimal, then bigint, then number. */
-  readonly plus: Arithmetic<Value, OutputName, "plus">;
+  /** `a + b`. A decimal operand makes a decimal, then a float, then a bigint. */
+  readonly plus: Arithmetic<Stored, Traits, OutputName, "plus">;
   /** `a - b`, with the same promotion as plus(). */
-  readonly minus: Arithmetic<Value, OutputName, "minus">;
+  readonly minus: Arithmetic<Stored, Traits, OutputName, "minus">;
   /** `a * b`, such as `price.multiply(quantity)` for a decimal line total. */
-  readonly multiply: Arithmetic<Value, OutputName, "multiply">;
+  readonly multiply: Arithmetic<Stored, Traits, OutputName, "multiply">;
   /**
-   * `a / b`. Two integer operands divide as integers in PostgreSQL (`7 / 2` is
-   * `3`); a decimal or float operand keeps the fraction. Dividing by zero fails.
+   * `a / b`, never truncated: integers, bigints and decimals divide as exact
+   * decimals (`7 / 2` is `"3.5000000000000000"`), floats as floats. Dividing by
+   * zero fails the query.
    */
-  readonly divide: Arithmetic<Value, OutputName, "divide">;
+  readonly divide: Arithmetic<Stored, Traits, OutputName, "divide">;
+  /**
+   * Integer division, truncated toward zero: `7 / 2` is `3` in the integer
+   * type (number, bigint, or `div()` for a decimal), and a float's quotient is
+   * truncated too. Dividing by zero fails the query.
+   */
+  readonly quotient: Arithmetic<Stored, Traits, OutputName, "quotient">;
   readonly ascending: Ordering;
   readonly descending: Ordering;
 };
@@ -736,7 +1095,20 @@ export type PredicateDescription =
       readonly kind: "exists";
       readonly query: SelectPlan;
       readonly negated: boolean;
-    };
+    }
+  | ScopePredicate;
+
+/**
+ * A `$scope()` filter on one table occurrence. `predicate` is the callback's
+ * result when the query was built and decides the compiled SQL; `evaluate`
+ * runs the callback again, so every execution binds its current values.
+ */
+export type ScopePredicate = {
+  readonly kind: "scope";
+  readonly binding: TableBinding;
+  readonly evaluate: (binding: TableBinding) => PredicateDescription;
+  readonly predicate: PredicateDescription;
+};
 
 export interface Predicate {
   readonly [PREDICATE_EXPRESSION]: PredicateDescription;
@@ -1131,39 +1503,273 @@ const membership = (
 
 type NumericClass = "decimal" | "bigint" | "float" | "integer";
 
-/** How PostgreSQL types an arithmetic operand, from its SQL type or codec. */
+const castNode = (node: ValueNode, sqlType: string): ValueNode =>
+  freeze({ kind: "raw", parts: freeze(["(", node, `)::${sqlType}`]), sqlType });
+
+/** A json/jsonb expression, such as a jsonb column or a path that does not reach a typed field. */
+const isJsonValue = (description: ExpressionDescription): boolean => {
+  const sqlType = expressionSqlType(description);
+
+  return sqlType === "json" || sqlType === "jsonb";
+};
+
+/**
+ * Whether a value was reached with `path()`, into a nested result or an array
+ * (also aggregated, coalesced, windowed or selected through a derived table).
+ */
+const readByPath = (node: ValueNode): boolean => {
+  switch (node.kind) {
+    case "jsonPath":
+    case "arrayIndex":
+      return true;
+    case "column": {
+      const source =
+        node.description.binding.projection?.[node.description.column.name];
+
+      return !!source && readByPath(source.node);
+    }
+    case "subquery":
+      return (
+        !!node.query.selection[0] && readByPath(node.query.selection[0].node)
+      );
+    case "window":
+      return readByPath(node.expression);
+    case "relativeWindow":
+      return readByPath(node.value);
+    case "coalesce":
+      return !!node.values[0] && readByPath(node.values[0]);
+    case "aggregate":
+      return (
+        (node.name === "MIN" || node.name === "MAX") &&
+        !!node.value &&
+        readByPath(node.value)
+      );
+    default:
+      return false;
+  }
+};
+
+/**
+ * How PostgreSQL computes an operand, from its SQL type or codec, as
+ * `NumericKind` types it: a JSON value, and a number reached with `path()`,
+ * computes as double precision, the type of a JavaScript number; `count()` and
+ * the ranking functions are integers, read as numbers.
+ */
 const numericClass = (expression: ExpressionDescription): NumericClass => {
+  if (isJsonValue(expression)) {
+    return "float";
+  }
+
   const sqlType = expressionSqlType(expression);
 
   if (expression.codec === numericCodec || sqlType.startsWith("numeric")) {
     return "decimal";
   }
 
+  if (expression.codec === countCodec) {
+    return "integer";
+  }
+
   if (expression.codec === bigintCodec || sqlType === "bigint") {
     return "bigint";
   }
 
-  return /^(real|double precision)$/.test(sqlType) ? "float" : "integer";
+  return sqlType === "real" ||
+    sqlType === "double precision" ||
+    readByPath(expression.node)
+    ? "float"
+    : "integer";
 };
 
-const castNode = (node: ValueNode, sqlType: string): ValueNode =>
-  freeze({ kind: "raw", parts: freeze(["(", node, `)::${sqlType}`]), sqlType });
+/**
+ * PostgreSQL has no LIKE, arithmetic or SUM over jsonb, so a JSON value enters
+ * them as its text (`#>> '{}'`: a string's characters, a number's digits),
+ * cast to a SQL number when given. Other expressions pass through unchanged.
+ */
+const jsonScalar = (
+  description: ExpressionDescription,
+  sqlType?: "double precision" | "numeric",
+): ExpressionDescription => {
+  if (!isJsonValue(description)) {
+    return description;
+  }
+
+  const text: ValueNode = freeze({
+    kind: "raw",
+    parts: freeze(["(", description.node, " #>> '{}')"]),
+    sqlType: "text",
+  });
+
+  return {
+    outputName: description.outputName,
+    node: sqlType ? castNode(text, sqlType) : text,
+  };
+};
 
 const decimalCodec: RuntimeCodec = freeze({
   ...numericCodec,
   sqlType: "numeric",
 });
 
+/** One side of an arithmetic operation: its class and the SQL type it has. */
+type ArithmeticSide = {
+  readonly kind: NumericClass;
+  readonly sqlType: string;
+} & (
+  | { readonly expression: ExpressionDescription }
+  | { readonly literal: unknown; readonly cast?: string }
+);
+
+/** SQL types without arithmetic, whose values the types never offer it for: text, enums, dates, arrays, … */
+const NOT_NUMERIC =
+  /^(text|varchar|char|enum|uuid|boolean|date|time|timestamp|timestamptz|interval|bytea|inet|tsvector|vector)(\(|$)|\[\]$/;
+
+/** A column or expression operand; raw SQL of unknown type cannot be typed. */
+const expressionSide = (description: ExpressionDescription): ArithmeticSide => {
+  const sqlType = expressionSqlType(description);
+
+  if (NOT_NUMERIC.test(sqlType)) {
+    throw new Error(
+      `symmetria: arithmetic needs a number, bigint or numeric value, not ${sqlType}`,
+    );
+  }
+
+  if (sqlType === "derived") {
+    // Ranking functions are bigint in SQL and read as numbers, like count().
+    if (description.codec === countCodec) {
+      return { kind: "integer", sqlType: "bigint", expression: description };
+    }
+
+    throw new Error(
+      "symmetria: arithmetic needs expressions of a known SQL type; write raw SQL as sql.of(column)`…`, such as sql.of(int)`…`",
+    );
+  }
+
+  return { kind: numericClass(description), sqlType, expression: description };
+};
+
 /**
- * `left <operator> right` with PostgreSQL's numeric promotion made explicit: a
- * decimal operand turns the other side into numeric, a bigint operand keeps
- * bigint, and a fractional JavaScript number is sent as double precision, so
- * `quantity.multiply("19.99")` and `quantity.multiply(1.5)` neither truncate
- * nor fail to parse as integers.
+ * A JavaScript operand. Decimal text is a decimal and a bigint a bigint; a
+ * number takes the other side's class, so next to an integer or bigint column
+ * it must be an integer in range (a value error otherwise, as their codecs
+ * report) and a fraction is written as decimal text: `quantity.multiply("1.5")`.
+ * Like a SQL integer literal, a number next to a smallint is an integer.
+ */
+const literalSide = (value: unknown, left: ArithmeticSide): ArithmeticSide => {
+  if (typeof value === "string") {
+    return {
+      kind: "decimal",
+      sqlType: "numeric",
+      literal: value,
+      cast: "numeric",
+    };
+  }
+
+  if (typeof value === "bigint") {
+    return {
+      kind: "bigint",
+      sqlType: "bigint",
+      literal: encodeValue(value, bigintCodec),
+      ...(left.sqlType === "bigint" ? {} : { cast: "bigint" }),
+    };
+  }
+
+  if (typeof value !== "number") {
+    throw new Error(
+      "symmetria: arithmetic operands are numbers, bigints, decimal strings or numeric columns",
+    );
+  }
+
+  if (left.kind === "decimal") {
+    return {
+      kind: "decimal",
+      sqlType: "numeric",
+      literal: String(value),
+      cast: "numeric",
+    };
+  }
+
+  if (left.kind === "float") {
+    return {
+      kind: "float",
+      sqlType: "double precision",
+      literal: value,
+      cast: "double precision",
+    };
+  }
+
+  // Next to a bigint, or a count() that is bigint in SQL, any safe integer fits.
+  return left.kind === "bigint" || left.sqlType === "bigint"
+    ? {
+        kind: left.kind,
+        sqlType: "bigint",
+        literal: encodeValue(value, bigintCodec),
+      }
+    : {
+        kind: "integer",
+        sqlType: "integer",
+        literal: encodeValue(value, codecFor("integer")),
+        ...(left.sqlType === "smallint" ? { cast: "integer" } : {}),
+      };
+};
+
+const RESULT_TYPES: Readonly<Record<NumericClass, string>> = {
+  decimal: "numeric",
+  float: "double precision",
+  bigint: "bigint",
+  integer: "integer",
+};
+
+/** An operand as the result's SQL type: decimals and floats cast the other side explicitly. */
+const operandNode = (side: ArithmeticSide, result: NumericClass): ValueNode => {
+  if ("literal" in side) {
+    const cast =
+      result === "decimal" || result === "float"
+        ? RESULT_TYPES[result]
+        : side.cast;
+
+    return freeze({
+      kind: "parameter",
+      value: cloneParameter(side.literal),
+      ...(cast ? { cast } : {}),
+    });
+  }
+
+  const { expression } = side;
+
+  if (isJsonValue(expression)) {
+    return jsonScalar(
+      expression,
+      result === "decimal" ? "numeric" : "double precision",
+    ).node;
+  }
+
+  const converted =
+    result === "decimal"
+      ? side.kind === "decimal"
+      : result === "float"
+        ? side.sqlType === "double precision"
+        : true;
+
+  return converted
+    ? expression.node
+    : castNode(expression.node, RESULT_TYPES[result]);
+};
+
+type ArithmeticOperator = "+" | "-" | "*" | "/" | "quotient";
+
+/**
+ * `left <operator> right` with PostgreSQL's numeric promotion made explicit,
+ * as `ArithmeticColumn` types it: a decimal operand makes the result numeric,
+ * then a float double precision, then a bigint bigint. Division never
+ * truncates: integers and bigints divide as numeric. `quotient` divides
+ * toward zero in the integer type, with `div()` for decimals and `trunc()` for
+ * floats. A JSON value computes as double precision, the type of a
+ * JavaScript number.
  */
 const arithmetic = (
-  description: ExpressionDescription,
-  operator: "+" | "-" | "*" | "/",
+  source: ExpressionDescription,
+  operator: ArithmeticOperator,
   value: unknown,
 ): QueryColumn<unknown, string> => {
   if (value === undefined || value === null) {
@@ -1172,97 +1778,121 @@ const arithmetic = (
     );
   }
 
-  const left = numericClass(description);
-  const operand =
+  const left = expressionSide(source);
+  const right =
     typeof value === "object" && COLUMN_EXPRESSION in value
-      ? readColumn(value as SelectedColumn)
-      : undefined;
-  const right: NumericClass = operand
-    ? numericClass(operand)
-    : typeof value === "string"
-      ? "decimal"
-      : typeof value === "bigint"
+      ? expressionSide(readColumn(value as SelectedColumn))
+      : literalSide(value, left);
+  const sides = [left.kind, right.kind];
+  const promoted: NumericClass = sides.includes("decimal")
+    ? "decimal"
+    : sides.includes("float")
+      ? "float"
+      : sides.includes("bigint")
         ? "bigint"
-        : typeof value === "number" && !Number.isInteger(value)
-          ? "float"
-          : left === "bigint" || left === "decimal"
-            ? left
-            : "integer";
-
-  if (
-    !operand &&
-    typeof value !== "number" &&
-    typeof value !== "bigint" &&
-    typeof value !== "string"
-  ) {
-    throw new Error(
-      "symmetria: arithmetic operands are numbers, bigints, decimal strings or numeric columns",
-    );
-  }
-
+        : "integer";
   const result: NumericClass =
-    left === "decimal" || right === "decimal"
+    operator === "/" && (promoted === "bigint" || promoted === "integer")
       ? "decimal"
-      : left === "float" || right === "float"
-        ? "float"
-        : left === "bigint" || right === "bigint"
-          ? "bigint"
-          : "integer";
-  const leftNode =
-    result === "decimal" && left !== "decimal"
-      ? castNode(description.node, "numeric")
-      : description.node;
-  const rightNode = operand
-    ? result === "decimal" && right !== "decimal"
-      ? castNode(operand.node, "numeric")
-      : operand.node
-    : freeze({
-        kind: "parameter" as const,
-        value: cloneParameter(
-          right === "bigint"
-            ? bigintCodec.encode(value as bigint)
-            : typeof value === "number" && result === "decimal"
-              ? String(value)
-              : value,
-        ),
-        ...(right === "decimal" || result === "decimal"
-          ? { cast: "numeric" }
-          : right === "float"
-            ? { cast: "double precision" }
-            : right === "bigint" && left !== "bigint"
-              ? { cast: "bigint" }
-              : {}),
-      });
-  const sqlType =
-    result === "decimal"
-      ? "numeric"
+      : promoted;
+  // Integers keep PostgreSQL's width: smallint with smallint, bigint for count().
+  const integerType =
+    left.sqlType === "bigint" || right.sqlType === "bigint"
+      ? "bigint"
+      : left.sqlType === "smallint" && right.sqlType === "smallint"
+        ? "smallint"
+        : "integer";
+  const sqlType = result === "integer" ? integerType : RESULT_TYPES[result];
+  const leftNode = operandNode(left, result);
+  const rightNode = operandNode(right, result);
+  const quotient = operator === "quotient";
+  const division: ValueNode = freeze({
+    kind: "binary",
+    left: leftNode,
+    operator: quotient ? "/" : operator,
+    right: rightNode,
+    sqlType,
+  });
+  const node: ValueNode = !quotient
+    ? division
+    : result === "decimal"
+      ? freeze({
+          kind: "raw",
+          parts: freeze(["div(", leftNode, ", ", rightNode, ")"]),
+          sqlType,
+        })
       : result === "float"
-        ? "double precision"
-        : result === "bigint"
-          ? "bigint"
-          : "integer";
-  const codec =
-    result === "decimal"
-      ? decimalCodec
-      : result === "bigint"
-        ? bigintCodec
-        : result === "float"
-          ? codecFor("double precision")
-          : left === "integer" && right === "integer"
-            ? description.codec
-            : undefined;
+        ? freeze({ kind: "raw", parts: freeze(["trunc", division]), sqlType })
+        : division;
 
   return createExpression({
-    outputName: description.outputName,
-    node: freeze({
-      kind: "binary",
-      left: leftNode,
-      operator,
-      right: rightNode,
-      sqlType,
-    }),
-    ...(codec ? { codec } : {}),
+    outputName: source.outputName,
+    node,
+    codec:
+      result === "decimal"
+        ? decimalCodec
+        : result === "bigint"
+          ? bigintCodec
+          : result === "float"
+            ? codecFor("double precision")!
+            : integerType === "bigint"
+              ? countCodec
+              : codecFor(integerType)!,
   });
+};
+
+/**
+ * JS null written to a non-nullable json/jsonb column: the JSON value `null`,
+ * checked by the column's codec (a jsonb(schema) validates it). Nullable
+ * columns keep null as SQL NULL.
+ */
+export const jsonNullNode = (
+  codec: RuntimeCodec | undefined,
+  sqlType: string,
+): ValueNode =>
+  freeze({
+    kind: "parameter",
+    value: codec ? codec.encode(null as never) : "null",
+    cast: codec?.parameterCast ?? sqlType,
+  });
+
+/** A non-nullable jsonb table column, where JS null is stored as JSON null. */
+const storesJsonNull = (description: ExpressionDescription): boolean =>
+  description.node.kind === "column" &&
+  description.node.description.column.notNull &&
+  !description.node.description.binding.projection &&
+  expressionSqlType(description) === "jsonb";
+
+const nullPredicate = (
+  description: ExpressionDescription,
+  negated: boolean,
+): Predicate => {
+  const check: PredicateDescription = {
+    kind: "nullCheck",
+    value: description.node,
+    negated,
+  };
+
+  // SQL NULL still appears through outer joins, so both forms count as null.
+  return storesJsonNull(description)
+    ? predicate({
+        kind: "group",
+        operator: negated ? "AND" : "OR",
+        predicates: freeze([
+          freeze(check),
+          freeze({
+            kind: "comparison" as const,
+            left: description.node,
+            operator: negated ? ("<>" as const) : ("=" as const),
+            right: freeze({
+              kind: "raw" as const,
+              parts: freeze(["'null'::jsonb"]),
+              sqlType: "jsonb",
+            }),
+          }),
+        ]),
+      })
+    : predicate(check);
 };
 
 /** Callable equality whose string properties are enum-member predicates. */
@@ -1270,7 +1900,7 @@ const equality = (description: ExpressionDescription, negated: boolean) =>
   new Proxy(
     (value: unknown) =>
       value === null
-        ? predicate({ kind: "nullCheck", value: description.node, negated })
+        ? nullPredicate(description, negated)
         : compare(description, negated ? "<>" : "=", value),
     {
       get: (target, name) =>
@@ -1436,6 +2066,7 @@ class ColumnHandle {
   searchRank(query: unknown, options: SearchRankOptions = {}) {
     return createExpression<number, "searchRank">({
       outputName: "searchRank",
+      codec: codecFor("real")!,
       node: freeze({
         kind: "searchRank",
         value: this[COLUMN_EXPRESSION].node,
@@ -1554,11 +2185,11 @@ class ColumnHandle {
   }
 
   like(pattern: string) {
-    return compare(this[COLUMN_EXPRESSION], "LIKE", pattern);
+    return compare(jsonScalar(this[COLUMN_EXPRESSION]), "LIKE", pattern);
   }
 
   ilike(pattern: string) {
-    return compare(this[COLUMN_EXPRESSION], "ILIKE", pattern);
+    return compare(jsonScalar(this[COLUMN_EXPRESSION]), "ILIKE", pattern);
   }
 
   plus(value: unknown) {
@@ -1576,17 +2207,23 @@ class ColumnHandle {
   divide(value: unknown) {
     return arithmetic(this[COLUMN_EXPRESSION], "/", value);
   }
+
+  quotient(value: unknown) {
+    return arithmetic(this[COLUMN_EXPRESSION], "quotient", value);
+  }
 }
 
 export const createExpression = <
   Value = unknown,
   OutputName extends string = string,
+  Traits = {},
 >(
   description: ExpressionDescription<OutputName>,
-): QueryColumn<Value, OutputName> =>
+): QueryColumn<Value, OutputName, Traits> =>
   freeze(new ColumnHandle(description)) as unknown as QueryColumn<
     Value,
-    OutputName
+    OutputName,
+    Traits
   >;
 
 /**
@@ -1653,70 +2290,144 @@ export const count = (
     codec: countCodec,
   });
 
-export const sum = (
-  expression: SelectedColumn<number | bigint | string | null>,
+/** A JSON number is summed exactly, as numeric. */
+export const sum = <
+  Expression extends SelectedColumn<number | bigint | Decimal | null>,
+>(
+  expression: Expression & Summable<Expression>,
 ): QueryColumn<Decimal | null, "sum"> =>
   createExpression({
     node: freeze({
       kind: "aggregate",
       name: "SUM",
-      value: readColumn(expression).node,
+      value: jsonScalar(readColumn(expression), "numeric").node,
       numeric: true,
     }),
     outputName: "sum",
     codec: numericCodec,
   });
 
-export const average = (
-  expression: SelectedColumn<number | bigint | string | null>,
+export const average = <
+  Expression extends SelectedColumn<number | bigint | Decimal | null>,
+>(
+  expression: Expression & Summable<Expression>,
 ): QueryColumn<Decimal | null, "average"> =>
   createExpression({
     node: freeze({
       kind: "aggregate",
       name: "AVG",
-      value: readColumn(expression).node,
+      value: jsonScalar(readColumn(expression), "numeric").node,
       numeric: true,
     }),
     outputName: "average",
     codec: numericCodec,
   });
 
-export const minimum = <Value>(
-  expression: SelectedColumn<Value>,
-): QueryColumn<Value | null, "minimum"> => {
+/** Types PostgreSQL orders without a MIN or MAX of their own, besides JSON and boolean. */
+const ELEMENT_ORDERED = /^(uuid|bytea|tsvector|vector)(\(|$)/;
+
+/** A JSON value as jsonb: `json` has no equality or ordering. */
+const jsonbNode = (description: ExpressionDescription): ValueNode =>
+  expressionSqlType(description) === "json"
+    ? castNode(description.node, "jsonb")
+    : description.node;
+
+/**
+ * MIN or MAX in PostgreSQL's ordering of the value's type. Booleans use
+ * bool_and / bool_or. JSON, uuid, bytea and tsvector have no MIN or MAX, so
+ * the first element of the aggregated one-element arrays stands in, ordered by
+ * the type's comparison: JSON orders objects above arrays above booleans above
+ * numbers (numerically) above strings (textually), and skips JSON null like
+ * SQL NULL.
+ */
+const ordered = <Name extends "minimum" | "maximum">(
+  expression: SelectedColumn,
+  name: Name,
+): QueryColumn<unknown, Name> => {
   const description = readColumn(expression);
+  const sqlType = expressionSqlType(description);
+  const json = isJsonValue(description);
 
   return createExpression({
     ...description,
     node: freeze({
       kind: "aggregate",
-      name: "MIN",
-      value: description.node,
+      name:
+        sqlType === "boolean"
+          ? name === "minimum"
+            ? "BOOL_AND"
+            : "BOOL_OR"
+          : name === "minimum"
+            ? "MIN"
+            : "MAX",
+      value: json ? jsonbNode(description) : description.node,
+      ...(json
+        ? { element: "json" as const }
+        : ELEMENT_ORDERED.test(sqlType)
+          ? { element: "value" as const }
+          : {}),
     }),
-    outputName: "minimum",
+    outputName: name,
   });
 };
 
-export const maximum = <Value>(
-  expression: SelectedColumn<Value>,
-): QueryColumn<Value | null, "maximum"> => {
-  const description = readColumn(expression);
+/** The smallest value, ignoring NULL (and JSON null); `null` for no rows. */
+export const minimum = <Expression extends SelectedColumn>(
+  expression: Expression,
+): QueryColumn<
+  ExpressionValue<Expression> | null,
+  "minimum",
+  TraitsOf<Expression>
+> => ordered(expression, "minimum") as never;
 
-  return createExpression({
-    ...description,
-    node: freeze({
-      kind: "aggregate",
-      name: "MAX",
-      value: description.node,
-    }),
-    outputName: "maximum",
+/** The largest value, ignoring NULL (and JSON null); `null` for no rows. */
+export const maximum = <Expression extends SelectedColumn>(
+  expression: Expression,
+): QueryColumn<
+  ExpressionValue<Expression> | null,
+  "maximum",
+  TraitsOf<Expression>
+> => ordered(expression, "maximum") as never;
+
+/** A JSON value with JSON null turned into SQL NULL, since both decode to null. */
+const withoutJsonNull = (description: ExpressionDescription): ValueNode => {
+  const value: ValueNode = freeze({
+    kind: "raw",
+    parts: freeze(["NULLIF(", jsonbNode(description), ", 'null'::jsonb)"]),
+    sqlType: "jsonb",
   });
+
+  return expressionSqlType(description) === "json"
+    ? castNode(value, "json")
+    : value;
 };
 
-export const coalesce = <Value>(
-  expression: SelectedColumn<Value>,
-  fallback: NonNullable<Value> | SelectedColumn<NonNullable<Value>>,
-): QueryColumn<NonNullable<Value>, "coalesce"> => {
+/**
+ * `IS NOT NULL`; a JSON value must also not be JSON null, which reads as null
+ * as well. `whereNotNull()` narrows with it.
+ */
+export const notNullPredicate = (
+  description: ExpressionDescription,
+): PredicateDescription =>
+  isJsonValue(description)
+    ? {
+        kind: "nullCheck",
+        value: withoutJsonNull(description),
+        negated: true,
+      }
+    : { kind: "nullCheck", value: description.node, negated: true };
+
+/** The value, or `fallback` where it is NULL (or JSON null): never null. */
+export const coalesce = <Expression extends SelectedColumn>(
+  expression: Expression,
+  fallback:
+    | Literal<StoredOf<Expression>>
+    | SelectedColumn<NonNullable<ExpressionValue<Expression>>>,
+): QueryColumn<
+  NonNullable<ExpressionValue<Expression>>,
+  "coalesce",
+  TraitsOf<Expression>
+> => {
   const description = readColumn(expression);
 
   return createExpression({
@@ -1724,7 +2435,9 @@ export const coalesce = <Value>(
     node: freeze({
       kind: "coalesce",
       values: freeze([
-        description.node,
+        isJsonValue(description)
+          ? withoutJsonNull(description)
+          : description.node,
         valueNode(fallback, description.codec),
       ]),
     }),
@@ -1820,17 +2533,24 @@ class SqlHandle extends ColumnHandle {
   }
 }
 
-type SqlTemplate<Value> = QueryColumn<Value, "expression"> & {
+/** A `sql<Value>` template: its SQL type is whatever the SQL says, unknown to Symmetria. */
+type RawTraits = { readonly numeric: "raw" };
+
+type SqlTemplate<Value, Traits = RawTraits> = QueryColumn<
+  Value,
+  "expression",
+  Traits
+> & {
   kind: "sql";
   sql: string;
 };
 
-const sqlTemplate = <Value>(
+const sqlTemplate = <Value, Traits = RawTraits>(
   strings: TemplateStringsArray,
   values: readonly unknown[],
   codec?: RuntimeCodec,
   sqlType?: string,
-): SqlTemplate<Value> => {
+): SqlTemplate<Value, Traits> => {
   const parts: (string | ValueNode)[] = [];
   strings.forEach((text, index) => {
     parts.push(text);
@@ -1854,7 +2574,7 @@ const sqlTemplate = <Value>(
       strings,
       values.length > 0,
     ),
-  ) as unknown as SqlTemplate<Value>;
+  ) as unknown as SqlTemplate<Value, Traits>;
 };
 
 type ColumnResult<Definition> =
@@ -1864,19 +2584,26 @@ type ColumnResult<Definition> =
       : Metadata["valueType"]
     : never;
 
+/** How a column's values compute and compare in SQL (see `ColumnTraits`). */
+type DefinitionTraits<Definition> =
+  Definition extends Column<infer Metadata> ? MetadataTraits<Metadata> : {};
+
 // Keep recursive column types named when this callable is included in ShapeTools.
 export interface SqlTag {
   <Value = unknown>(
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): SqlTemplate<Value>;
-  /** A template typed and decoded like a column, including driver-specific codecs. */
+  /**
+   * A template typed and decoded like a column, including driver-specific
+   * codecs; arithmetic and comparisons treat it as that column's SQL type.
+   */
   of: <Definition extends Column>(
     column: Definition,
   ) => (
     strings: TemplateStringsArray,
     ...values: unknown[]
-  ) => SqlTemplate<ColumnResult<Definition>>;
+  ) => SqlTemplate<ColumnResult<Definition>, DefinitionTraits<Definition>>;
 }
 
 /** Interpolations are parameters or expression nodes; only the template's literal text is SQL. */
@@ -1895,8 +2622,8 @@ export const sql: SqlTag = Object.assign(
       (
         strings: TemplateStringsArray,
         ...values: unknown[]
-      ): SqlTemplate<ColumnResult<Definition>> =>
-        sqlTemplate<ColumnResult<Definition>>(
+      ): SqlTemplate<ColumnResult<Definition>, DefinitionTraits<Definition>> =>
+        sqlTemplate<ColumnResult<Definition>, DefinitionTraits<Definition>>(
           strings,
           values,
           column[COLUMN_CODEC] ??

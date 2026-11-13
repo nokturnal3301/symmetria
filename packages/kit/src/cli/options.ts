@@ -10,7 +10,7 @@ export const help = `symmetria <command>
   inspect [table]      Inspect tables, columns, relations, indexes and checks
   graph [file]         Print or write a Mermaid entity-relationship diagram
   profile              Observe live application requests and SQL timings
-  generate <name>       Generate up.sql, down.sql and a versioned snapshot
+  generate <name>      Generate up.sql and down.sql, and update the snapshot
   migrate              Apply pending migrations atomically
   status               Show applied and pending migrations
   rollback             Revert the latest migration
@@ -30,9 +30,10 @@ export const help = `symmetria <command>
   --diff <file.json>    Explicit rename hints and USING conversions for generate
   --empty              Generate an empty, editable SQL migration
   --allow-destructive  Explicitly permit destructive generation
+  --allow-custom-sql   squash: drop SQL that generate did not write (seeds, edits)
   --transaction <mode> batch (default), each, or none
   --pending            Lint only migrations pending in the configured database
-  --online             Generate concurrent indexes and phased validation (transaction none)
+  --online             generate/diff/lint: concurrent indexes and phased validation (transaction none)
   --plan               Show SQL and transaction groups without executing migrations
   --action <action>    repair: retry or complete, after manual data reconciliation
   --verify-url <url>   Administrative PostgreSQL URL for disposable verification databases
@@ -40,6 +41,7 @@ export const help = `symmetria <command>
   --lock-timeout <ms>   DDL lock wait (default: 5000; 0 disables)
   --statement-timeout <ms>  Statement duration (default: 600000; 0 disables)
   --to <migration-id>   Apply up to a migration
+  --ignore-table <name> pull/drift/adopt/repair/verify: leave an undeclared table out (repeatable)
   --steps <number>      Number of migrations to rollback (default: 1)
   --strict             Exit with code 1 when lint or drift report findings
   --force              Overwrite the file written by pull or graph
@@ -50,7 +52,7 @@ export const help = `symmetria <command>
   --no-color           Disable terminal colors
   --no-animation       Disable logo and loading animations
   --no-interactive     Disable dashboard, schema browser and rename questions
-  --help               Show this help
+  --help, -h           Show this help
 `;
 
 const COMMANDS = [
@@ -75,42 +77,47 @@ const COMMANDS = [
 ] as const;
 export type Command = (typeof COMMANDS)[number];
 
+/** Every flag; `--help`, the README and the reference list each one. */
+export const FLAGS = {
+  config: { type: "string" },
+  dir: { type: "string" },
+  "database-url": { type: "string" },
+  "profile-url": { type: "string" },
+  "profile-token": { type: "string" },
+  diff: { type: "string" },
+  strict: { type: "boolean" },
+  force: { type: "boolean" },
+  compact: { type: "boolean" },
+  empty: { type: "boolean" },
+  "allow-destructive": { type: "boolean" },
+  "allow-custom-sql": { type: "boolean" },
+  "ignore-table": { type: "string", multiple: true },
+  transaction: { type: "string" },
+  pending: { type: "boolean" },
+  online: { type: "boolean" },
+  plan: { type: "boolean" },
+  action: { type: "string" },
+  "verify-url": { type: "string" },
+  "advisory-lock-timeout": { type: "string" },
+  "lock-timeout": { type: "string" },
+  "statement-timeout": { type: "string" },
+  to: { type: "string" },
+  steps: { type: "string" },
+  help: { type: "boolean", short: "h" },
+  sql: { type: "boolean" },
+  json: { type: "boolean" },
+  relations: { type: "boolean" },
+  "no-color": { type: "boolean" },
+  "no-animation": { type: "boolean" },
+  "no-interactive": { type: "boolean" },
+} as const;
+
 export const parseCommandLine = (argumentsList: string[]) =>
   parseArgs({
     args: argumentsList,
     allowPositionals: true,
     strict: true,
-    options: {
-      config: { type: "string" },
-      dir: { type: "string" },
-      "database-url": { type: "string" },
-      "profile-url": { type: "string" },
-      "profile-token": { type: "string" },
-      diff: { type: "string" },
-      strict: { type: "boolean" },
-      force: { type: "boolean" },
-      compact: { type: "boolean" },
-      empty: { type: "boolean" },
-      "allow-destructive": { type: "boolean" },
-      transaction: { type: "string" },
-      pending: { type: "boolean" },
-      online: { type: "boolean" },
-      plan: { type: "boolean" },
-      action: { type: "string" },
-      "verify-url": { type: "string" },
-      "advisory-lock-timeout": { type: "string" },
-      "lock-timeout": { type: "string" },
-      "statement-timeout": { type: "string" },
-      to: { type: "string" },
-      steps: { type: "string" },
-      help: { type: "boolean", short: "h" },
-      sql: { type: "boolean" },
-      json: { type: "boolean" },
-      relations: { type: "boolean" },
-      "no-color": { type: "boolean" },
-      "no-animation": { type: "boolean" },
-      "no-interactive": { type: "boolean" },
-    },
+    options: FLAGS,
   });
 
 type CommandLine = ReturnType<typeof parseCommandLine>;
@@ -134,10 +141,26 @@ const SCOPED_FLAGS: readonly {
   readonly message: string;
 }[] = [
   {
-    flags: ["allow-destructive", "transaction", "online"],
+    flags: ["allow-destructive", "transaction"],
     commands: ["generate"],
     message:
-      "symmetria: --allow-destructive, --transaction and --online are generate options",
+      "symmetria: --allow-destructive and --transaction are generate options",
+  },
+  {
+    flags: ["online"],
+    commands: ["generate", "diff", "lint"],
+    message: "symmetria: --online is a generate/diff/lint option",
+  },
+  {
+    flags: ["allow-custom-sql"],
+    commands: ["squash"],
+    message: "symmetria: --allow-custom-sql is a squash option",
+  },
+  {
+    flags: ["ignore-table"],
+    commands: ["pull", "drift", "adopt", "repair", "verify"],
+    message:
+      "symmetria: --ignore-table is a pull/drift/adopt/repair/verify option",
   },
   {
     flags: ["pending"],

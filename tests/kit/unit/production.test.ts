@@ -215,7 +215,7 @@ test("SQL lint sees anonymous table constraints, including those added next to a
       [1, "blocking"],
       [2, "blocking"],
       [3, "blocking"],
-      [4, "caution"],
+      [4, "blocking"],
       [5, "caution"],
       [6, "caution"],
     ],

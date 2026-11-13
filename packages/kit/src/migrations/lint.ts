@@ -1,4 +1,11 @@
+/**
+ * Schema-level lint: reviews a migration plan for operations that lose data,
+ * fail on populated tables or need deploy planning.
+ */
+import { quoteIdentifier } from "symmetria/internal";
 import type { MigrationPlan, RenameHints } from "./diff";
+import { conversionMessage, typeConversion } from "./conversions";
+import { renameExpressionIdentifiers } from "./expression-tokens";
 import type { MigrationColumn, MigrationTable } from "./snapshot";
 
 /**
@@ -48,6 +55,28 @@ export const lintMigration = (
     });
   };
 
+  // A type that keeps its labels under a new name is renamed in place (ALTER TYPE … RENAME TO).
+  const renamedEnumeration = (from?: string, to?: string): boolean => {
+    const previous = plan.before.enumerations.find(
+      (enumeration) => enumeration.name === from,
+    );
+    const next = plan.after.enumerations.find(
+      (enumeration) => enumeration.name === to,
+    );
+
+    return (
+      previous !== undefined &&
+      next !== undefined &&
+      !plan.after.enumerations.some(
+        (enumeration) => enumeration.name === from,
+      ) &&
+      !plan.before.enumerations.some(
+        (enumeration) => enumeration.name === to,
+      ) &&
+      previous.values.join("\u0000") === next.values.join("\u0000")
+    );
+  };
+
   const compareColumns = (
     before: MigrationTable,
     after: MigrationTable,
@@ -75,17 +104,57 @@ export const lintMigration = (
         continue;
       }
 
-      if (renamedTo) {
+      // Renames are catalog-only changes, and SQL lint passes the generated
+      // RENAME statements; reporting them here would fail --strict only until
+      // the migration is generated.
+      compareColumn(after, column, next);
+
+      // A new foreign key validates every existing value; a changed action on
+      // the same target column cannot fail, as the old key held.
+      const target = column.references && {
+        table:
+          renamedTables[column.references.table] ?? column.references.table,
+        column: column.references.column,
+      };
+      const targetColumn =
+        target &&
+        (renames.columns?.[target.table]?.[target.column] ?? target.column);
+
+      if (
+        next.references &&
+        (target?.table !== next.references.table ||
+          targetColumn !== next.references.column)
+      ) {
         report(
-          "caution",
+          "blocking",
           after.name,
-          `Column "${column.name}" is renamed to "${renamedTo}".`,
-          "Deploy code that tolerates both names, or add the new column and backfill it before removing the old one.",
-          renamedTo,
+          `Column "${next.name}" gains a foreign key to ${next.references.table}.${next.references.column}; the statement fails when an existing value has no match.`,
+          "Fix or clear unmatched values first, or generate with --online, which adds the key NOT VALID and validates it separately.",
+          next.name,
         );
       }
+    }
 
-      compareColumn(after, column, next);
+    // CHECK constraints validate every existing row, like NOT NULL.
+    const columnNames = new Map(
+      Object.entries(renamedColumns).map(([previous, next]) => [
+        quoteIdentifier(previous),
+        quoteIdentifier(next),
+      ]),
+    );
+    const previousChecks = (before.checks ?? []).map((check) =>
+      renameExpressionIdentifiers(check.expression, columnNames),
+    );
+
+    for (const definition of after.checks ?? []) {
+      if (!previousChecks.includes(definition.expression)) {
+        report(
+          "blocking",
+          after.name,
+          `CHECK constraint "${definition.sqlName}" is added; the statement fails when an existing row violates it.`,
+          "Fix violating rows first, or generate with --online, which adds the check NOT VALID and validates it separately.",
+        );
+      }
     }
 
     for (const column of after.columns) {
@@ -157,10 +226,23 @@ export const lintMigration = (
     before: MigrationColumn,
     after: MigrationColumn,
   ): void => {
-    if (
+    const retyped =
       before.sqlType !== after.sqlType ||
-      before.enumeration !== after.enumeration
-    ) {
+      (before.enumeration !== after.enumeration &&
+        !renamedEnumeration(before.enumeration, after.enumeration));
+    const change = retyped ? typeConversion(before, after) : undefined;
+
+    if (change?.lossy) {
+      report(
+        "destructive",
+        table.name,
+        conversionMessage(before, after, change),
+        change.assignmentCast
+          ? "Shorten or move longer values first, then generate with --allow-destructive; the SQL has no truncating cast, so PostgreSQL refuses values that still do not fit."
+          : "Copy the column or back up the table if the lost precision matters, then generate with --allow-destructive.",
+        after.name,
+      );
+    } else if (retyped) {
       report(
         "caution",
         table.name,
@@ -203,15 +285,6 @@ export const lintMigration = (
         "Stop using the table in a release first, keep a backup, then drop it in a later migration.",
       );
       continue;
-    }
-
-    if (renamedTo) {
-      report(
-        "caution",
-        next.name,
-        `Table "${table.name}" is renamed to "${renamedTo}".`,
-        "Deploy code that tolerates both names, or create a view with the old name until every deployment is updated.",
-      );
     }
 
     compareColumns(table, next);

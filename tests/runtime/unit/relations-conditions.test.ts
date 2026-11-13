@@ -23,13 +23,13 @@ const posts = table({
 }));
 const model = schema({ users, comments, posts });
 
-test("a to-one condition relation joins LEFT on its predicate", () => {
+test("a to-one condition relation joins LEFT on its first match by primary key", () => {
   const { sql } = model
     .posts((post) => ({ title: post.title, author: post.author.name }))
     .toSQL();
 
   expect(sql).toContain(
-    'LEFT JOIN "users" AS "__symmetria_path_0" ON "posts"."author_name" = "__symmetria_path_0"."name"',
+    'LEFT JOIN "users" AS "__symmetria_path_0" ON "__symmetria_path_0"."id" = (SELECT "__symmetria_path_0_2"."id" AS "id"\nFROM "users" AS "__symmetria_path_0_2"\nWHERE "posts"."author_name" = "__symmetria_path_0_2"."name"\nORDER BY "__symmetria_path_0_2"."id" ASC\nLIMIT 1)',
   );
   expect(
     model
@@ -40,7 +40,31 @@ test("a to-one condition relation joins LEFT on its predicate", () => {
       })
       .toSQL().sql,
   ).toContain(
-    'INNER JOIN "users" AS "author" ON "posts"."author_name" = "author"."name"',
+    'INNER JOIN "users" AS "author" ON "author"."id" = (SELECT "author_2"."id" AS "id"\nFROM "users" AS "author_2"\nWHERE "posts"."author_name" = "author_2"."name"',
+  );
+  // Nested objects read the same first match instead of failing on a second row.
+  expect(
+    model
+      .posts((post) => ({ author: post.author((user) => ({ id: user.id })) }))
+      .toSQL().sql,
+  ).toContain(
+    'WHERE "__symmetria_aggregate_0"."id" = (SELECT "__symmetria_aggregate_0_2"."id" AS "id"',
+  );
+});
+
+test("a to-one condition relation needs a primary key on its target", () => {
+  const plain = table({ name: text, active: bool });
+  const keyless = schema({
+    people: plain,
+    notes: table({ id: int.auto, owner: text }).relations((note, { to }) => ({
+      person: to(plain).one((person) => note.owner.is(person.name)),
+    })),
+  });
+
+  expect(() =>
+    keyless.notes((note) => ({ person: note.person.name })).toSQL(),
+  ).toThrow(
+    /"notes\.person" is one\(\) and resolves to the first match by the primary key of "people", which has none/,
   );
 });
 
@@ -85,8 +109,9 @@ test("scoped predicates are ANDed into the condition JOIN", () => {
     .posts((post) => ({ author: post.author.name }))
     .toSQL();
 
+  // The first match is picked among the rows the scope admits.
   expect(sql).toContain(
-    'ON ("posts"."author_name" = "__symmetria_path_0"."name" AND "__symmetria_path_0"."active" = $1)',
+    'WHERE "posts"."author_name" = "__symmetria_path_0_2"."name" AND "__symmetria_path_0_2"."active" = $1\nORDER BY "__symmetria_path_0_2"."id" ASC\nLIMIT 1) AND "__symmetria_path_0"."active" = $2)',
   );
 });
 
@@ -165,7 +190,7 @@ test("keyed links, plain records and thunks all name their target", () => {
 
   expect(
     keyed.posts((post) => ({ author: post.author.name })).toSQL().sql,
-  ).toContain('ON "posts"."author_name" = "__symmetria_path_0"."name"');
+  ).toContain('WHERE "posts"."author_name" = "__symmetria_path_0_2"."name"');
 
   const people = { id: int.auto, name: text };
   const notes = table({ id: int.auto, owner: text }).relations(

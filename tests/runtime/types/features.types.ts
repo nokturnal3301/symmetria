@@ -156,6 +156,24 @@ const model = schema({
   type OptionalSnippet = Expect<
     AreEqual<Awaited<typeof highlighted>[number]["optional"], string | null>
   >;
+  // Ranking NULL text, or with a NULL query, gives NULL.
+  const ranked = documents.docs((docs) => ({
+    title: docs.title.searchRank("x"),
+    body: docs.body.searchRank("x"),
+    byColumn: docs.title.searchRank(docs.body),
+    snippet: docs.title.searchHeadline(docs.body),
+  }));
+  type Ranked = Expect<
+    AreEqual<
+      Awaited<typeof ranked>[number],
+      {
+        title: number;
+        body: number | null;
+        byColumn: number | null;
+        snippet: string | null;
+      }
+    >
+  >;
   documents.docs({
     where: (docs) =>
       searchDocument(
@@ -220,6 +238,10 @@ const model = schema({
   );
   type Distance = Expect<
     AreEqual<Awaited<typeof nearest>[number]["distance"], number>
+  >;
+  // A NULL embedding has no distance: PostgreSQL returns NULL.
+  type OptionalDistance = Expect<
+    AreEqual<Awaited<typeof nearest>[number]["other"], number | null>
   >;
   // The unique index on a classed key still registers the unique lookup.
   vectors.docs.by.content("x");

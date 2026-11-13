@@ -112,9 +112,33 @@ test("prepared queries offer the query terminals", async () => {
   });
   expect(await countByName.exists({ name: "Ada", size: 10 })).toBe(true);
   expect(lastCount().sql).toContain('AS "__symmetria_exists"');
-  expect(() => countByName.one({ name: "Ada", size: 1 })).toThrow(
-    /bind a parameterized LIMIT/,
+  // A parameterized root LIMIT keeps its SQL; first() and one() bind
+  // min(limit, 1) and min(limit, 2), so a LIMIT of 1 never reports two rows.
+  const { database: limited, last: lastLimited } = recording([
+    { id: 1 },
+    { id: 2 },
+  ]);
+  const page = prepare({ size: int }, (parameters) =>
+    limited.users((user) => ({ id: user.id }), {
+      orderBy: (user) => user.id.ascending,
+      limit: parameters.size,
+    }),
   );
+  expect(await page.first({ size: 5 })).toEqual({ id: 1 });
+  expect(lastLimited()).toEqual({
+    sql: 'SELECT "users"."id" AS "id"\nFROM "users" AS "users"\nORDER BY "users"."id" ASC\nLIMIT $1',
+    parameters: [1],
+  });
+  await expect(page.one({ size: 5 })).rejects.toMatchObject({
+    code: "SYMMETRIA_TOO_MANY_ROWS",
+  });
+  expect(lastLimited().parameters).toEqual([2]);
+  await page.maybeOne({ size: 1 }).catch(() => undefined);
+  expect(lastLimited().parameters).toEqual([1]);
+  await page.first({ size: 0 });
+  expect(lastLimited().parameters).toEqual([0]);
+  expect(await page({ size: 7 })).toHaveLength(2);
+  expect(lastLimited().parameters).toEqual([7]);
 
   const report = await byName.inspect({ name: "Grace" });
   expect(report.parameters).toEqual(["Grace"]);

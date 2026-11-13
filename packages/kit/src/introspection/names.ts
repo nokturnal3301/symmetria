@@ -145,6 +145,124 @@ export const keyAllocator = (
   };
 };
 
+/** Every identifier a generated module imports or declares at its top level. */
+export const MODULE_IDENTIFIERS: readonly string[] = [
+  "and",
+  "bigint",
+  "bool",
+  "bytea",
+  "customType",
+  "date",
+  "doublePrecision",
+  "index",
+  "inet",
+  "int",
+  "interval",
+  "jsonb",
+  "junction",
+  "not",
+  "numeric",
+  "oneOf",
+  "operatorClass",
+  "or",
+  "passthrough",
+  "real",
+  "schema",
+  "smallint",
+  "sql",
+  "table",
+  "text",
+  "time",
+  "timestamp",
+  "timestamptz",
+  "tsvector",
+  "uuid",
+  "varchar",
+  "vector",
+];
+
+/** Words a module cannot use as a parameter or binding name. */
+const RESERVED_WORDS = new Set([
+  "arguments",
+  "await",
+  "break",
+  "case",
+  "catch",
+  "class",
+  "const",
+  "continue",
+  "debugger",
+  "default",
+  "delete",
+  "do",
+  "else",
+  "enum",
+  "eval",
+  "export",
+  "extends",
+  "false",
+  "finally",
+  "for",
+  "function",
+  "if",
+  "implements",
+  "import",
+  "in",
+  "instanceof",
+  "interface",
+  "let",
+  "new",
+  "null",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "return",
+  "static",
+  "super",
+  "switch",
+  "this",
+  "throw",
+  "true",
+  "try",
+  "typeof",
+  "undefined",
+  "var",
+  "void",
+  "while",
+  "with",
+  "yield",
+]);
+
+/**
+ * Identifiers for tables inside generated callbacks. A table keyed like a builder
+ * (`date`, `text`) would shadow the import in `({ date }) =>`, and a reserved word
+ * cannot be a parameter, so those tables are bound as `dateTable` instead.
+ */
+export const tableBindings = (keys: readonly string[]): Map<string, string> => {
+  const taken = new Set([...MODULE_IDENTIFIERS, ...keys]);
+  const bindings = new Map<string, string>();
+
+  for (const key of keys) {
+    if (!MODULE_IDENTIFIERS.includes(key) && !RESERVED_WORDS.has(key)) {
+      bindings.set(key, key);
+      continue;
+    }
+
+    let binding = `${key}Table`;
+    let ordinal = 2;
+
+    while (taken.has(binding)) {
+      binding = `${key}Table${ordinal++}`;
+    }
+
+    taken.add(binding);
+    bindings.set(key, binding);
+  }
+
+  return bindings;
+};
+
 export const isReservedColumnKey = (key: string): boolean =>
   RESERVED_COLUMN_KEYS.has(key);
 
@@ -181,3 +299,7 @@ export const quoteString = (text: string): string => JSON.stringify(text);
 /** `"identifier"` in SQL, for suggested fixes. */
 export const quoteSql = (identifier: string): string =>
   `"${identifier.replaceAll('"', '""')}"`;
+
+/** `'text'` in SQL, for suggested fixes. */
+export const sqlString = (text: string): string =>
+  `'${text.replaceAll("'", "''")}'`;

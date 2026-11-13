@@ -10,7 +10,7 @@ import {
   sql,
   prepare,
 } from "../../../packages/runtime/src";
-import { postgres as bun } from "../../../packages/runtime/src/entries/bun";
+import { bun } from "../../support/postgres";
 import { postgres as pg } from "../../../packages/runtime/src/entries/pg";
 import { testDatabase } from "../../../packages/kit/src/testing";
 

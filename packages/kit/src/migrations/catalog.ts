@@ -10,6 +10,8 @@ export type CatalogOptions = {
   schemaName?: string;
   metadataSchema?: string;
   metadataTable?: string;
+  /** Tables left out of the catalog, like the journal: other tools' tables. */
+  ignoreTables?: readonly string[];
 };
 export type CatalogConstraint = {
   table_name: string;
@@ -72,20 +74,26 @@ export const readCatalog = async (options: CatalogOptions) => {
     data_type: string;
     enum_name: string | null;
     enum_schema: string | null;
+    /** PostgreSQL 18 keeps attnotnull for a NOT VALID NOT NULL constraint, which allows existing NULLs. */
     not_null: boolean;
     identity: string;
     default: string | null;
+    /** The column's collation when it is not its type's default. */
+    collation: string | null;
   }>(`
     SELECT relation.relname AS table_name, attribute.attname AS column_name,
       format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
       CASE WHEN typ.typtype = 'e' THEN typ.typname ELSE NULL END AS enum_name,
       CASE WHEN typ.typtype = 'e' AND typ.typnamespace <> relation.relnamespace THEN typ_namespace.nspname ELSE NULL END AS enum_schema,
-      attribute.attnotnull AS not_null, attribute.attidentity AS identity,
-      pg_get_expr(definition.adbin, definition.adrelid) AS default
+      attribute.attnotnull AND NOT EXISTS (SELECT 1 FROM pg_constraint not_null WHERE not_null.conrelid = attribute.attrelid AND not_null.contype = 'n' AND NOT not_null.convalidated AND not_null.conkey[1] = attribute.attnum) AS not_null,
+      attribute.attidentity AS identity,
+      pg_get_expr(definition.adbin, definition.adrelid) AS default,
+      CASE WHEN attribute.attcollation <> typ.typcollation THEN collation_entry.collname::text ELSE NULL END AS collation
     FROM pg_attribute attribute JOIN pg_class relation ON relation.oid = attribute.attrelid
     JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
     JOIN pg_type typ ON typ.oid = attribute.atttypid
     JOIN pg_namespace typ_namespace ON typ_namespace.oid = typ.typnamespace
+    LEFT JOIN pg_collation collation_entry ON collation_entry.oid = attribute.attcollation
     LEFT JOIN pg_attrdef definition ON definition.adrelid = relation.oid AND definition.adnum = attribute.attnum
     WHERE ${filter} AND relation.relkind IN ('r', 'p') AND attribute.attnum > 0 AND NOT attribute.attisdropped
     ORDER BY relation.relname COLLATE "C", attribute.attname COLLATE "C"`);
@@ -126,6 +134,20 @@ export const readCatalog = async (options: CatalogOptions) => {
     JOIN pg_enum enum ON enum.enumtypid = typ.oid
     WHERE namespace.nspname = COALESCE($1, current_schema()) AND $2::text IS NOT NULL AND $3::text IS NOT NULL
     GROUP BY typ.typname ORDER BY typ.typname COLLATE "C"`);
+  const ignored = new Set(options.ignoreTables ?? []);
 
-  return { tables, columns, constraints, indexes, enumerations };
+  const kept = <Row extends { name?: string; table_name?: string }>(
+    rows: Row[],
+  ): Row[] =>
+    ignored.size
+      ? rows.filter((row) => !ignored.has(row.table_name ?? row.name ?? ""))
+      : rows;
+
+  return {
+    tables: kept(tables),
+    columns: kept(columns),
+    constraints: kept(constraints),
+    indexes: kept(indexes),
+    enumerations,
+  };
 };

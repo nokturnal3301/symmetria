@@ -27,16 +27,13 @@ import {
   sql,
   coalesce,
 } from "../../../packages/runtime/src";
-import { postgres } from "../../support/postgres";
+import { postgres, searchPathURL } from "../../support/postgres";
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("PostgreSQL through Bun SQL", () => {
-  const driver = postgres({
-    url: databaseUrl ?? "postgres://localhost/postgres",
-    max: 1,
-  });
   const namespace = `symmetria_test_${crypto.randomUUID().replaceAll("-", "")}`;
+  const driver = postgres({ url: searchPathURL(namespace), max: 1 });
   let queryCount = 0;
   const model = schema(
     {
@@ -94,7 +91,6 @@ describe.skipIf(!databaseUrl)("PostgreSQL through Bun SQL", () => {
 
   beforeAll(async () => {
     await run(`CREATE SCHEMA "${namespace}"`);
-    await run(`SET search_path TO "${namespace}"`);
 
     for (const statement of [
       "CREATE TYPE user_role AS ENUM ('admin', 'member')",

@@ -218,6 +218,13 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
         });
       case "exists":
         return freeze({ ...original, query: query(original.query) });
+      case "scope":
+        // The callback runs again against the new occurrence at execution.
+        return freeze({
+          ...original,
+          binding: binding(original.binding),
+          predicate: predicate(original.predicate),
+        });
     }
   };
 

@@ -142,9 +142,9 @@ try {
       private: true,
       type: "module",
       dependencies: tarballs,
+      // No @types/pg: the published declarations must compile with skipLibCheck off without it.
       devDependencies: {
         "@types/bun": rootPackage.devDependencies["@types/bun"],
-        "@types/pg": rootPackage.devDependencies["@types/pg"],
       },
     }),
   );

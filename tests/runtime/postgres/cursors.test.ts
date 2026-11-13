@@ -6,17 +6,14 @@ import {
   customType,
   createDatabase,
 } from "../../../packages/runtime/src";
-import { postgres } from "../../support/postgres";
+import { postgres, searchPathURL } from "../../support/postgres";
 import { createSchemaSQL } from "../../../packages/kit/src";
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("compound-key cursors with lossy codecs", () => {
-  const driver = postgres({
-    url: databaseUrl ?? "postgres://localhost/postgres",
-    max: 1,
-  });
   const namespace = `symmetria_cursors_${crypto.randomUUID().replaceAll("-", "")}`;
+  const driver = postgres({ url: searchPathURL(namespace), max: 1 });
   const score = customType<number>("integer", {
     encode: (value) => value * 10,
     decode: (value) => Math.floor(Number(value) / 10),
@@ -34,7 +31,6 @@ describe.skipIf(!databaseUrl)("compound-key cursors with lossy codecs", () => {
 
   beforeAll(async () => {
     await run(`CREATE SCHEMA "${namespace}"`);
-    await run(`SET search_path TO "${namespace}"`);
 
     for (const statement of createSchemaSQL(model.$snapshot())) {
       await driver.execute(statement);

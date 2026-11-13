@@ -7,10 +7,13 @@ import {
   expressionUsesLiteral,
   renameExpressionIdentifiers,
 } from "./expression-tokens";
+import { expressionKey, indexKeyKey } from "./expressions";
+import { typeConversion } from "./conversions";
 import type { CompiledQuery, SchemaSnapshot } from "symmetria";
 import {
   columnSQL,
   columnTypeSQL,
+  identitySQL,
   enumerationSQL,
   foreignKeySQL,
   indexSQL,
@@ -74,6 +77,8 @@ type TablePair = {
   affected: string[];
   /** Applies column renames to a previous definition; PostgreSQL renames them in place. */
   renamed: <Definition>(definition: Definition) => Definition;
+  /** SQL types of the new table's columns, for comparing expressions. */
+  types: ReadonlyMap<string, string>;
 };
 type Casts = Readonly<Record<string, Readonly<Record<string, string>>>>;
 
@@ -88,6 +93,36 @@ const anonymous = (definition: unknown): unknown =>
     ),
   );
 
+/**
+ * A check or index as the diff compares it: without names, and with its
+ * expressions in normalized form, so rendering differences (outer parentheses,
+ * literal casts, `= TRUE`, `= ANY (ARRAY[…])` for `IN`) are no change.
+ * `columns` maps column names to SQL types.
+ */
+const comparable = (
+  definition: unknown,
+  columns: ReadonlyMap<string, string>,
+): unknown => {
+  const entry = anonymous(definition) as Record<string, unknown>;
+
+  return {
+    ...entry,
+    ...(typeof entry.expression === "string"
+      ? { expression: expressionKey(entry.expression, columns) }
+      : {}),
+    ...(typeof entry.where === "string"
+      ? { where: expressionKey(entry.where, columns) }
+      : {}),
+    ...(Array.isArray(entry.keys)
+      ? {
+          keys: entry.keys.map((key) =>
+            typeof key === "string" ? indexKeyKey(key, columns) : key,
+          ),
+        }
+      : {}),
+  };
+};
+
 /** A string as it appears inside canonical JSON, without the surrounding quotes. */
 const escapedJSON = (value: string): string =>
   JSON.stringify(value).slice(1, -1);
@@ -98,6 +133,8 @@ const direction = (
   renames: RenameHints,
   casts: Casts,
   online = false,
+  /** Down SQL: USING expressions name columns as the up migration left them. */
+  reverse = false,
 ): string[] => {
   const beforeTables = new Map(
     before.tables.map((table) => [table.name, table]),
@@ -156,6 +193,65 @@ const direction = (
     after.enumerations.map((enumeration) => [enumeration.name, enumeration]),
   );
 
+  // An enum that keeps its labels and its columns under a new name (a typeName()
+  // edit, or a renamed table or column behind a derived name) is renamed in place.
+  const enumerationColumns = (
+    snapshot: MigrationSnapshot,
+    name: string,
+  ): [string, string][] =>
+    snapshot.tables.flatMap((table) =>
+      table.columns
+        .filter((column) => column.enumeration === name)
+        .map((column): [string, string] => [table.name, column.name]),
+    );
+  const enumerationRenames = new Map<string, string>();
+
+  for (const next of after.enumerations) {
+    if (beforeEnumerations.has(next.name)) {
+      continue;
+    }
+
+    const candidates = before.enumerations.filter((previous) => {
+      if (
+        afterEnumerations.has(previous.name) ||
+        !equal(previous.values, next.values)
+      ) {
+        return false;
+      }
+
+      const continued = enumerationColumns(before, previous.name).map(
+        ([table, column]) => {
+          const tableName = tableNames[table] ?? table;
+          const columnName = renames.columns?.[tableName]?.[column] ?? column;
+
+          return afterTables
+            .get(tableName)
+            ?.columns.find((candidate) => candidate.name === columnName)
+            ?.enumeration;
+        },
+      );
+
+      return (
+        continued.includes(next.name) &&
+        continued.every(
+          (enumeration) =>
+            enumeration === undefined || enumeration === next.name,
+        )
+      );
+    });
+
+    if (
+      candidates.length === 1 &&
+      ![...enumerationRenames.keys()].includes(candidates[0]!.name)
+    ) {
+      enumerationRenames.set(candidates[0]!.name, next.name);
+    }
+  }
+
+  /** The before-name of an enum, through a rename detected above. */
+  const previousEnumeration = (name: string): string =>
+    [...enumerationRenames].find(([, next]) => next === name)?.[0] ?? name;
+
   // ALTER TYPE ... ADD VALUE runs inside a transaction on PostgreSQL 12+, but the new
   // label cannot be used until commit. Values that a default or CHECK in this migration
   // already needs force the replace-and-cast rewrite instead.
@@ -209,13 +305,18 @@ const direction = (
     next: MigrationColumn,
   ): boolean =>
     previous.sqlType !== next.sqlType ||
-    previous.enumeration !== next.enumeration ||
+    (previous.enumeration === undefined
+      ? undefined
+      : (enumerationRenames.get(previous.enumeration) ??
+        previous.enumeration)) !== next.enumeration ||
+    // A new collation is applied with ALTER COLUMN ... TYPE ... COLLATE.
+    previous.collation !== next.collation ||
     !!(
       next.enumeration &&
       !additiveEnums.has(next.enumeration) &&
       !equal(
-        beforeEnumerations.get(next.enumeration),
-        afterEnumerations.get(next.enumeration),
+        beforeEnumerations.get(previousEnumeration(next.enumeration))?.values,
+        afterEnumerations.get(next.enumeration)?.values,
       )
     );
 
@@ -312,6 +413,9 @@ const direction = (
         previous.name !== next.name &&
         previous.primaryKey.length > 0,
       affected,
+      types: new Map(
+        next.columns.map((column) => [column.name, column.sqlType]),
+      ),
       renamed: (definition) =>
         columnRenames.size
           ? JSON.parse(
@@ -372,7 +476,10 @@ const direction = (
 
     return (
       pair.affected.some((name) => text.includes(escapedJSON(name))) ||
-      !equal(anonymous(pair.renamed(previous)), anonymous(next))
+      !equal(
+        comparable(pair.renamed(previous), pair.types),
+        comparable(next, pair.types),
+      )
     );
   };
 
@@ -405,11 +512,13 @@ const direction = (
         continue;
       }
 
-      const shape = canonicalJSON(anonymous(pair.renamed(definition)));
+      const shape = canonicalJSON(
+        comparable(pair.renamed(definition), pair.types),
+      );
       const candidates = next.filter(
         (candidate) =>
           !taken.has(candidate.sqlName) &&
-          canonicalJSON(anonymous(candidate)) === shape,
+          canonicalJSON(comparable(candidate, pair.types)) === shape,
       );
 
       if (candidates.length === 1) {
@@ -508,6 +617,11 @@ const direction = (
   const uniqueChanged = (column: ColumnPair): boolean =>
     column.typeChanged || column.before.unique !== column.after.unique;
 
+  // Down SQL retypes a renamed column before renaming it back: the reverse of
+  // up's rename-then-retype, so a `using` down expression sees the name up gave it.
+  const renamedAfterRetype = (column: ColumnPair): boolean =>
+    reverse && column.typeChanged && column.before.name !== column.after.name;
+
   const statements: string[] = [];
   const droppedReferences = new Set<string>();
 
@@ -579,7 +693,10 @@ const direction = (
     }
 
     for (const column of pair.columns) {
-      if (column.before.name !== column.after.name) {
+      if (
+        column.before.name !== column.after.name &&
+        !renamedAfterRetype(column)
+      ) {
         statements.push(
           `ALTER TABLE ${quoteIdentifier(pair.after.name)} RENAME COLUMN ${quoteIdentifier(column.before.name)} TO ${quoteIdentifier(column.after.name)}`,
         );
@@ -682,6 +799,14 @@ const direction = (
 
   for (const enumeration of after.enumerations) {
     const previous = beforeEnumerations.get(enumeration.name);
+    const renamedFrom = previousEnumeration(enumeration.name);
+
+    if (renamedFrom !== enumeration.name) {
+      statements.push(
+        `ALTER TYPE ${quoteIdentifier(renamedFrom)} RENAME TO ${quoteIdentifier(enumeration.name)}`,
+      );
+      continue;
+    }
 
     if (previous && equal(previous, enumeration)) {
       continue;
@@ -756,28 +881,41 @@ const direction = (
     for (const column of pair.columns) {
       const previous = column.before;
       const next = column.after;
-      const prefix = `${alter} ALTER COLUMN ${quoteIdentifier(next.name)}`;
+      const renameLater = renamedAfterRetype(column);
+      const current = renameLater ? previous.name : next.name;
+      let prefix = `${alter} ALTER COLUMN ${quoteIdentifier(current)}`;
 
       if (previous.identity && !next.identity) {
         statements.push(`${prefix} DROP IDENTITY`);
       }
 
+      // SET DEFAULT replaces a default in place; dropping it first would leave
+      // a window without one when each statement commits (--online).
       if (
         previous.default !== undefined &&
-        (column.typeChanged ||
-          previous.default !== next.default ||
-          next.identity)
+        (column.typeChanged || next.identity || next.default === undefined)
       ) {
         statements.push(`${prefix} DROP DEFAULT`);
       }
 
       if (column.typeChanged) {
+        // An explicit ::varchar(n) cuts long values; without USING, PostgreSQL's
+        // assignment cast rejects them instead.
         const conversion =
           casts[pair.after.name]?.[next.name] ??
-          `${quoteIdentifier(next.name)}${previous.enumeration || next.enumeration ? "::text" : ""}::${columnTypeSQL(next)}`;
+          (typeConversion(previous, next)?.assignmentCast
+            ? undefined
+            : `${quoteIdentifier(current)}${previous.enumeration || next.enumeration ? "::text" : ""}::${columnTypeSQL(next)}`);
         statements.push(
-          `${prefix} TYPE ${columnTypeSQL(next)} USING ${conversion}`,
+          `${prefix} TYPE ${columnTypeSQL(next)}${conversion === undefined ? "" : ` USING ${conversion}`}`,
         );
+
+        if (renameLater) {
+          statements.push(
+            `${alter} RENAME COLUMN ${quoteIdentifier(previous.name)} TO ${quoteIdentifier(next.name)}`,
+          );
+          prefix = `${alter} ALTER COLUMN ${quoteIdentifier(next.name)}`;
+        }
       }
 
       if (previous.notNull !== next.notNull) {
@@ -803,8 +941,18 @@ const direction = (
         }
       }
 
+      if (
+        previous.identity &&
+        next.identity &&
+        !previous.identityByDefault !== !next.identityByDefault
+      ) {
+        statements.push(
+          `${prefix} SET GENERATED ${next.identityByDefault ? "BY DEFAULT" : "ALWAYS"}`,
+        );
+      }
+
       if (!previous.identity && next.identity) {
-        statements.push(`${prefix} ADD GENERATED ALWAYS AS IDENTITY`);
+        statements.push(`${prefix} ADD ${identitySQL(next)}`);
         statements.push(
           `SELECT setval(pg_get_serial_sequence(${quoteLiteral(quoteIdentifier(pair.after.name))}, ${quoteLiteral(next.name)}), GREATEST(COALESCE(MAX(${quoteIdentifier(next.name)}), 0), 0) + 1, false) FROM ${quoteIdentifier(pair.after.name)}`,
         );
@@ -913,7 +1061,11 @@ const direction = (
   for (const enumeration of before.enumerations) {
     const temporary = oldEnumerationNames.get(enumeration.name);
 
-    if (temporary || !afterEnumerations.has(enumeration.name)) {
+    if (
+      temporary ||
+      (!afterEnumerations.has(enumeration.name) &&
+        !enumerationRenames.has(enumeration.name))
+    ) {
       statements.push(
         `DROP TYPE ${quoteIdentifier(temporary ?? enumeration.name)}`,
       );
@@ -989,6 +1141,7 @@ export const diffSchemas = (
       { tables: reverseTables, columns: reverseColumns },
       reverseCasts,
       options.online,
+      true,
     ),
   };
 };

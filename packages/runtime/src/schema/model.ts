@@ -4,9 +4,11 @@
  * Runtime lowering reuses the snapshot assembler; queries use the typed graph.
  */
 import { extendBuilder } from "../query/expressions/callable";
+import type { TraitedRow } from "../query/expressions";
 import {
   COLUMN_CODEC,
   isColumn,
+  type ColumnInputType,
   type ColumnMetadata as ColumnTypeMetadata,
   type Column,
   builderExample,
@@ -82,9 +84,11 @@ import { createNestedInsert } from "../query/write/nested-inserts";
 import type { NestedInsertQuery } from "../query/write/mutations";
 import { executorProfiling } from "../observability/profiling";
 import { isRetryableTransactionError } from "../driver/errors";
-import type { Omittable, Writable } from "./infer";
+import type { Omittable, TableTraits, Writable } from "./infer";
 
 const LINK = Symbol("symmetria.schema.link");
+/** The longest wait between two `$transaction` retries, unless retryDelayMs is longer. */
+const MAX_RETRY_DELAY_MS = 1000;
 export type LinkOptions = {
   [OptionName in keyof ReferenceFlags]?: ReferenceFlags[OptionName] | undefined;
 } & { inverse?: string | undefined };
@@ -355,6 +359,13 @@ type ColumnValue<Definition> =
       ? Metadata["valueType"] | null
       : Metadata["valueType"]
     : never;
+/** What a write accepts: a jsonb(schema)'s input type, otherwise the read type. */
+type ColumnWriteValue<Definition> =
+  Definition extends Column<infer Metadata>
+    ? Metadata["notNull"] extends false
+      ? ColumnInputType<Metadata> | null
+      : ColumnInputType<Metadata>
+    : never;
 type PrimaryKeyValue<
   Definition extends SchemaDefinitions,
   TableName extends StringKeys<Definition>,
@@ -393,15 +404,19 @@ type ThroughBy<
     >
   : undefined;
 
+/** The row a read returns; with `Write`, the values a write accepts (a jsonb(schema)'s input). */
 export type Row<
   Definition extends SchemaDefinitions,
   TableName extends StringKeys<Definition>,
+  Write extends boolean = false,
 > = Simplify<
   {
     [ColumnName in Exclude<
       StringKeys<Definition[TableName]>,
       ReferenceColumnNames<Definition[TableName]>
-    >]: ColumnValue<Definition[TableName][ColumnName]>;
+    >]: Write extends true
+      ? ColumnWriteValue<Definition[TableName][ColumnName]>
+      : ColumnValue<Definition[TableName][ColumnName]>;
   } & {
     [ColumnName in ReferenceColumnNames<
       Definition[TableName]
@@ -442,18 +457,18 @@ export type Insert<
   TableName extends StringKeys<Definition>,
 > = Writable<
   Omit<
-    Row<Definition, TableName>,
+    Row<Definition, TableName, true>,
     | OptionalColumnNames<Definition[TableName]>
     | GeneratedColumns<Definition[TableName]>
   > &
     Omittable<
       Pick<
-        Row<Definition, TableName>,
+        Row<Definition, TableName, true>,
         Exclude<
           OptionalColumnNames<Definition[TableName]>,
           GeneratedColumns<Definition[TableName]>
         > &
-          keyof Row<Definition, TableName>
+          keyof Row<Definition, TableName, true>
       >
     > & { [ColumnName in GeneratedColumns<Definition[TableName]>]?: undefined }
 >;
@@ -686,8 +701,12 @@ type ValidateSchema<Definition extends SchemaDefinitions> = [
       >;
     };
 
+/** Read rows carrying their columns' query traits (float and jsonb columns, stored jsonb(schema) input). */
 type QueryRows<Definition extends SchemaDefinitions> = {
-  [TableName in StringKeys<Definition>]: Row<Definition, TableName>;
+  [TableName in StringKeys<Definition>]: TraitedRow<
+    Row<Definition, TableName>,
+    TableTraits<Definition[TableName]>
+  >;
 };
 
 type UniqueColumnNames<Columns> = {
@@ -910,7 +929,7 @@ export type SchemaOptions<
 /** Per-table predicates applied to every read, update and delete of a scoped database. */
 export type ScopeDefinitions<Definition extends SchemaDefinitions> = {
   readonly [TableName in StringKeys<Definition>]?: (
-    columns: Columns<Row<Definition, TableName>>,
+    columns: Columns<QueryRows<Definition>[TableName]>,
   ) => Predicate;
 };
 
@@ -954,7 +973,7 @@ export type Database<
   $transaction: <Result>(
     callback: (
       transaction: TransactionDatabase<Definition, Relations>,
-    ) => Promise<Result>,
+    ) => PromiseLike<Result>,
     options?: TransactionOptions,
   ) => Promise<Result>;
 };
@@ -976,7 +995,7 @@ export type TransactionDatabase<
   readonly $transaction: <Result>(
     callback: (
       transaction: TransactionDatabase<Definition, Relations>,
-    ) => Promise<Result>,
+    ) => PromiseLike<Result>,
   ) => Promise<Result>;
   readonly $createIndexes: (
     options?: Omit<CreateIndexesOptions, "concurrently"> & {
@@ -992,7 +1011,7 @@ export type Transaction<
   },
 > = Parameters<DatabaseInstance["$transaction"]>[0] extends (
   transaction: infer TransactionScope,
-) => Promise<unknown>
+) => PromiseLike<unknown>
   ? TransactionScope
   : never;
 
@@ -1680,6 +1699,7 @@ const createSchema = <
         codecs,
         (scope) => ({ [second]: index(scope[table.name]![second]!) }),
         table.name,
+        true,
       );
     }
   }
@@ -1715,7 +1735,7 @@ const createSchema = <
     const profile = executorProfiling(executor);
 
     const runTransaction = async <Result>(
-      callback: (database: Record<string, unknown>) => Promise<Result>,
+      callback: (database: Record<string, unknown>) => PromiseLike<Result>,
       options?: TransactionOptions,
     ): Promise<Result> => {
       const run = async (connection: TransactionDriver) =>
@@ -1771,7 +1791,14 @@ const createSchema = <
             throw error;
           }
 
-          const delay = Math.random() * retryDelayMs * 2 ** attempt;
+          // The wait doubles per attempt up to a second (or retryDelayMs when
+          // larger), so twenty retries under contention never wait for hours.
+          const delay =
+            Math.random() *
+            Math.min(
+              retryDelayMs * 2 ** attempt,
+              Math.max(retryDelayMs, MAX_RETRY_DELAY_MS),
+            );
 
           if (delay > 0) {
             await new Promise((resolve) => setTimeout(resolve, delay));

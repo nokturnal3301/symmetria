@@ -6,10 +6,19 @@ import {
   COLUMN_CODEC,
   isColumn,
   type Column,
+  type ColumnInputType,
+  type IsDecimalText,
+  type MetadataTraits,
   type Vector,
 } from "../../schema/column";
 import { codecFor, encodeValue, cloneParameter } from "../codecs";
-import { compileQuery, executeCompiled } from "../compile";
+import { throwDataErrors } from "../codecs/deferred";
+import {
+  compileTemplate,
+  currentScopes,
+  executeCompiled,
+  type CompiledStatement,
+} from "../compile";
 import {
   createExpression,
   NAMED_PARAMETER,
@@ -42,15 +51,31 @@ type ParameterTypes<Definitions extends Record<string, Column>> = {
     ? Metadata["valueType"] | (Metadata["notNull"] extends false ? null : never)
     : never;
 };
-/** Values passed at execution; vectors accept plain number arrays and decimals any string, like writes do. */
+/** How a parameter computes and compares, like a column of its type. */
+type ParameterTraits<Definition> =
+  Definition extends Column<infer Metadata> ? MetadataTraits<Metadata> : {};
+/** What a parameter stores: a jsonb(schema)'s input, otherwise its value type. */
+type ParameterInputs<Definitions extends Record<string, Column>> = {
+  [Name in keyof Definitions]: Definitions[Name] extends Column<infer Metadata>
+    ?
+        | ColumnInputType<Metadata>
+        | (Metadata["notNull"] extends false ? null : never)
+    : never;
+};
+/**
+ * Values passed at execution, encoded like writes: vectors accept plain number
+ * arrays, decimals any string and a jsonb(schema) its input.
+ */
 type ParameterValues<Definitions extends Record<string, Column>> = {
   [Name in keyof Definitions]: NonNullable<
-    ParameterTypes<Definitions>[Name]
+    ParameterInputs<Definitions>[Name]
   > extends Vector
-    ? ParameterTypes<Definitions>[Name] | readonly number[]
-    : NonNullable<ParameterTypes<Definitions>[Name]> extends `${number}`
-      ? ParameterTypes<Definitions>[Name] | string
-      : ParameterTypes<Definitions>[Name];
+    ? ParameterInputs<Definitions>[Name] | readonly number[]
+    : IsDecimalText<
+          NonNullable<ParameterInputs<Definitions>[Name]>
+        > extends true
+      ? ParameterInputs<Definitions>[Name] | string
+      : ParameterInputs<Definitions>[Name];
 };
 type PreparedArguments<Values> = keyof Values extends never
   ? []
@@ -118,7 +143,8 @@ export const prepare = <
     parameters: {
       readonly [Name in keyof Definitions & string]: Parameter<
         ParameterTypes<Definitions>[Name],
-        Name
+        Name,
+        ParameterTraits<Definitions[Name]>
       >;
     },
   ) => Preparable<Result, Kind>,
@@ -191,13 +217,13 @@ export const preparePlan = (
     return node;
   };
 
-  const templates = new WeakMap<SelectPlan | MutationPlan, CompiledQuery>();
+  const templates = new WeakMap<SelectPlan | MutationPlan, CompiledStatement>();
 
-  const template = (state: SelectPlan | MutationPlan): CompiledQuery => {
+  const template = (state: SelectPlan | MutationPlan): CompiledStatement => {
     let compiled = templates.get(state);
 
     if (!compiled) {
-      compiled = compileQuery(state, placeholder);
+      compiled = compileTemplate(state, placeholder);
       templates.set(state, compiled);
     }
 
@@ -227,11 +253,20 @@ export const preparePlan = (
     }
   };
 
-  const bind = (
+  const bindValues = (
     state: SelectPlan | MutationPlan,
     values: Record<string, unknown>,
   ): CompiledQuery => {
-    const compiled = state === plan && primary ? primary : template(state);
+    const statement = state === plan && primary ? primary : template(state);
+    // $scope() filters bind the values current at this execution.
+    const compiled = statement.scopes
+      ? currentScopes(
+          state,
+          statement,
+          statement.parameters.slice(),
+          placeholder,
+        )
+      : statement;
 
     return {
       sql: compiled.sql,
@@ -258,10 +293,24 @@ export const preparePlan = (
           );
         }
 
-        return cloneParameter(encodeValue(bound, node.codec));
+        return cloneParameter(
+          encodeValue(
+            node.cap === undefined
+              ? bound
+              : Math.min(bound as number, node.cap),
+            node.codec,
+          ),
+        );
       }),
     };
   };
+
+  const bind = (
+    state: SelectPlan | MutationPlan,
+    values: Record<string, unknown>,
+  ): CompiledQuery =>
+    // Values bound at execution fail it, even when bound inside a builder.
+    throwDataErrors(() => bindValues(state, values));
 
   const execute = async (values: Record<string, unknown> = {}) => {
     validate(values);
@@ -302,13 +351,16 @@ export const preparePlan = (
 
     return (await executeCompiled(state, bind(state, values), executor)).rows;
   };
-  const limited = (limit: 1 | 2): SelectPlan => {
-    if (typeof plan.limit === "object") {
-      throw new Error("symmetria: bind a parameterized LIMIT with prepare()");
-    }
-
-    return limitedPlan(plan, limit);
-  };
+  // A parameterized root LIMIT keeps its SQL and binds min(value, cap), so a
+  // LIMIT of 1 still reads at most one row and one() never sees a false second.
+  const capped: (SelectPlan | undefined)[] = [];
+  const limited = (limit: 1 | 2): SelectPlan =>
+    typeof plan.limit === "object"
+      ? (capped[limit] ??= freeze({
+          ...plan,
+          limit: freeze({ ...plan.limit, cap: limit }),
+        }))
+      : limitedPlan(plan, limit);
   const single = async (
     values: Record<string, unknown>,
     required: boolean,

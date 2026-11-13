@@ -14,9 +14,14 @@
  *   - `self` (with the same chain as tables, e.g. `self.nullable.inverse("children")`) → self-reference
  */
 
-import { isColumn, type ColumnMetadata, type Column } from "./column";
+import {
+  isColumn,
+  type ColumnMetadata,
+  type Column,
+  type TraitsMetadata,
+} from "./column";
 import type { LinkMetadata, LinkOptions } from "./model";
-import type { RowOf } from "./infer";
+import type { RowOf, TableTraits } from "./infer";
 import {
   createScope,
   type Columns as QueryColumns,
@@ -27,11 +32,13 @@ import {
   type Predicate,
   type SelectedColumn,
   type ExpressionValue,
+  type TraitedRow,
+  type TraitsOf,
 } from "../query/expressions";
 import type { ComputedCallback } from "./computed";
 import type { CONDITION, TableRelationCallback } from "./conditions";
 import type { TableBinding } from "../query/plan/types";
-import type { IndexDefinition } from "./indexes";
+import type { IndexDefinition, SchemaCondition } from "./indexes";
 
 export const TABLE: unique symbol = Symbol("symmetria.table");
 const TABLE_PRIMARY_KEY: unique symbol = Symbol("symmetria.table.primaryKey");
@@ -119,18 +126,21 @@ type LinkValue<Options, Value, Shape> = Options extends {
   : Value;
 
 export type TableIndexColumns<ColumnDefinitions> = QueryColumns<
-  RowOf<Omit<ColumnDefinitions, KeyedReferenceNames<ColumnDefinitions>>> & {
-    [ColumnName in KeyedReferenceNames<ColumnDefinitions> as `${ColumnName}Id`]: ColumnDefinitions[ColumnName] extends LinkMetadata<
-      string,
-      infer Options,
-      infer Value,
-      infer Shape
-    >
-      ?
-          | LinkValue<Options, Value, Shape>
-          | (Options extends { nullable: true } ? null : never)
-      : never;
-  }
+  TraitedRow<
+    RowOf<Omit<ColumnDefinitions, KeyedReferenceNames<ColumnDefinitions>>> & {
+      [ColumnName in KeyedReferenceNames<ColumnDefinitions> as `${ColumnName}Id`]: ColumnDefinitions[ColumnName] extends LinkMetadata<
+        string,
+        infer Options,
+        infer Value,
+        infer Shape
+      >
+        ?
+            | LinkValue<Options, Value, Shape>
+            | (Options extends { nullable: true } ? null : never)
+        : never;
+    },
+    TableTraits<ColumnDefinitions>
+  >
 >;
 
 export type TableIndexCallback = (
@@ -138,7 +148,7 @@ export type TableIndexCallback = (
 ) => Record<string, IndexDefinition>;
 export type TableCheckCallback = (
   columns: RuntimeScope[string],
-) => Record<string, Predicate>;
+) => Record<string, SchemaCondition>;
 
 type MarkedPrimaryKeys<ColumnDefinitions> = {
   [ColumnName in keyof ColumnDefinitions &
@@ -345,12 +355,14 @@ export type TableHandle<Columns> = Table<Columns> &
       callback: (columns: TableIndexColumns<Columns>) => Selection,
     ) => TableHandle<
       Columns & {
-        [Name in keyof Selection]: Column<{
-          valueType: ExpressionValue<Selection[Name]>;
-          notNull: true;
-          hasDefault: false;
-          computed: true;
-        }>;
+        [Name in keyof Selection]: Column<
+          {
+            valueType: ExpressionValue<Selection[Name]>;
+            notNull: true;
+            hasDefault: false;
+            computed: true;
+          } & TraitsMetadata<TraitsOf<Selection[Name]>>
+        >;
       }
     >;
     /**
@@ -394,10 +406,11 @@ export type TableHandle<Columns> = Table<Columns> &
         };
       }
     >;
+    /** CHECK constraints: predicates, or boolean expressions such as ``sql<boolean>`${t.price} > 0` ``. */
     readonly checks: (
       callback: (
         columns: TableIndexColumns<Columns>,
-      ) => Record<string, Predicate>,
+      ) => Record<string, SchemaCondition>,
     ) => TableHandle<Columns>;
     readonly primaryKey: Columns extends { readonly [TABLE_JUNCTION]: true }
       ? never

@@ -3,6 +3,7 @@
  */
 import { freeze } from "../plan/freeze";
 import { cloneParameter, type SchemaCodecs } from "../codecs";
+import { collectDataErrors } from "../codecs/deferred";
 import { quoteIdentifier } from "../compile";
 import {
   and,
@@ -289,9 +290,13 @@ export const createNestedInsert = (
     return freeze(result);
   };
 
-  const values = (Array.isArray(input) ? input : [input]).map((row) =>
-    capture(tableName, row),
-  ) as readonly Record<string, unknown>[];
+  // A value the codecs reject fails the insert when it runs.
+  const [values, failure] = collectDataErrors(
+    () =>
+      (Array.isArray(input) ? input : [input]).map((row) =>
+        capture(tableName, row),
+      ) as readonly Record<string, unknown>[],
+  );
 
   const build = (selector?: Selector): object => {
     const execute = () =>
@@ -504,7 +509,8 @@ export const createNestedInsert = (
             }
 
             // Under $scope() the upsert throws SYMMETRIA_OUT_OF_SCOPE when the
-            // existing row lies outside the scope, so nothing links to it.
+            // existing row lies outside the scope, so nothing links to it; like
+            // every row of a nested insert, the upserted row is checked too.
             return mutate(target, "insert", payload)
               .onConflict(...key)
               .doUpdate(...key)
@@ -655,13 +661,15 @@ export const createNestedInsert = (
         return Array.isArray(input) ? results : results[0];
       });
 
+    const run = () => (failure ? Promise.reject(failure.error) : execute());
+
     return freeze({
       returning: (next: Selector) => build(next),
-      execute,
+      execute: run,
       then: (
         onFulfilled?: ((value: unknown) => unknown) | null,
         onRejected?: ((reason: unknown) => unknown) | null,
-      ) => execute().then(onFulfilled, onRejected),
+      ) => run().then(onFulfilled, onRejected),
     });
   };
 

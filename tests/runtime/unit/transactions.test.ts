@@ -214,3 +214,61 @@ test("transactions retry serialization failures and deadlocks, nothing else", as
     ),
   ).rejects.toThrow(/non-negative/);
 });
+
+test("retry waits double up to a second, or retryDelayMs when it is longer", async () => {
+  const serialization = Object.assign(new Error("conflict"), { code: "40001" });
+  const conflicting = (failures: number): Driver => {
+    let calls = 0;
+
+    return {
+      execute: async () => [],
+      close: async () => {},
+      transaction: async (callback) => {
+        if (calls++ < failures) {
+          throw serialization;
+        }
+
+        return callback({
+          execute: async () => [],
+          transaction: async () => {
+            throw new Error("unused");
+          },
+        });
+      },
+    };
+  };
+  const waits: number[] = [];
+  const originalRandom = Math.random;
+  const originalTimeout = globalThis.setTimeout;
+  Math.random = () => 1;
+  // Record each wait and continue at once.
+  globalThis.setTimeout = ((resolve: () => void, delay: number) => {
+    waits.push(delay);
+
+    return originalTimeout(resolve, 0);
+  }) as typeof setTimeout;
+
+  try {
+    for (const retryDelayMs of [10, 3000]) {
+      await schema(
+        { users: { id: int } },
+        { driver: conflicting(20) },
+      ).$transaction(async () => "done", { retries: 20, retryDelayMs });
+    }
+  } finally {
+    Math.random = originalRandom;
+    globalThis.setTimeout = originalTimeout;
+  }
+
+  expect(waits.slice(0, 20)).toEqual([
+    10,
+    20,
+    40,
+    80,
+    160,
+    320,
+    640,
+    ...Array(13).fill(1000),
+  ]);
+  expect(waits.slice(20)).toEqual(Array(20).fill(3000));
+});

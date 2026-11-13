@@ -1,5 +1,6 @@
 /** Query handles: the shared prototype of every query and the callable that extends it. */
 import { freeze } from "../plan/freeze";
+import { collectDataErrors } from "../codecs/deferred";
 import { createExpression } from "../expressions";
 import {
   compilePlan,
@@ -164,21 +165,6 @@ export const createQueryFactory = (
       : initialPlan(state.root);
   };
 
-  /**
-   * The plan a terminal runs. A bare table or alias handle (`scoped.posts`,
-   * `scoped.posts.as("p")`) keeps the plan built when it was created, so its
-   * `$scope()` predicates are evaluated again here, like every new query does.
-   */
-  const currentPlan = (handle: QueryHandle): SelectPlan => {
-    const { plan, freshSource, allowScopedAlias } = handle[QUERY_STATE];
-
-    return freshSource &&
-      allowScopedAlias &&
-      registry.scopes[plan.root.table.name]
-      ? registry.scopedPlan(plan.root)
-      : plan;
-  };
-
   const single = async (
     state: SelectPlan,
     required: boolean,
@@ -194,6 +180,25 @@ export const createQueryFactory = (
     }
 
     return rows[0] ?? null;
+  };
+
+  /**
+   * A CTE named like a table would hide that table everywhere in the
+   * statement, so `FROM "products"` would silently read the CTE instead.
+   */
+  const commonTableName = (name: string): string => {
+    quoteIdentifier(name);
+    const hidden = registry.snapshot.tables.find(
+      (table) => table.sqlName === name,
+    );
+
+    if (hidden) {
+      throw new Error(
+        `symmetria: CTE "${name}" has the SQL name of table "${hidden.name}" and would hide it; choose another CTE name`,
+      );
+    }
+
+    return name;
   };
 
   // Top-level queries share their table's root binding, so a query placed inside
@@ -238,7 +243,10 @@ export const createQueryFactory = (
             throw new Error("symmetria: materialized must be a boolean");
           }
 
-          const derived = derivedBinding(embedded(this[QUERY_STATE]), name);
+          const derived = derivedBinding(
+            embedded(this[QUERY_STATE]),
+            commonTableName(name),
+          );
           const { derived: _query, ...binding } = derived;
           const identity = freeze({});
           const definition: CommonTableExpression = freeze({
@@ -283,7 +291,10 @@ export const createQueryFactory = (
             throw new Error("symmetria: unionAll must be a boolean");
           }
 
-          const derived = derivedBinding(embedded(this[QUERY_STATE]), name);
+          const derived = derivedBinding(
+            embedded(this[QUERY_STATE]),
+            commonTableName(name),
+          );
           const { derived: _query, ...binding } = derived;
           const identity = freeze({});
           const reference = freeze({
@@ -493,13 +504,18 @@ export const createQueryFactory = (
         },
         async count(this: QueryHandle) {
           return readCount(
-            (await executePlan(countPlan(currentPlan(this)), executor)).rows,
+            (await executePlan(countPlan(this[QUERY_STATE].plan), executor))
+              .rows,
           );
         },
         async exists(this: QueryHandle) {
           return readExists(
-            (await executePlan(existsPlan(currentPlan(this), false), executor))
-              .rows,
+            (
+              await executePlan(
+                existsPlan(this[QUERY_STATE].plan, false),
+                executor,
+              )
+            ).rows,
           );
         },
       }),
@@ -518,17 +534,22 @@ export const createQueryFactory = (
       options?: Record<string, unknown>,
     ) => {
       const shared = freshSource && !shapeFrame.bindings;
-      const current = freshSource
-        ? startPlan(state, allowScopedAlias, freshSource)
-        : queryOccurrence(state);
+      // Data errors in the callbacks fail the query when it runs.
+      const [plan, failure] = collectDataErrors(() => {
+        const current = freshSource
+          ? startPlan(state, allowScopedAlias, freshSource)
+          : queryOccurrence(state);
 
-      return createQuery(
-        applyShape(
+        return applyShape(
           createContext(registry, current),
           current.root,
           callback,
           options,
-        ),
+        );
+      });
+
+      return createQuery(
+        failure && !plan.failure ? freeze({ ...plan, failure }) : plan,
         false,
         false,
         queryPrototype,

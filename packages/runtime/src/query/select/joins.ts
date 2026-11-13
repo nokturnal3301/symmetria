@@ -21,7 +21,8 @@ import {
   type TableSource,
 } from "../plan/types";
 import { shapeExpressions } from "./projections";
-import { createScope, validatePredicate } from "./scope";
+import type { ColumnSnapshot, TableSnapshot } from "../../schema/assembly";
+import { createScope, initialPlan, validatePredicate } from "./scope";
 import { columnsOnly } from "./suggest";
 import {
   CONDITION,
@@ -55,6 +56,75 @@ export const columnNode = (
     kind: "column",
     description: freeze({ binding, column }),
   });
+};
+
+const primaryKeyColumns = (table: TableSnapshot): readonly ColumnSnapshot[] =>
+  table.primaryKey
+    ? table.primaryKey.map(
+        (name) => table.columns.find((column) => column.sqlName === name)!,
+      )
+    : table.columns.filter((column) => column.primaryKey);
+
+/**
+ * A one() condition relation can match several rows. It resolves to the first
+ * match by the target's primary key, so a JOIN never multiplies source rows
+ * and a nested object never meets a second row. Each key column equals a
+ * scalar subquery over the matches, which PostgreSQL can still hash-join.
+ */
+const firstMatch = (
+  registry: TableRegistry,
+  source: TableBinding,
+  relationName: string,
+  target: TableBinding,
+  condition: (target: TableBinding) => PredicateDescription,
+): PredicateDescription => {
+  const keys = primaryKeyColumns(target.table);
+
+  if (!keys.length) {
+    throw new Error(
+      `symmetria: relation "${source.table.name}.${relationName}" is one() and resolves to the first match by the primary key of "${target.table.name}", which has none; declare a primary key or use many()`,
+    );
+  }
+
+  const candidate = registry.bindingFor(target.table.name, target.alias);
+  const key = (column: ColumnSnapshot) =>
+    freeze({
+      outputName: column.name,
+      node: columnNode(candidate, column.name),
+    });
+  const matches: SelectPlan = freeze({
+    ...initialPlan(candidate),
+    predicates: freeze([
+      condition(candidate),
+      ...registry.scopePredicates(candidate),
+    ]),
+    ordering: freeze(
+      keys.map((column) =>
+        freeze({ expression: key(column), direction: "ASC" as const }),
+      ),
+    ),
+    limit: 1,
+  });
+  const comparisons = keys.map(
+    (column): PredicateDescription =>
+      freeze({
+        kind: "comparison",
+        left: columnNode(target, column.name),
+        operator: "=",
+        right: freeze({
+          kind: "subquery",
+          query: freeze({ ...matches, selection: freeze([key(column)]) }),
+        }),
+      }),
+  );
+
+  return comparisons.length === 1
+    ? comparisons[0]!
+    : freeze({
+        kind: "group",
+        operator: "AND",
+        predicates: freeze(comparisons),
+      });
 };
 
 export const joinRelation = (
@@ -140,46 +210,60 @@ export const joinRelation = (
   if (relation.kind === "condition") {
     // The declaring table's callbacks run again with this query's bindings, so
     // the predicate refers to the real source and target aliases.
-    const declaring = relation.reverse === true ? target : source;
-    const other = relation.reverse === true ? source : target;
-    const name = relation.reverse === true ? relation.inverseOf : relation.name;
-    const scope = createScope({
-      [declaring.alias]: declaring,
-      [other.alias]: other,
-    });
-    const strict = (binding: TableBinding) =>
-      columnsOnly(
-        binding.table,
-        scope[binding.alias]!,
-        "relations() predicates",
-      );
-    const declared = declaredConditions(
-      conditionRelations.get(declaring.table) ?? [],
-      strict(declaring),
-      declaring.table.name,
-    );
-    const entry = declared[name];
-
-    if (!entry) {
-      throw new Error(
-        `symmetria: condition relation "${declaring.table.name}.${name}" is not declared by relations()`,
-      );
-    }
-
-    const condition = readPredicate(entry[CONDITION].predicate(strict(other)));
-
-    try {
-      validatePredicate(condition, {
-        [source.alias]: source,
-        [target.alias]: target,
+    const declaredCondition = (
+      targetBinding: TableBinding,
+    ): PredicateDescription => {
+      const declaring = relation.reverse === true ? targetBinding : source;
+      const other = relation.reverse === true ? source : targetBinding;
+      const name =
+        relation.reverse === true ? relation.inverseOf : relation.name;
+      const scope = createScope({
+        [declaring.alias]: declaring,
+        [other.alias]: other,
       });
-    } catch (error) {
-      throw new Error(
-        `symmetria: relation "${declaring.table.name}.${name}" may only compare columns of "${source.table.name}" and "${target.table.name}" (${(error as Error).message.replace(/^symmetria: /, "")})`,
+      const strict = (binding: TableBinding) =>
+        columnsOnly(
+          binding.table,
+          scope[binding.alias]!,
+          "relations() predicates",
+        );
+      const declared = declaredConditions(
+        conditionRelations.get(declaring.table) ?? [],
+        strict(declaring),
+        declaring.table.name,
       );
-    }
+      const entry = declared[name];
 
-    addJoin(target, condition);
+      if (!entry) {
+        throw new Error(
+          `symmetria: condition relation "${declaring.table.name}.${name}" is not declared by relations()`,
+        );
+      }
+
+      const condition = readPredicate(
+        entry[CONDITION].predicate(strict(other)),
+      );
+
+      try {
+        validatePredicate(condition, {
+          [source.alias]: source,
+          [targetBinding.alias]: targetBinding,
+        });
+      } catch (error) {
+        throw new Error(
+          `symmetria: relation "${declaring.table.name}.${name}" may only compare columns of "${source.table.name}" and "${targetBinding.table.name}" (${(error as Error).message.replace(/^symmetria: /, "")})`,
+        );
+      }
+
+      return condition;
+    };
+
+    addJoin(
+      target,
+      relation.many
+        ? declaredCondition(target)
+        : firstMatch(registry, source, relationName, target, declaredCondition),
+    );
   } else if (relation.kind === "through") {
     const reservedAliases = new Set([
       ...outerAliases,

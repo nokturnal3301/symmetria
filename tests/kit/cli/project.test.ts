@@ -67,7 +67,7 @@ test("noninteractive generation requires destructive opt-in and lint still fails
     ).toBe(0);
     const lint = await run(directory, "lint", "--json");
     expect(lint.exitCode).toBe(1);
-    expect(JSON.parse(lint.stdout)).toEqual(
+    expect(JSON.parse(lint.stdout).findings).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ level: "destructive", table: "000002_mail" }),
       ]),
@@ -98,7 +98,7 @@ test("strict lint passes a fresh initial migration with unique keys, indexes and
         .exitCode,
     ).toBe(0);
     const lint = await run(directory, "lint", "--strict", "--json");
-    expect(JSON.parse(lint.stdout)).toEqual([]);
+    expect(JSON.parse(lint.stdout)).toEqual({ findings: [] });
     expect(lint.exitCode).toBe(0);
   }));
 
@@ -229,6 +229,25 @@ test("diff and inspect are offline, support SQL and JSON, and expose relations a
     expect((await run(directory, "inspect", "missing")).exitCode).toBe(1);
     expect((await run(directory, "diff", "--sql", "--json")).exitCode).toBe(1);
     expect((await run(directory)).stdout).toContain("inspect [table]");
+
+    // Every --json success is one object, never a bare array.
+    expect(
+      JSON.parse(
+        (await run(directory, "inspect", "posts", "--relations", "--json"))
+          .stdout,
+      ),
+    ).toMatchObject({ tables: [{ name: "posts", relations: {} }] });
+    expect(
+      JSON.parse((await run(directory, "lint", "--json")).stdout),
+    ).toMatchObject({ findings: expect.any(Array) });
+
+    // --online previews the online SQL in diff, as generate writes it.
+    expect(
+      (await run(directory, "diff", "--sql", "--online")).stdout,
+    ).toContain('CREATE INDEX CONCURRENTLY "posts_title_idx"');
+    expect((await run(directory, "squash", "x", "--online")).stderr).toContain(
+      "--online is a generate/diff/lint option",
+    );
   }));
 
 test("interactive rename decisions generate actual renames and support cancellation", async () => {
@@ -292,7 +311,9 @@ test("pull needs a connection and keeps --force to itself", () =>
   withMigrationDirectory(async (directory) => {
     const missing = await run(directory, "pull");
     expect(missing.exitCode).toBe(1);
-    expect(missing.stderr).toContain("configure databaseUrl or DATABASE_URL");
+    expect(missing.stderr).toContain(
+      "no database: set databaseUrl in the config, DATABASE_URL or --database-url",
+    );
 
     const scoped = await run(directory, "drift", "--force");
     expect(scoped.exitCode).toBe(1);

@@ -44,6 +44,8 @@ export type MigrationManifest = {
   after: string;
   /** Omitted/batch preserves atomic execution of all pending transactional migrations. */
   transaction?: "batch" | "each" | "none";
+  /** SHA-256 of up.sql as generate wrote it; squash refuses to drop SQL that differs. */
+  generated?: string;
 };
 export type Migration = {
   id: string;
@@ -68,6 +70,8 @@ export type GenerateMigrationOptions = MigrationDiffOptions & {
 export type SquashMigrationsOptions = {
   directory: string;
   name: string;
+  /** Drop SQL that generate did not write (seeds, views, edited up.sql) instead of refusing. */
+  allowCustomSQL?: boolean;
 };
 type MigrationJournal = {
   version: 1;
@@ -77,6 +81,48 @@ const migrationIdPattern = /^\d{6}_[a-z0-9][a-z0-9_]*$/;
 const hashPattern = /^[a-f0-9]{64}$/;
 const metadataFiles = ["migration.json", "snapshot.json"];
 const lockName = generationLockName;
+
+/** Checksums ignore CRLF line endings, so an editor or Git setting cannot invalidate applied migrations. */
+const lineFeeds = (sql: string): string => sql.replaceAll("\r\n", "\n");
+
+const migrationChecksum = (
+  manifest: MigrationManifest,
+  up: string,
+  down: string,
+): string =>
+  checksum(
+    canonicalJSON({ manifest, up: lineFeeds(up), down: lineFeeds(down) }),
+  );
+
+/**
+ * Whether a journal checksum belongs to this migration: the line-feed form, or
+ * the exact bytes that releases before the normalization hashed for CRLF files.
+ */
+export const checksumMatches = (
+  migration: Migration,
+  recorded: string,
+): boolean =>
+  migration.checksum === recorded ||
+  checksum(
+    canonicalJSON({
+      manifest: migration.manifest,
+      up: migration.up,
+      down: migration.down,
+    }),
+  ) === recorded;
+
+const sqlChecksum = (up: string): string => checksum(lineFeeds(up));
+
+const parseMetadata = (directory: string, name: string, text: string) => {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    throw new Error(
+      `symmetria: ${join(directory, "meta", name)} is not valid JSON (${error instanceof Error ? error.message : String(error)}); restore it from version control`,
+      { cause: error },
+    );
+  }
+};
 
 const missing = (error: unknown): boolean =>
   !!error &&
@@ -140,8 +186,14 @@ const readMigrationState = async (
       readFile(join(directory, "meta", name), "utf8"),
     ),
   );
-  const journal = JSON.parse(journalText!) as MigrationJournal;
-  const snapshot = parseMigrationSnapshot(JSON.parse(snapshotText!));
+  const journal = parseMetadata(
+    directory,
+    "migration.json",
+    journalText!,
+  ) as MigrationJournal;
+  const snapshot = parseMigrationSnapshot(
+    parseMetadata(directory, "snapshot.json", snapshotText!),
+  );
 
   if (
     !journal ||
@@ -149,8 +201,14 @@ const readMigrationState = async (
     !Array.isArray(journal.migrations) ||
     journal.migrations.length !== directories.length
   ) {
+    const listed = Array.isArray(journal?.migrations)
+      ? journal.migrations.map((manifest) => String(manifest?.id))
+      : [];
+    const unlisted = directories.filter((id) => !listed.includes(id));
+    const absent = listed.filter((id) => !directories.includes(id));
+
     throw new Error(
-      "symmetria: migration journal does not match SQL directories",
+      `symmetria: migration journal ${join(directory, "meta", "migration.json")} does not match the SQL directories in ${directory} (${listed.length} listed, ${directories.length} found${absent.length ? `; missing directories: ${absent.join(", ")}` : ""}${unlisted.length ? `; directories not in the journal: ${unlisted.join(", ")}` : ""})`,
     );
   }
 
@@ -172,7 +230,10 @@ const readMigrationState = async (
       typeof manifest.after !== "string" ||
       !hashPattern.test(manifest.after) ||
       (manifest.transaction !== undefined &&
-        !["batch", "each", "none"].includes(manifest.transaction))
+        !["batch", "each", "none"].includes(manifest.transaction)) ||
+      (manifest.generated !== undefined &&
+        (typeof manifest.generated !== "string" ||
+          !hashPattern.test(manifest.generated)))
     ) {
       throw new Error(`symmetria: migration chain mismatch at "${id}"`);
     }
@@ -200,7 +261,7 @@ const readMigrationState = async (
       manifest,
       up,
       down,
-      checksum: checksum(canonicalJSON({ manifest, up, down })),
+      checksum: migrationChecksum(manifest, up, down),
     });
     previousHash = manifest.after;
     previousOrdinal = Number(id.slice(0, 6));
@@ -208,7 +269,7 @@ const readMigrationState = async (
 
   if (snapshotHash(snapshot) !== previousHash) {
     throw new Error(
-      "symmetria: latest snapshot checksum does not match the migration journal",
+      `symmetria: latest snapshot checksum does not match the migration journal: ${join(directory, "meta", "snapshot.json")} is not the schema after ${migrations.at(-1) ? `"${migrations.at(-1)!.id}"` : "an empty chain"} in ${join(directory, "meta", "migration.json")}`,
     );
   }
 
@@ -429,24 +490,49 @@ export const squashMigrations = async (
       return null;
     }
 
+    // The baseline is generated from the snapshot alone, so a new installation
+    // never runs SQL that generate did not write.
+    const custom = migrations.flatMap((migration) => {
+      const { manifest } = migration;
+      const empty = manifest.before === manifest.after;
+      const edited =
+        manifest.generated === undefined
+          ? // Journals from before the recorded checksum: only empty migrations are known to be hand-written.
+            empty && splitMigrationSQL(migration.up).length > 0
+          : manifest.generated !== sqlChecksum(migration.up);
+
+      return edited
+        ? [
+            `  - ${migration.id}: ${empty ? "SQL written into an empty migration" : "up.sql edited after generation"}`,
+          ]
+        : [];
+    });
+
+    if (custom.length && !options.allowCustomSQL) {
+      throw new Error(
+        `symmetria: squash would drop SQL that generate did not write, so new installations would never run it:\n${custom.join("\n")}\nCopy that SQL into a migration after the baseline (generate <name> --empty), or pass --allow-custom-sql (allowCustomSQL: true) to drop it.`,
+      );
+    }
+
     const plan = diffSchemas(emptySnapshot(), snapshot);
     const id = `000001_${name}`;
+    const up = formatMigrationSQL(plan.up);
+    const down = formatMigrationSQL(plan.down);
     const manifest: MigrationManifest = {
       version: 1,
       id,
       parent: null,
       before: snapshotHash(emptySnapshot()),
       after: snapshotHash(snapshot),
+      generated: sqlChecksum(up),
     };
-    const up = formatMigrationSQL(plan.up);
-    const down = formatMigrationSQL(plan.down);
     const squashed: GeneratedMigration = {
       id,
       manifest,
       snapshot,
       up,
       down,
-      checksum: checksum(canonicalJSON({ manifest, up, down })),
+      checksum: migrationChecksum(manifest, up, down),
     };
     await writeMigrationFiles(
       directory,
@@ -523,6 +609,8 @@ export const generateMigration = async (
     }
 
     const id = `${String(ordinal).padStart(6, "0")}_${name}`;
+    const up = formatMigrationSQL(plan.up);
+    const down = formatMigrationSQL(plan.down);
     const manifest: MigrationManifest = {
       version: 1,
       id,
@@ -534,16 +622,15 @@ export const generateMigration = async (
         : options.transaction && options.transaction !== "batch"
           ? { transaction: options.transaction }
           : {}),
+      generated: sqlChecksum(up),
     };
-    const up = formatMigrationSQL(plan.up);
-    const down = formatMigrationSQL(plan.down);
     const migration: GeneratedMigration = {
       id,
       manifest,
       snapshot: after,
       up,
       down,
-      checksum: checksum(canonicalJSON({ manifest, up, down })),
+      checksum: migrationChecksum(manifest, up, down),
     };
     await writeMigrationFiles(directory, migration, [
       ...migrations.map((entry) => entry.manifest),

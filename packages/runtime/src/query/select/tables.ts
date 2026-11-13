@@ -3,6 +3,7 @@ import { freeze } from "../plan/freeze";
 import type { ColumnSnapshot, SchemaSnapshot } from "../../schema/assembly";
 import { computedFields } from "../../schema/computed";
 import type { SchemaCodecs } from "../codecs";
+import { collectDataErrors, dataError } from "../codecs/deferred";
 import { quoteIdentifier } from "../compile";
 import {
   readColumn,
@@ -76,6 +77,7 @@ export const createQueryTables = (
               return createMutation("update", plan.root, values, executor, {
                 ...mutationOptions,
                 scope: () => plan.predicates,
+                ...(plan.failure ? { failure: plan.failure } : {}),
               });
             },
             delete(this: QueryHandle) {
@@ -84,6 +86,7 @@ export const createQueryTables = (
               return createMutation("delete", plan.root, {}, executor, {
                 ...mutationOptions,
                 scope: () => plan.predicates,
+                ...(plan.failure ? { failure: plan.failure } : {}),
               });
             },
           }),
@@ -92,37 +95,64 @@ export const createQueryTables = (
 
       /**
        * Key lookups build their plan directly instead of materializing a column
-       * scope; scoped tables and computed fields still need the full scope.
+       * scope; scoped tables and computed fields still need the full scope. A
+       * key value the codecs reject fails the lookup when it runs.
        */
       const keyLookup = (
+        label: "primary key" | "unique key",
         keys: readonly ColumnSnapshot[],
         values: readonly unknown[],
       ): object => {
+        const [plan, failure] = collectDataErrors(() =>
+          keyPlan(label, keys, values),
+        );
+
+        return createQuery(
+          failure ? freeze({ ...plan, failure }) : plan,
+          false,
+          false,
+          lookupPrototype,
+          plan.root === root,
+        );
+      };
+
+      const keyPlan = (
+        label: "primary key" | "unique key",
+        keys: readonly ColumnSnapshot[],
+        keyValues: readonly unknown[],
+      ): SelectPlan => {
         const binding = shapeFrame.bindings ? freeze({ ...root }) : root;
+        const values = keyValues.map((value, position) => {
+          if (value !== null && value !== undefined) {
+            return value;
+          }
+
+          dataError(
+            new Error(
+              `symmetria: ${label} "${keys[position]!.name}" cannot be null or undefined`,
+            ),
+          );
+
+          return null;
+        });
 
         if (registry.scopes[table.name] || computedFields.get(table)?.length) {
           const columns = createScope({ [binding.alias]: binding })[
             binding.alias
           ]!;
 
-          return createQuery(
-            freeze({
-              ...initialPlan(binding),
-              predicates: freeze([
-                ...registry.scopePredicates(binding),
-                ...keys.map((column, position) =>
-                  readPredicate(
-                    columns[column.name]!.is(values[position] as never),
-                  ),
+          return freeze({
+            ...initialPlan(binding),
+            predicates: freeze([
+              ...registry.scopePredicates(binding),
+              ...keys.map((column, position) =>
+                readPredicate(
+                  columns[column.name]!.is(values[position] as never),
                 ),
-              ]),
-              selection: freeze(Object.values(columns).map(readColumn)),
-            }),
-            false,
-            false,
-            lookupPrototype,
-            binding === root,
-          );
+              ),
+            ]),
+            selection: freeze(Object.values(columns).map(readColumn)),
+          });
         }
 
         const columnNode = (column: ColumnSnapshot): ValueNode =>
@@ -159,17 +189,11 @@ export const createQueryTables = (
           });
         });
 
-        return createQuery(
-          freeze({
-            ...initialPlan(binding),
-            predicates: freeze(predicates),
-            selection: freeze(selection),
-          }),
-          false,
-          false,
-          lookupPrototype,
-          binding === root,
-        );
+        return freeze({
+          ...initialPlan(binding),
+          predicates: freeze(predicates),
+          selection: freeze(selection),
+        });
       };
 
       const uniqueLookup = (names: readonly string[], value: unknown) => {
@@ -186,26 +210,16 @@ export const createQueryTables = (
           );
         }
 
-        const values = names.map((name) => {
-          const selected =
-            names.length === 1
-              ? value
-              : (value as Record<string, unknown>)[name];
-
-          if (selected === null || selected === undefined) {
-            throw new Error(
-              `symmetria: unique key "${name}" cannot be null or undefined`,
-            );
-          }
-
-          return selected;
-        });
-
         return keyLookup(
+          "unique key",
           names.map(
             (name) => table.columns.find((column) => column.name === name)!,
           ),
-          values,
+          names.map((name) =>
+            names.length === 1
+              ? value
+              : (value as Record<string, unknown>)[name],
+          ),
         );
       };
 
@@ -290,22 +304,15 @@ export const createQueryTables = (
               );
             }
 
-            const values = keys.map((column) => {
-              const selected =
+            return keyLookup(
+              "primary key",
+              keys,
+              keys.map((column) =>
                 keys.length === 1
                   ? value
-                  : (value as Record<string, unknown>)[column.name];
-
-              if (selected === null || selected === undefined) {
-                throw new Error(
-                  `symmetria: primary key "${column.name}" cannot be null or undefined`,
-                );
-              }
-
-              return selected;
-            });
-
-            return keyLookup(keys, values);
+                  : (value as Record<string, unknown>)[column.name],
+              ),
+            );
           },
           insert: (
             values:

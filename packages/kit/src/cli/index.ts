@@ -8,6 +8,27 @@ import { createContext, type Output } from "./context";
 import { formatHelp } from "./ui/format";
 import { help, parseCommandLine, resolveCommand } from "./options";
 import { formatError, supportsColor } from "./ui/style";
+import { sqlState } from "symmetria";
+import { MigrationExecutionError } from "../migrations/execution";
+
+/** A failure as JSON: the message, plus the failing statement for migration errors. */
+const errorJSON = (error: unknown, message: string) => {
+  if (error instanceof MigrationExecutionError) {
+    return {
+      message,
+      migration: error.migration,
+      direction: error.direction,
+      statement: error.statement,
+      sql: error.sql,
+      ...(error.sqlState ? { sqlState: error.sqlState } : {}),
+      ...(error.detail ? { detail: error.detail } : {}),
+    };
+  }
+
+  const state = sqlState(error);
+
+  return state ? { message, sqlState: state } : { message };
+};
 
 const runMigrationCLI = async (
   argumentsList: string[],
@@ -57,19 +78,35 @@ if (import.meta.main) {
     const messages: string[] = [];
 
     while (cause instanceof Error) {
-      messages.push(cause.message);
+      const { message } = cause;
+
+      // Wrappers such as MigrationExecutionError already quote their cause.
+      if (!messages.some((previous) => previous.includes(message))) {
+        messages.push(message);
+      }
+
       cause = cause.cause;
     }
 
-    console.error(
-      formatError(
-        messages.length ? messages.join("\n") : String(error),
-        supportsColor() &&
-          !process.argv.includes("--no-color") &&
-          !process.argv.includes("--json") &&
-          !process.argv.includes("--sql"),
-      ),
-    );
-    process.exitCode = 1;
+    const message = messages.length ? messages.join("\n") : String(error);
+
+    if (process.argv.includes("--json")) {
+      // Machine-readable runs get JSON on failure too, on stdout like a result.
+      console.log(JSON.stringify({ error: errorJSON(error, message) }));
+    } else {
+      console.error(
+        formatError(
+          message,
+          supportsColor() &&
+            !process.argv.includes("--no-color") &&
+            !process.argv.includes("--sql"),
+        ),
+      );
+    }
+
+    // Ctrl-C and SIGTERM already chose 130 and 143.
+    if (!process.exitCode) {
+      process.exitCode = 1;
+    }
   }
 }

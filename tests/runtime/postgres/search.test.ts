@@ -187,27 +187,23 @@ describe.skipIf(!databaseUrl)("full-text search on PostgreSQL", () => {
       })
       .toSQL();
 
-    await isolated.driver.execute({
-      sql: "SET enable_seqscan = off",
-      parameters: [],
-    });
+    // SET LOCAL keeps the planner setting on this transaction's connection.
+    const plan = await isolated.driver.transaction(async (transaction) => {
+      await transaction.execute({
+        sql: "SET LOCAL enable_seqscan = off",
+        parameters: [],
+      });
 
-    try {
-      const plan = rows(
-        await isolated.driver.execute({
+      return rows(
+        await transaction.execute({
           sql: `EXPLAIN ${compiled.sql}`,
           parameters: [...compiled.parameters],
         }),
       )
         .map((row) => String(row["QUERY PLAN"]))
         .join("\n");
+    });
 
-      expect(plan).toContain("posts_search_idx");
-    } finally {
-      await isolated.driver.execute({
-        sql: "RESET enable_seqscan",
-        parameters: [],
-      });
-    }
+    expect(plan).toContain("posts_search_idx");
   });
 });

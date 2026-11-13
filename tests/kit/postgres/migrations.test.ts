@@ -1,7 +1,6 @@
 import {
   afterAll,
   afterEach,
-  beforeAll,
   beforeEach,
   describe,
   expect,
@@ -42,15 +41,14 @@ import { migrationDirectory } from "../../support/directories";
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
-  const driver = postgres({
-    url: databaseUrl ?? "postgres://localhost/postgres",
-    max: 1,
-  });
-  const secondDriver = postgres({
-    url: databaseUrl ?? "postgres://localhost/postgres",
-    max: 1,
-  });
   const namespace = `symmetria_migrate_${crypto.randomUUID().replaceAll("-", "")}`;
+  // Migrations run in a session, whose connection is closed afterwards: every
+  // connection gets the search_path from the URL rather than from a SET. The
+  // second connection answers the migrator's transaction-pooling check.
+  const address = new URL(databaseUrl ?? "postgres://localhost/postgres");
+  address.searchParams.set("options", `-c search_path=${namespace}`);
+  const driver = postgres({ url: address.toString(), max: 2 });
+  const secondDriver = postgres({ url: address.toString(), max: 2 });
   let directory: string;
 
   const execute = async (statement: string, parameters: unknown[] = []) => {
@@ -112,13 +110,6 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     ),
   });
 
-  beforeAll(async () => {
-    await execute(`SET search_path TO "${namespace}"`);
-    await secondDriver.execute({
-      sql: `SET search_path TO "${namespace}"`,
-      parameters: [],
-    });
-  });
   beforeEach(async () => {
     directory = await migrationDirectory();
     await execute(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`);
@@ -1099,8 +1090,18 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     expect((await run("status")).stdout).toContain("applied 000001_cli");
     expect(await run("drift", "--strict", "--json")).toMatchObject({
       exitCode: 0,
-      stdout: "[]\n",
+      stdout: '{\n  "findings": []\n}\n',
     });
+    // Lists are one object too: status, plans and lint.
+    expect(JSON.parse((await run("status", "--json")).stdout)).toMatchObject({
+      migrations: [{ id: "000001_cli", status: "applied" }],
+    });
+    expect(
+      JSON.parse((await run("rollback", "--plan", "--json")).stdout),
+    ).toMatchObject({ steps: [{ id: "000001_cli", group: 1 }] });
+    expect(
+      JSON.parse((await run("lint", "--pending", "--json")).stdout),
+    ).toEqual({ findings: [] });
     expect(
       (await execute("SELECT to_regclass('cli_records')::text AS name"))[0]
         ?.name,
@@ -1257,15 +1258,17 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       expect(await runCli(config, "drift", "--strict", "--json")).toMatchObject(
         {
           exitCode: 0,
-          stdout: "[]\n",
+          stdout: '{\n  "findings": []\n}\n',
         },
       );
       await execute("ALTER TABLE history ADD COLUMN manual text");
       const drift = await runCli(config, "drift", "--strict", "--json");
       expect(drift.exitCode, drift.stderr).toBe(1);
-      expect(JSON.parse(drift.stdout)).toEqual([
-        { kind: "extra-column", table: "history", column: "manual" },
-      ]);
+      expect(JSON.parse(drift.stdout)).toEqual({
+        findings: [
+          { kind: "extra-column", table: "history", column: "manual" },
+        ],
+      });
       expect((await runCli(config, "rollback")).exitCode).toBe(0);
       expect(
         await execute(`SELECT id FROM "${metadataSchema}".history`),

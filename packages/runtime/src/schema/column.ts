@@ -18,6 +18,13 @@ export const COLUMN_CODEC = Symbol("symmetria.column.codec");
  *  every extra field here multiplies type instantiations across the whole schema. */
 export type ColumnMetadata = {
   valueType: unknown;
+  /** What writes accept when it differs from what reads return: a jsonb(schema)'s input. */
+  inputType?: unknown;
+  /**
+   * How values compute when it is not by their type alone: `"float"` for real
+   * and double precision, `"json"` for jsonb, `"raw"` for a computed `sql<Value>`.
+   */
+  numeric?: "float" | "json" | "raw" | undefined;
   notNull: boolean;
   hasDefault: boolean;
   generated?: boolean | undefined;
@@ -37,15 +44,69 @@ export type ColumnDefinition = {
   index?: boolean;
   default?: ColumnDefault;
   enumerationValues?: readonly string[];
+  /** PostgreSQL type name set with `oneOf(...).typeName()`; otherwise derived from the table and column. */
+  enumerationName?: string;
+  /** Collation set with `.collate()`; absent when the type's default applies. */
+  collation?: string;
   /** SQL name set with `.named()`; otherwise the schema key decides it. */
   sqlName?: string;
 };
+
+/** The value a column stores and accepts on write: its input type when it declares one. */
+export type ColumnInputType<Metadata extends ColumnMetadata> =
+  Metadata extends {
+    inputType: infer Input;
+  }
+    ? Input
+    : Metadata["valueType"];
+
+/**
+ * The query traits of a column (see `ColumnTraits` in the query expressions):
+ * how its values compute and, for a jsonb(schema), the input form it stores.
+ */
+export type MetadataTraits<Metadata> = (Metadata extends {
+  numeric: infer Numeric;
+}
+  ? { readonly numeric: Numeric }
+  : {}) &
+  (Metadata extends { inputType: infer Input }
+    ? { readonly stored: Input }
+    : {});
+
+/** Column metadata carrying an expression's query traits, for computed fields. */
+export type TraitsMetadata<Traits> = (Traits extends {
+  readonly numeric: infer Numeric extends "float" | "json" | "raw";
+}
+  ? { numeric: Numeric }
+  : {}) &
+  (Traits extends { readonly stored: infer Stored }
+    ? { inputType: Stored }
+    : {});
 
 declare const COLUMN_METADATA: unique symbol;
 declare const VALUE_BRAND: unique symbol;
 export type Branded<Value, Name extends string> = Value & {
   readonly [VALUE_BRAND]: Name;
 };
+
+type BrandName<Value> = Value extends { readonly [VALUE_BRAND]: infer Name }
+  ? Name
+  : never;
+/**
+ * Whether a value type is decimal text, `${number}` or a brand of it: what
+ * `numeric` columns, sums and decimal arithmetic hold. String literals that
+ * merely look numeric, such as an enum label `"1"`, are not.
+ */
+export type IsDecimalText<Value> = [Value] extends [`${number}`]
+  ? [
+      `${number}` &
+        ([BrandName<Value>] extends [never]
+          ? unknown
+          : { readonly [VALUE_BRAND]: BrandName<Value> }),
+    ] extends [Value]
+    ? true
+    : false
+  : false;
 
 export interface Column<Metadata extends ColumnMetadata = ColumnMetadata> {
   readonly [COLUMN_METADATA]?: Metadata;
@@ -60,12 +121,19 @@ export interface Column<Metadata extends ColumnMetadata = ColumnMetadata> {
   readonly unique: Column<Metadata & { unique: true }>;
   readonly index: Column<Metadata>;
   readonly primaryKey: Column<Metadata & { primaryKey: true }>;
-  /** PostgreSQL array of this type (`text.array` → `text[]`, `string[]`). */
-  readonly array: Column<{
-    valueType: Metadata["valueType"][];
-    notNull: Metadata["notNull"];
-    hasDefault: false;
-  }>;
+  /**
+   * PostgreSQL array of this type (`text.array` → `text[]`, `string[]`); its
+   * elements compute like the column (JSON elements as JSON).
+   */
+  readonly array: Column<
+    {
+      valueType: Metadata["valueType"][];
+      notNull: Metadata["notNull"];
+      hasDefault: false;
+    } & (Metadata extends { numeric: infer Numeric }
+      ? { numeric: Numeric }
+      : {})
+  >;
   readonly brand: <const Name extends string>(
     name: Name,
   ) => Column<
@@ -75,9 +143,14 @@ export interface Column<Metadata extends ColumnMetadata = ColumnMetadata> {
   >;
   /** The column's SQL name when the key should not decide it, such as `"createdAt"`. */
   named(sqlName: string): Column<Metadata>;
+  /**
+   * The column's collation, such as `text.collate("C")` for byte-order comparison
+   * and sorting; text-like columns only (other types throw).
+   */
+  collate(collation: string): Column<Metadata>;
   default(
     value:
-      | Metadata["valueType"]
+      | ColumnInputType<Metadata>
       | (Metadata["notNull"] extends false ? null : never)
       | { kind: "sql"; sql: string },
   ): Column<
@@ -100,6 +173,26 @@ const defineGetter = (
     configurable: false,
   });
 };
+
+/** The sentinel SQL defaults of identity columns: `int.auto` and `int.auto.byDefault`. */
+export const IDENTITY_ALWAYS = "identity";
+export const IDENTITY_BY_DEFAULT = "identity by default";
+
+/** Whether a column default declares an identity column, of either generation. */
+export const isIdentityDefault = (value: ColumnDefault | undefined): boolean =>
+  value?.kind === "sql" &&
+  (value.sql === IDENTITY_ALWAYS || value.sql === IDENTITY_BY_DEFAULT);
+
+/** Built-in types without collations; `collate()` rejects them. */
+const NOT_COLLATABLE =
+  /^(enum|integer|bigint|smallint|real|double precision|boolean|uuid|timestamptz|timestamp|date|time|interval|bytea|inet|jsonb|json|numeric|tsvector|vector)(\(|\[|$)/;
+
+/** A name PostgreSQL accepts for a type or collation: nonempty, no null bytes, at most 63 bytes. */
+const validName = (name: unknown): name is string =>
+  typeof name === "string" &&
+  !!name &&
+  !name.includes("\0") &&
+  Buffer.byteLength(name) <= 63;
 
 /** Marks a column builder function so a schema can explain `price: jsonb` instead of `price: jsonb()`. */
 export const COLUMN_BUILDER = Symbol("symmetria.column.builder");
@@ -161,10 +254,7 @@ const makeColumn = (
       throw new Error("symmetria: vector columns cannot be arrays");
     }
 
-    if (
-      definition.default?.kind === "sql" &&
-      definition.default.sql === "identity"
-    ) {
+    if (isIdentityDefault(definition.default)) {
       throw new Error("symmetria: identity columns cannot be arrays");
     }
 
@@ -176,6 +266,9 @@ const makeColumn = (
         primaryKey: false,
         ...(definition.sqlName !== undefined
           ? { sqlName: definition.sqlName }
+          : {}),
+        ...(definition.collation !== undefined
+          ? { collation: definition.collation }
           : {}),
       },
       {},
@@ -197,6 +290,44 @@ const makeColumn = (
     },
     enumerable: false,
   });
+
+  Object.defineProperty(column, "collate", {
+    value: (collation: string) => {
+      if (!validName(collation)) {
+        throw new Error(
+          'symmetria: collate() expects a collation name, such as "C"',
+        );
+      }
+
+      if (
+        definition.enumerationValues ||
+        NOT_COLLATABLE.test(definition.sqlType)
+      ) {
+        throw new Error(
+          `symmetria: collate() needs a text column; ${definition.sqlType} has no collation`,
+        );
+      }
+
+      return chain({ ...definition, collation });
+    },
+    enumerable: false,
+  });
+
+  // Enum columns can name their PostgreSQL type, which several columns may share.
+  if (definition.enumerationValues) {
+    Object.defineProperty(column, "typeName", {
+      value: (name: string) => {
+        if (!validName(name)) {
+          throw new Error(
+            'symmetria: typeName() expects the enum type\'s SQL name, such as "Role"',
+          );
+        }
+
+        return chain({ ...definition, enumerationName: name });
+      },
+      enumerable: false,
+    });
+  }
 
   Object.defineProperty(column, "default", {
     value: (value: unknown) => {
@@ -254,6 +385,25 @@ interface UuidColumn
   readonly v7: Column<{ valueType: string; notNull: true; hasDefault: true }>;
 }
 
+/** `GENERATED ALWAYS AS IDENTITY`; `.byDefault` also accepts explicit values. */
+interface IdentityColumn<Value>
+  extends Column<{
+    valueType: Value;
+    notNull: true;
+    hasDefault: true;
+    generated: true;
+  }> {
+  /**
+   * `GENERATED BY DEFAULT AS IDENTITY`: inserts may supply their own value, as
+   * with `serial`, so code that writes explicit ids keeps working.
+   */
+  readonly byDefault: Column<{
+    valueType: Value;
+    notNull: true;
+    hasDefault: true;
+  }>;
+}
+
 interface IntegerColumn
   extends Column<{
     valueType: number;
@@ -261,12 +411,7 @@ interface IntegerColumn
     hasDefault: false;
   }> {
   /** GENERATED ALWAYS AS IDENTITY */
-  readonly auto: Column<{
-    valueType: number;
-    notNull: true;
-    hasDefault: true;
-    generated: true;
-  }>;
+  readonly auto: IdentityColumn<number>;
 }
 
 interface BigintColumn
@@ -276,12 +421,7 @@ interface BigintColumn
     hasDefault: false;
   }> {
   /** GENERATED ALWAYS AS IDENTITY */
-  readonly auto: Column<{
-    valueType: bigint;
-    notNull: true;
-    hasDefault: true;
-    generated: true;
-  }>;
+  readonly auto: IdentityColumn<bigint>;
 }
 
 interface TimestampWithTimeZoneColumn
@@ -311,19 +451,29 @@ export const text = base("text") as Column<{
   hasDefault: false;
 }>;
 
-export const int = base("integer", {
+/** `.auto` and `.auto.byDefault` of the integer builders. */
+const identityExtras: Record<string, DefinitionTransform> = {
   auto: (definition) => ({
     ...definition,
-    default: { kind: "sql", sql: "identity" },
+    default: { kind: "sql", sql: IDENTITY_ALWAYS },
   }),
-}) as IntegerColumn;
+  byDefault: (definition) => {
+    if (!isIdentityDefault(definition.default)) {
+      throw new Error(
+        "symmetria: byDefault follows auto, as in int.auto.byDefault",
+      );
+    }
 
-export const bigint = base("bigint", {
-  auto: (definition) => ({
-    ...definition,
-    default: { kind: "sql", sql: "identity" },
-  }),
-}) as BigintColumn;
+    return {
+      ...definition,
+      default: { kind: "sql", sql: IDENTITY_BY_DEFAULT },
+    };
+  },
+};
+
+export const int = base("integer", identityExtras) as IntegerColumn;
+
+export const bigint = base("bigint", identityExtras) as BigintColumn;
 
 export const bool = base("boolean") as Column<{
   valueType: boolean;
@@ -331,8 +481,10 @@ export const bool = base("boolean") as Column<{
   hasDefault: false;
 }>;
 
-type NumberColumn = Column<{
+/** Floats compute in double precision: dividing one keeps the fraction as a number. */
+type FloatColumn = Column<{
   valueType: number;
+  numeric: "float";
   notNull: true;
   hasDefault: false;
 }>;
@@ -343,16 +495,11 @@ type StringColumn = Column<{
 }>;
 
 /** 16-bit integer; `smallint.auto` is an identity column like `int.auto`. */
-export const smallint = base("smallint", {
-  auto: (definition) => ({
-    ...definition,
-    default: { kind: "sql", sql: "identity" },
-  }),
-}) as IntegerColumn;
+export const smallint = base("smallint", identityExtras) as IntegerColumn;
 /** Single-precision float; `NaN` and `±Infinity` round-trip. */
-export const real = base("real") as NumberColumn;
+export const real = base("real") as FloatColumn;
 /** Double-precision float; `NaN` and `±Infinity` round-trip. */
-export const doublePrecision = base("double precision") as NumberColumn;
+export const doublePrecision = base("double precision") as FloatColumn;
 /** Calendar date as `YYYY-MM-DD` text: no time zone shifts on either driver. */
 export const date = base("date") as StringColumn;
 /** Time of day as `HH:MM:SS[.ffffff]` text. */
@@ -430,13 +577,17 @@ export const varchar: VarcharColumn = makeColumn(
 ) as VarcharColumn;
 
 /** Minimal Standard Schema contract (https://standardschema.dev): Zod, Valibot, ArkType and friends. */
-export type StandardSchema<Output = unknown> = {
+export type StandardSchema<Output = unknown, Input = unknown> = {
   readonly "~standard": {
     readonly version: 1;
     readonly vendor: string;
     readonly validate: (
       value: unknown,
     ) => StandardResult<Output> | Promise<StandardResult<Output>>;
+    /** Type-only: the schema's input and output, when it declares them. */
+    readonly types?:
+      | { readonly input: Input; readonly output: Output }
+      | undefined;
   };
 };
 // Matches the Standard Schema V1 spec, whose optional members include undefined
@@ -450,11 +601,48 @@ type StandardIssue = {
 type StandardResult<Output> =
   | { readonly value: Output; readonly issues?: undefined }
   | { readonly issues: readonly StandardIssue[] };
-export type StandardOutput<Schema> =
-  Schema extends StandardSchema<infer Output> ? Output : never;
+/** The `value` of `validate`'s successful results; a failure result widened with `value?: undefined` adds nothing. */
+type ValidatedOutput<Schema> = Schema extends {
+  readonly "~standard": { readonly validate: (value: unknown) => infer Result };
+}
+  ? Exclude<Awaited<Result>, { readonly issues: readonly unknown[] }> extends {
+      readonly value: infer Output;
+    }
+    ? Output
+    : never
+  : never;
+/** The value a schema returns after its transforms: its declared output type, else what `validate` returns. */
+export type StandardOutput<Schema> = Schema extends {
+  readonly "~standard": { readonly types?: infer Types };
+}
+  ? NonNullable<Types> extends { readonly output: infer Output }
+    ? Output
+    : ValidatedOutput<Schema>
+  : ValidatedOutput<Schema>;
+/** The value a schema validates before its transforms; its output when it declares no input type. */
+export type StandardInput<Schema> = Schema extends {
+  readonly "~standard": { readonly types?: infer Types };
+}
+  ? NonNullable<Types> extends { readonly input: infer Input }
+    ? Input
+    : StandardOutput<Schema>
+  : StandardOutput<Schema>;
 
+/** JSON values compute in double precision and order as jsonb. */
 type JsonbColumn<Value> = Column<{
   valueType: Value;
+  numeric: "json";
+  notNull: true;
+  hasDefault: false;
+}>;
+/**
+ * Reads return the schema's output; writes, filters, `contains()` and paths
+ * take its input, which is what is stored.
+ */
+type SchemaJsonbColumn<Schema> = Column<{
+  valueType: StandardOutput<Schema>;
+  inputType: StandardInput<Schema>;
+  numeric: "json";
   notNull: true;
   hasDefault: false;
 }>;
@@ -475,16 +663,16 @@ const formatIssue = (issue: StandardIssue): string => {
 
 /**
  * `jsonb<Value>()` trusts the type; `jsonb(schema)` validates every written and
- * read value with a Standard Schema and infers the value type from it.
+ * read value with a Standard Schema. The database stores the schema's input
+ * form: a write is validated but stored as given, so transforms run once, on
+ * read, and reads return the schema's output.
  */
 export const jsonb: {
   <Value>(): JsonbColumn<Value>;
-  <Schema extends StandardSchema>(
-    schema: Schema,
-  ): JsonbColumn<StandardOutput<Schema>>;
-} = <Value>(schema?: StandardSchema): JsonbColumn<Value> => {
+  <Schema extends StandardSchema>(schema: Schema): SchemaJsonbColumn<Schema>;
+} = (schema?: StandardSchema): never => {
   if (!schema) {
-    return base("jsonb") as JsonbColumn<Value>;
+    return base("jsonb") as never;
   }
 
   if (typeof schema["~standard"]?.validate !== "function") {
@@ -511,20 +699,33 @@ export const jsonb: {
     { sqlType: "jsonb", notNull: true, unique: false, primaryKey: false },
     {},
     Object.freeze({
-      encode: (value: unknown) => JSON.stringify(validate(value)),
+      // Storing the output would run the transforms again on every read.
+      encode: (value: unknown) => {
+        validate(value);
+
+        return JSON.stringify(value);
+      },
       decode: validate,
       parameterCast: "jsonb" as const,
     }),
-  ) as JsonbColumn<Value>;
+  ) as never;
 };
 
 // The call form preserves enum labels as a literal union through a const type parameter.
 
-type EnumerationColumn<Value extends string> = Column<{
-  valueType: Value;
-  notNull: true;
-  hasDefault: false;
-}>;
+export interface EnumerationColumn<Value extends string>
+  extends Column<{
+    valueType: Value;
+    notNull: true;
+    hasDefault: false;
+  }> {
+  /**
+   * The PostgreSQL type's name, such as Prisma's `"Role"`; without it the type is
+   * `<table>_<column>_enum`. Columns naming the same type share one, so their
+   * labels must match.
+   */
+  typeName(name: string): EnumerationColumn<Value>;
+}
 
 export const oneOf = <const Values extends readonly [string, ...string[]]>(
   ...values: Values

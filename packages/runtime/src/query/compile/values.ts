@@ -134,6 +134,37 @@ export const searchVector = (
     : rendered;
 };
 
+/**
+ * An aggregate call, rendered with its argument now and completed with a
+ * window's OVER clause, if any, right after the call. MIN and MAX of a type
+ * without them take the first element of the aggregated one-element arrays,
+ * which order by the type's comparison, skipping NULL and JSON null.
+ */
+const aggregateSql = (
+  compilation: Compilation,
+  node: Extract<ValueNode, { kind: "aggregate" }>,
+  bindings: Bindings,
+): ((over?: string) => string) => {
+  const value = node.value ? valueSql(compilation, node.value, bindings) : "*";
+
+  return (over = "") => {
+    if (node.element) {
+      const present =
+        node.element === "json"
+          ? `${value} <> 'null'::jsonb`
+          : `${value} IS NOT NULL`;
+
+      return `(${node.name}(ARRAY[${value}]) FILTER (WHERE ${present})${over})[1]`;
+    }
+
+    const aggregate = `${node.name}(${value})${over}`;
+
+    return node.numeric
+      ? compilation.renderer.cast(aggregate, { kind: "numeric" })
+      : aggregate;
+  };
+};
+
 const renderValue = (
   compilation: Compilation,
   node: ValueNode,
@@ -212,16 +243,8 @@ const renderValue = (
         .join("");
     case "binary":
       return `(${operandSql(compilation, node.left, bindings)} ${node.operator} ${operandSql(compilation, node.right, bindings)})`;
-    case "aggregate": {
-      const value = node.value
-        ? valueSql(compilation, node.value, bindings)
-        : "*";
-      const aggregate = `${node.name}(${value})`;
-
-      return node.numeric
-        ? renderer.cast(aggregate, { kind: "numeric" })
-        : aggregate;
-    }
+    case "aggregate":
+      return aggregateSql(compilation, node, bindings)();
     case "case":
       return `(CASE ${valueSql(compilation, node.value, bindings)} ${node.branches.map((branch) => `WHEN ${valueSql(compilation, branch.when, bindings)} THEN ${valueSql(compilation, branch.then, bindings)}`).join(" ")} END)`;
     case "coalesce":
@@ -231,12 +254,14 @@ const renderValue = (
     case "relativeWindow":
       return `${node.name.toUpperCase()}(${[node.value, node.offset, ...(node.fallback ? [node.fallback] : [])].map((value) => valueSql(compilation, value, bindings)).join(", ")})`;
     case "window": {
-      const numeric =
-        node.expression.kind === "aggregate" && node.expression.numeric;
-      const expression = numeric
-        ? { ...node.expression, numeric: false }
-        : node.expression;
-      const expressionSQL = valueSql(compilation, expression, bindings);
+      // The expression renders first, so its parameters precede the frame's.
+      const aggregate =
+        node.expression.kind === "aggregate"
+          ? aggregateSql(compilation, node.expression, bindings)
+          : undefined;
+      const expressionSQL = aggregate
+        ? ""
+        : valueSql(compilation, node.expression, bindings);
       const fragments: string[] = [];
 
       if (node.partitionBy.length) {
@@ -265,9 +290,9 @@ const renderValue = (
       }
 
       const suffix = ` OVER (${fragments.join(" ")})`;
-      const window = `${expressionSQL}${suffix}`;
 
-      return numeric ? renderer.cast(window, { kind: "numeric" }) : window;
+      // OVER follows the aggregate call, inside its numeric cast or element access.
+      return aggregate ? aggregate(suffix) : `${expressionSQL}${suffix}`;
     }
     case "subquery":
       return `(${compilation.selectSql(node.query, bindings)})`;

@@ -22,8 +22,13 @@ export const serveProfiler = async (options: {
         }
       }
 
+      // The request target is an origin-form path; resolving it against the
+      // base would read "//x" as another host, so it is appended instead.
+      const target = incoming.url ?? "/";
       const request = new Request(
-        new URL(incoming.url ?? "/", `http://${hostname}:${port}`).href,
+        new URL(
+          `http://${hostname}:${port}${target.startsWith("/") ? target : `/${target}`}`,
+        ).href,
         {
           method: incoming.method ?? "GET",
           headers,

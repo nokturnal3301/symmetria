@@ -3,8 +3,15 @@
  */
 import { emitKeypressEvents } from "node:readline";
 import type { ProfiledRequest, ProfiledQuery } from "symmetria";
-import { fitLine, theme, wrapLines } from "../ui/style";
+import { fitLine, terminalWidth, theme, wrapLines } from "../ui/style";
 import { withScreen } from "../ui/terminal";
+import { explainLines, wrapExplainLines } from "./query-inspector";
+
+/** Why the profiler endpoint refused a request, with the fix for a wrong token. */
+export const profilerHttpError = (status: number): string =>
+  status === 403
+    ? "symmetria: the profiler rejected the token; pass --profile-token or set SYMMETRIA_PROFILE_TOKEN to the value used by profiler.serve()"
+    : `symmetria: profiler returned HTTP ${status}`;
 
 export const profileScreen = async (
   address: string,
@@ -21,7 +28,8 @@ export const profileScreen = async (
         let mode: "requests" | "queries" | "sql" | "plan" = "requests";
         let offset = 0;
         let error = "";
-        let plan = "";
+        // The plan tree, as the query inspector shows it.
+        let plan: string[] = [];
         let closed = false;
         let pending = false;
         let activeRequest: ProfiledRequest | undefined;
@@ -37,10 +45,16 @@ export const profileScreen = async (
           const selected = query();
           const lines: string[] = [];
 
+          // Narrow terminals shorten labels and drop columns rather than
+          // cutting the timings off.
+          const width = terminalWidth();
+          const labelWidth = Math.max(12, Math.min(42, width - 35));
+          const compact = width < 72;
+
           if (mode === "requests") {
             lines.push(
               style(
-                "Request                                      SQL    Build     Total",
+                `${"Request".padEnd(labelWidth + 3)}SQL    Build     Total`,
                 "muted",
               ),
             );
@@ -54,7 +68,7 @@ export const profileScreen = async (
                 new Set(request.queries.map((entry) => entry.sql)).size;
               lines.push(
                 style(
-                  `${start + position === selectedRequest ? "›" : " "} ${request.label.padEnd(42)} ${String(request.queries.length).padStart(3)}  ${request.buildMs.toFixed(2).padStart(7)}  ${request.durationMs.toFixed(2).padStart(7)}${duplicates ? `  ↻ ${duplicates}` : ""}${request.error ? "  ERROR" : ""}`,
+                  `${start + position === selectedRequest ? "›" : " "} ${fitLine(request.label, labelWidth).padEnd(labelWidth)} ${String(request.queries.length).padStart(3)}  ${request.buildMs.toFixed(2).padStart(7)}  ${request.durationMs.toFixed(2).padStart(7)}${duplicates ? `  ↻ ${duplicates}` : ""}${request.error ? "  ERROR" : ""}`,
                   start + position === selectedRequest ? "selected" : "text",
                 ),
               );
@@ -74,7 +88,9 @@ export const profileScreen = async (
             );
             lines.push(
               style(
-                "Query                       Compile       Database       Decode    Rows",
+                compact
+                  ? `${"Query".padEnd(18)}${"Database".padStart(10)} ${"Rows".padStart(6)}`
+                  : "Query                       Compile       Database       Decode    Rows",
                 "muted",
               ),
             );
@@ -83,25 +99,29 @@ export const profileScreen = async (
             for (const [position, entry] of activeRequest!.queries
               .slice(start, start + height - 2)
               .entries()) {
+              const marker = start + position === selectedQuery ? "›" : " ";
               lines.push(
                 style(
-                  `${start + position === selectedQuery ? "›" : " "} ${entry.kind.padEnd(9)} #${String(entry.id).padEnd(10)} ${entry.compileMs.toFixed(3).padStart(9)} ${entry.databaseMs.toFixed(3).padStart(14)} ${entry.decodeMs.toFixed(3).padStart(12)} ${String(entry.rows).padStart(7)}${entry.error ? " ERROR" : ""}`,
+                  compact
+                    ? `${marker} ${entry.kind.padEnd(7)} #${String(entry.id).padEnd(6)} ${entry.databaseMs.toFixed(3).padStart(10)} ${String(entry.rows).padStart(6)}${entry.error ? " ERROR" : ""}`
+                    : `${marker} ${entry.kind.padEnd(9)} #${String(entry.id).padEnd(10)} ${entry.compileMs.toFixed(3).padStart(9)} ${entry.databaseMs.toFixed(3).padStart(14)} ${entry.decodeMs.toFixed(3).padStart(12)} ${String(entry.rows).padStart(7)}${entry.error ? " ERROR" : ""}`,
                   start + position === selectedQuery ? "selected" : "text",
                 ),
               );
             }
           } else {
-            const content =
+            const wrapped =
               mode === "plan"
-                ? plan
-                : `${selected!.sql}\n\nParameters\n${JSON.stringify(selected!.parameters, null, 2)}${selected!.error ? `\n\n${selected!.error}` : ""}`;
-            const wrapped = wrapLines(content);
+                ? wrapExplainLines(plan, terminalWidth())
+                : wrapLines(
+                    `${selected!.sql}\n\nParameters\n${JSON.stringify(selected!.parameters, null, 2)}${selected!.error ? `\n\n${selected!.error}` : ""}`,
+                  );
             offset = Math.min(offset, Math.max(0, wrapped.length - height));
             lines.push(...wrapped.slice(offset, offset + height));
           }
 
           process.stdout.write(
-            `\u001b[H\u001b[2J  ${brand()} ${style("/ live profiler", "muted")}\n  ${style(fitLine(error || address), error ? "danger" : "muted")}\n\n${lines.map((line) => `  ${fitLine(line)}`).join("\n")}\u001b[${Math.max(1, (process.stdout.rows || 24) - 1)};1H  ${style(fitLine("↑ ↓ navigate · enter open · esc back · e explain · a analyze · q quit"), "muted")}`,
+            `\u001b[H\u001b[2J  ${fitLine(`${brand()} ${style("/ live profiler", "muted")}`)}\n  ${style(fitLine(error || address), error ? "danger" : "muted")}\n\n${lines.map((line) => `  ${fitLine(line)}`).join("\n")}\u001b[${Math.max(1, (process.stdout.rows || 24) - 1)};1H  ${style(fitLine("↑ ↓ navigate · enter open · esc back · e explain · a analyze · q quit"), "muted")}`,
           );
         };
 
@@ -119,11 +139,7 @@ export const profileScreen = async (
             });
 
             if (!response.ok) {
-              throw new Error(
-                response.status === 403
-                  ? "Profiler rejected the token; pass --profile-token or set SYMMETRIA_PROFILE_TOKEN to the value used by profiler.serve()"
-                  : `Profiler returned HTTP ${response.status}`,
-              );
+              throw new Error(profilerHttpError(response.status));
             }
 
             const updated = (await response.json()) as ProfiledRequest[];
@@ -184,7 +200,12 @@ export const profileScreen = async (
               );
             }
 
-            plan = JSON.stringify(result, null, 2);
+            plan = Array.isArray(result) ? explainLines(result) : [];
+
+            if (!plan.length) {
+              plan = JSON.stringify(result, null, 2).split("\n");
+            }
+
             mode = "plan";
             offset = 0;
             error = "";

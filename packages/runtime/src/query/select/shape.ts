@@ -1,6 +1,7 @@
 /** applyShape(): evaluates one projection callback with its options into a plan. */
 import { freeze } from "../plan/freeze";
 import {
+  notNullPredicate,
   readColumn,
   type Ordering,
   type Parameter,
@@ -116,11 +117,7 @@ export const applyShape = (
       ...context.plan,
       predicates: freeze([
         ...context.plan.predicates,
-        freeze({
-          kind: "nullCheck" as const,
-          value: expression.node,
-          negated: true,
-        }),
+        freeze(notNullPredicate(expression)),
       ]),
     });
 

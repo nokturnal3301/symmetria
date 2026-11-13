@@ -1,6 +1,6 @@
 /**
  * Transaction lifecycle shared by both adapters: BEGIN options, savepoints, scope poisoning after a
- * failed statement and nested-scope serialisation.
+ * failed statement, one operation at a time per connection and nested-scope serialisation.
  */
 import {
   IsolationLevel,
@@ -10,7 +10,15 @@ import {
   type TransactionOptions,
 } from "../query/plan/types";
 import type { PostgresConnection } from "./pool";
+import { scopeViolation } from "./errors";
 import { createPendingTasks } from "./pending";
+import {
+  callerInside,
+  createSerialQueue,
+  nestedFrame,
+  runInFrame,
+  type NestedFrame,
+} from "./serial";
 
 const transactionStatements = (): TransactionStatements<PostgresConnection> => {
   let nextSavepoint = 0;
@@ -140,9 +148,18 @@ type TransactionStatements<Connection> = {
   ) => Promise<Result>;
 };
 
+/** The cursor of a `stream()` (see streamRows in query/select/query.ts). */
+const STREAM_CURSOR = /^(DECLARE|CLOSE) ("__symmetria_stream_\d+")/;
+
+/** What an operation still waiting to start returns once the scope has closed. */
+const ABANDONED = Symbol("symmetria.abandoned");
+
 /**
- * Shared transaction lifecycle: closed contexts reject late queries, a failed
- * statement poisons the scope, and nested savepoints serialize against their parent.
+ * Shared transaction lifecycle: operations run one at a time in call order,
+ * closed contexts reject late queries, a failed statement poisons the scope,
+ * and a nested savepoint holds the connection until it ends; parent operations
+ * issued meanwhile wait for it. An operation still pending when the callback
+ * returns rejects, since the transaction then rolls back.
  */
 const transactionScope = async <Connection, Result>(
   connection: Connection,
@@ -150,17 +167,23 @@ const transactionScope = async <Connection, Result>(
   callback: (driver: TransactionDriver) => Promise<Result>,
 ): Promise<Result> => {
   const pending = createPendingTasks();
+  const queue = createSerialQueue();
+  // Cursors of streams that have not finished: open work like a pending query.
+  const cursors = new Set<string>();
 
-  let active = true;
-  let childActive = false;
+  let closed = false;
+  let unsettled = 0;
+  let nested: NestedFrame | undefined;
   let failure: { error: unknown } | undefined;
 
   const assertAvailable = (): void => {
-    if (!active) {
+    if (closed) {
       throw new Error("symmetria: transaction context is closed");
     }
 
-    if (childActive) {
+    // Queued behind the nested transaction, a call from inside its own
+    // callback would wait for itself.
+    if (nested && callerInside(nested)) {
       throw new Error(
         "symmetria: await the nested transaction before using its parent context",
       );
@@ -172,54 +195,100 @@ const transactionScope = async <Connection, Result>(
   };
 
   // A failed statement poisons the scope; savepoints report through their own scope.
-  const track = <Value>(
-    task: Promise<Value>,
-    statement = false,
-  ): Promise<Value> =>
-    pending.track(
-      statement
-        ? task.then(undefined, (error: unknown) => {
-            failure ??= { error };
-            throw error;
-          })
-        : task,
+  const schedule = <Value>(
+    operation: () => Promise<Value>,
+    statement: boolean,
+  ): Promise<Value> => {
+    unsettled += 1;
+
+    return pending.track(
+      queue
+        .run(async (): Promise<Value | typeof ABANDONED> => {
+          if (closed) {
+            return ABANDONED;
+          }
+
+          if (failure) {
+            throw failure.error;
+          }
+
+          return operation();
+        })
+        .then(
+          (value) => {
+            unsettled -= 1;
+
+            if (closed) {
+              throw new Error(
+                "symmetria: the transaction ended before this operation was awaited; it was rolled back",
+              );
+            }
+
+            return value as Value;
+          },
+          (error: unknown) => {
+            unsettled -= 1;
+
+            if (!statement) {
+              throw error;
+            }
+
+            // Later operations report a failed $scope() write check as such too.
+            const reported = scopeViolation(error);
+            failure ??= { error: reported };
+
+            throw reported;
+          },
+        ),
     );
+  };
 
   const driver: TransactionDriver = Object.freeze({
     execute: (query) => {
       assertAvailable();
+      const cursor = STREAM_CURSOR.exec(query.sql);
 
-      return track(statements.execute(connection, query), true);
+      return schedule(async () => {
+        if (cursor?.[1] === "CLOSE") {
+          cursors.delete(cursor[2]!);
+        }
+
+        const result = await statements.execute(connection, query);
+
+        if (cursor?.[1] === "DECLARE") {
+          cursors.add(cursor[2]!);
+        }
+
+        return result;
+      }, true);
     },
     transaction: async <Value>(
-      nested: (driver: TransactionDriver) => Promise<Value>,
+      callback: (driver: TransactionDriver) => Promise<Value>,
     ): Promise<Value> => {
       assertAvailable();
+      const frame = nestedFrame();
 
-      if (pending.size()) {
-        throw new Error(
-          "symmetria: await pending queries before starting a savepoint",
-        );
-      }
+      return schedule(async () => {
+        nested = frame;
 
-      childActive = true;
-
-      try {
-        return await track(
-          statements.savepoint(connection, (reserved) =>
-            transactionScope(reserved, statements, nested),
-          ),
-        );
-      } finally {
-        childActive = false;
-      }
+        try {
+          return await runInFrame(frame, () =>
+            statements.savepoint(connection, (reserved) =>
+              transactionScope(reserved, statements, callback),
+            ),
+          );
+        } finally {
+          nested = undefined;
+        }
+      }, false);
     },
   });
 
   try {
     const result = await callback(driver);
-    const unfinished = pending.size() > 0;
-    active = false;
+    closed = true;
+    const unfinished = unsettled > 0;
+    const streaming = cursors.size > 0;
 
     await pending.settle();
 
@@ -233,9 +302,15 @@ const transactionScope = async <Connection, Result>(
       );
     }
 
+    if (streaming) {
+      throw new Error(
+        "symmetria: finish or break out of every stream() before returning from the transaction callback",
+      );
+    }
+
     return result;
   } finally {
-    active = false;
+    closed = true;
     await pending.settle();
   }
 };

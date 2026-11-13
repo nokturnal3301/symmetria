@@ -78,12 +78,14 @@ export const inspect = async (
   }
 
   context.emit({
-    json: values.relations
-      ? tables.map((table) => ({
-          name: table.name,
-          relations: table.relations,
-        }))
-      : { tables },
+    json: {
+      tables: values.relations
+        ? tables.map((table) => ({
+            name: table.name,
+            relations: table.relations,
+          }))
+        : tables,
+    },
     replacer: (_name, value) =>
       typeof value === "bigint" ? value.toString() : value,
     indent: 2,
@@ -108,7 +110,9 @@ export const lint = async (
 
   if (values.pending) {
     if (!project.databaseUrl) {
-      throw new Error("symmetria: --pending requires databaseUrl");
+      throw new Error(
+        "symmetria: --pending needs a database: set databaseUrl in the config, DATABASE_URL or --database-url",
+      );
     }
 
     const driver = postgres(project.databaseUrl);
@@ -142,7 +146,7 @@ export const lint = async (
     ...lintMigration(plan, diffOptions.renames),
   ];
   context.emit({
-    json: findings,
+    json: { findings },
     indent: 2,
     plain: () => formatLintFindings(findings),
   });

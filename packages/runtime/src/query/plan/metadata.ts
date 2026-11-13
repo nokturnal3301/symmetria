@@ -40,6 +40,8 @@ export const expressionSqlType = (
       return "tsvector";
     case "searchHeadline":
       return "text";
+    case "arrayLength":
+      return "integer";
     case "window":
       return expressionSqlType({ ...expression, node: node.expression });
     case "relativeWindow":

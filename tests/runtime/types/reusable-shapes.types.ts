@@ -40,6 +40,9 @@ const query = database.posts((post) => ({
     published: "Published",
   }),
   views: post.state.match({ draft: post.views, published: 0n }),
+  // A literal next to a column branch reads as that column: bigint, not 0.
+  zero: post.state.match({ draft: post.views, published: 0 }),
+  missing: post.state.match({ draft: post.views, published: null }),
 }));
 type Result = Expect<
   AreEqual<
@@ -50,6 +53,8 @@ type Result = Expect<
       label: "Draft" | "Published";
       optionalLabel: "Draft" | "Published" | null;
       views: bigint;
+      zero: bigint;
+      missing: bigint | null;
     }[]
   >
 >;
@@ -86,6 +91,9 @@ database.posts((post) => {
   });
   // @ts-expect-error ordinary strings are not finite enums
   post.author.name.match({ draft: "Draft" });
+  // @ts-expect-error literals alone need one type, as the CASE has one
+  post.state.match({ draft: "Draft", published: 1 });
+  post.state.match({ draft: "Draft", published: null });
 
   return { id: post.id };
 });

@@ -1,3 +1,6 @@
+/**
+ * `symmetria/bun`: PostgreSQL adapter built on Bun's SQL pool.
+ */
 import { SQL } from "bun";
 import { createPostgresDriver, type PostgresDriver } from "./pool";
 import { postgresParameters } from "./parameters";
@@ -66,6 +69,13 @@ export const postgres = (
               .unsafe("ROLLBACK")
               .catch(() => {})
               .finally(() => reserved.release());
+          },
+          // Closing a reserved connection frees its pool slot for a fresh one.
+          discard: async () => {
+            if (!released) {
+              released = true;
+              await reserved.close().catch(() => {});
+            }
           },
         };
       },

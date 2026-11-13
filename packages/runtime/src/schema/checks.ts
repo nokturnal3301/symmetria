@@ -4,9 +4,10 @@
 import { codecFor, codecMap, type SchemaCodecs } from "../query/codecs";
 import { quoteIdentifier } from "../query/compile";
 import { ddlExpressions } from "./ddl-expressions";
-import { readPredicate } from "../query/expressions";
 import { createScope } from "../query/select";
 import { sqlKey, type SchemaSnapshot } from "./assembly";
+import { conditionSQL, readCondition } from "./indexes";
+import { objectName } from "./naming";
 import type { TableCheckCallback } from "./table";
 
 export type CheckSnapshot = {
@@ -56,7 +57,12 @@ export const applyChecks = (
     callback(createScope({ [tableName]: binding })[tableName]!),
   )) {
     quoteIdentifier(name);
-    const sqlName = `${table.sqlName}_${sqlKey(name, snapshot.casing)}_check`;
+    // Derived like constraint names: over 63 bytes, shortened with a hash.
+    const sqlName = objectName(
+      table.sqlName,
+      sqlKey(name, snapshot.casing),
+      "check",
+    );
     quoteIdentifier(sqlName);
 
     if (names.has(sqlName)) {
@@ -70,7 +76,7 @@ export const applyChecks = (
       Object.freeze({
         name,
         sqlName,
-        expression: expressions.predicateSQL(readPredicate(condition)),
+        expression: conditionSQL(readCondition(condition), expressions),
       }),
     ]);
   }

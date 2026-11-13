@@ -5,7 +5,14 @@
  * undefined definitions are rejected during runtime schema assembly.
  */
 
-import type { ColumnMetadata, Column, Vector } from "./column";
+import type {
+  ColumnInputType,
+  ColumnMetadata,
+  Column,
+  IsDecimalText,
+  MetadataTraits,
+  Vector,
+} from "./column";
 import type { UpdateValues } from "../query/write/mutations";
 import type {
   PrimaryKeyNames,
@@ -50,6 +57,30 @@ type ColumnValue<Definition> =
       ? Metadata["valueType"]
       : Metadata["valueType"] | null
     : never;
+
+/** What a write accepts: a jsonb(schema)'s input type, otherwise the read type. */
+type ColumnWriteValue<Definition> =
+  ColumnMetadataOf<Definition> extends infer Metadata extends ColumnMetadata
+    ? Metadata["notNull"] extends true
+      ? ColumnInputType<Metadata>
+      : ColumnInputType<Metadata> | null
+    : never;
+
+/**
+ * The query traits of the columns that have any (float and jsonb columns, a
+ * jsonb(schema)'s stored input), so query columns compute and compare like the
+ * SQL columns. References and other columns have none.
+ */
+export type TableTraits<Columns> = {
+  [ColumnName in keyof Columns & string as ReadColumn<
+    Columns,
+    ColumnName
+  > extends Column<infer Metadata>
+    ? Metadata extends { numeric: unknown } | { inputType: unknown }
+      ? ColumnName
+      : never
+    : never]: MetadataTraits<ColumnMetadataOf<ReadColumn<Columns, ColumnName>>>;
+};
 
 // ---------------------------------------------------------------------------
 // Reference targets
@@ -104,17 +135,18 @@ export type WriteValue<Value> = [NonNullable<Value>] extends [never]
   ? Value
   : NonNullable<Value> extends Vector
     ? Value | readonly number[]
-    : NonNullable<Value> extends `${number}`
+    : IsDecimalText<NonNullable<Value>> extends true
       ? // Decimal columns read exact text and accept any string on write.
         Value | string
-      : NonNullable<Value> extends readonly `${number}`[]
-        ? Value | readonly (string | null)[]
-        :
-            | Value
-            | (bigint extends NonNullable<Value> ? number : never)
-            | (NonNullable<Value> extends readonly bigint[]
-                ? (bigint | number)[]
-                : never);
+      : NonNullable<Value> extends readonly (infer Element)[]
+        ? IsDecimalText<Element> extends true
+          ? Value | readonly (string | null)[]
+          :
+              | Value
+              | (NonNullable<Value> extends readonly bigint[]
+                  ? (bigint | number)[]
+                  : never)
+        : Value | (bigint extends NonNullable<Value> ? number : never);
 export type Writable<Shape> = {
   [PropertyName in keyof Shape]: WriteValue<Shape[PropertyName]>;
 } & {};
@@ -127,11 +159,12 @@ export type Omittable<Shape> = {
 // Row / Insert
 // ---------------------------------------------------------------------------
 
-export type RowOf<Columns> = Flatten<
+/** The row a read returns; with `Write`, the values a write accepts. */
+export type RowOf<Columns, Write extends boolean = false> = Flatten<
   {
-    [ColumnName in ScalarColumnNames<Columns>]: ColumnValue<
-      ReadColumn<Columns, ColumnName>
-    >;
+    [ColumnName in ScalarColumnNames<Columns>]: Write extends true
+      ? ColumnWriteValue<ReadColumn<Columns, ColumnName>>
+      : ColumnValue<ReadColumn<Columns, ColumnName>>;
   } & {
     [ColumnName in ReferenceColumnNames<Columns> as `${ColumnName}Id`]: ReferenceFlagsOf<
       ReadColumn<Columns, ColumnName>
@@ -174,12 +207,15 @@ type GeneratedNamesOf<Columns> = {
 
 /** Insert input for a standalone table(): defaults, nullable fields and nullable references are optional. */
 export type InsertOf<Columns> = Writable<
-  Omit<RowOf<Columns>, OptionalNamesOf<Columns> | GeneratedNamesOf<Columns>> &
+  Omit<
+    RowOf<Columns, true>,
+    OptionalNamesOf<Columns> | GeneratedNamesOf<Columns>
+  > &
     Omittable<
       Pick<
-        RowOf<Columns>,
+        RowOf<Columns, true>,
         Exclude<OptionalNamesOf<Columns>, GeneratedNamesOf<Columns>> &
-          keyof RowOf<Columns>
+          keyof RowOf<Columns, true>
       >
     > & { [ColumnName in GeneratedNamesOf<Columns>]?: undefined }
 >;

@@ -25,6 +25,7 @@ export {
   isColumn,
   type StandardSchema,
   type StandardOutput,
+  type StandardInput,
   type Column,
   type ColumnMetadata,
   type ColumnDefinition,
@@ -104,6 +105,7 @@ export {
 export type {
   Query,
   QueryColumn,
+  ColumnTraits,
   SelectedColumn,
   Predicate,
   PredicateList,
@@ -133,6 +135,7 @@ export {
   type IndexMethod,
   type IndexQuery,
   type CreateIndexesOptions,
+  type SchemaCondition,
 } from "./schema/indexes";
 
 export {

@@ -143,7 +143,8 @@ describe.skipIf(!databaseUrl)("CTEs and windows on PostgreSQL", () => {
           (entries) => ({
             id: entries.id,
             amount: entries.amount,
-            depth: sql<number>`0::integer`,
+            // Typed like an int column, so the recursive term can compute with it.
+            depth: sql.of(int)`0`,
           }),
           { where: (entries) => entries.id.is(parameters.rootId) },
         )

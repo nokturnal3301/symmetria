@@ -26,12 +26,21 @@ export const pull = async (
   const databaseUrl =
     values["database-url"] ?? project?.databaseUrl ?? explicit;
   const { metadataSchema, metadataTable } = project?.config ?? {};
+  // Only the tables the config and flags name: Prisma's history table, which
+  // other commands leave out on their own, stays listed for review here.
+  const ignoreTables = [
+    ...new Set([
+      ...(project?.config.ignoreTables ?? []),
+      ...(values["ignore-table"] ?? []),
+    ]),
+  ];
   const result = await withDatabase({ databaseUrl }, (driver) =>
     context.progress("Reading the database", () =>
       pullSchema({
         execute: driver.execute,
         ...(metadataSchema ? { metadataSchema } : {}),
         ...(metadataTable ? { metadataTable } : {}),
+        ...(ignoreTables.length ? { ignoreTables } : {}),
       }),
     ),
   );

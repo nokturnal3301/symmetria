@@ -20,7 +20,7 @@ import {
   sql,
   customType,
 } from "../../../packages/runtime/src";
-import { postgres } from "../../support/postgres";
+import { postgres, searchPathURL } from "../../support/postgres";
 import { createSchemaSQL } from "../../../packages/kit/src";
 
 const users = table({
@@ -58,19 +58,15 @@ const wallets = table({ id: int.auto, owner: users, amount: amount.unique });
 const model = schema({ users, posts, tags, postTags, handles, wallets });
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
-  const driver = postgres({
-    url: databaseUrl ?? "postgres://localhost/postgres",
-    max: 1,
-  });
-  const database = createDatabase({ schema: model, driver });
   const namespace = `symmetria_nested_${crypto.randomUUID().replaceAll("-", "")}`;
+  const driver = postgres({ url: searchPathURL(namespace), max: 1 });
+  const database = createDatabase({ schema: model, driver });
 
   const run = (statement: string) =>
     driver.execute({ sql: statement, parameters: [] });
 
   beforeAll(async () => {
     await run(`CREATE SCHEMA "${namespace}"`);
-    await run(`SET search_path TO "${namespace}"`);
 
     for (const statement of createSchemaSQL(model.$snapshot())) {
       await driver.execute(statement);
@@ -348,7 +344,7 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
     ).toHaveLength(1);
   });
 
-  test("a scoped database never rewrites or links a conflicting row outside its scope", async () => {
+  test("a scoped database never rewrites, links or writes a row outside its scope", async () => {
     const [ada, bob] = await database.users
       .insert([
         { email: "ada", name: "Ada" },
@@ -389,12 +385,28 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
         .doUpdate("ownerId")
         .execute(),
     ).rejects.toMatchObject({ code: "SYMMETRIA_OUT_OF_SCOPE" });
-    const own = await acme.wallets
-      .insert({ ownerId: bob!.id, amount: cents(100n) })
-      .onConflict("amount")
-      .doUpdate("ownerId")
-      .returning((wallets) => ({ ownerId: wallets.ownerId }));
-    expect(own).toEqual({ ownerId: bob!.id });
+    // Updating the row inside the scope would move it out of the scope.
+    await expect(
+      acme.wallets
+        .insert({ ownerId: bob!.id, amount: cents(100n) })
+        .onConflict("amount")
+        .doUpdate("ownerId")
+        .returning((wallets) => ({ ownerId: wallets.ownerId }))
+        .execute(),
+    ).rejects.toMatchObject({
+      code: "SYMMETRIA_OUT_OF_SCOPE",
+      table: "wallets",
+      message: expect.stringContaining(
+        'insert on "wallets" would write a row outside the database scope',
+      ),
+    });
+    expect(
+      await acme.wallets
+        .insert({ ownerId: ada!.id, amount: cents(100n) })
+        .onConflict("amount")
+        .doUpdate("ownerId")
+        .returning((wallets) => ({ ownerId: wallets.ownerId })),
+    ).toEqual({ ownerId: ada!.id });
     expect(
       await database.wallets(
         (wallets) => ({
@@ -402,7 +414,7 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
         }),
         { orderBy: (wallets) => wallets.id.ascending },
       ),
-    ).toEqual([{ ownerId: bob!.id }, { ownerId: bob!.id }]);
+    ).toEqual([{ ownerId: ada!.id }, { ownerId: bob!.id }]);
 
     await database.tags.insert({ label: "shared" }).execute();
     await expect(
@@ -420,6 +432,23 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
     });
     expect(await database.posts.by.slug("first").maybeOne()).toBeNull();
     expect(await database.users.by.email("eve").maybeOne()).toBeNull();
+    // A created row of a scoped table must satisfy its scope as well; the
+    // whole nested insert rolls back.
+    await expect(
+      acme.posts
+        .insert({
+          slug: "first",
+          title: "First",
+          author: { create: { email: "eve", name: "Eve" } },
+          tags: { create: [{ label: "acme-new" }, { label: "elsewhere" }] },
+        })
+        .execute(),
+    ).rejects.toMatchObject({
+      code: "SYMMETRIA_OUT_OF_SCOPE",
+      table: "tags",
+    });
+    expect(await database.posts.by.slug("first").maybeOne()).toBeNull();
+    expect(await database.tags.by.label("acme-new").maybeOne()).toBeNull();
     await acme.posts
       .insert({
         slug: "second",

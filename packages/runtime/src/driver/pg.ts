@@ -4,24 +4,68 @@
 import { Pool, types, type PoolConfig, type QueryResult } from "pg";
 import type { CompiledQuery, ExecutionResult } from "../query/plan/types";
 import type { QueryProfiler } from "../observability/profiling";
+import { timestampFromText } from "../query/codecs";
 import { postgresParameters } from "./parameters";
+import { isConnectionError, sqlState } from "./errors";
 import {
   createPostgresDriver,
   type PostgresDriver,
   type PostgresConnection,
 } from "./pool";
 
-export type PostgresOptions = Omit<PoolConfig, "types"> & {
-  readonly url?: string;
+/**
+ * node-postgres pool options (`pg.PoolConfig` without `types`, which the
+ * adapter sets), declared here so the published types need no `@types/pg`.
+ * Callback options receive node-postgres objects.
+ */
+export type PostgresOptions = {
+  readonly url?: string | undefined;
   readonly profiler?: QueryProfiler | undefined;
+  readonly connectionString?: string | undefined;
+  readonly host?: string | undefined;
+  readonly port?: number | undefined;
+  readonly user?: string | undefined;
+  readonly password?: string | (() => string | Promise<string>) | undefined;
+  readonly database?: string | undefined;
+  /** `true` or Node.js `tls.ConnectionOptions`. */
+  readonly ssl?: boolean | object | undefined;
+  readonly sslnegotiation?: "postgres" | "direct" | undefined;
+  readonly enableChannelBinding?: boolean | undefined;
+  readonly max?: number | undefined;
+  readonly min?: number | undefined;
+  readonly idleTimeoutMillis?: number | null | undefined;
+  readonly connectionTimeoutMillis?: number | undefined;
+  readonly maxUses?: number | undefined;
+  readonly maxLifetimeSeconds?: number | undefined;
+  readonly allowExitOnIdle?: boolean | undefined;
+  readonly keepAlive?: boolean | undefined;
+  readonly keepAliveInitialDelayMillis?: number | undefined;
+  readonly statement_timeout?: false | number | undefined;
+  readonly query_timeout?: number | undefined;
+  readonly lock_timeout?: number | undefined;
+  readonly idle_in_transaction_session_timeout?: number | undefined;
+  readonly application_name?: string | undefined;
+  readonly fallback_application_name?: string | undefined;
+  readonly options?: string | undefined;
+  readonly client_encoding?: string | undefined;
+  readonly pipeline?: boolean | undefined;
+  readonly log?: ((...messages: unknown[]) => void) | undefined;
+  readonly Promise?: PromiseConstructorLike | undefined;
+  /** A socket factory: `() => stream.Duplex`. */
+  readonly stream?: (() => unknown) | undefined;
+  /** A `pg.Client` subclass. */
+  readonly Client?: (new () => object) | undefined;
+  /** Receives each new `pg.PoolClient`. */
+  readonly onConnect?: ((client: never) => void | Promise<void>) | undefined;
+  readonly verify?:
+    | ((client: never, done: (error?: Error) => void) => void)
+    | undefined;
 };
 export type { PostgresDriver } from "./pool";
 
-/** `2024-01-31 12:00:00.123` as UTC; infinity and BC dates stay text for the codec to report. */
+/** `2024-01-31 12:00:00.123` (also BC) as UTC; infinity stays text for the codec to report. */
 const utcTimestamp = (value: string): Date | string =>
-  /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(\.\d+)?$/.test(value)
-    ? new Date(`${value.replace(" ", "T")}Z`)
-    : value;
+  timestampFromText(value) ?? value;
 
 // Per-pool parsers preserve integer precision without changing pg's global state.
 const parsers: NonNullable<PoolConfig["types"]> = {
@@ -70,16 +114,27 @@ const parsers: NonNullable<PoolConfig["types"]> = {
   },
 };
 
+/**
+ * A failure that leaves the client unusable: the connection was lost or the
+ * server ended the session, or node-postgres failed without a SQLSTATE, so not
+ * because of a statement. Ordinary SQL errors and Symmetria's own parameter
+ * errors keep their healthy connection.
+ */
+const brokenConnection = (error: unknown): boolean =>
+  isConnectionError(error) ||
+  (!sqlState(error) &&
+    !(error instanceof Error && error.message.startsWith("symmetria:")));
+
 export const postgres = (
   connection: string | PostgresOptions,
 ): PostgresDriver => {
   const { profiler, url, ...options } =
     typeof connection === "string" ? { url: connection } : connection;
-  const config: PoolConfig = {
+  const config = {
     ...options,
     ...(url ? { connectionString: url } : {}),
     types: parsers,
-  };
+  } as PoolConfig;
 
   const pool = new Pool(config);
   pool.on("error", () => {});
@@ -114,6 +169,14 @@ export const postgres = (
 
     client.on("error", onError);
 
+    const release = (error?: Error | true) => {
+      if (!released) {
+        released = true;
+        client.removeListener("error", onError);
+        client.release(error ?? failure);
+      }
+    };
+
     return {
       execute: async (query) => {
         if (failure) {
@@ -121,16 +184,15 @@ export const postgres = (
         }
 
         return result(
-          await client.query(query.sql, postgresParameters(query.parameters)),
+          await client.query(
+            query.sql,
+            postgresParameters(query.parameters, true),
+          ),
         );
       },
-      release: (error) => {
-        if (!released) {
-          released = true;
-          client.removeListener("error", onError);
-          client.release(error ?? failure);
-        }
-      },
+      release,
+      // node-postgres closes a client released with `true`.
+      discard: async () => release(true),
     };
   };
 
@@ -141,6 +203,16 @@ export const postgres = (
 
         try {
           return await connection.execute(query);
+        } catch (error) {
+          // A client killed mid-query may not have noticed its closed socket
+          // yet; returned to the pool, it would fail the next query.
+          if (brokenConnection(error)) {
+            connection.release(
+              error instanceof Error ? error : new Error(String(error)),
+            );
+          }
+
+          throw error;
         } finally {
           connection.release();
         }

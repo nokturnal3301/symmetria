@@ -9,14 +9,17 @@ import {
 
 test("createDatabase reuses declarations and scopes across independent drivers", async () => {
   let declarations = 0;
-  const model = schema({
+  const unscoped = schema({
     records: { id: int, tenantId: int, name: text },
     notes: ({ records }) => {
       declarations++;
 
       return { id: int, record: records, body: text };
     },
-  }).$scope({ records: (record) => record.tenantId.is(1) });
+  });
+  const model = unscoped.$scope({
+    records: (record) => record.tenantId.is(1),
+  });
   const first = isolatedDriver();
   const second = isolatedDriver();
   first.createTables(model);
@@ -25,10 +28,16 @@ test("createDatabase reuses declarations and scopes across independent drivers",
   const other = createDatabase({ schema: model, driver: second });
 
   try {
-    await database.records.insert([
-      { id: 1, tenantId: 1, name: "first" },
-      { id: 2, tenantId: 2, name: "hidden" },
-    ]);
+    // The scoped database writes rows inside its scope only.
+    await expect(
+      database.records.insert({ id: 2, tenantId: 2, name: "hidden" }).execute(),
+    ).rejects.toMatchObject({ code: "SYMMETRIA_OUT_OF_SCOPE" });
+    await createDatabase({ schema: unscoped, driver: first }).records.insert({
+      id: 2,
+      tenantId: 2,
+      name: "hidden",
+    });
+    await database.records.insert({ id: 1, tenantId: 1, name: "first" });
     await database.notes.insert({ id: 1, recordId: 1, body: "related" });
     await other.records.insert({ id: 1, tenantId: 1, name: "second" });
 

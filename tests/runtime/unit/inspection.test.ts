@@ -6,6 +6,7 @@ import {
   bigint,
   timestamptz,
   jsonb,
+  sql,
   type CompiledQuery,
 } from "../../../packages/runtime/src";
 import { createQueryInspection } from "../../../packages/runtime/src/observability/inspection";
@@ -114,7 +115,11 @@ test("inspection decodes nested results and EXPLAIN retains placeholders and imm
     (posts) => ({
       id: posts.id,
     }),
-    { where: (posts) => posts.createdAt.is(new Date("2026-01-01")) },
+    // Column comparisons bind Dates as ISO text; raw SQL keeps the Date object.
+    {
+      where: (posts) =>
+        posts.createdAt.is(sql<Date>`${new Date("2026-01-01")}`),
+    },
   );
   const inspection = createQueryInspection(dated[QUERY_PLAN], async (query) => {
     expect((query.parameters[0] as Date).getUTCFullYear()).toBe(2026);

@@ -73,3 +73,24 @@ const model = schema({
   // @ts-expect-error INSERT has no WHERE
   model.users.insert({ name: "Ada" }).where(() => true);
 }
+
+// IN accepts a subquery over a nullable column of the same type; its NULLs never match.
+{
+  model.users({
+    where: (users) =>
+      users.id.in(model.posts((posts) => ({ editorId: posts.editorId }))),
+  });
+  model.users({
+    where: (users) =>
+      users.id.notIn(model.posts((posts) => ({ editorId: posts.editorId }))),
+  });
+  model.posts({
+    where: (posts) =>
+      posts.editorId.in(model.users((users) => ({ id: users.id }))),
+  });
+  model.users({
+    where: (users) =>
+      // @ts-expect-error a nullable subquery still has to select the same type
+      users.id.in(model.posts((posts) => ({ metadata: posts.metadata }))),
+  });
+}

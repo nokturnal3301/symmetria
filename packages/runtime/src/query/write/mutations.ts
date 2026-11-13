@@ -1,8 +1,14 @@
 /**
  * Table mutation builders: insert, update, delete and upsert with RETURNING; whole-table UPDATE/DELETE
- * must be confirmed with all().
+ * must be confirmed with all(). A scoped database's writes check every written row against the scope.
  */
 import { freeze } from "../plan/freeze";
+import { scopeViolation } from "../../driver/errors";
+import {
+  collectDataErrors,
+  dataError,
+  type DeferredError,
+} from "../codecs/deferred";
 import type { PredicateList } from "../select/types";
 import {
   compilePlan,
@@ -28,6 +34,7 @@ import {
   and,
   readPredicate,
   valueNode,
+  jsonNullNode,
   type Predicate,
   type PredicateDescription,
   type SelectedColumn,
@@ -89,12 +96,18 @@ const PARAMETER_LIMIT = 65535;
 /** Hooks a table's query machinery hands to its mutations: $scope() filters and relation-path contexts. */
 export type MutationOptions = {
   readonly atomic?: AtomicRunner;
-  /** `$scope()` predicates, evaluated each time a write is built. */
+  /**
+   * The rows an UPDATE or DELETE may reach, evaluated each time a write is
+   * built: the `$scope()` predicates, plus a lookup's key. Its `$scope()`
+   * predicates are also checked against every row an INSERT or UPDATE writes.
+   */
   readonly scope?: () => readonly PredicateDescription[];
   readonly context?: (plan: SelectPlan) => {
     readonly plan: SelectPlan;
     readonly scope: () => RuntimeScope;
   };
+  /** A data error of the lookup the write starts from. */
+  readonly failure?: DeferredError;
 };
 
 type FlatInsert<
@@ -288,6 +301,94 @@ export type TableMutations<
   >;
 };
 
+/** The bound value of a conflict column as a comparable key; undefined when only PostgreSQL knows it. */
+const conflictKey = (
+  value: ValueNode | typeof DEFAULT_VALUE | undefined,
+): string | undefined => {
+  if (
+    value === undefined ||
+    value === DEFAULT_VALUE ||
+    value.kind !== "parameter" ||
+    value.value === null
+  ) {
+    return undefined;
+  }
+
+  const bound = value.value;
+
+  if (bound instanceof Date) {
+    return `date:${bound.getTime()}`;
+  }
+
+  return bound !== null && typeof bound === "object"
+    ? `json:${JSON.stringify(bound, (_key, entry: unknown) =>
+        typeof entry === "bigint" ? String(entry) : entry,
+      )}`
+    : `value:${String(bound)}`;
+};
+
+/**
+ * PostgreSQL refuses to DO UPDATE one row twice in a statement, but a large
+ * insert split into chunks would let the later duplicate win silently, so
+ * duplicates are refused for every size, as a data error. NULL and
+ * SQL-expression keys never conflict here and are left to PostgreSQL.
+ */
+const rejectDuplicateKeys = (
+  root: TableBinding,
+  columns: readonly ColumnSnapshot[],
+  rows: MutationPlan["values"],
+): void => {
+  if (rows.length < 2) {
+    return;
+  }
+
+  const seen = new Map<string, number>();
+
+  rows.forEach((values, position) => {
+    const parts: string[] = [];
+
+    for (const column of columns) {
+      const key = conflictKey(values[column.name]);
+
+      if (key === undefined) {
+        return;
+      }
+
+      parts.push(key);
+    }
+
+    const key = JSON.stringify(parts);
+    const first = seen.get(key);
+
+    if (first !== undefined) {
+      dataError(
+        Object.assign(
+          new Error(
+            `symmetria: rows ${first + 1} and ${position + 1} of the upsert on "${root.table.name}" share a conflict key (${columns.map((column) => column.name).join(", ")}); ON CONFLICT DO UPDATE cannot change a row twice in one statement, so merge or remove the duplicates`,
+          ),
+          { code: "SYMMETRIA_DUPLICATE_CONFLICT_KEY" },
+        ),
+      );
+    }
+
+    seen.set(key, position);
+  });
+};
+
+/** A JS null stored as JSON null; a jsonb(schema) that rejects null makes it a data error. */
+const jsonNullValue = (
+  codec: TableBinding["codecs"][string] | undefined,
+  sqlType: string,
+): ValueNode => {
+  try {
+    return jsonNullNode(codec, sqlType);
+  } catch (error) {
+    dataError(error);
+
+    return valueNode(null);
+  }
+};
+
 export const createMutation = (
   kind: MutationPlan["kind"],
   root: TableBinding,
@@ -374,7 +475,9 @@ export const createMutation = (
     insert = false,
   ): Readonly<Record<string, ValueNode | typeof DEFAULT_VALUE>> => {
     if (!values || typeof values !== "object" || Array.isArray(values)) {
-      throw new Error("symmetria: values must be an object");
+      dataError(new Error("symmetria: values must be an object"));
+
+      return freeze(Object.create(null));
     }
 
     // undefined means omitted, as for query options; unknown keys still fail.
@@ -394,12 +497,23 @@ export const createMutation = (
         continue;
       }
 
-      if (value === null && column.notNull) {
-        throw new Error(`symmetria: "${root.alias}.${name}" cannot be null`);
+      // A non-nullable json/jsonb column stores null as the JSON value null.
+      const jsonNull =
+        value === null &&
+        column.notNull &&
+        (column.sqlType === "jsonb" || column.sqlType === "json");
+
+      // Errors about the values themselves fail the write when it runs.
+      if (value === null && column.notNull && !jsonNull) {
+        dataError(
+          new Error(`symmetria: "${root.alias}.${name}" cannot be null`),
+        );
       }
 
       if (value === DEFAULT_VALUE && !column.default && column.notNull) {
-        throw new Error(`symmetria: "${root.alias}.${name}" has no default`);
+        dataError(
+          new Error(`symmetria: "${root.alias}.${name}" has no default`),
+        );
       }
 
       if (
@@ -407,15 +521,19 @@ export const createMutation = (
         column.default.sql === "identity" &&
         value !== DEFAULT_VALUE
       ) {
-        throw new Error(
-          `symmetria: "${root.alias}.${name}" is generated always; use defaultValue`,
+        dataError(
+          new Error(
+            `symmetria: "${root.alias}.${name}" is generated always; use defaultValue`,
+          ),
         );
       }
 
       const node =
         value === DEFAULT_VALUE
           ? DEFAULT_VALUE
-          : valueNode(value, root.codecs[name]);
+          : jsonNull
+            ? jsonNullValue(root.codecs[name], column.sqlType)
+            : valueNode(value, root.codecs[name]);
 
       if (
         node !== DEFAULT_VALUE &&
@@ -437,68 +555,95 @@ export const createMutation = (
           !column.default &&
           values[column.name] === undefined
         ) {
-          throw new Error(
-            `symmetria: missing required column "${root.alias}.${column.name}"`,
+          dataError(
+            new Error(
+              `symmetria: missing required column "${root.alias}.${column.name}"`,
+            ),
           );
         }
       }
     }
 
     if (!insert && !assigned) {
-      throw new Error("symmetria: update() requires at least one value");
+      dataError(new Error("symmetria: update() requires at least one value"));
     }
 
     return freeze(result);
   };
 
-  const resolved =
-    typeof input === "function"
-      ? input(
-          columnsOnly(
-            root.table,
-            scope[root.alias]!,
-            `${kind === "insert" ? "insert" : "update"} values`,
-          ),
-        )
-      : input;
-  const rows = Array.isArray(resolved) ? resolved : [resolved];
-  const single = kind === "insert" && !Array.isArray(resolved);
+  // A lookup's key and the $scope() restrict UPDATE and DELETE; the $scope()
+  // predicates alone are checked against every row an INSERT or UPDATE writes.
+  const restriction = options.scope?.() ?? [];
+  const checks =
+    kind !== "delete" && restriction.length
+      ? restriction.filter((description) => description.kind === "scope")
+      : [];
 
-  if (kind === "update" && !rows.length) {
-    throw new Error("symmetria: update() requires at least one value");
-  }
+  const [initial, failure] = collectDataErrors((): MutationPlan => {
+    const resolved =
+      typeof input === "function"
+        ? input(
+            columnsOnly(
+              root.table,
+              scope[root.alias]!,
+              `${kind === "insert" ? "insert" : "update"} values`,
+            ),
+          )
+        : input;
+    const rows = Array.isArray(resolved) ? resolved : [resolved];
+    const single = kind === "insert" && !Array.isArray(resolved);
 
-  const initial: MutationPlan = freeze({
-    kind,
-    root,
-    bindings,
-    values: freeze(
+    if (kind === "update" && !rows.length) {
+      dataError(new Error("symmetria: update() requires at least one value"));
+    }
+
+    const values = freeze(
       kind === "delete"
         ? []
         : rows.map((row) => readValues(row, kind === "insert")),
-    ),
-    atomicValues,
-    predicates: freeze(kind === "insert" ? [] : [...(options.scope?.() ?? [])]),
-    selection: freeze([]),
-    ...(single ? { single: true as const } : {}),
+    );
+
+    return freeze({
+      kind,
+      root,
+      bindings,
+      values,
+      atomicValues,
+      predicates: freeze(kind === "insert" ? [] : [...restriction]),
+      selection: freeze([]),
+      ...(checks.length ? { checks: freeze(checks) } : {}),
+      ...(single ? { single: true as const } : {}),
+    });
   });
+
+  /** The next immutable state; data errors found while building it fail it when it runs. */
+  const derive = (next: () => MutationPlan): MutationPlan => {
+    const [plan, error] = collectDataErrors(next);
+
+    return error && !plan.failure ? freeze({ ...plan, failure: error }) : plan;
+  };
 
   const chunkPlans = new WeakMap<MutationPlan, readonly MutationPlan[]>();
 
   const executeChunked = async (
     state: MutationPlan,
-    runner: QueryExecutor | undefined = executor,
     compile?: (plan: MutationPlan) => CompiledQuery,
-    insideAtomic = false,
   ) => {
     const limit = PARAMETER_LIMIT;
     const compiled = compile ?? compilePlan;
     let chunks = chunkPlans.get(state);
 
-    const run = (plan: MutationPlan, execute: QueryExecutor | undefined) =>
-      compile
+    const run = (plan: MutationPlan, execute: QueryExecutor | undefined) => {
+      const result = compile
         ? executeCompiled(plan, compile(plan), execute)
         : executePlan(plan, execute);
+
+      return plan.checks
+        ? result.catch((error: unknown) => {
+            throw scopeViolation(error);
+          })
+        : result;
+    };
 
     if (
       state.kind !== "insert" ||
@@ -511,7 +656,7 @@ export const createMutation = (
         state.values.length * root.table.columns.length + 1000 <= limit) ||
       (!chunks && compiled(state).parameters.length <= limit)
     ) {
-      return run(state, runner);
+      return run(state, executor);
     }
 
     // Halve until every chunk fits; rows may bind different numbers of parameters.
@@ -548,48 +693,19 @@ export const createMutation = (
       return { rows, affectedRows };
     };
 
-    return insideAtomic ? runChunks(runner) : options.atomic(runChunks);
+    return options.atomic(runChunks);
   };
 
   const build = (state: MutationPlan): object => {
     const executeUsing = async (
       compile?: (plan: MutationPlan) => CompiledQuery,
     ) => {
-      // `insert([])` is a no-op: nothing to write, nothing returned.
-      // A scoped upsert's DO UPDATE is filtered by the scope: a conflict with a
-      // row outside it writes nothing, which must not pass as success.
-      const inScope = <Result extends { affectedRows: number }>(
-        result: Result,
-      ): Result => {
-        if (
-          state.conflict?.predicates?.length &&
-          !state.conflict.condition &&
-          result.affectedRows < state.values.length
-        ) {
-          throw Object.assign(
-            new Error(
-              `symmetria: upsert on "${root.table.name}" conflicted with a row outside the database scope`,
-            ),
-            { code: "SYMMETRIA_OUT_OF_SCOPE" },
-          );
-        }
-
-        return result;
-      };
-
+      // `insert([])` is a no-op: nothing to write, nothing returned. Scope
+      // checks run inside each statement, which fails as a whole.
       const result =
         state.kind === "insert" && !state.values.length
           ? { rows: [], affectedRows: 0 }
-          : state.conflict?.predicates?.length &&
-              state.values.length > 1 &&
-              options.atomic
-            ? // Several rows: the rows the scope admits must not stay written.
-              await options.atomic((atomicExecutor) =>
-                executeChunked(state, atomicExecutor, compile, true).then(
-                  inScope,
-                ),
-              )
-            : inScope(await executeChunked(state, executor, compile));
+          : await executeChunked(state, compile);
 
       if (!state.selection.length) {
         return { affectedRows: result.affectedRows };
@@ -607,17 +723,19 @@ export const createMutation = (
         ) => readonly SelectedColumn[] | ProjectionObject,
       ) =>
         build(
-          freeze({
-            ...state,
-            selection: readSelection(
-              returningProjection(
-                selector as never,
-                columnsOnly(root.table, scope[root.alias]!, "RETURNING"),
-                root.table,
+          derive(() =>
+            freeze({
+              ...state,
+              selection: readSelection(
+                returningProjection(
+                  selector as never,
+                  columnsOnly(root.table, scope[root.alias]!, "RETURNING"),
+                  root.table,
+                ),
+                bindings,
               ),
-              bindings,
-            ),
-          }),
+            }),
+          ),
         ),
       where: (
         callback: (
@@ -629,10 +747,15 @@ export const createMutation = (
         }
 
         return build(
-          freeze({
-            ...state,
-            predicates: freeze([...state.predicates, wherePredicate(callback)]),
-          }),
+          derive(() =>
+            freeze({
+              ...state,
+              predicates: freeze([
+                ...state.predicates,
+                wherePredicate(callback),
+              ]),
+            }),
+          ),
         );
       },
       all: () => {
@@ -729,55 +852,60 @@ export const createMutation = (
               );
             }
 
-            const conflictScopePredicates = options.scope?.() ?? [];
             const excluded = freeze({ ...root, alias: "excluded" });
             const conflictScope = createScope({ ...bindings, excluded });
-            const condition = where
-              ? (() => {
-                  const result = (
-                    where as (
-                      row: RuntimeScope[string],
-                      excluded: RuntimeScope[string],
-                    ) => Predicate | PredicateList
-                  )(conflictScope[root.alias]!, conflictScope.excluded!);
-                  const description = readPredicate(
-                    Array.isArray(result)
-                      ? and(...(result as PredicateList))
-                      : (result as Predicate),
-                  );
-                  validatePredicate(description, { ...bindings, excluded });
 
-                  return description;
-                })()
-              : undefined;
-
+            // The plan's scope checks also guard the conflicting row.
             return build(
-              freeze({
-                ...state,
-                conflict: freeze({
-                  columns: freeze(columns),
-                  action: "update",
-                  excluded,
-                  ...(condition ? { condition } : {}),
-                  ...(conflictScopePredicates.length
-                    ? { predicates: freeze([...conflictScopePredicates]) }
-                    : {}),
-                  values: readValues(
-                    typeof values === "string"
-                      ? Object.fromEntries(
-                          [values, ...names].map((name) => [
-                            name,
-                            conflictScope.excluded![name],
-                          ]),
-                        )
-                      : typeof values === "function"
-                        ? values(
-                            conflictScope[root.alias]!,
-                            conflictScope.excluded!,
+              derive(() => {
+                rejectDuplicateKeys(root, columns, state.values);
+
+                const condition = where
+                  ? (() => {
+                      const result = (
+                        where as (
+                          row: RuntimeScope[string],
+                          excluded: RuntimeScope[string],
+                        ) => Predicate | PredicateList
+                      )(conflictScope[root.alias]!, conflictScope.excluded!);
+                      const description = readPredicate(
+                        Array.isArray(result)
+                          ? and(...(result as PredicateList))
+                          : (result as Predicate),
+                      );
+                      validatePredicate(description, {
+                        ...bindings,
+                        excluded,
+                      });
+
+                      return description;
+                    })()
+                  : undefined;
+
+                return freeze({
+                  ...state,
+                  conflict: freeze({
+                    columns: freeze(columns),
+                    action: "update" as const,
+                    excluded,
+                    ...(condition ? { condition } : {}),
+                    values: readValues(
+                      typeof values === "string"
+                        ? Object.fromEntries(
+                            [values, ...names].map((name) => [
+                              name,
+                              conflictScope.excluded![name],
+                            ]),
                           )
-                        : values,
-                  ),
-                }),
+                        : typeof values === "function"
+                          ? values(
+                              conflictScope[root.alias]!,
+                              conflictScope.excluded!,
+                            )
+                          : values,
+                    ),
+                  }),
+                });
               }),
             );
           },
@@ -797,5 +925,7 @@ export const createMutation = (
     return profile ? profile.trackBuilder(builder) : builder;
   };
 
-  return build(initial);
+  const error = options.failure ?? failure;
+
+  return build(error ? freeze({ ...initial, failure: error }) : initial);
 };

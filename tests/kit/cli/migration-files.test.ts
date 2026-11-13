@@ -285,7 +285,7 @@ export default defineMigrationConfig({ schema: schema({ records: { id: int.auto,
     expect(JSON.parse(diff.stdout)).toMatchObject({ up: [], down: [] });
     expect(await run("lint", "--json", "--strict")).toMatchObject({
       exitCode: 0,
-      stdout: "[]\n",
+      stdout: '{\n  "findings": []\n}\n',
     });
     await rm(join(directory, "symmetria.config.ts"));
     expect(
@@ -326,6 +326,7 @@ test("squash replaces the journal and SQL chain while keeping the current schema
       parent: null,
       before: snapshotHash(emptySnapshot()),
       after: latest.manifest.after,
+      generated: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     expect(squashed.up).toContain('CREATE TABLE "tags"');
     expect(squashed.up).toContain('"title" text');

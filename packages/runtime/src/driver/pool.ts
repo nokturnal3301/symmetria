@@ -16,7 +16,10 @@ import type { QueryProfiler } from "../observability/profiling";
 
 export type PostgresConnection = {
   readonly execute: (query: CompiledQuery) => Promise<ExecutionResult>;
+  /** Return the connection to the pool; with an error, close it instead. */
   readonly release: (error?: Error) => void;
+  /** Close the connection instead of returning it, so none of its session state reaches the pool. */
+  readonly discard: () => Promise<void>;
 };
 
 export type PostgresPool = {

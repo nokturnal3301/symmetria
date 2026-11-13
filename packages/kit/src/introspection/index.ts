@@ -14,6 +14,12 @@ export type PullOptions = RenderOptions & {
   /** Location of the migration journal, which is never part of the declared schema. */
   readonly metadataSchema?: string;
   readonly metadataTable?: string;
+  /**
+   * Tables to leave out, such as another service's tables or PostGIS
+   * `spatial_ref_sys`: they are not declared and not reviewed, and foreign keys
+   * pointing to them stay plain columns, with a warning.
+   */
+  readonly ignoreTables?: readonly string[];
 };
 
 export type PullResult = {
@@ -22,7 +28,7 @@ export type PullResult = {
   readonly schemaName: string;
   /** SQL names of the declared tables. */
   readonly tables: string[];
-  /** Enum types declared with oneOf(). */
+  /** Enum types declared with oneOf(), by their SQL names. */
   readonly enumerations: string[];
   /** Extensions declared through the schema options. */
   readonly extensions: string[];
@@ -32,23 +38,12 @@ export type PullResult = {
 export const pullSchema = async (options: PullOptions): Promise<PullResult> => {
   const catalog = await readPullCatalog(options);
   const model = buildPulledSchema(catalog);
-  const declaredEnums = new Set(
-    model.tables.flatMap((table) =>
-      table.members.flatMap((member) =>
-        member.kind === "column" && member.type.kind === "enum"
-          ? [`${table.sqlName}_${member.sqlName}_enum`]
-          : [],
-      ),
-    ),
-  );
 
   return {
     source: renderSchema(model, options),
     schemaName: model.schemaName,
     tables: model.tables.map((table) => table.sqlName),
-    enumerations: catalog.enumerations
-      .map((entry) => entry.name)
-      .filter((name) => declaredEnums.has(name)),
+    enumerations: model.enumerations,
     extensions: model.extensions,
     warnings: model.warnings,
   };

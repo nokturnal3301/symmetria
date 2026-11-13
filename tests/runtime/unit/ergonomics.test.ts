@@ -80,7 +80,8 @@ test("unique lookup mutations retain scopes and detached method ownership", () =
   const { update, delete: remove } = db.users.by.email("ada");
   const statement = update({ name: "Ada" }).toSQL();
   expect(statement.sql).toStartWith("UPDATE");
-  expect(statement.parameters).toEqual(["Ada", 10, "ada"]);
+  // The scope restricts the update and checks the updated row.
+  expect(statement.parameters).toEqual(["Ada", 10, "ada", 10]);
   expect(remove().toSQL().parameters).toEqual([10, "ada"]);
   expect(model.users.byId(2).update({ name: "Ada" }).toSQL()).toEqual(
     model.users

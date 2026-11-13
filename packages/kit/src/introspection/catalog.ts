@@ -36,6 +36,8 @@ export type IndexDetailRow = {
   included: string[];
   /** Non-default operator class per key, null when the default applies. */
   opclasses: (string | null)[];
+  /** Collation per key when it differs from the key's own (a `COLLATE` in the definition), else null. */
+  collations: (string | null)[];
   /** Storage parameters as `name=value` strings, or null. */
   reloptions: string[] | null;
   predicate: string | null;
@@ -96,6 +98,15 @@ export const readIndexDetails = (options: CatalogOptions) =>
       ARRAY(SELECT CASE WHEN opclass.opcdefault THEN NULL ELSE opclass.opcname::text END
         FROM unnest(index.indclass::oid[]) WITH ORDINALITY classes(oid, position)
         JOIN pg_opclass opclass ON opclass.oid = classes.oid ORDER BY position) AS opclasses,
+      ARRAY(SELECT CASE
+          WHEN index.indcollation[position - 1] = 0 THEN NULL
+          WHEN index.indkey[position - 1] <> 0 THEN (SELECT CASE WHEN keycolumn.attcollation = index.indcollation[position - 1] THEN NULL ELSE collation_entry.collname::text END
+            FROM pg_attribute keycolumn WHERE keycolumn.attrelid = index.indrelid AND keycolumn.attnum = index.indkey[position - 1])
+          WHEN strpos(pg_get_indexdef(index.indexrelid, 0, true), pg_get_indexdef(index.indexrelid, position, true) || ' COLLATE ') > 0 THEN collation_entry.collname::text
+          ELSE NULL END
+        FROM generate_series(1, index.indnkeyatts) position
+        LEFT JOIN pg_collation collation_entry ON collation_entry.oid = index.indcollation[position - 1]
+        ORDER BY position) AS collations,
       indexrelation.reloptions::text[] AS reloptions,
       pg_get_expr(index.indpred, index.indrelid, true) AS predicate,
       pg_get_indexdef(index.indexrelid) AS definition
@@ -139,6 +150,8 @@ export const readUndeclaredObjects = (options: CatalogOptions) =>
 
 export type PullCatalog = Awaited<ReturnType<typeof readCatalog>> & {
   schemaName: string;
+  /** Tables of the schema left out through `ignoreTables`. */
+  ignored?: string[];
   layout: ColumnLayoutRow[];
   details: TableDetailRow[];
   indexDetails: IndexDetailRow[];
@@ -146,7 +159,12 @@ export type PullCatalog = Awaited<ReturnType<typeof readCatalog>> & {
   undeclared: UndeclaredObjectRow[];
 };
 
-/** Everything `pull` needs in one round of queries. */
+/**
+ * Everything `pull` needs in one round of queries. Tables in `ignoreTables`
+ * are left out with their columns, constraints, indexes and triggers, and so
+ * are enum types only they use; foreign keys of other tables that point to
+ * them stay in, for the model to report.
+ */
 export const readPullCatalog = async (
   options: CatalogOptions,
 ): Promise<PullCatalog> => {
@@ -154,20 +172,47 @@ export const readPullCatalog = async (
     options,
     "SELECT COALESCE($1, current_schema()) AS name WHERE $2::text IS NOT NULL AND $3::text IS NOT NULL",
   );
-  const catalog = await readCatalog(options);
+  const catalog = await readCatalog({ ...options, ignoreTables: [] });
   const layout = await readColumnLayout(options);
   const details = await readTableDetails(options);
   const indexDetails = await readIndexDetails(options);
   const extensions = await readExtensions(options);
   const undeclared = await readUndeclaredObjects(options);
+  const ignoreTables = new Set(options.ignoreTables ?? []);
+
+  const kept = <Row extends { table_name?: string | null; name?: string }>(
+    rows: Row[],
+  ): Row[] =>
+    rows.filter((row) => !ignoreTables.has(row.table_name ?? row.name ?? ""));
+
+  const columns = kept(catalog.columns);
+  const ignoredEnumerations = new Set(
+    catalog.columns
+      .filter(
+        (column) =>
+          column.enum_name &&
+          ignoreTables.has(column.table_name) &&
+          !columns.some((entry) => entry.enum_name === column.enum_name),
+      )
+      .map((column) => column.enum_name),
+  );
 
   return {
-    ...catalog,
+    tables: kept(catalog.tables),
+    columns,
+    constraints: kept(catalog.constraints),
+    indexes: kept(catalog.indexes),
+    enumerations: catalog.enumerations.filter(
+      (enumeration) => !ignoredEnumerations.has(enumeration.name),
+    ),
     schemaName: schemaRow?.name ?? options.schemaName ?? "public",
-    layout,
-    details,
-    indexDetails,
+    ignored: catalog.tables
+      .filter((table) => ignoreTables.has(table.name))
+      .map((table) => table.name),
+    layout: kept(layout),
+    details: kept(details),
+    indexDetails: kept(indexDetails),
     extensions,
-    undeclared,
+    undeclared: kept(undeclared),
   };
 };

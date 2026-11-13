@@ -6,14 +6,19 @@ import {
   bigint,
   numeric,
   real,
+  smallint,
   text,
+  oneOf,
   sum,
+  sql,
   databaseError,
 } from "../../../packages/runtime/src";
+import { expectDataError } from "../../support/data-errors";
 
 const lines = table({
   id: int.auto,
   quantity: int,
+  small: smallint,
   price: numeric(10, 2),
   weight: real,
   views: bigint,
@@ -21,6 +26,7 @@ const lines = table({
 });
 const rows: Record<string, unknown>[] = [];
 const model = schema({ lines }, { executor: async () => rows });
+type Line = Parameters<Parameters<typeof model.lines>[0]>[0];
 const sqlOf = (
   build: (
     line: Parameters<Parameters<typeof model.lines>[0]>[0],
@@ -46,12 +52,30 @@ test("a decimal operand turns the other side into numeric", () => {
   ).toContain('("lines"."price" / (("lines"."weight")::numeric))');
 });
 
-test("integers divide as integers unless an operand is decimal or fractional", () => {
+test("divide() never truncates; quotient() divides toward zero in the integer type", () => {
   expect(sqlOf((line) => ({ x: line.quantity.divide(2) })).sql).toContain(
+    '((("lines"."quantity")::numeric) / $1::text::numeric)',
+  );
+  expect(
+    sqlOf((line) => ({ x: line.views.divide(line.quantity) })).sql,
+  ).toContain(
+    '((("lines"."views")::numeric) / (("lines"."quantity")::numeric))',
+  );
+  expect(sqlOf((line) => ({ x: line.quantity.quotient(2) })).sql).toContain(
     '("lines"."quantity" / $1)',
   );
-  expect(sqlOf((line) => ({ x: line.quantity.multiply(1.5) })).sql).toContain(
-    '("lines"."quantity" * $1::text::double precision)',
+  expect(sqlOf((line) => ({ x: line.price.quotient(2) })).sql).toContain(
+    'div("lines"."price", $1::text::numeric)',
+  );
+  expect(sqlOf((line) => ({ x: line.weight.quotient(2) })).sql).toContain(
+    'trunc((("lines"."weight")::double precision) / $1::text::double precision)',
+  );
+  // Floats compute in double precision, whatever the other side.
+  expect(sqlOf((line) => ({ x: line.weight.divide(2) })).sql).toContain(
+    '((("lines"."weight")::double precision) / $1::text::double precision)',
+  );
+  expect(sqlOf((line) => ({ x: line.weight.multiply(10n) })).sql).toContain(
+    '((("lines"."weight")::double precision) * $1::text::double precision)',
   );
   expect(sqlOf((line) => ({ x: line.quantity.plus(10n) })).sql).toContain(
     '("lines"."quantity" + $1::text::bigint)',
@@ -59,6 +83,77 @@ test("integers divide as integers unless an operand is decimal or fractional", (
   expect(sqlOf((line) => ({ x: line.views.plus(1) }))).toMatchObject({
     parameters: ["1"],
   });
+  // A number next to a smallint is an integer, like a SQL literal.
+  expect(sqlOf((line) => ({ x: line.small.plus(1) })).sql).toContain(
+    '("lines"."small" + $1::text::integer)',
+  );
+});
+
+test("numbers next to integer columns are integers in range; fractions are decimal text", async () => {
+  expect(sqlOf((line) => ({ x: line.quantity.multiply("1.5") })).sql).toContain(
+    '((("lines"."quantity")::numeric) * $1::text::numeric)',
+  );
+
+  for (const [build, message] of [
+    [
+      (line: Line) => line.quantity.multiply(1.5),
+      /integer values are integers from -2147483648 to 2147483647, received 1.5/,
+    ],
+    [(line: Line) => line.quantity.plus(2 ** 31), /received 2147483648/],
+    [(line: Line) => line.small.minus(Number.NaN), /received NaN/],
+    [
+      (line: Line) => line.views.multiply(0.5),
+      /bigint values or safe integers/,
+    ],
+  ] as const) {
+    await expectDataError(
+      () => model.lines((line) => ({ x: build(line) })),
+      message,
+    );
+  }
+
+  // Next to a count(), which is bigint in SQL, any safe integer fits.
+  expect(
+    model.lines((_line, { count }) => ({ x: count().plus(2 ** 40) })).toSQL(),
+  ).toMatchObject({ parameters: [String(2 ** 40)] });
+});
+
+test("text that looks numeric has no arithmetic: enums and match() labels", () => {
+  const coded = schema(
+    {
+      codes: table({
+        id: int.auto,
+        code: oneOf("1", "2"),
+        state: oneOf("a", "b"),
+      }),
+    },
+    { executor: async () => [] },
+  );
+
+  expect(() =>
+    coded.codes((row) => ({
+      x: (row.code as never as Line["quantity"]).plus(1),
+    })),
+  ).toThrow(/arithmetic needs a number, bigint or numeric value, not enum/);
+  expect(() =>
+    coded.codes((row) => ({
+      x: (
+        row.state.match({ a: "1", b: "2" }) as never as Line["quantity"]
+      ).multiply(2),
+    })),
+  ).toThrow(/not text/);
+});
+
+test("arithmetic on raw SQL needs a SQL type", () => {
+  expect(() =>
+    sqlOf(() => ({ x: sql<number>`1`.plus(1 as never) as never })),
+  ).toThrow(/known SQL type; write raw SQL as sql.of\(column\)/);
+  expect(() =>
+    sqlOf((line) => ({ x: line.quantity.plus(sql<number>`1` as never) })),
+  ).toThrow(/known SQL type/);
+  expect(sqlOf(() => ({ x: sql.of(int)`7`.divide(2) })).sql).toContain(
+    "(((7))::numeric) / $1::text::numeric)",
+  );
 });
 
 test("results decode with the promoted type, including sums of products", async () => {
@@ -66,12 +161,16 @@ test("results decode with the promoted type, including sums of products", async 
     total: "606.30",
     views: "9007199254740994",
     ratio: 4.5,
+    half: "1.5000000000000000",
+    whole: 1,
     sum: "607.00",
   });
   const [row] = await model.lines((line) => ({
     total: line.quantity.multiply(line.price),
     views: line.views.plus(1),
-    ratio: line.quantity.multiply(1.5),
+    ratio: line.weight.multiply(1.5),
+    half: line.quantity.divide(2),
+    whole: line.quantity.quotient(2),
     sum: sum(line.quantity.multiply(line.price)),
   }));
 
@@ -79,6 +178,8 @@ test("results decode with the promoted type, including sums of products", async 
     total: "606.30",
     views: 9007199254740994n,
     ratio: 4.5,
+    half: "1.5000000000000000",
+    whole: 1,
     sum: "607.00",
   });
 });

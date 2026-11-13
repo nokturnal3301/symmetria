@@ -183,6 +183,7 @@ export const validatePredicate = (
       break;
     case "not":
     case "notTrue":
+    case "scope":
       validatePredicate(description.predicate, bindings);
       break;
     case "membership":

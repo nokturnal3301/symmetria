@@ -106,15 +106,30 @@ export const rollbackPublication = async (publication: Publication) => {
   }
 };
 
-/** Recover a process crash without discarding a live writer or guessing at incomplete metadata. */
+/**
+ * Recover a process crash without discarding a live writer or guessing at
+ * incomplete metadata. Resolves false when no generation lock is left behind.
+ */
 export const recoverMigrationFiles = async (
   directory: string,
-): Promise<void> => {
+): Promise<boolean> => {
   directory = resolve(directory);
   const lock = join(directory, generationLockName);
-  const owner = JSON.parse(
-    await readFile(join(lock, "owner.json"), "utf8"),
-  ) as { pid: number; host: string };
+
+  if ((await fileIdentity(lock)) === undefined) {
+    return false;
+  }
+
+  let owner: { pid: number; host: string };
+
+  try {
+    owner = JSON.parse(await readFile(join(lock, "owner.json"), "utf8"));
+  } catch (error) {
+    throw new Error(
+      `symmetria: generation lock ${lock} has no readable owner.json (the generator stopped before recording it); make sure no generate or squash is running, then inspect and remove the lock manually`,
+      { cause: error },
+    );
+  }
 
   if (
     owner.host !== hostname() ||
@@ -186,4 +201,6 @@ export const recoverMigrationFiles = async (
     await rm(recovery, { recursive: true, force: true });
     throw error;
   }
+
+  return true;
 };

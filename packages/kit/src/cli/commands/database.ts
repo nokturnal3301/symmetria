@@ -64,16 +64,18 @@ export const drift = async (
     }
 
     const { metadataSchema, metadataTable } = project.config;
+    const { ignoreTables } = project.runnerOptions;
     const findings = await context.progress("Inspecting the database", () =>
       detectDrift({
         execute: driver.execute,
         snapshot: expected,
         ...(metadataSchema ? { metadataSchema } : {}),
         ...(metadataTable ? { metadataTable } : {}),
+        ...(ignoreTables ? { ignoreTables } : {}),
       }),
     );
     context.emit({
-      json: findings,
+      json: { findings },
       indent: 2,
       plain: () => formatDriftFindings(findings),
     });
@@ -106,7 +108,7 @@ const plan = async (
     direction,
   });
   context.emit({
-    json: steps,
+    json: { steps },
     indent: 2,
     plain: () =>
       steps
@@ -158,7 +160,7 @@ export const status = (context: CliContext, project: Project): Promise<void> =>
     }
 
     context.emit({
-      json: statuses,
+      json: { migrations: statuses },
       pretty: () => formatStatus(statuses, context.color),
       plain: () =>
         statuses.length
@@ -185,14 +187,27 @@ export const migrate = (context: CliContext, project: Project): Promise<void> =>
       runner.migrate(values.to ? { to: values.to } : {}),
     );
     const durationMs = Math.round(performance.now() - started);
+    // `--to` an applied migration does nothing; say where the database stands.
+    const current =
+      !applied.length && values.to
+        ? (await runner.status())
+            .filter((entry) => entry.status === "applied")
+            .at(-1)?.id
+        : undefined;
+    const idle =
+      current === undefined
+        ? "Database is up to date."
+        : current === values.to
+          ? `Database is already at ${values.to}.`
+          : `${values.to} is already applied; the database is further along, at ${current}. Use rollback to go back.`;
     context.emit({
       json: { applied, durationMs },
       pretty: () =>
-        formatExecution(applied, "Applied", durationMs, context.color),
+        current === undefined
+          ? formatExecution(applied, "Applied", durationMs, context.color)
+          : `\n  ${context.style("✓", "success")} ${idle}\n`,
       plain: () =>
-        applied.length
-          ? applied.map((id) => `Applied ${id}`).join("\n")
-          : "Database is up to date.",
+        applied.length ? applied.map((id) => `Applied ${id}`).join("\n") : idle,
     });
   });
 

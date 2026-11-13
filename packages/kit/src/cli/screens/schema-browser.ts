@@ -5,7 +5,7 @@ import stringWidth from "string-width";
 import { emitKeypressEvents } from "node:readline";
 import { stripVTControlCharacters } from "node:util";
 import type { SchemaSnapshot, TableSnapshot } from "symmetria";
-import { fitLine, theme, wrapLines } from "../ui/style";
+import { fitLine, numberedLines, theme, wrapLines } from "../ui/style";
 import {
   highlightSQL,
   inspectEntries,
@@ -221,21 +221,15 @@ export const inspectSchema = (
           );
         }
 
-        const sqlLines = wrapLines(
+        const sqlLines = numberedLines(
           sqlCache.get(position.table)!,
           innerWidth - 5,
+          (label) => style(label, "muted"),
         );
         pageSize = innerHeight - detail.length;
         rowCount = sqlLines.length;
         position.row = Math.max(0, Math.min(position.row, rowCount - pageSize));
-        detail.push(
-          ...sqlLines
-            .slice(position.row, position.row + pageSize)
-            .map(
-              (line, index) =>
-                `${style(String(position.row + index + 1).padStart(3), "muted")}  ${line}`,
-            ),
-        );
+        detail.push(...sqlLines.slice(position.row, position.row + pageSize));
         pageLabel = `SQL ${position.row + 1}–${Math.min(rowCount, position.row + pageSize)}/${rowCount}`;
       } else {
         const nameWidth = Math.min(
@@ -349,7 +343,7 @@ export const inspectSchema = (
           : style("/ search tables and fields", "muted");
       const hint =
         width >= 90
-          ? "↑↓ select · Tab pane · ←→ tabs · Enter follow · / search · ⌫ back · Esc exit"
+          ? "↑↓ select · Tab pane · ←→ tabs · Enter follow · / search · ⌫ back · Esc/q exit"
           : width >= 64
             ? "↑↓ select · Tab pane · ←→ tabs · Enter follow · / find · Esc back"
             : "Tab pane · ←→ tabs · / find · Esc back";
@@ -446,6 +440,11 @@ export const inspectSchema = (
         draw();
 
         return;
+      }
+
+      // q closes the browser as it does the query inspector and the profiler.
+      if (input === "q" && !key.ctrl && !key.meta) {
+        return finish();
       }
 
       if (key.name === "escape") {

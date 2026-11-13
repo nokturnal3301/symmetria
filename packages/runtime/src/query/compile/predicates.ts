@@ -3,7 +3,11 @@
  */
 import { expressionSqlType } from "../plan/metadata";
 import { isJsonType } from "./postgres/values";
-import type { PredicateDescription, ValueNode } from "../expressions";
+import type {
+  PredicateDescription,
+  ScopePredicate,
+  ValueNode,
+} from "../expressions";
 import type { SelectPlan } from "../plan/types";
 import {
   parameter,
@@ -43,6 +47,41 @@ const largeListType = (
     : undefined;
 };
 
+/**
+ * A $scope() filter renders like any predicate, and the compilation records
+ * where it landed: its SQL, parameter range, bindings and aliases, so each
+ * execution can render the callback's current result in its place. Expression
+ * caches stay out of it, so no other clause reuses its parameters.
+ */
+const scopeSql = (
+  compilation: Compilation,
+  description: ScopePredicate,
+  bindings: Bindings,
+): string => {
+  const current =
+    compilation.scopeValues?.get(description) ?? description.predicate;
+  const caches = compilation.expressionCaches;
+  const aliases = new Map(compilation.aliasNames);
+  const start = compilation.parameters.length;
+  compilation.expressionCaches = undefined;
+
+  try {
+    const sql = predicateSql(compilation, current, bindings);
+    (compilation.scopes ??= []).push({
+      description,
+      bindings,
+      aliases,
+      start,
+      end: compilation.parameters.length,
+      sql,
+    });
+
+    return sql;
+  } finally {
+    compilation.expressionCaches = caches;
+  }
+};
+
 export const predicateSql = (
   compilation: Compilation,
   description: PredicateDescription,
@@ -57,6 +96,8 @@ export const predicateSql = (
       }
 
       return `(${description.predicates.map((child) => predicateSql(compilation, child, bindings)).join(` ${description.operator} `)})`;
+    case "scope":
+      return scopeSql(compilation, description, bindings);
     case "not":
       return `NOT (${predicateSql(compilation, description.predicate, bindings)})`;
     case "notTrue":

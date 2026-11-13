@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { request } from "node:http";
 import {
   createProfiler,
   schema,
@@ -136,6 +137,29 @@ test("profiler fetch wrapper and loopback endpoint expose request SQL", async ()
     >;
     expect(requests[0]!.label).toBe("GET /records");
     expect(requests[0]!.queries[0]!.sql).toContain('FROM "records"');
+
+    // A path starting with "//" is a path on this server, not another host;
+    // fetch() normalizes it, so the request is sent raw.
+    const doubled = await new Promise<number | undefined>((resolve, reject) => {
+      request(
+        {
+          host: server.url.hostname,
+          port: server.port,
+          path: "//requests",
+          headers: {
+            host: server.url.host,
+            "x-symmetria-token": server.token,
+          },
+        },
+        (response) => {
+          response.resume();
+          resolve(response.statusCode);
+        },
+      )
+        .on("error", reject)
+        .end();
+    });
+    expect(doubled).toBe(404);
   } finally {
     await server.stop(true);
   }

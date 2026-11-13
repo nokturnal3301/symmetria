@@ -15,6 +15,8 @@ import { selectSql } from "./select";
  */
 export const collectCommonTables = (compilation: Compilation): void => {
   const { plan, commonTables, visiting, references } = compilation;
+  // SQL names of the real tables the statement reads or writes.
+  const tables = new Set<string>();
 
   const walkValue = (node: ValueNode): void => {
     switch (node.kind) {
@@ -107,6 +109,12 @@ export const collectCommonTables = (compilation: Compilation): void => {
         walkPredicate(description.predicate);
 
         return;
+      case "scope":
+        walkPredicate(
+          compilation.scopeValues?.get(description) ?? description.predicate,
+        );
+
+        return;
       case "nullCheck":
         walkValue(description.value);
 
@@ -161,6 +169,8 @@ export const collectCommonTables = (compilation: Compilation): void => {
   const walkBinding = (binding: TableBinding): void => {
     if (binding.cteReference) {
       references.set(binding.cteReference.identity, binding.cteReference.name);
+    } else if (!binding.derived) {
+      tables.add(binding.table.sqlName);
     }
 
     if (binding.cte) {
@@ -245,13 +255,13 @@ export const collectCommonTables = (compilation: Compilation): void => {
 
       if (query.conflict?.action === "update") {
         walkAssignments(query.conflict.values);
-        query.conflict.predicates?.forEach(walkPredicate);
       }
     } else if (query.kind === "update") {
       walkAssignments(query.values[0]!);
     }
 
     query.predicates.forEach(walkPredicate);
+    query.checks?.forEach(walkPredicate);
     query.selection.forEach((expression) => walkValue(expression.node));
   };
 
@@ -265,6 +275,15 @@ export const collectCommonTables = (compilation: Compilation): void => {
     if (commonTables.get(name)?.identity !== identity) {
       throw new Error(
         `symmetria: recursive reference "${name}" escaped its CTE`,
+      );
+    }
+  }
+
+  // WITH names shadow tables everywhere in the statement.
+  for (const name of commonTables.keys()) {
+    if (tables.has(name)) {
+      throw new Error(
+        `symmetria: CTE "${name}" has the SQL name of a table in this statement and would hide it; choose another CTE name`,
       );
     }
   }

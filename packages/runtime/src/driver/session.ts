@@ -1,5 +1,5 @@
 /**
- * Runs a callback on one pinned connection (a $scope session) and releases it afterwards.
+ * Runs a callback on one pinned connection (a $scope session) and closes it afterwards.
  */
 import type {
   SessionDriver,
@@ -9,6 +9,13 @@ import type {
 import type { PostgresPool } from "./pool";
 import { runTransaction } from "./transactions";
 import { createPendingTasks } from "./pending";
+import {
+  callerInside,
+  createSerialQueue,
+  nestedFrame,
+  runInFrame,
+  type NestedFrame,
+} from "./serial";
 
 export const runPostgresSession = async <Result>(
   pool: PostgresPool,
@@ -25,21 +32,25 @@ export const runPostgresSession = async <Result>(
       })
     ).rows[0]!.pid as number;
   } catch (error) {
-    connection.release();
+    await connection.discard();
     throw error;
   }
 
   const cancellations = createPendingTasks();
   const pending = createPendingTasks();
+  // Statements run one at a time in call order; a session transaction holds
+  // the connection until it ends, and session statements issued meanwhile wait.
+  const queue = createSerialQueue();
   let active = true;
-  let transaction = false;
+  let transaction: NestedFrame | undefined;
 
   const available = () => {
     if (!active) {
       throw new Error("symmetria: session context is closed");
     }
 
-    if (transaction) {
+    // Queued behind the transaction, a call from inside its callback would wait for itself.
+    if (transaction && callerInside(transaction)) {
       throw new Error(
         "symmetria: await the session transaction before using its parent context",
       );
@@ -57,48 +68,47 @@ export const runPostgresSession = async <Result>(
     execute: (query) => {
       available();
 
-      return pending.track(connection.execute(query));
+      return pending.track(queue.run(() => connection.execute(query)));
     },
     transaction: async <Value>(
       operation: (driver: TransactionDriver) => Promise<Value>,
       options?: TransactionOptions,
     ) => {
       available();
+      const frame = nestedFrame();
 
-      if (pending.size()) {
-        throw new Error(
-          "symmetria: await pending queries before starting a session transaction",
-        );
-      }
+      return pending.track(
+        queue.run(async () => {
+          transaction = frame;
 
-      transaction = true;
+          try {
+            return await runInFrame(frame, () =>
+              runTransaction(
+                connection,
+                async (driver) => {
+                  try {
+                    const result = await operation(driver);
+                    await cancellations.settle();
 
-      try {
-        return await pending.track(
-          runTransaction(
-            connection,
-            async (driver) => {
-              try {
-                const result = await operation(driver);
-                await cancellations.settle();
+                    if (!active) {
+                      throw new Error(
+                        "symmetria: await the session transaction before returning from the callback",
+                      );
+                    }
 
-                if (!active) {
-                  throw new Error(
-                    "symmetria: await the session transaction before returning from the callback",
-                  );
-                }
-
-                return result;
-              } finally {
-                await cancellations.settle();
-              }
-            },
-            options,
-          ),
-        );
-      } finally {
-        transaction = false;
-      }
+                    return result;
+                  } finally {
+                    await cancellations.settle();
+                  }
+                },
+                options,
+              ),
+            );
+          } finally {
+            transaction = undefined;
+          }
+        }),
+      );
     },
   });
 
@@ -116,6 +126,8 @@ export const runPostgresSession = async <Result>(
     active = false;
     await pending.settle();
     await cancellations.settle();
-    connection.release();
+    // Settings, advisory locks, temporary tables and a transaction left open
+    // belong to the connection: it is closed rather than returned to the pool.
+    await connection.discard();
   }
 };
