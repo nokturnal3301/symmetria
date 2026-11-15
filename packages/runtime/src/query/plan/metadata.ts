@@ -1,4 +1,5 @@
 import type { ExpressionDescription } from "../expressions";
+import { unhandledKind } from "./traverse";
 
 export const expressionSqlType = (
   expression: ExpressionDescription,
@@ -66,12 +67,16 @@ export const expressionSqlType = (
       return node.query.selection[0]
         ? expressionSqlType(node.query.selection[0])
         : "derived";
-    default:
+    case "tuple":
+    case "rowCount":
+    case "searchRank":
       return (
         expression.codec?.parameterCast ??
         expression.codec?.sqlType ??
         "derived"
       );
+    default:
+      return unhandledKind(node);
   }
 };
 

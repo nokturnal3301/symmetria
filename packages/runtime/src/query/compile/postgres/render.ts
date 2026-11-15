@@ -2,15 +2,7 @@
  * PostgreSQL renderer: dialect-specific SQL for casts, JSON aggregation, arrays and operators.
  */
 import { freeze } from "../../plan/freeze";
-import { postgresArrayLiteral } from "./values";
-import {
-  searchHeadlineSql,
-  searchRankSql,
-  searchVectorSql,
-  sqlString,
-  tsquerySql,
-  tsvectorSql,
-} from "./search";
+import { sqlString } from "./search";
 import type { PostgresRenderer, JsonObjectEntry } from "./types";
 
 const jsonArray = (value: string): string =>
@@ -39,7 +31,6 @@ const jsonObject = (
 
 /** PostgreSQL SQL rendering, shared by every execution adapter. */
 export const postgresRenderer: PostgresRenderer = {
-  name: "postgres",
   placeholder: (position) => `$${position}`,
   cast: (value, target) => {
     switch (target.kind) {
@@ -53,7 +44,6 @@ export const postgresRenderer: PostgresRenderer = {
         return `(${value})::${target.type}`;
     }
   },
-  comparisonOperator: (operator) => operator,
   limitOffset: (limit, offset) => [
     ...(limit === undefined ? [] : [`LIMIT ${limit}`]),
     ...(offset === undefined ? [] : [`OFFSET ${offset}`]),
@@ -61,7 +51,6 @@ export const postgresRenderer: PostgresRenderer = {
   rowLock: (lock) =>
     `FOR ${lock.mode}${lock.of ? ` OF ${lock.of.join(", ")}` : ""}${lock.noWait ? " NOWAIT" : lock.skipLocked ? " SKIP LOCKED" : ""}`,
   textCast: { prefix: "", suffix: "::text" },
-  jsonArray,
   jsonObject,
   jsonRows: (nested, many, jsonOutput) => {
     const aggregate = jsonOutput ? "json_agg" : "jsonb_agg";
@@ -82,9 +71,6 @@ export const postgresRenderer: PostgresRenderer = {
   },
   arrayLength: (value, json) =>
     json ? `jsonb_array_length(${jsonArray(value)})` : `cardinality(${value})`,
-  jsonComparison: (left, right, operator) => `${left} ${operator} ${right}`,
-  jsonMembership: (left, operand, negated) =>
-    `${left} ${negated ? "NOT " : ""}IN (${operand.kind === "list" ? operand.values.join(", ") : operand.sql})`,
   jsonHas: (value, element, options, context) => {
     const array = jsonArray(value);
     const elementAlias = context.nestedAlias("__symmetria_element");
@@ -101,16 +87,9 @@ export const postgresRenderer: PostgresRenderer = {
     return `EXISTS (SELECT 1 FROM jsonb_array_elements(${array}) AS ${elementAlias}("value") WHERE ${elementAlias}."value" = COALESCE(${options.encoded ? element : `to_jsonb(${element})`}, 'null'::jsonb))`;
   },
   arrayHas: (value, element) => `${element} = ANY(${value})`,
-  searchVector: searchVectorSql,
-  searchQuery: tsquerySql,
   search: (vector, query) => `${vector} @@ ${query}`,
-  searchRank: searchRankSql,
-  searchHeadline: searchHeadlineSql,
-  searchDocument: tsvectorSql,
   recursiveUnion: (anchor, recursive, options) =>
     `(${anchor})\nUNION${options.unionAll ? " ALL" : ""}\n(${recursive})`,
-  parameterValue: (value) =>
-    Array.isArray(value) ? postgresArrayLiteral(value) : value,
   explain: (sql, analyze) => ({
     sql: `EXPLAIN (FORMAT JSON${analyze ? ", ANALYZE, BUFFERS" : ""}) ${sql}`,
     analyzed: analyze,

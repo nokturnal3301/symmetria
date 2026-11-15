@@ -29,7 +29,9 @@ import {
 } from "./json-path";
 import {
   COLUMN_CODEC,
+  SQL_DEFAULT,
   type Column,
+  type SqlDefault,
   type IsDecimalText,
   type MetadataTraits,
   type TsVector,
@@ -757,6 +759,11 @@ type ValidPath<
     : never
   : readonly [];
 
+/** What `set()` writes at a path: the JSON value there, or a column or expression of it. */
+type JsonSetValue<Value> =
+  | Exclude<Value, undefined>
+  | SelectedColumn<Exclude<Value, undefined>>;
+
 /** A path into JSON: the stored JSON value at the path. */
 type JsonPathColumn<
   Stored,
@@ -879,6 +886,29 @@ type ColumnMethods<Value, OutputName extends string, Traits, Stored> = {
     : <const Path extends readonly [string | number, ...(string | number)[]]>(
         ...path: Path & ValidPath<Stored, Path>
       ) => PathColumn<Value, Traits, Path, OutputName>;
+  /**
+   * `jsonb_set(column, path, value)`: the JSON with one key replaced, or added
+   * when its parent exists; the other keys stay. A NULL column stays NULL.
+   */
+  readonly set: NonNullable<Stored> extends Vector
+    ? never
+    : NonNullable<Stored> extends object
+      ? {
+          <const Key extends JsonKey<Stored> & keyof NonNullable<Stored>>(
+            key: Key,
+            value: JsonSetValue<NonNullable<Stored>[Key]>,
+          ): QueryColumn<Value, OutputName, Traits>;
+          <
+            const Path extends readonly [
+              string | number,
+              ...(string | number)[],
+            ],
+          >(
+            path: Path & ValidPath<Stored, Path>,
+            value: JsonSetValue<PathValue<Stored, Path>>,
+          ): QueryColumn<Value, OutputName, Traits>;
+        }
+      : never;
   readonly contains: NonNullable<Stored> extends Vector
     ? never
     : NonNullable<Stored> extends object
@@ -1544,6 +1574,7 @@ const readByPath = (node: ValueNode): boolean => {
         !!node.value &&
         readByPath(node.value)
       );
+    // An allow-list of the kinds a path value passes through unchanged.
     default:
       return false;
   }
@@ -1660,7 +1691,7 @@ const literalSide = (value: unknown, left: ArithmeticSide): ArithmeticSide => {
     return {
       kind: "decimal",
       sqlType: "numeric",
-      literal: value,
+      literal: encodeValue(value, numericCodec),
       cast: "numeric",
     };
   }
@@ -1895,20 +1926,128 @@ const nullPredicate = (
     : predicate(check);
 };
 
-/** Callable equality whose string properties are enum-member predicates. */
-const equality = (description: ExpressionDescription, negated: boolean) =>
-  new Proxy(
+/** The labels of the enum column an expression reads, however far it was projected. */
+const enumerationOf = (
+  description: ExpressionDescription,
+): readonly string[] | undefined => {
+  const source = expressionSource(description).node;
+
+  return source.kind === "column"
+    ? source.description.column.enumerationValues
+    : undefined;
+};
+
+/**
+ * Callable equality whose enum labels are predicates (`state.is.published`).
+ * Anything else reads the function itself, so `is.call`, `is.name` or a
+ * `then` probe behave as on any function.
+ */
+const equality = (description: ExpressionDescription, negated: boolean) => {
+  // Resolved on the first label read: most uses only call the function.
+  let labels: readonly string[] | null | undefined;
+
+  return new Proxy(
     (value: unknown) =>
       value === null
         ? nullPredicate(description, negated)
         : compare(description, negated ? "<>" : "=", value),
     {
-      get: (target, name) =>
-        typeof name === "string"
+      get: (target, name) => {
+        if (typeof name !== "string") {
+          return Reflect.get(target, name);
+        }
+
+        if (labels === undefined) {
+          labels = enumerationOf(description) ?? null;
+        }
+
+        // A label wins over a function property of the same name, such as an
+        // enum member "name" or "length". Without an enum column behind it
+        // (a `sql<"a" | "b">` template, say) the labels exist only in the
+        // types, so every name the function does not own stays a predicate.
+        const member = labels
+          ? labels.includes(name)
+          : name !== "then" && !(name in target);
+
+        return member
           ? compare(description, negated ? "<>" : "=", name)
-          : Reflect.get(target, name),
+          : Reflect.get(target, name);
+      },
     },
   );
+};
+
+const jsonPathKeys = (
+  path: readonly unknown[],
+): readonly (string | number)[] => {
+  if (
+    !path.length ||
+    path.some(
+      (part) =>
+        typeof part !== "string" &&
+        !(typeof part === "number" && Number.isSafeInteger(part) && part >= 0),
+    )
+  ) {
+    throw new Error(
+      "symmetria: JSON paths require string keys or nonnegative integer positions",
+    );
+  }
+
+  return path as readonly (string | number)[];
+};
+
+/**
+ * A value written inside JSON travels as JSON text, `$n::text::jsonb`, which
+ * both drivers bind alike. Without a JSON form (undefined, a function) it
+ * would bind NULL, and `jsonb_set` returns NULL for a NULL value.
+ */
+const jsonSetCodec: RuntimeCodec = freeze({
+  parameterCast: "jsonb",
+  encode: (value: unknown) => {
+    const text = jsonValueCodec(undefined).encode(value as never);
+
+    if (typeof text !== "string") {
+      throw new Error("symmetria: set() needs a JSON value");
+    }
+
+    return text;
+  },
+  decode: (value: unknown) => value,
+});
+
+const JSON_NULL: ValueNode = freeze({
+  kind: "raw",
+  parts: freeze(["'null'::jsonb"]),
+  sqlType: "jsonb",
+});
+
+/** The new value of a `set()` as jsonb, never SQL NULL: null is the JSON value null. */
+const jsonSetValue = (value: unknown): ValueNode => {
+  if (value === null) {
+    return JSON_NULL;
+  }
+
+  if (!(value && typeof value === "object" && COLUMN_EXPRESSION in value)) {
+    return valueNode(value, jsonSetCodec);
+  }
+
+  const description = readColumn(value as SelectedColumn);
+  const sqlType = expressionSqlType(description);
+  const node =
+    description.node.kind === "placeholder"
+      ? valueNode(value, jsonSetCodec)
+      : sqlType === "jsonb"
+        ? description.node
+        : sqlType === "json"
+          ? castNode(description.node, "jsonb")
+          : freeze({
+              kind: "raw" as const,
+              parts: freeze(["to_jsonb(", description.node, ")"]),
+              sqlType: "jsonb",
+            });
+
+  return freeze({ kind: "coalesce", values: freeze([node, JSON_NULL]) });
+};
 
 const HANDLE_MEMO = Symbol("symmetria.query.memo");
 
@@ -1962,24 +2101,43 @@ class ColumnHandle {
   }
 
   path(...path: (string | number)[]) {
-    if (
-      !path.length ||
-      path.some(
-        (part) =>
-          typeof part !== "string" &&
-          !(
-            typeof part === "number" &&
-            Number.isSafeInteger(part) &&
-            part >= 0
-          ),
-      )
-    ) {
+    return createExpression(
+      jsonPathDescription(this[COLUMN_EXPRESSION], jsonPathKeys(path)),
+    );
+  }
+
+  set(path: unknown, value: unknown) {
+    const description = this[COLUMN_EXPRESSION];
+
+    if (expressionSqlType(description) !== "jsonb") {
       throw new Error(
-        "symmetria: JSON paths require string keys or nonnegative integer positions",
+        "symmetria: set() replaces a key inside a jsonb column or expression",
       );
     }
 
-    return createExpression(jsonPathDescription(this[COLUMN_EXPRESSION], path));
+    const keys = jsonPathKeys(Array.isArray(path) ? path : [path]);
+
+    // The keys are bound like those of path(); only the template's text is SQL.
+    return createExpression({
+      ...description,
+      node: freeze({
+        kind: "raw",
+        parts: freeze([
+          "jsonb_set(",
+          description.node,
+          ", ARRAY[",
+          ...keys.flatMap((key, position) => [
+            ...(position ? [", "] : []),
+            freeze({ kind: "parameter" as const, value: String(key) }),
+            "::text",
+          ]),
+          "], ",
+          jsonSetValue(value),
+          ", true)",
+        ]),
+        sqlType: "jsonb",
+      }),
+    });
   }
 
   contains(value: unknown) {
@@ -2445,6 +2603,94 @@ export const coalesce = <Expression extends SelectedColumn>(
   });
 };
 
+const DATE_TRUNC_UNITS = [
+  "microseconds",
+  "milliseconds",
+  "second",
+  "minute",
+  "hour",
+  "day",
+  "week",
+  "month",
+  "quarter",
+  "year",
+  "decade",
+  "century",
+  "millennium",
+] as const;
+
+/** A precision `date_trunc` cuts a timestamp down to. */
+export type DateTruncUnit = (typeof DATE_TRUNC_UNITS)[number];
+
+export type DateTruncOptions = {
+  /**
+   * The zone whose calendar decides where a day, week or month begins,
+   * `"Europe/Berlin"`; the session's time zone without it. `timestamptz` only.
+   */
+  readonly timeZone?: string | SelectedColumn<string>;
+};
+
+/**
+ * `date_trunc(unit, value)`: the start of the value's hour, day, month, …. A
+ * `timestamptz` or `timestamp` keeps its type; a `date` becomes the
+ * `timestamptz` of that start in the session's time zone, as in PostgreSQL.
+ */
+export const dateTrunc = <
+  Expression extends SelectedColumn<Date | string | null>,
+>(
+  unit: DateTruncUnit,
+  value: Expression,
+  options: DateTruncOptions = {},
+): QueryColumn<Date | NullWhen<ExpressionValue<Expression>>, "dateTrunc"> => {
+  // The unit is written into the SQL text, so only the known names pass.
+  if (!DATE_TRUNC_UNITS.includes(unit)) {
+    throw new Error(
+      `symmetria: dateTrunc() units are ${DATE_TRUNC_UNITS.join(", ")}`,
+    );
+  }
+
+  const description = readColumn(value);
+  const sqlType = expressionSqlType(description);
+  const input = /^(timestamptz|timestamp|date)(\(\d\))?$/.exec(sqlType)?.[1];
+
+  if (!input) {
+    throw new Error(
+      `symmetria: dateTrunc() needs a timestamptz, timestamp or date value, not ${sqlType === "derived" ? "raw SQL of an unknown type; write it as sql.of(timestamptz)\`…\`" : sqlType}`,
+    );
+  }
+
+  const { timeZone } = options;
+
+  if (timeZone !== undefined && input !== "timestamptz") {
+    throw new Error(
+      `symmetria: dateTrunc() takes a timeZone for timestamptz values, not ${input}`,
+    );
+  }
+
+  if (timeZone === "") {
+    throw new Error("symmetria: dateTrunc() timeZone must be a zone name");
+  }
+
+  const result = input === "timestamp" ? "timestamp" : "timestamptz";
+
+  return createExpression({
+    node: freeze({
+      kind: "raw",
+      parts: freeze([
+        `date_trunc('${unit}', `,
+        description.node,
+        ...(timeZone === undefined
+          ? []
+          : [", ", valueNode(timeZone, codecFor("text")), "::text"]),
+        ")",
+      ]),
+      sqlType: result,
+    }),
+    outputName: "dateTrunc",
+    codec: codecFor(result)!,
+  });
+};
+
 const SEARCH_WEIGHTS: ReadonlySet<string> = new Set(["A", "B", "C", "D"]);
 
 /**
@@ -2510,6 +2756,7 @@ const SQL_TEMPLATE = Symbol("symmetria.query.sql");
 
 class SqlHandle extends ColumnHandle {
   readonly kind = "sql" as const;
+  readonly [SQL_DEFAULT] = true as const;
   readonly [SQL_TEMPLATE]: {
     readonly strings: TemplateStringsArray;
     readonly interpolated: boolean;
@@ -2540,10 +2787,11 @@ type SqlTemplate<Value, Traits = RawTraits> = QueryColumn<
   Value,
   "expression",
   Traits
-> & {
-  kind: "sql";
-  sql: string;
-};
+> &
+  SqlDefault & {
+    kind: "sql";
+    sql: string;
+  };
 
 const sqlTemplate = <Value, Traits = RawTraits>(
   strings: TemplateStringsArray,

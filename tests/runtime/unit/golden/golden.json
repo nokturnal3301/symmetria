@@ -1,0 +1,1166 @@
+{
+  "select/columns": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"name\" AS \"name\"\nFROM \"users\" AS \"users\"",
+    "parameters": []
+  },
+  "select/all-columns": {
+    "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\"\nFROM \"records\" AS \"records\"",
+    "parameters": []
+  },
+  "select/paths": {
+    "sql": "SELECT \"posts\".\"title\" AS \"title\", \"__symmetria_path_0\".\"name\" AS \"author\", \"__symmetria_path_1\".\"title\" AS \"tenant\", \"__symmetria_path_2\".\"name\" AS \"editor\", \"__symmetria_path_3\".\"title\" AS \"editorTenant\"\nFROM \"posts\" AS \"posts\"\nINNER JOIN \"users\" AS \"__symmetria_path_0\" ON \"posts\".\"author_id\" = \"__symmetria_path_0\".\"id\"\nLEFT JOIN \"tenants\" AS \"__symmetria_path_1\" ON \"__symmetria_path_0\".\"tenant_id\" = \"__symmetria_path_1\".\"code\"\nLEFT JOIN \"users\" AS \"__symmetria_path_2\" ON \"posts\".\"editor_id\" = \"__symmetria_path_2\".\"id\"\nLEFT JOIN \"tenants\" AS \"__symmetria_path_3\" ON \"__symmetria_path_2\".\"tenant_id\" = \"__symmetria_path_3\".\"code\"\nWHERE \"__symmetria_path_0\".\"name\" = $1 AND (\"posts\".\"views\" > $2 OR \"posts\".\"editor_id\" IS NULL) AND NOT (\"posts\".\"title\" LIKE $3) AND \"posts\".\"id\" IN ($4, $5, $6) AND TRUE AND \"posts\".\"views\" BETWEEN $7 AND $8\nORDER BY \"__symmetria_path_0\".\"name\" ASC NULLS LAST, \"posts\".\"id\" DESC\nLIMIT 10\nOFFSET 20",
+    "parameters": ["Ada", "10", "draft%", 1, 2, 3, "1", "100"]
+  },
+  "select/explicit-joins": {
+    "sql": "SELECT \"posts\".\"title\" AS \"title\", \"reviewer\".\"name\" AS \"reviewer\", \"writer\".\"name\" AS \"writer\", \"otherPosts\".\"id\" AS \"otherId\"\nFROM \"posts\" AS \"posts\"\nINNER JOIN \"users\" AS \"reviewer\" ON (\"posts\".\"editor_id\" = \"reviewer\".\"id\")\nLEFT JOIN \"users\" AS \"writer\" ON \"posts\".\"author_id\" = \"writer\".\"id\"\nLEFT JOIN \"posts\" AS \"otherPosts\" ON \"writer\".\"id\" = \"otherPosts\".\"author_id\"",
+    "parameters": []
+  },
+  "select/self-reference": {
+    "sql": "SELECT \"categories\".\"name\" AS \"name\", \"__symmetria_path_1\".\"name\" AS \"grandparent\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"name\" AS \"name\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_1\".\"name\" AS \"name\"\nFROM \"categories\" AS \"__symmetria_aggregate_1\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_aggregate_1\".\"parent_id\") AS \"__symmetria_row\") AS \"grandchildren\"\nFROM \"categories\" AS \"__symmetria_aggregate_0\"\nWHERE \"categories\".\"id\" = \"__symmetria_aggregate_0\".\"parent_id\") AS \"__symmetria_row\") AS \"children\"\nFROM \"categories\" AS \"categories\"\nLEFT JOIN \"categories\" AS \"__symmetria_path_0\" ON \"categories\".\"parent_id\" = \"__symmetria_path_0\".\"id\"\nLEFT JOIN \"categories\" AS \"__symmetria_path_1\" ON \"__symmetria_path_0\".\"parent_id\" = \"__symmetria_path_1\".\"id\"",
+    "parameters": []
+  },
+  "select/reverse-one-path": {
+    "sql": "SELECT \"__symmetria_path_0\".\"bio\" AS \"bio\"\nFROM \"users\" AS \"users\"\nLEFT JOIN \"profiles\" AS \"__symmetria_path_0\" ON \"users\".\"id\" = \"__symmetria_path_0\".\"user_id\"",
+    "parameters": []
+  },
+  "select/group-having-distinct": {
+    "sql": "SELECT DISTINCT \"author\".\"name\" AS \"name\", COUNT(*) AS \"posts\", SUM(\"posts\".\"views\")::numeric AS \"views\", MAX(\"posts\".\"created_at\") AS \"latest\"\nFROM \"posts\" AS \"posts\"\nINNER JOIN \"users\" AS \"author\" ON \"posts\".\"author_id\" = \"author\".\"id\"\nGROUP BY \"author\".\"name\"\nHAVING COUNT(*) > $1\nORDER BY \"author\".\"name\" ASC",
+    "parameters": [1]
+  },
+  "select/case-coalesce-arithmetic": {
+    "sql": "SELECT COALESCE(\"users\".\"tenant_id\", $1) AS \"label\", ((\"users\".\"visits\" * $2) + $3) AS \"doubled\", (\"users\".\"balance\" / $4::text::numeric) AS \"share\", concat($5::text, \"users\".\"name\") AS \"raw\"\nFROM \"users\" AS \"users\"",
+    "parameters": ["none", 2, 1, "3", "Hello "]
+  },
+  "select/for-update": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"id\" = $1\nFOR UPDATE",
+    "parameters": [1]
+  },
+  "nested/three-levels": {
+    "sql": "SELECT \"users\".\"name\" AS \"name\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\", \"__symmetria_path_1_0\".\"name\" AS \"author\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_1\".\"body\" AS \"body\", (SELECT row_to_json(\"__symmetria_row\") FROM (SELECT \"__symmetria_aggregate_2\".\"name\" AS \"name\", (SELECT row_to_json(\"__symmetria_row\") FROM (SELECT \"__symmetria_aggregate_3\".\"bio\" AS \"bio\"\nFROM \"profiles\" AS \"__symmetria_aggregate_3\"\nWHERE \"__symmetria_aggregate_2\".\"id\" = \"__symmetria_aggregate_3\".\"user_id\") AS \"__symmetria_row\") AS \"profile\"\nFROM \"users\" AS \"__symmetria_aggregate_2\"\nWHERE \"__symmetria_aggregate_1\".\"author_id\" = \"__symmetria_aggregate_2\".\"id\") AS \"__symmetria_row\") AS \"author\"\nFROM (SELECT \"__symmetria_aggregate_1\".\"id\" AS \"id\", \"__symmetria_aggregate_1\".\"post_id\" AS \"post_id\", \"__symmetria_aggregate_1\".\"author_id\" AS \"author_id\", \"__symmetria_aggregate_1\".\"body\" AS \"body\", \"__symmetria_aggregate_1\".\"score\" AS \"score\"\nFROM \"comments\" AS \"__symmetria_aggregate_1\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_aggregate_1\".\"post_id\" AND \"__symmetria_aggregate_1\".\"score\" > $1\nORDER BY \"__symmetria_aggregate_1\".\"score\" DESC\nLIMIT 2) AS \"__symmetria_aggregate_1\"\nORDER BY \"__symmetria_aggregate_1\".\"score\" DESC) AS \"__symmetria_row\") AS \"comments\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_1\".\"label\" AS \"label\"\nFROM \"post_tags\" AS \"__symmetria_junction_0\"\nINNER JOIN \"tags\" AS \"__symmetria_aggregate_1\" ON \"__symmetria_junction_0\".\"tag_id\" = \"__symmetria_aggregate_1\".\"id\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_junction_0\".\"post_id\"\nORDER BY \"__symmetria_aggregate_1\".\"label\" ASC) AS \"__symmetria_row\") AS \"tags\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nINNER JOIN \"users\" AS \"__symmetria_path_1_0\" ON \"__symmetria_aggregate_0\".\"author_id\" = \"__symmetria_path_1_0\".\"id\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\" AND \"__symmetria_aggregate_0\".\"views\" > $2\nORDER BY \"__symmetria_aggregate_0\".\"created_at\" DESC, \"__symmetria_aggregate_0\".\"id\" DESC\nLIMIT 3\nOFFSET 1) AS \"__symmetria_row\") AS \"posts\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"id\" AS \"id\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"editor_id\") AS \"__symmetria_row\") AS \"edited\"\nFROM (SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenant_id\", \"users\".\"created_at\" AS \"created_at\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"id\" > $3\nORDER BY \"users\".\"id\" ASC\nLIMIT 50\nOFFSET 100) AS \"users\"\nORDER BY \"users\".\"id\" ASC",
+    "parameters": [0, "1", 10]
+  },
+  "nested/many-to-many-both-sides": {
+    "sql": "SELECT \"tags\".\"label\" AS \"label\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_1\".\"id\" AS \"id\"\nFROM \"post_tags\" AS \"__symmetria_junction_1\"\nINNER JOIN \"tags\" AS \"__symmetria_aggregate_1\" ON \"__symmetria_junction_1\".\"tag_id\" = \"__symmetria_aggregate_1\".\"id\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_junction_1\".\"post_id\") AS \"__symmetria_row\") AS \"tags\"\nFROM \"post_tags\" AS \"__symmetria_junction_0\"\nINNER JOIN \"posts\" AS \"__symmetria_aggregate_0\" ON \"__symmetria_junction_0\".\"post_id\" = \"__symmetria_aggregate_0\".\"id\"\nWHERE \"tags\".\"id\" = \"__symmetria_junction_0\".\"tag_id\"\nLIMIT 5) AS \"__symmetria_row\") AS \"posts\"\nFROM \"tags\" AS \"tags\"",
+    "parameters": []
+  },
+  "nested/forward-object": {
+    "sql": "SELECT \"comments\".\"body\" AS \"body\", (SELECT row_to_json(\"__symmetria_row\") FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\", (SELECT row_to_json(\"__symmetria_row\") FROM (SELECT \"__symmetria_aggregate_1\".\"name\" AS \"name\"\nFROM \"users\" AS \"__symmetria_aggregate_1\"\nWHERE \"__symmetria_aggregate_0\".\"author_id\" = \"__symmetria_aggregate_1\".\"id\") AS \"__symmetria_row\") AS \"author\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"comments\".\"post_id\" = \"__symmetria_aggregate_0\".\"id\") AS \"__symmetria_row\") AS \"post\"\nFROM \"comments\" AS \"comments\"",
+    "parameters": []
+  },
+  "nested/composite-parent": {
+    "sql": "SELECT \"tenants\".\"code\" AS \"code\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"external_id\" AS \"externalId\", (SELECT row_to_json(\"__symmetria_row\") FROM (SELECT \"__symmetria_aggregate_1\".\"title\" AS \"title\"\nFROM \"tenants\" AS \"__symmetria_aggregate_1\"\nWHERE \"__symmetria_aggregate_0\".\"tenant_id\" = \"__symmetria_aggregate_1\".\"code\") AS \"__symmetria_row\") AS \"tenant\"\nFROM (SELECT \"__symmetria_aggregate_0\".\"tenant_id\" AS \"tenant_id\", \"__symmetria_aggregate_0\".\"external_id\" AS \"external_id\", \"__symmetria_aggregate_0\".\"title\" AS \"title\", \"__symmetria_aggregate_0\".\"amount\" AS \"amount\"\nFROM \"records\" AS \"__symmetria_aggregate_0\"\nWHERE \"tenants\".\"code\" = \"__symmetria_aggregate_0\".\"tenant_id\"\nORDER BY \"__symmetria_aggregate_0\".\"external_id\" ASC\nLIMIT 2) AS \"__symmetria_aggregate_0\"\nORDER BY \"__symmetria_aggregate_0\".\"external_id\" ASC) AS \"__symmetria_row\") AS \"records\"\nFROM \"tenants\" AS \"tenants\"",
+    "parameters": []
+  },
+  "nested/scoped": {
+    "sql": "SELECT \"users\".\"name\" AS \"name\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\", \"__symmetria_path_1_0\".\"name\" AS \"author\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nINNER JOIN \"users\" AS \"__symmetria_path_1_0\" ON (\"__symmetria_aggregate_0\".\"author_id\" = \"__symmetria_path_1_0\".\"id\" AND \"__symmetria_path_1_0\".\"active\" = $1)\nWHERE (\"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\" AND \"__symmetria_aggregate_0\".\"author_id\" = $2)) AS \"__symmetria_row\") AS \"posts\", (SELECT COUNT(*) AS \"count\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE (\"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\" AND \"__symmetria_aggregate_0\".\"author_id\" = $3)) AS \"total\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"active\" = $4",
+    "parameters": [true, 7, 7, true]
+  },
+  "aggregates/relation": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", \"__symmetria_shared_0\".\"count\" AS \"posts\", \"__symmetria_shared_1\".\"sum\" AS \"views\", (SELECT MAX(\"__symmetria_aggregate_0\".\"created_at\") AS \"maximum\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"latest\", (SELECT AVG(\"__symmetria_aggregate_0\".\"score\")::numeric AS \"average\"\nFROM \"comments\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"average\", (SELECT MIN(\"__symmetria_aggregate_0\".\"id\") AS \"minimum\"\nFROM \"comments\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"first\", EXISTS (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"editor_id\") AS \"any\", (SELECT COUNT(*) FROM (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\"\nLIMIT 2\nOFFSET 1) AS \"__symmetria_count\") AS \"paged\", EXISTS (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\"\nLIMIT 0) AS \"none\"\nFROM \"users\" AS \"users\"\nLEFT JOIN LATERAL (SELECT COUNT(*) AS \"count\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_shared_0\" ON TRUE\nLEFT JOIN LATERAL (SELECT SUM(\"__symmetria_aggregate_0\".\"views\")::numeric AS \"sum\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_shared_1\" ON TRUE\nWHERE \"__symmetria_shared_0\".\"count\" > $1 AND \"__symmetria_shared_1\".\"sum\" > $2\nORDER BY \"__symmetria_shared_0\".\"count\" DESC",
+    "parameters": [2, 10]
+  },
+  "aggregates/nested": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\", ((SELECT COUNT(*) AS \"count\"\nFROM \"comments\" AS \"__symmetria_aggregate_1\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_aggregate_1\".\"post_id\"))::text AS \"comments\", (SELECT MAX(\"__symmetria_aggregate_1\".\"score\") AS \"maximum\"\nFROM \"comments\" AS \"__symmetria_aggregate_1\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_aggregate_1\".\"post_id\") AS \"best\", ((SELECT COUNT(*) AS \"count\"\nFROM \"post_tags\" AS \"__symmetria_junction_0\"\nINNER JOIN \"tags\" AS \"__symmetria_aggregate_1\" ON \"__symmetria_junction_0\".\"tag_id\" = \"__symmetria_aggregate_1\".\"id\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_junction_0\".\"post_id\"))::text AS \"tags\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_row\") AS \"posts\"\nFROM \"users\" AS \"users\"",
+    "parameters": []
+  },
+  "aggregates/quantifiers": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\"\nFROM \"users\" AS \"users\"\nWHERE EXISTS (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\" AND NOT EXISTS (SELECT 1 AS \"present\"\nFROM \"post_tags\" AS \"__symmetria_junction_0\"\nINNER JOIN \"tags\" AS \"__symmetria_aggregate_1\" ON \"__symmetria_junction_0\".\"tag_id\" = \"__symmetria_aggregate_1\".\"id\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_junction_0\".\"post_id\" AND \"__symmetria_aggregate_1\".\"label\" = $1)) AND NOT EXISTS (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nLEFT JOIN \"users\" AS \"__symmetria_path_1_0\" ON \"__symmetria_aggregate_0\".\"editor_id\" = \"__symmetria_path_1_0\".\"id\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\" AND (\"__symmetria_path_1_0\".\"name\" = $2) IS NOT TRUE) AND EXISTS (SELECT 1 AS \"present\"\nFROM \"comments\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\")",
+    "parameters": ["hidden", "Ada"]
+  },
+  "aggregates/shared": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", \"__symmetria_shared_0\".\"count\" AS \"total\"\nFROM \"users\" AS \"users\"\nLEFT JOIN LATERAL (SELECT COUNT(*) AS \"count\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_shared_0\" ON TRUE\nWHERE \"__symmetria_shared_0\".\"count\" > $1\nORDER BY \"__symmetria_shared_0\".\"count\" DESC\nLIMIT 5",
+    "parameters": [1]
+  },
+  "aggregates/root-first-pagination": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", (SELECT COUNT(*) AS \"count\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"total\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"id\" AS \"id\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_row\") AS \"posts\"\nFROM (SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenant_id\", \"users\".\"created_at\" AS \"created_at\"\nFROM \"users\" AS \"users\"\nORDER BY \"users\".\"id\" ASC\nLIMIT 5\nOFFSET 5) AS \"users\"\nORDER BY \"users\".\"id\" ASC",
+    "parameters": []
+  },
+  "conditions/one-path": {
+    "sql": "SELECT \"notes\".\"body\" AS \"body\", \"__symmetria_path_0\".\"title\" AS \"record\", \"__symmetria_path_1\".\"name\" AS \"author\", \"__symmetria_path_2\".\"role\" AS \"role\"\nFROM \"notes\" AS \"notes\"\nLEFT JOIN \"records\" AS \"__symmetria_path_0\" ON (\"__symmetria_path_0\".\"external_id\" = (SELECT \"__symmetria_path_0_2\".\"external_id\" AS \"externalId\"\nFROM \"records\" AS \"__symmetria_path_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_path_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_path_0_2\".\"external_id\")\nORDER BY \"__symmetria_path_0_2\".\"external_id\" ASC, \"__symmetria_path_0_2\".\"tenant_id\" ASC\nLIMIT 1) AND \"__symmetria_path_0\".\"tenant_id\" = (SELECT \"__symmetria_path_0_2\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"__symmetria_path_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_path_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_path_0_2\".\"external_id\")\nORDER BY \"__symmetria_path_0_2\".\"external_id\" ASC, \"__symmetria_path_0_2\".\"tenant_id\" ASC\nLIMIT 1))\nLEFT JOIN \"users\" AS \"__symmetria_path_1\" ON \"__symmetria_path_1\".\"id\" = (SELECT \"__symmetria_path_1_2\".\"id\" AS \"id\"\nFROM \"users\" AS \"__symmetria_path_1_2\"\nWHERE \"notes\".\"author_email\" = \"__symmetria_path_1_2\".\"email\"\nORDER BY \"__symmetria_path_1_2\".\"id\" ASC\nLIMIT 1)\nLEFT JOIN \"memberships\" AS \"__symmetria_path_2\" ON (\"__symmetria_path_2\".\"group_id\" = (SELECT \"__symmetria_path_2_2\".\"group_id\" AS \"groupId\"\nFROM \"memberships\" AS \"__symmetria_path_2_2\"\nWHERE \"__symmetria_path_2_2\".\"role\" = \"notes\".\"body\"\nORDER BY \"__symmetria_path_2_2\".\"group_id\" ASC, \"__symmetria_path_2_2\".\"user_id\" ASC\nLIMIT 1) AND \"__symmetria_path_2\".\"user_id\" = (SELECT \"__symmetria_path_2_2\".\"user_id\" AS \"userId\"\nFROM \"memberships\" AS \"__symmetria_path_2_2\"\nWHERE \"__symmetria_path_2_2\".\"role\" = \"notes\".\"body\"\nORDER BY \"__symmetria_path_2_2\".\"group_id\" ASC, \"__symmetria_path_2_2\".\"user_id\" ASC\nLIMIT 1))",
+    "parameters": []
+  },
+  "conditions/one-nested": {
+    "sql": "SELECT (SELECT row_to_json(\"__symmetria_row\") FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\", \"__symmetria_path_1_0\".\"title\" AS \"tenant\"\nFROM \"records\" AS \"__symmetria_aggregate_0\"\nINNER JOIN \"tenants\" AS \"__symmetria_path_1_0\" ON \"__symmetria_aggregate_0\".\"tenant_id\" = \"__symmetria_path_1_0\".\"code\"\nWHERE (\"__symmetria_aggregate_0\".\"external_id\" = (SELECT \"__symmetria_aggregate_0_2\".\"external_id\" AS \"externalId\"\nFROM \"records\" AS \"__symmetria_aggregate_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_aggregate_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_aggregate_0_2\".\"external_id\")\nORDER BY \"__symmetria_aggregate_0_2\".\"external_id\" ASC, \"__symmetria_aggregate_0_2\".\"tenant_id\" ASC\nLIMIT 1) AND \"__symmetria_aggregate_0\".\"tenant_id\" = (SELECT \"__symmetria_aggregate_0_2\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"__symmetria_aggregate_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_aggregate_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_aggregate_0_2\".\"external_id\")\nORDER BY \"__symmetria_aggregate_0_2\".\"external_id\" ASC, \"__symmetria_aggregate_0_2\".\"tenant_id\" ASC\nLIMIT 1))) AS \"__symmetria_row\") AS \"record\", (SELECT row_to_json(\"__symmetria_row\") FROM (SELECT \"__symmetria_aggregate_0\".\"role\" AS \"role\"\nFROM \"memberships\" AS \"__symmetria_aggregate_0\"\nWHERE (\"__symmetria_aggregate_0\".\"group_id\" = (SELECT \"__symmetria_aggregate_0_2\".\"group_id\" AS \"groupId\"\nFROM \"memberships\" AS \"__symmetria_aggregate_0_2\"\nWHERE \"__symmetria_aggregate_0_2\".\"role\" = \"notes\".\"body\"\nORDER BY \"__symmetria_aggregate_0_2\".\"group_id\" ASC, \"__symmetria_aggregate_0_2\".\"user_id\" ASC\nLIMIT 1) AND \"__symmetria_aggregate_0\".\"user_id\" = (SELECT \"__symmetria_aggregate_0_2\".\"user_id\" AS \"userId\"\nFROM \"memberships\" AS \"__symmetria_aggregate_0_2\"\nWHERE \"__symmetria_aggregate_0_2\".\"role\" = \"notes\".\"body\"\nORDER BY \"__symmetria_aggregate_0_2\".\"group_id\" ASC, \"__symmetria_aggregate_0_2\".\"user_id\" ASC\nLIMIT 1))) AS \"__symmetria_row\") AS \"membership\"\nFROM \"notes\" AS \"notes\"",
+    "parameters": []
+  },
+  "conditions/one-join": {
+    "sql": "SELECT \"notes\".\"body\" AS \"body\", \"record\".\"title\" AS \"title\"\nFROM \"notes\" AS \"notes\"\nINNER JOIN \"records\" AS \"record\" ON (\"record\".\"external_id\" = (SELECT \"record_2\".\"external_id\" AS \"externalId\"\nFROM \"records\" AS \"record_2\"\nWHERE (\"notes\".\"record_tenant\" = \"record_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"record_2\".\"external_id\")\nORDER BY \"record_2\".\"external_id\" ASC, \"record_2\".\"tenant_id\" ASC\nLIMIT 1) AND \"record\".\"tenant_id\" = (SELECT \"record_2\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"record_2\"\nWHERE (\"notes\".\"record_tenant\" = \"record_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"record_2\".\"external_id\")\nORDER BY \"record_2\".\"external_id\" ASC, \"record_2\".\"tenant_id\" ASC\nLIMIT 1))",
+    "parameters": []
+  },
+  "conditions/inverse-many": {
+    "sql": "SELECT \"users\".\"name\" AS \"name\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"body\" AS \"body\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\") AS \"__symmetria_row\") AS \"notes\", (SELECT COUNT(*) AS \"count\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\") AS \"total\"\nFROM \"users\" AS \"users\"\nWHERE EXISTS (SELECT 1 AS \"present\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\" AND \"__symmetria_aggregate_0\".\"body\" = $1)",
+    "parameters": ["x"]
+  },
+  "conditions/scoped-one": {
+    "sql": "SELECT \"__symmetria_path_0\".\"title\" AS \"record\", \"__symmetria_path_1\".\"name\" AS \"author\"\nFROM \"notes\" AS \"notes\"\nLEFT JOIN \"records\" AS \"__symmetria_path_0\" ON ((\"__symmetria_path_0\".\"external_id\" = (SELECT \"__symmetria_path_0_2\".\"external_id\" AS \"externalId\"\nFROM \"records\" AS \"__symmetria_path_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_path_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_path_0_2\".\"external_id\") AND \"__symmetria_path_0_2\".\"tenant_id\" = $1\nORDER BY \"__symmetria_path_0_2\".\"external_id\" ASC, \"__symmetria_path_0_2\".\"tenant_id\" ASC\nLIMIT 1) AND \"__symmetria_path_0\".\"tenant_id\" = (SELECT \"__symmetria_path_0_2\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"__symmetria_path_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_path_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_path_0_2\".\"external_id\") AND \"__symmetria_path_0_2\".\"tenant_id\" = $2\nORDER BY \"__symmetria_path_0_2\".\"external_id\" ASC, \"__symmetria_path_0_2\".\"tenant_id\" ASC\nLIMIT 1)) AND \"__symmetria_path_0\".\"tenant_id\" = $3)\nLEFT JOIN \"users\" AS \"__symmetria_path_1\" ON (\"__symmetria_path_1\".\"id\" = (SELECT \"__symmetria_path_1_2\".\"id\" AS \"id\"\nFROM \"users\" AS \"__symmetria_path_1_2\"\nWHERE \"notes\".\"author_email\" = \"__symmetria_path_1_2\".\"email\" AND \"__symmetria_path_1_2\".\"active\" = $4\nORDER BY \"__symmetria_path_1_2\".\"id\" ASC\nLIMIT 1) AND \"__symmetria_path_1\".\"active\" = $5)",
+    "parameters": ["acme", "acme", "acme", true, true]
+  },
+  "conditions/where-through-one": {
+    "sql": "SELECT \"notes\".\"id\" AS \"id\"\nFROM \"notes\" AS \"notes\"\nLEFT JOIN \"records\" AS \"__symmetria_path_0\" ON (\"__symmetria_path_0\".\"external_id\" = (SELECT \"__symmetria_path_0_2\".\"external_id\" AS \"externalId\"\nFROM \"records\" AS \"__symmetria_path_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_path_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_path_0_2\".\"external_id\")\nORDER BY \"__symmetria_path_0_2\".\"external_id\" ASC, \"__symmetria_path_0_2\".\"tenant_id\" ASC\nLIMIT 1) AND \"__symmetria_path_0\".\"tenant_id\" = (SELECT \"__symmetria_path_0_2\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"__symmetria_path_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_path_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_path_0_2\".\"external_id\")\nORDER BY \"__symmetria_path_0_2\".\"external_id\" ASC, \"__symmetria_path_0_2\".\"tenant_id\" ASC\nLIMIT 1))\nWHERE \"__symmetria_path_0\".\"amount\" > $1",
+    "parameters": [1]
+  },
+  "byId/single": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"id\" = $1",
+    "parameters": [7]
+  },
+  "byId/single-text": {
+    "sql": "SELECT \"tenants\".\"code\" AS \"code\", \"tenants\".\"title\" AS \"title\"\nFROM \"tenants\" AS \"tenants\"\nWHERE \"tenants\".\"code\" = $1",
+    "parameters": ["acme"]
+  },
+  "byId/composite-out-of-order": {
+    "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\"\nFROM \"records\" AS \"records\"\nWHERE \"records\".\"external_id\" = $1 AND \"records\".\"tenant_id\" = $2",
+    "parameters": ["r1", "acme"]
+  },
+  "byId/composite-out-of-order-shaped": {
+    "sql": "SELECT \"records\".\"title\" AS \"title\", \"__symmetria_path_0\".\"title\" AS \"tenant\"\nFROM \"records\" AS \"records\"\nINNER JOIN \"tenants\" AS \"__symmetria_path_0\" ON \"records\".\"tenant_id\" = \"__symmetria_path_0\".\"code\"\nWHERE \"records\".\"external_id\" = $1 AND \"records\".\"tenant_id\" = $2",
+    "parameters": ["r1", "acme"]
+  },
+  "byId/composite-references": {
+    "sql": "SELECT \"memberships\".\"user_id\" AS \"userId\", \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"role\" AS \"role\"\nFROM \"memberships\" AS \"memberships\"\nWHERE \"memberships\".\"group_id\" = $1 AND \"memberships\".\"user_id\" = $2",
+    "parameters": [2, 1]
+  },
+  "byId/junction": {
+    "sql": "SELECT \"postTags\".\"post_id\" AS \"postId\", \"postTags\".\"tag_id\" AS \"tagId\"\nFROM \"post_tags\" AS \"postTags\"\nWHERE \"postTags\".\"post_id\" = $1 AND \"postTags\".\"tag_id\" = $2",
+    "parameters": [1, 2]
+  },
+  "byId/scoped": {
+    "sql": "SELECT \"posts\".\"id\" AS \"id\", \"posts\".\"slug\" AS \"slug\", \"posts\".\"title\" AS \"title\", \"posts\".\"body\" AS \"body\", \"posts\".\"author_id\" AS \"authorId\", \"posts\".\"editor_id\" AS \"editorId\", \"posts\".\"views\" AS \"views\", \"posts\".\"metadata\" AS \"metadata\", \"posts\".\"document\" AS \"document\", \"posts\".\"status\" AS \"status\", \"posts\".\"labels\" AS \"labels\", \"posts\".\"created_at\" AS \"createdAt\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"author_id\" = $1 AND \"posts\".\"id\" = $2",
+    "parameters": [7, 3]
+  },
+  "byId/scoped-composite": {
+    "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\"\nFROM \"records\" AS \"records\"\nWHERE \"records\".\"tenant_id\" = $1 AND \"records\".\"external_id\" = $2 AND \"records\".\"tenant_id\" = $3",
+    "parameters": ["acme", "r1", "acme"]
+  },
+  "byId/update": {
+    "sql": "UPDATE \"users\" AS \"users\" SET \"name\" = $1\nWHERE \"users\".\"id\" = $2",
+    "parameters": ["Ada", 7]
+  },
+  "byId/composite-update": {
+    "sql": "UPDATE \"records\" AS \"records\" SET \"amount\" = (\"records\".\"amount\" + $1)\nWHERE \"records\".\"external_id\" = $2 AND \"records\".\"tenant_id\" = $3\nRETURNING \"records\".\"amount\" AS \"amount\"",
+    "parameters": [1, "r1", "acme"]
+  },
+  "byId/composite-delete": {
+    "sql": "DELETE FROM \"memberships\" AS \"memberships\"\nWHERE \"memberships\".\"group_id\" = $1 AND \"memberships\".\"user_id\" = $2",
+    "parameters": [2, 1]
+  },
+  "byId/junction-delete": {
+    "sql": "DELETE FROM \"post_tags\" AS \"postTags\"\nWHERE \"postTags\".\"post_id\" = $1 AND \"postTags\".\"tag_id\" = $2",
+    "parameters": [1, 2]
+  },
+  "byId/scoped-update": {
+    "sql": "UPDATE \"posts\" AS \"posts\" SET \"title\" = $1\nWHERE \"posts\".\"author_id\" = $2 AND \"posts\".\"id\" = $3\nRETURNING CASE WHEN \"posts\".\"author_id\" = $4 THEN TRUE ELSE ('SYMMETRIA_OUT_OF_SCOPE:update:posts:' || \"posts\".tableoid)::boolean END AS \"__symmetria_scope\"",
+    "parameters": ["x", 7, 1, 7]
+  },
+  "by/unique-column": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"name\" AS \"name\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"email\" = $1",
+    "parameters": ["ada@example.com"]
+  },
+  "by/unique-column-update": {
+    "sql": "UPDATE \"users\" AS \"users\" SET \"name\" = $1\nWHERE \"users\".\"email\" = $2\nRETURNING \"users\".\"id\" AS \"id\"",
+    "parameters": ["Ada", "ada@example.com"]
+  },
+  "by/unique-column-delete": {
+    "sql": "DELETE FROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"slug\" = $1",
+    "parameters": ["first"]
+  },
+  "by/unique-index": {
+    "sql": "SELECT \"handles\".\"id\" AS \"id\", \"handles\".\"tenant\" AS \"tenant\", \"handles\".\"handle\" AS \"handle\", \"handles\".\"active\" AS \"active\"\nFROM \"handles\" AS \"handles\"\nWHERE \"handles\".\"tenant\" = $1 AND \"handles\".\"handle\" = $2",
+    "parameters": ["one", "ada"]
+  },
+  "by/unique-index-update": {
+    "sql": "UPDATE \"handles\" AS \"handles\" SET \"active\" = $1\nWHERE \"handles\".\"tenant\" = $2 AND \"handles\".\"handle\" = $3",
+    "parameters": [0, "one", "ada"]
+  },
+  "by/unique-index-delete": {
+    "sql": "DELETE FROM \"handles\" AS \"handles\"\nWHERE \"handles\".\"tenant\" = $1 AND \"handles\".\"handle\" = $2",
+    "parameters": ["one", "ada"]
+  },
+  "by/unique-reference": {
+    "sql": "SELECT \"profiles\".\"id\" AS \"id\", \"profiles\".\"user_id\" AS \"userId\", \"profiles\".\"bio\" AS \"bio\"\nFROM \"profiles\" AS \"profiles\"\nWHERE \"profiles\".\"user_id\" = $1",
+    "parameters": [1]
+  },
+  "by/scoped": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"active\" = $1 AND \"users\".\"email\" = $2",
+    "parameters": [true, "ada@example.com"]
+  },
+  "by/names": {
+    "sql": "{\"tenants\":[],\"users\":[\"email\"],\"posts\":[\"slug\"],\"comments\":[],\"tags\":[\"label\"],\"postTags\":[],\"profiles\":[\"userId\"],\"records\":[],\"groups\":[\"name\"],\"memberships\":[],\"handles\":[\"identity\"],\"aliases\":[],\"notes\":[],\"entries\":[],\"categories\":[]}",
+    "parameters": []
+  },
+  "insert/bulk-returning": {
+    "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\", \"views\", \"metadata\") VALUES ($1, $2, $3, $4, $5::text::jsonb), ($6, $7, $8, DEFAULT, DEFAULT)\nRETURNING \"posts\".\"id\" AS \"id\", \"posts\".\"title\" AS \"title\"",
+    "parameters": [
+      "a",
+      "first",
+      3,
+      "9007199254740993",
+      "{\"tags\":[\"sql\"],\"rating\":1}",
+      "b",
+      "second",
+      3
+    ]
+  },
+  "insert/returning-projection": {
+    "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)\nRETURNING \"users\".\"id\" AS \"id\", upper(\"users\".\"name\") AS \"upper\", (\"users\".\"visits\" + $3) AS \"visits\"",
+    "parameters": ["a", "Ada", 1]
+  },
+  "insert/scoped": {
+    "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING \"posts\".\"id\" AS \"id\", CASE WHEN \"posts\".\"author_id\" = $4 THEN TRUE ELSE ('SYMMETRIA_OUT_OF_SCOPE:insert:posts:' || \"posts\".tableoid)::boolean END AS \"__symmetria_scope\"",
+    "parameters": ["a", "x", 7, 7]
+  },
+  "update/expression": {
+    "sql": "UPDATE \"users\" AS \"users\" SET \"visits\" = (\"users\".\"visits\" + $1), \"name\" = $2\nWHERE \"users\".\"id\" = $3\nRETURNING \"users\".\"visits\" AS \"visits\"",
+    "parameters": [1, "Ada", 7]
+  },
+  "update/relation-path": {
+    "sql": "UPDATE \"posts\" AS \"posts\" SET \"title\" = $1\nWHERE \"posts\".\"id\" IN (SELECT \"posts\".\"id\" AS \"id\"\nFROM \"posts\" AS \"posts\"\nINNER JOIN \"users\" AS \"__symmetria_path_0\" ON \"posts\".\"author_id\" = \"__symmetria_path_0\".\"id\"\nWHERE \"__symmetria_path_0\".\"name\" = $2)",
+    "parameters": ["x", "Ada"]
+  },
+  "update/relation-path-composite-out-of-order": {
+    "sql": "UPDATE \"records\" AS \"records\" SET \"title\" = $1\nWHERE (\"records\".\"external_id\", \"records\".\"tenant_id\") IN (SELECT \"records\".\"external_id\" AS \"externalId\", \"records\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"records\"\nINNER JOIN \"tenants\" AS \"__symmetria_path_0\" ON \"records\".\"tenant_id\" = \"__symmetria_path_0\".\"code\"\nWHERE \"__symmetria_path_0\".\"title\" = $2)",
+    "parameters": ["x", "Acme"]
+  },
+  "update/relation-path-composite-references": {
+    "sql": "UPDATE \"memberships\" AS \"memberships\" SET \"role\" = $1\nWHERE (\"memberships\".\"group_id\", \"memberships\".\"user_id\") IN (SELECT \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"user_id\" AS \"userId\"\nFROM \"memberships\" AS \"memberships\"\nINNER JOIN \"users\" AS \"__symmetria_path_0\" ON \"memberships\".\"user_id\" = \"__symmetria_path_0\".\"id\"\nINNER JOIN \"groups\" AS \"__symmetria_path_1\" ON \"memberships\".\"group_id\" = \"__symmetria_path_1\".\"id\"\nWHERE (\"__symmetria_path_0\".\"name\" = $2 AND \"__symmetria_path_1\".\"name\" = $3))",
+    "parameters": ["owner", "Ada", "core"]
+  },
+  "update/relation-path-junction": {
+    "sql": "UPDATE \"post_tags\" AS \"postTags\" SET \"tag_id\" = $1\nWHERE (\"postTags\".\"post_id\", \"postTags\".\"tag_id\") IN (SELECT \"postTags\".\"post_id\" AS \"postId\", \"postTags\".\"tag_id\" AS \"tagId\"\nFROM \"post_tags\" AS \"postTags\"\nINNER JOIN \"posts\" AS \"__symmetria_path_0\" ON \"postTags\".\"post_id\" = \"__symmetria_path_0\".\"id\"\nWHERE \"__symmetria_path_0\".\"title\" = $2)",
+    "parameters": [2, "x"]
+  },
+  "update/relation-path-scoped": {
+    "sql": "UPDATE \"records\" AS \"records\" SET \"title\" = $1\nWHERE \"records\".\"tenant_id\" = $2 AND (\"records\".\"external_id\", \"records\".\"tenant_id\") IN (SELECT \"records\".\"external_id\" AS \"externalId\", \"records\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"records\"\nINNER JOIN \"tenants\" AS \"__symmetria_path_0\" ON \"records\".\"tenant_id\" = \"__symmetria_path_0\".\"code\"\nWHERE \"__symmetria_path_0\".\"title\" = $3)\nRETURNING CASE WHEN \"records\".\"tenant_id\" = $4 THEN TRUE ELSE ('SYMMETRIA_OUT_OF_SCOPE:update:records:' || \"records\".tableoid)::boolean END AS \"__symmetria_scope\"",
+    "parameters": ["x", "acme", "Acme", "acme"]
+  },
+  "update/quantifier": {
+    "sql": "UPDATE \"users\" AS \"users\" SET \"active\" = $1\nWHERE EXISTS (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\" AND \"__symmetria_aggregate_0\".\"views\" > $2)",
+    "parameters": [false, "10"]
+  },
+  "update/all": {
+    "sql": "UPDATE \"users\" AS \"users\" SET \"active\" = $1",
+    "parameters": [false]
+  },
+  "delete/relation-path": {
+    "sql": "DELETE FROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"id\" IN (SELECT \"posts\".\"id\" AS \"id\"\nFROM \"posts\" AS \"posts\"\nINNER JOIN \"users\" AS \"__symmetria_path_0\" ON \"posts\".\"author_id\" = \"__symmetria_path_0\".\"id\"\nWHERE \"__symmetria_path_0\".\"name\" = $1)",
+    "parameters": ["Ada"]
+  },
+  "delete/relation-path-composite-out-of-order": {
+    "sql": "DELETE FROM \"records\" AS \"records\"\nWHERE (\"records\".\"external_id\", \"records\".\"tenant_id\") IN (SELECT \"records\".\"external_id\" AS \"externalId\", \"records\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"records\"\nINNER JOIN \"tenants\" AS \"__symmetria_path_0\" ON \"records\".\"tenant_id\" = \"__symmetria_path_0\".\"code\"\nWHERE (\"__symmetria_path_0\".\"title\" = $1 AND \"records\".\"amount\" > $2))\nRETURNING \"records\".\"external_id\" AS \"externalId\"",
+    "parameters": ["Acme", 1]
+  },
+  "delete/relation-path-composite-references": {
+    "sql": "DELETE FROM \"memberships\" AS \"memberships\"\nWHERE (\"memberships\".\"group_id\", \"memberships\".\"user_id\") IN (SELECT \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"user_id\" AS \"userId\"\nFROM \"memberships\" AS \"memberships\"\nINNER JOIN \"groups\" AS \"__symmetria_path_0\" ON \"memberships\".\"group_id\" = \"__symmetria_path_0\".\"id\"\nWHERE \"__symmetria_path_0\".\"name\" = $1)",
+    "parameters": ["core"]
+  },
+  "delete/relation-path-junction": {
+    "sql": "DELETE FROM \"post_tags\" AS \"postTags\"\nWHERE (\"postTags\".\"post_id\", \"postTags\".\"tag_id\") IN (SELECT \"postTags\".\"post_id\" AS \"postId\", \"postTags\".\"tag_id\" AS \"tagId\"\nFROM \"post_tags\" AS \"postTags\"\nINNER JOIN \"tags\" AS \"__symmetria_path_0\" ON \"postTags\".\"tag_id\" = \"__symmetria_path_0\".\"id\"\nWHERE \"__symmetria_path_0\".\"label\" = $1)",
+    "parameters": ["hidden"]
+  },
+  "delete/condition-path": {
+    "sql": "DELETE FROM \"notes\" AS \"notes\"\nWHERE \"notes\".\"id\" IN (SELECT \"notes\".\"id\" AS \"id\"\nFROM \"notes\" AS \"notes\"\nLEFT JOIN \"records\" AS \"__symmetria_path_0\" ON (\"__symmetria_path_0\".\"external_id\" = (SELECT \"__symmetria_path_0_2\".\"external_id\" AS \"externalId\"\nFROM \"records\" AS \"__symmetria_path_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_path_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_path_0_2\".\"external_id\")\nORDER BY \"__symmetria_path_0_2\".\"external_id\" ASC, \"__symmetria_path_0_2\".\"tenant_id\" ASC\nLIMIT 1) AND \"__symmetria_path_0\".\"tenant_id\" = (SELECT \"__symmetria_path_0_2\".\"tenant_id\" AS \"tenantId\"\nFROM \"records\" AS \"__symmetria_path_0_2\"\nWHERE (\"notes\".\"record_tenant\" = \"__symmetria_path_0_2\".\"tenant_id\" AND \"notes\".\"record_external_id\" = \"__symmetria_path_0_2\".\"external_id\")\nORDER BY \"__symmetria_path_0_2\".\"external_id\" ASC, \"__symmetria_path_0_2\".\"tenant_id\" ASC\nLIMIT 1))\nWHERE \"__symmetria_path_0\".\"amount\" = $1)",
+    "parameters": [0]
+  },
+  "delete/scoped": {
+    "sql": "DELETE FROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"author_id\" = $1",
+    "parameters": [7]
+  },
+  "upsert/do-update-where": {
+    "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)\nON CONFLICT (\"email\") DO UPDATE SET \"name\" = \"excluded\".\"name\", \"visits\" = (\"users\".\"visits\" + $3)\nWHERE \"excluded\".\"visits\" > \"users\".\"visits\"\nRETURNING \"users\".\"id\" AS \"id\", \"users\".\"visits\" AS \"visits\"",
+    "parameters": ["a", "Ada", 1]
+  },
+  "upsert/do-update-names": {
+    "sql": "INSERT INTO \"records\" AS \"records\"\n(\"tenant_id\", \"external_id\", \"title\") VALUES ($1, $2, $3)\nON CONFLICT (\"external_id\", \"tenant_id\") DO UPDATE SET \"title\" = \"excluded\".\"title\"",
+    "parameters": ["acme", "r1", "t"]
+  },
+  "upsert/do-nothing": {
+    "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)\nON CONFLICT DO NOTHING",
+    "parameters": ["a", "Ada"]
+  },
+  "upsert/scoped-do-update-where": {
+    "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nON CONFLICT (\"slug\") DO UPDATE SET \"title\" = $4\nWHERE CASE WHEN \"posts\".\"author_id\" = $5 THEN \"excluded\".\"views\" > \"posts\".\"views\" ELSE ('SYMMETRIA_OUT_OF_SCOPE:conflict:posts:' || \"posts\".tableoid)::boolean END\nRETURNING CASE WHEN \"posts\".\"author_id\" = $6 THEN TRUE ELSE ('SYMMETRIA_OUT_OF_SCOPE:insert:posts:' || \"posts\".tableoid)::boolean END AS \"__symmetria_scope\"",
+    "parameters": ["a", "x", 7, "y", 7, 7]
+  },
+  "nested-insert/create-forward-and-many": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)\nRETURNING json_build_object('id', \"users\".\"id\", 'email', \"users\".\"email\", 'name', \"users\".\"name\", 'active', \"users\".\"active\", 'visits', \"users\".\"visits\", 'balance', (\"users\".\"balance\")::text, 'settings', \"users\".\"settings\", 'tenantId', \"users\".\"tenant_id\", 'createdAt', \"users\".\"created_at\") AS \"row\"",
+        "parameters": ["ada", "Ada"]
+      },
+      {
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\", json_build_object('id', \"posts\".\"id\", 'authorId', \"posts\".\"author_id\") AS \"result\"",
+        "parameters": ["first", "First", 1]
+      },
+      {
+        "sql": "INSERT INTO \"comments\" AS \"comments\"\n(\"post_id\", \"author_id\", \"body\") VALUES ($1, $2, $3), ($4, $5, $6)",
+        "parameters": [1, 1, "one", 1, 2, "two"]
+      }
+    ]
+  },
+  "nested-insert/connect-forward": {
+    "statements": [
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE (\"users\".\"id\" = $1)\nLIMIT 2",
+        "parameters": [1]
+      },
+      {
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
+        "parameters": ["s", "t", 1]
+      }
+    ]
+  },
+  "nested-insert/connect-forward-unique": {
+    "statements": [
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE (\"users\".\"email\" = $1)\nLIMIT 2",
+        "parameters": ["ada"]
+      },
+      {
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
+        "parameters": ["s", "t", 1]
+      }
+    ]
+  },
+  "nested-insert/connect-or-create-forward": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)\nON CONFLICT (\"email\") DO UPDATE SET \"email\" = \"excluded\".\"email\"\nRETURNING \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"",
+        "parameters": ["ada", "Ada"]
+      },
+      {
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
+        "parameters": ["s", "t", 1]
+      }
+    ]
+  },
+  "nested-insert/many-to-many": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
+        "parameters": ["s", "t", 1]
+      },
+      {
+        "sql": "INSERT INTO \"tags\" AS \"tags\"\n(\"label\") VALUES ($1)\nRETURNING json_build_object('id', \"tags\".\"id\", 'label', \"tags\".\"label\") AS \"row\"",
+        "parameters": ["new"]
+      },
+      {
+        "sql": "INSERT INTO \"post_tags\" AS \"postTags\"\n(\"post_id\", \"tag_id\") VALUES ($1, $2)\nON CONFLICT (\"post_id\", \"tag_id\") DO NOTHING",
+        "parameters": [1, 1]
+      },
+      {
+        "sql": "SELECT \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"\nFROM \"tags\" AS \"tags\"\nWHERE (\"tags\".\"id\" = $1)\nLIMIT 2",
+        "parameters": [1]
+      },
+      {
+        "sql": "SELECT \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"\nFROM \"tags\" AS \"tags\"\nWHERE (\"tags\".\"label\" = $1)\nLIMIT 2",
+        "parameters": ["known"]
+      },
+      {
+        "sql": "INSERT INTO \"post_tags\" AS \"postTags\"\n(\"post_id\", \"tag_id\") VALUES ($1, $2), ($3, $4)\nON CONFLICT (\"post_id\", \"tag_id\") DO NOTHING",
+        "parameters": [1, 1, 1, 1]
+      },
+      {
+        "sql": "INSERT INTO \"tags\" AS \"tags\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"",
+        "parameters": ["bun"]
+      },
+      {
+        "sql": "INSERT INTO \"tags\" AS \"tags\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"",
+        "parameters": ["postgres"]
+      },
+      {
+        "sql": "INSERT INTO \"post_tags\" AS \"postTags\"\n(\"post_id\", \"tag_id\") VALUES ($1, $2), ($3, $4)\nON CONFLICT (\"post_id\", \"tag_id\") DO NOTHING",
+        "parameters": [1, 1, 1, 1]
+      }
+    ]
+  },
+  "nested-insert/reverse-connect": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)\nRETURNING json_build_object('id', \"users\".\"id\", 'email', \"users\".\"email\", 'name', \"users\".\"name\", 'active', \"users\".\"active\", 'visits', \"users\".\"visits\", 'balance', (\"users\".\"balance\")::text, 'settings', \"users\".\"settings\", 'tenantId', \"users\".\"tenant_id\", 'createdAt', \"users\".\"created_at\") AS \"row\"",
+        "parameters": ["a", "Ada"]
+      },
+      {
+        "sql": "SELECT \"posts\".\"id\" AS \"id\", \"posts\".\"slug\" AS \"slug\", \"posts\".\"title\" AS \"title\", \"posts\".\"body\" AS \"body\", \"posts\".\"author_id\" AS \"authorId\", \"posts\".\"editor_id\" AS \"editorId\", \"posts\".\"views\" AS \"views\", \"posts\".\"metadata\" AS \"metadata\", \"posts\".\"document\" AS \"document\", \"posts\".\"status\" AS \"status\", \"posts\".\"labels\" AS \"labels\", \"posts\".\"created_at\" AS \"createdAt\"\nFROM \"posts\" AS \"posts\"\nWHERE (\"posts\".\"id\" = $1)\nLIMIT 2",
+        "parameters": [1]
+      },
+      {
+        "sql": "UPDATE \"posts\" AS \"posts\" SET \"author_id\" = $1\nWHERE (\"posts\".\"id\" = $2)",
+        "parameters": [1, 1]
+      },
+      {
+        "sql": "SELECT \"posts\".\"id\" AS \"id\", \"posts\".\"slug\" AS \"slug\", \"posts\".\"title\" AS \"title\", \"posts\".\"body\" AS \"body\", \"posts\".\"author_id\" AS \"authorId\", \"posts\".\"editor_id\" AS \"editorId\", \"posts\".\"views\" AS \"views\", \"posts\".\"metadata\" AS \"metadata\", \"posts\".\"document\" AS \"document\", \"posts\".\"status\" AS \"status\", \"posts\".\"labels\" AS \"labels\", \"posts\".\"created_at\" AS \"createdAt\"\nFROM \"posts\" AS \"posts\"\nWHERE (\"posts\".\"slug\" = $1)\nLIMIT 2",
+        "parameters": ["known"]
+      },
+      {
+        "sql": "UPDATE \"posts\" AS \"posts\" SET \"author_id\" = $1\nWHERE (\"posts\".\"id\" = $2)",
+        "parameters": [1, 1]
+      },
+      {
+        "sql": "INSERT INTO \"profiles\" AS \"profiles\"\n(\"user_id\", \"bio\") VALUES ($1, $2)",
+        "parameters": [1, "hi"]
+      }
+    ]
+  },
+  "nested-insert/reverse-connect-composite-out-of-order": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"tenants\" AS \"tenants\"\n(\"code\", \"title\") VALUES ($1, $2)\nRETURNING json_build_object('code', \"tenants\".\"code\", 'title', \"tenants\".\"title\") AS \"row\"",
+        "parameters": ["acme", "Acme"]
+      },
+      {
+        "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\"\nFROM \"records\" AS \"records\"\nWHERE (\"records\".\"tenant_id\" = $1 AND \"records\".\"external_id\" = $2)\nLIMIT 2",
+        "parameters": ["other", "r1"]
+      },
+      {
+        "sql": "UPDATE \"records\" AS \"records\" SET \"tenant_id\" = $1\nWHERE (\"records\".\"external_id\" = $2 AND \"records\".\"tenant_id\" = $3)",
+        "parameters": ["v1", 1, 1]
+      },
+      {
+        "sql": "INSERT INTO \"records\" AS \"records\"\n(\"tenant_id\", \"external_id\", \"title\") VALUES ($1, $2, $3)",
+        "parameters": ["v1", "r2", "t"]
+      }
+    ]
+  },
+  "nested-insert/reverse-connect-composite-references": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"groups\" AS \"groups\"\n(\"name\") VALUES ($1)\nRETURNING json_build_object('id', \"groups\".\"id\", 'name', \"groups\".\"name\") AS \"row\"",
+        "parameters": ["core"]
+      },
+      {
+        "sql": "SELECT \"memberships\".\"user_id\" AS \"userId\", \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"role\" AS \"role\"\nFROM \"memberships\" AS \"memberships\"\nWHERE (\"memberships\".\"user_id\" = $1 AND \"memberships\".\"group_id\" = $2)\nLIMIT 2",
+        "parameters": [1, 9]
+      },
+      {
+        "sql": "UPDATE \"memberships\" AS \"memberships\" SET \"group_id\" = $1\nWHERE (\"memberships\".\"group_id\" = $2 AND \"memberships\".\"user_id\" = $3)",
+        "parameters": [1, 1, 1]
+      },
+      {
+        "sql": "INSERT INTO \"memberships\" AS \"memberships\"\n(\"user_id\", \"group_id\") VALUES ($1, $2)",
+        "parameters": [2, 1]
+      }
+    ]
+  },
+  "nested-insert/reverse-connect-or-create-composite": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"tenants\" AS \"tenants\"\n(\"code\", \"title\") VALUES ($1, $2)\nRETURNING json_build_object('code', \"tenants\".\"code\", 'title', \"tenants\".\"title\") AS \"row\"",
+        "parameters": ["acme", "Acme"]
+      },
+      {
+        "sql": "INSERT INTO \"records\" AS \"records\"\n(\"tenant_id\", \"external_id\", \"title\") VALUES ($1, $2, $3)\nON CONFLICT (\"external_id\", \"tenant_id\") DO UPDATE SET \"external_id\" = \"excluded\".\"external_id\", \"tenant_id\" = \"excluded\".\"tenant_id\"\nRETURNING \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\"",
+        "parameters": ["v1", "r3", "t"]
+      },
+      {
+        "sql": "UPDATE \"records\" AS \"records\" SET \"tenant_id\" = $1\nWHERE (\"records\".\"external_id\" = $2 AND \"records\".\"tenant_id\" = $3)",
+        "parameters": ["v1", 1, 1]
+      }
+    ]
+  },
+  "nested-insert/reverse-connect-or-create-references": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"groups\" AS \"groups\"\n(\"name\") VALUES ($1)\nRETURNING json_build_object('id', \"groups\".\"id\", 'name', \"groups\".\"name\") AS \"row\"",
+        "parameters": ["core"]
+      },
+      {
+        "sql": "INSERT INTO \"memberships\" AS \"memberships\"\n(\"user_id\", \"group_id\", \"role\") VALUES ($1, $2, $3)\nON CONFLICT (\"group_id\", \"user_id\") DO UPDATE SET \"group_id\" = \"excluded\".\"group_id\", \"user_id\" = \"excluded\".\"user_id\"\nRETURNING \"memberships\".\"user_id\" AS \"userId\", \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"role\" AS \"role\"",
+        "parameters": [3, 1, "owner"]
+      },
+      {
+        "sql": "UPDATE \"memberships\" AS \"memberships\" SET \"group_id\" = $1\nWHERE (\"memberships\".\"group_id\" = $2 AND \"memberships\".\"user_id\" = $3)",
+        "parameters": [1, 1, 1]
+      }
+    ]
+  },
+  "nested-insert/deep": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"tenants\" AS \"tenants\"\n(\"code\", \"title\") VALUES ($1, $2)\nON CONFLICT (\"code\") DO UPDATE SET \"code\" = \"excluded\".\"code\"\nRETURNING \"tenants\".\"code\" AS \"code\", \"tenants\".\"title\" AS \"title\"",
+        "parameters": ["acme", "Acme"]
+      },
+      {
+        "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\", \"tenant_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"users\".\"id\", 'email', \"users\".\"email\", 'name', \"users\".\"name\", 'active', \"users\".\"active\", 'visits', \"users\".\"visits\", 'balance', (\"users\".\"balance\")::text, 'settings', \"users\".\"settings\", 'tenantId', \"users\".\"tenant_id\", 'createdAt', \"users\".\"created_at\") AS \"row\", json_build_object('id', \"users\".\"id\") AS \"result\"",
+        "parameters": ["a", "Ada", "v1"]
+      },
+      {
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
+        "parameters": ["p", "P", 1]
+      },
+      {
+        "sql": "INSERT INTO \"tags\" AS \"tags\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"",
+        "parameters": ["x"]
+      },
+      {
+        "sql": "INSERT INTO \"post_tags\" AS \"postTags\"\n(\"post_id\", \"tag_id\") VALUES ($1, $2)\nON CONFLICT (\"post_id\", \"tag_id\") DO NOTHING",
+        "parameters": [1, 1]
+      },
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE (\"users\".\"email\" = $1)\nLIMIT 2",
+        "parameters": ["bob"]
+      },
+      {
+        "sql": "INSERT INTO \"comments\" AS \"comments\"\n(\"post_id\", \"author_id\", \"body\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"comments\".\"id\", 'postId', \"comments\".\"post_id\", 'authorId', \"comments\".\"author_id\", 'body', \"comments\".\"body\", 'score', \"comments\".\"score\") AS \"row\"",
+        "parameters": [1, 1, "c"]
+      }
+    ]
+  },
+  "nested-insert/bulk": {
+    "statements": [
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE (\"users\".\"id\" = $1)\nLIMIT 2",
+        "parameters": [1]
+      },
+      {
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
+        "parameters": ["a", "A", 1]
+      },
+      {
+        "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)\nRETURNING json_build_object('id', \"users\".\"id\", 'email', \"users\".\"email\", 'name', \"users\".\"name\", 'active', \"users\".\"active\", 'visits', \"users\".\"visits\", 'balance', (\"users\".\"balance\")::text, 'settings', \"users\".\"settings\", 'tenantId', \"users\".\"tenant_id\", 'createdAt', \"users\".\"created_at\") AS \"row\"",
+        "parameters": ["b", "B"]
+      },
+      {
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
+        "parameters": ["b", "B", 1]
+      }
+    ]
+  },
+  "nested-insert/self-reference": {
+    "statements": [
+      {
+        "sql": "SELECT \"categories\".\"id\" AS \"id\", \"categories\".\"name\" AS \"name\", \"categories\".\"parent_id\" AS \"parentId\"\nFROM \"categories\" AS \"categories\"\nWHERE (\"categories\".\"id\" = $1)\nLIMIT 2",
+        "parameters": [1]
+      },
+      {
+        "sql": "INSERT INTO \"categories\" AS \"categories\"\n(\"name\", \"parent_id\") VALUES ($1, $2)\nRETURNING json_build_object('id', \"categories\".\"id\", 'name', \"categories\".\"name\", 'parentId', \"categories\".\"parent_id\") AS \"row\"",
+        "parameters": ["root", 1]
+      },
+      {
+        "sql": "INSERT INTO \"categories\" AS \"categories\"\n(\"name\", \"parent_id\") VALUES ($1, $2)",
+        "parameters": ["leaf", 1]
+      },
+      {
+        "sql": "SELECT \"categories\".\"id\" AS \"id\", \"categories\".\"name\" AS \"name\", \"categories\".\"parent_id\" AS \"parentId\"\nFROM \"categories\" AS \"categories\"\nWHERE (\"categories\".\"id\" = $1)\nLIMIT 2",
+        "parameters": [5]
+      },
+      {
+        "sql": "UPDATE \"categories\" AS \"categories\" SET \"parent_id\" = $1\nWHERE (\"categories\".\"id\" = $2)",
+        "parameters": [1, 1]
+      }
+    ]
+  },
+  "nested-insert/connect-unique-index": {
+    "statements": [
+      {
+        "sql": "SELECT \"handles\".\"id\" AS \"id\", \"handles\".\"tenant\" AS \"tenant\", \"handles\".\"handle\" AS \"handle\", \"handles\".\"active\" AS \"active\"\nFROM \"handles\" AS \"handles\"\nWHERE (\"handles\".\"handle\" = $1 AND \"handles\".\"tenant\" = $2)\nLIMIT 2",
+        "parameters": ["ada", "one"]
+      },
+      {
+        "sql": "INSERT INTO \"aliases\" AS \"aliases\"\n(\"handle_id\", \"label\") VALUES ($1, $2)\nRETURNING json_build_object('id', \"aliases\".\"id\", 'handleId', \"aliases\".\"handle_id\", 'label', \"aliases\".\"label\") AS \"row\"",
+        "parameters": [1, "a"]
+      }
+    ]
+  },
+  "nested-insert/connect-or-create-unique-index": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"handles\" AS \"handles\"\n(\"tenant\", \"handle\", \"active\") VALUES ($1, $2, $3)\nON CONFLICT (\"tenant\", \"handle\") DO UPDATE SET \"tenant\" = \"excluded\".\"tenant\", \"handle\" = \"excluded\".\"handle\"\nRETURNING \"handles\".\"id\" AS \"id\", \"handles\".\"tenant\" AS \"tenant\", \"handles\".\"handle\" AS \"handle\", \"handles\".\"active\" AS \"active\"",
+        "parameters": ["one", "ada", 1]
+      },
+      {
+        "sql": "INSERT INTO \"aliases\" AS \"aliases\"\n(\"handle_id\", \"label\") VALUES ($1, $2)\nRETURNING json_build_object('id', \"aliases\".\"id\", 'handleId', \"aliases\".\"handle_id\", 'label', \"aliases\".\"label\") AS \"row\"",
+        "parameters": [1, "a"]
+      }
+    ]
+  },
+  "nested-insert/connect-partial-index": {
+    "statements": [],
+    "error": "symmetria: connect on \"handles\" requires a complete non-null unique key"
+  },
+  "nested-insert/missing-connect": {
+    "statements": [],
+    "error": "symmetria: connect on \"users\" requires a complete non-null unique key"
+  },
+  "nested-insert/connect-not-found": {
+    "statements": [
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE (\"users\".\"id\" = $1)\nLIMIT 2",
+        "parameters": [1]
+      }
+    ],
+    "error": "symmetria: connect on \"users\" expected one existing row"
+  },
+  "nested-insert/condition-relation": {
+    "statements": [],
+    "error": "symmetria: \"notes.author\" is a condition relation; it has no foreign key to write"
+  },
+  "cte/plain": {
+    "sql": "WITH \"ranked\" AS NOT MATERIALIZED (SELECT \"entries\".\"id\" AS \"id\", \"entries\".\"amount\" AS \"amount\", ROW_NUMBER() OVER (PARTITION BY \"entries\".\"team\" ORDER BY \"entries\".\"amount\" DESC, \"entries\".\"id\" ASC) AS \"position\"\nFROM \"entries\" AS \"entries\"\nWHERE \"entries\".\"team\" = $1)\nSELECT \"ranked\".\"id\" AS \"id\", \"ranked\".\"position\" AS \"position\"\nFROM \"ranked\" AS \"ranked\"\nWHERE \"ranked\".\"position\" <= $2",
+    "parameters": ["A", 2]
+  },
+  "cte/dependencies": {
+    "sql": "WITH \"first\" AS (SELECT \"entries\".\"id\" AS \"id\"\nFROM \"entries\" AS \"entries\"),\n\"second\" AS MATERIALIZED (SELECT \"first\".\"id\" AS \"id\"\nFROM \"first\" AS \"first\")\nSELECT \"second\".\"id\" AS \"id\"\nFROM \"second\" AS \"second\"\nINNER JOIN \"first\" AS \"first\" ON (\"second\".\"id\" = \"first\".\"id\")",
+    "parameters": []
+  },
+  "cte/in-subqueries": {
+    "sql": "WITH \"leaders\" AS (SELECT \"entries\".\"id\" AS \"id\"\nFROM \"entries\" AS \"entries\"\nWHERE \"entries\".\"amount\" > $1),\n\"teams\" AS (SELECT \"entries\".\"team\" AS \"team\"\nFROM \"entries\" AS \"entries\"\nWHERE \"entries\".\"parent_id\" IS NULL)\nSELECT \"entries\".\"id\" AS \"id\", (SELECT MAX(\"leaders\".\"id\") AS \"id\"\nFROM \"leaders\" AS \"leaders\") AS \"leader\", COALESCE(LAG(\"entries\".\"amount\", $2) OVER (ORDER BY \"entries\".\"id\" ASC), $3) AS \"relative\"\nFROM \"entries\" AS \"entries\"\nWHERE \"entries\".\"id\" IN (SELECT \"leaders\".\"id\" AS \"id\"\nFROM \"leaders\" AS \"leaders\") AND EXISTS (SELECT \"teams\".\"team\" AS \"team\"\nFROM \"teams\" AS \"teams\"\nWHERE \"teams\".\"team\" = \"entries\".\"team\") AND \"entries\".\"amount\" BETWEEN $4 AND (SELECT MAX(\"leaders\".\"id\") AS \"id\"\nFROM \"leaders\" AS \"leaders\")",
+    "parameters": ["100", 1, "0", "1"]
+  },
+  "cte/recursive": {
+    "sql": "WITH RECURSIVE \"tree\" AS ((SELECT \"entries\".\"id\" AS \"id\", \"entries\".\"amount\" AS \"amount\", 0 AS \"depth\"\nFROM \"entries\" AS \"entries\"\nWHERE \"entries\".\"id\" = $1)\nUNION ALL\n(SELECT \"entries\".\"id\" AS \"id\", \"entries\".\"amount\" AS \"amount\", (\"tree\".\"depth\" + $2) AS \"depth\"\nFROM \"entries\" AS \"entries\"\nINNER JOIN \"tree\" AS \"tree\" ON (\"entries\".\"parent_id\" = \"tree\".\"id\")))\nSELECT \"tree\".\"id\" AS \"id\", \"tree\".\"depth\" AS \"depth\"\nFROM \"tree\" AS \"tree\"\nORDER BY \"tree\".\"id\" ASC",
+    "parameters": [1, 1]
+  },
+  "cte/recursive-union": {
+    "sql": "WITH RECURSIVE \"sequence\" AS ((SELECT \"entries\".\"id\" AS \"id\"\nFROM \"entries\" AS \"entries\"\nORDER BY \"entries\".\"id\" ASC\nLIMIT 1)\nUNION\n(SELECT (\"sequence\".\"id\" + $1) AS \"id\"\nFROM \"sequence\" AS \"sequence\"\nWHERE \"sequence\".\"id\" < $2))\nSELECT \"sequence\".\"id\" AS \"id\"\nFROM \"sequence\" AS \"sequence\"",
+    "parameters": [1, 3]
+  },
+  "cte/upsert-condition": {
+    "sql": "WITH \"leaders\" AS (SELECT \"entries\".\"id\" AS \"id\"\nFROM \"entries\" AS \"entries\"\nWHERE \"entries\".\"amount\" > $1)\nINSERT INTO \"entries\" AS \"entries\"\n(\"id\", \"team\", \"amount\") VALUES ($2, $3, $4)\nON CONFLICT (\"id\") DO UPDATE SET \"amount\" = $5\nWHERE \"entries\".\"id\" IN (SELECT \"leaders\".\"id\" AS \"id\"\nFROM \"leaders\" AS \"leaders\")",
+    "parameters": ["100", 1, "A", "5", "6"]
+  },
+  "cte/update-where": {
+    "sql": "WITH \"leaders\" AS (SELECT \"entries\".\"id\" AS \"id\"\nFROM \"entries\" AS \"entries\")\nUPDATE \"entries\" AS \"entries\" SET \"team\" = $1\nWHERE \"entries\".\"id\" IN (SELECT \"leaders\".\"id\" AS \"id\"\nFROM \"leaders\" AS \"leaders\")",
+    "parameters": ["B"]
+  },
+  "cte/derived-and-nested": {
+    "sql": "WITH \"busy\" AS (SELECT \"users\".\"id\" AS \"id\", (SELECT COUNT(*) AS \"count\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"total\"\nFROM \"users\" AS \"users\")\nSELECT \"busy\".\"id\" AS \"id\", \"busy\".\"total\" AS \"total\", \"recent\".\"authorId\" AS \"authorId\"\nFROM \"busy\" AS \"busy\"\nINNER JOIN (SELECT \"posts\".\"author_id\" AS \"authorId\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"views\" > $1) AS \"recent\" ON (\"busy\".\"id\" = \"recent\".\"authorId\")",
+    "parameters": ["9"]
+  },
+  "window/functions": {
+    "sql": "SELECT \"entries\".\"id\" AS \"id\", ROW_NUMBER() OVER (PARTITION BY \"entries\".\"team\" ORDER BY \"entries\".\"id\" ASC) AS \"position\", RANK() OVER (ORDER BY \"entries\".\"amount\" DESC) AS \"placed\", LAG(\"entries\".\"amount\", $1, $2) OVER (PARTITION BY \"entries\".\"team\" ORDER BY \"entries\".\"id\" ASC ROWS BETWEEN $3 PRECEDING AND CURRENT ROW) AS \"previous\", LEAD(\"entries\".\"amount\", $4) OVER (ORDER BY \"entries\".\"id\" ASC) AS \"next\", LEAD(\"entries\".\"amount\", $5) OVER (ORDER BY \"entries\".\"id\" ASC) AS \"following\", SUM(\"entries\".\"amount\") OVER (PARTITION BY \"entries\".\"team\" ORDER BY \"entries\".\"id\" ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)::numeric AS \"running\", (\"entries\".\"amount\" - LAG(\"entries\".\"amount\", $6) OVER (ORDER BY \"entries\".\"id\" ASC)) AS \"change\"\nFROM \"entries\" AS \"entries\"",
+    "parameters": [2, "0", 3, 1, 1, 1]
+  },
+  "window/prepared": {
+    "sql": "SELECT LAG(\"entries\".\"amount\", $1, $2) OVER (PARTITION BY \"entries\".\"team\" ORDER BY \"entries\".\"id\" ASC) AS \"previous\"\nFROM \"entries\" AS \"entries\"\nWHERE \"entries\".\"team\" = $3\nLIMIT $4",
+    "parameters": [2, "0", "A", 3]
+  },
+  "page/forward": {
+    "statements": [
+      {
+        "sql": "SELECT \"posts\".\"id\" AS \"id\", \"posts\".\"title\" AS \"title\", \"posts\".\"title\"::text AS \"__symmetria_cursor_0\", \"posts\".\"id\"::text AS \"__symmetria_cursor_1\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"views\" > $1\nORDER BY \"posts\".\"title\" DESC, \"posts\".\"id\" ASC\nLIMIT 3",
+        "parameters": ["1"]
+      }
+    ]
+  },
+  "page/after": {
+    "statements": [
+      {
+        "sql": "SELECT \"posts\".\"id\" AS \"id\", \"posts\".\"title\" AS \"title\", \"posts\".\"title\"::text AS \"__symmetria_cursor_0\", \"posts\".\"id\"::text AS \"__symmetria_cursor_1\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"views\" > $1 AND (((\"posts\".\"title\" < $2)) OR (\"posts\".\"title\" IS NOT DISTINCT FROM $3 AND (\"posts\".\"id\" > $4)))\nORDER BY \"posts\".\"title\" DESC, \"posts\".\"id\" ASC\nLIMIT 3",
+        "parameters": ["1", "2", "2", "2"]
+      }
+    ]
+  },
+  "page/before": {
+    "statements": [
+      {
+        "sql": "SELECT \"posts\".\"id\" AS \"id\", \"posts\".\"title\" AS \"title\", \"posts\".\"title\"::text AS \"__symmetria_cursor_0\", \"posts\".\"id\"::text AS \"__symmetria_cursor_1\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"views\" > $1 AND (((\"posts\".\"title\" > $2)) OR (\"posts\".\"title\" IS NOT DISTINCT FROM $3 AND (\"posts\".\"id\" < $4)))\nORDER BY \"posts\".\"title\" ASC NULLS LAST, \"posts\".\"id\" DESC NULLS FIRST\nLIMIT 3",
+        "parameters": ["1", "1", "1", "1"]
+      }
+    ]
+  },
+  "page/composite-out-of-order-forward": {
+    "statements": [
+      {
+        "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\", \"records\".\"tenant_id\"::text AS \"__symmetria_cursor_0\", \"records\".\"external_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"records\" AS \"records\"\nORDER BY \"records\".\"tenant_id\" ASC, \"records\".\"external_id\" DESC\nLIMIT 2",
+        "parameters": []
+      }
+    ]
+  },
+  "page/composite-out-of-order-after": {
+    "statements": [
+      {
+        "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\", \"records\".\"tenant_id\"::text AS \"__symmetria_cursor_0\", \"records\".\"external_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"records\" AS \"records\"\nWHERE (((\"records\".\"tenant_id\" > $1)) OR (\"records\".\"tenant_id\" IS NOT DISTINCT FROM $2 AND (\"records\".\"external_id\" < $3)))\nORDER BY \"records\".\"tenant_id\" ASC, \"records\".\"external_id\" DESC\nLIMIT 2",
+        "parameters": ["1", "1", "1"]
+      }
+    ]
+  },
+  "page/composite-out-of-order-before": {
+    "statements": [
+      {
+        "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\", \"records\".\"tenant_id\"::text AS \"__symmetria_cursor_0\", \"records\".\"external_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"records\" AS \"records\"\nWHERE (((\"records\".\"tenant_id\" < $1)) OR (\"records\".\"tenant_id\" IS NOT DISTINCT FROM $2 AND (\"records\".\"external_id\" > $3)))\nORDER BY \"records\".\"tenant_id\" DESC NULLS FIRST, \"records\".\"external_id\" ASC NULLS LAST\nLIMIT 2",
+        "parameters": ["1", "1", "1"]
+      }
+    ]
+  },
+  "page/composite-references-forward": {
+    "statements": [
+      {
+        "sql": "SELECT \"memberships\".\"user_id\" AS \"userId\", \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"role\" AS \"role\", \"memberships\".\"user_id\"::text AS \"__symmetria_cursor_0\", \"memberships\".\"group_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"memberships\" AS \"memberships\"\nORDER BY \"memberships\".\"user_id\" ASC, \"memberships\".\"group_id\" DESC\nLIMIT 2",
+        "parameters": []
+      }
+    ]
+  },
+  "page/composite-references-after": {
+    "statements": [
+      {
+        "sql": "SELECT \"memberships\".\"user_id\" AS \"userId\", \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"role\" AS \"role\", \"memberships\".\"user_id\"::text AS \"__symmetria_cursor_0\", \"memberships\".\"group_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"memberships\" AS \"memberships\"\nWHERE (((\"memberships\".\"user_id\" > $1)) OR (\"memberships\".\"user_id\" IS NOT DISTINCT FROM $2 AND (\"memberships\".\"group_id\" < $3)))\nORDER BY \"memberships\".\"user_id\" ASC, \"memberships\".\"group_id\" DESC\nLIMIT 2",
+        "parameters": ["1", "1", "1"]
+      }
+    ]
+  },
+  "page/composite-references-before": {
+    "statements": [
+      {
+        "sql": "SELECT \"memberships\".\"user_id\" AS \"userId\", \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"role\" AS \"role\", \"memberships\".\"user_id\"::text AS \"__symmetria_cursor_0\", \"memberships\".\"group_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"memberships\" AS \"memberships\"\nWHERE (((\"memberships\".\"user_id\" < $1)) OR (\"memberships\".\"user_id\" IS NOT DISTINCT FROM $2 AND (\"memberships\".\"group_id\" > $3)))\nORDER BY \"memberships\".\"user_id\" DESC NULLS FIRST, \"memberships\".\"group_id\" ASC NULLS LAST\nLIMIT 2",
+        "parameters": ["1", "1", "1"]
+      }
+    ]
+  },
+  "page/scoped-composite-forward": {
+    "statements": [
+      {
+        "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\", \"records\".\"tenant_id\"::text AS \"__symmetria_cursor_0\", \"records\".\"external_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"records\" AS \"records\"\nWHERE \"records\".\"tenant_id\" = $1\nORDER BY \"records\".\"tenant_id\" ASC, \"records\".\"external_id\" DESC\nLIMIT 2",
+        "parameters": ["acme"]
+      }
+    ]
+  },
+  "page/scoped-composite-after": {
+    "statements": [
+      {
+        "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\", \"records\".\"tenant_id\"::text AS \"__symmetria_cursor_0\", \"records\".\"external_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"records\" AS \"records\"\nWHERE \"records\".\"tenant_id\" = $1 AND (((\"records\".\"tenant_id\" > $2)) OR (\"records\".\"tenant_id\" IS NOT DISTINCT FROM $3 AND (\"records\".\"external_id\" < $4)))\nORDER BY \"records\".\"tenant_id\" ASC, \"records\".\"external_id\" DESC\nLIMIT 2",
+        "parameters": ["acme", "1", "1", "1"]
+      }
+    ]
+  },
+  "page/scoped-composite-before": {
+    "statements": [
+      {
+        "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\", \"records\".\"tenant_id\"::text AS \"__symmetria_cursor_0\", \"records\".\"external_id\"::text AS \"__symmetria_cursor_1\"\nFROM \"records\" AS \"records\"\nWHERE \"records\".\"tenant_id\" = $1 AND (((\"records\".\"tenant_id\" < $2)) OR (\"records\".\"tenant_id\" IS NOT DISTINCT FROM $3 AND (\"records\".\"external_id\" > $4)))\nORDER BY \"records\".\"tenant_id\" DESC NULLS FIRST, \"records\".\"external_id\" ASC NULLS LAST\nLIMIT 2",
+        "parameters": ["acme", "1", "1", "1"]
+      }
+    ]
+  },
+  "page/expression-and-window": {
+    "statements": [
+      {
+        "sql": "SELECT \"__symmetria_page\".\"id\" AS \"id\", \"__symmetria_page\".\"position\" AS \"position\", \"__symmetria_page\".\"__symmetria_order_0\"::text AS \"__symmetria_cursor_0\", \"__symmetria_page\".\"__symmetria_order_1\"::text AS \"__symmetria_cursor_1\"\nFROM (SELECT \"entries\".\"id\" AS \"id\", ROW_NUMBER() OVER (ORDER BY \"entries\".\"id\" ASC) AS \"position\", (\"entries\".\"amount\" + $1) AS \"__symmetria_order_0\", \"entries\".\"id\" AS \"__symmetria_order_1\"\nFROM \"entries\" AS \"entries\") AS \"__symmetria_page\"\nORDER BY \"__symmetria_page\".\"__symmetria_order_0\" DESC, \"__symmetria_page\".\"__symmetria_order_1\" ASC\nLIMIT 2",
+        "parameters": ["1"]
+      },
+      {
+        "sql": "SELECT \"__symmetria_page\".\"id\" AS \"id\", \"__symmetria_page\".\"position\" AS \"position\", \"__symmetria_page\".\"__symmetria_order_0\"::text AS \"__symmetria_cursor_0\", \"__symmetria_page\".\"__symmetria_order_1\"::text AS \"__symmetria_cursor_1\"\nFROM (SELECT \"entries\".\"id\" AS \"id\", ROW_NUMBER() OVER (ORDER BY \"entries\".\"id\" ASC) AS \"position\", (\"entries\".\"amount\" + $1) AS \"__symmetria_order_0\", \"entries\".\"id\" AS \"__symmetria_order_1\"\nFROM \"entries\" AS \"entries\") AS \"__symmetria_page\"\nWHERE (((\"__symmetria_page\".\"__symmetria_order_0\" < $2)) OR (\"__symmetria_page\".\"__symmetria_order_0\" IS NOT DISTINCT FROM $3 AND (\"__symmetria_page\".\"__symmetria_order_1\" > $4)))\nORDER BY \"__symmetria_page\".\"__symmetria_order_0\" DESC, \"__symmetria_page\".\"__symmetria_order_1\" ASC\nLIMIT 2",
+        "parameters": ["1", "1", "1", "1"]
+      }
+    ]
+  },
+  "page/unique-column": {
+    "statements": [
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\"::text AS \"__symmetria_cursor_0\"\nFROM \"users\" AS \"users\"\nORDER BY \"users\".\"email\" ASC\nLIMIT 2",
+        "parameters": []
+      },
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\"::text AS \"__symmetria_cursor_0\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"email\" > $1\nORDER BY \"users\".\"email\" ASC\nLIMIT 2",
+        "parameters": ["1"]
+      }
+    ]
+  },
+  "page/incomplete-key": {
+    "statements": [],
+    "error": "symmetria: page() ORDER BY must include a complete primary key or a non-null unique column"
+  },
+  "page/joined-ordering": {
+    "statements": [],
+    "error": "symmetria: page() requires an ungrouped root-table query without joins, LIMIT or OFFSET"
+  },
+  "terminal/count": {
+    "statements": [
+      {
+        "sql": "SELECT COUNT(*) AS \"count\"\nFROM \"posts\" AS \"posts\"",
+        "parameters": []
+      }
+    ]
+  },
+  "terminal/count-filtered": {
+    "statements": [
+      {
+        "sql": "SELECT COUNT(*) AS \"count\"\nFROM \"posts\" AS \"posts\"\nINNER JOIN \"users\" AS \"__symmetria_path_0\" ON \"posts\".\"author_id\" = \"__symmetria_path_0\".\"id\"\nWHERE \"__symmetria_path_0\".\"name\" = $1",
+        "parameters": ["Ada"]
+      }
+    ]
+  },
+  "terminal/count-limited": {
+    "statements": [
+      {
+        "sql": "SELECT COUNT(*) AS \"count\"\nFROM (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"posts\"\nLIMIT 5) AS \"__symmetria_count\"",
+        "parameters": []
+      }
+    ]
+  },
+  "terminal/count-distinct": {
+    "statements": [
+      {
+        "sql": "SELECT COUNT(*) AS \"count\"\nFROM (SELECT DISTINCT \"posts\".\"title\" AS \"title\"\nFROM \"posts\" AS \"posts\") AS \"__symmetria_count\"",
+        "parameters": []
+      }
+    ]
+  },
+  "terminal/count-scoped": {
+    "statements": [
+      {
+        "sql": "SELECT COUNT(*) AS \"count\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"active\" = $1",
+        "parameters": [true]
+      }
+    ]
+  },
+  "terminal/exists": {
+    "statements": [
+      {
+        "sql": "SELECT 1 AS \"present\"\nFROM \"users\" AS \"users\"\nLIMIT 1",
+        "parameters": []
+      }
+    ]
+  },
+  "terminal/exists-by-id": {
+    "statements": [
+      {
+        "sql": "SELECT 1 AS \"present\"\nFROM \"records\" AS \"records\"\nWHERE \"records\".\"external_id\" = $1 AND \"records\".\"tenant_id\" = $2\nLIMIT 1",
+        "parameters": ["b", "a"]
+      }
+    ]
+  },
+  "terminal/exists-scoped": {
+    "statements": [
+      {
+        "sql": "SELECT 1 AS \"present\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"author_id\" = $1 AND \"posts\".\"views\" > $2\nLIMIT 1",
+        "parameters": [7, "1"]
+      }
+    ]
+  },
+  "terminal/first": {
+    "statements": [
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\"\nFROM \"users\" AS \"users\"\nLIMIT 1",
+        "parameters": []
+      }
+    ]
+  },
+  "terminal/maybe-one": {
+    "statements": [
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"id\" = $1\nLIMIT 2",
+        "parameters": [1]
+      }
+    ]
+  },
+  "terminal/transaction": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)",
+        "parameters": ["a", "A"]
+      },
+      {
+        "sql": "UPDATE \"users\" AS \"users\" SET \"name\" = $1\nWHERE \"users\".\"id\" = $2",
+        "parameters": ["B", 1]
+      },
+      {
+        "sql": "DELETE FROM \"users\" AS \"users\"\nWHERE \"users\".\"id\" = $1",
+        "parameters": [1]
+      }
+    ]
+  },
+  "prepared/select": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", (SELECT COUNT(*) AS \"count\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"total\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nINNER JOIN \"users\" AS \"__symmetria_path_1_0\" ON \"__symmetria_aggregate_0\".\"author_id\" = \"__symmetria_path_1_0\".\"id\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\" AND \"__symmetria_path_1_0\".\"name\" = $1\nLIMIT $2) AS \"__symmetria_row\") AS \"posts\"\nFROM (SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenant_id\", \"users\".\"created_at\" AS \"created_at\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"id\" > $3\nORDER BY \"users\".\"id\" ASC\nLIMIT $4) AS \"users\"\nORDER BY \"users\".\"id\" ASC",
+    "parameters": ["Ada", 2, 5, 2]
+  },
+  "prepared/by-unique": {
+    "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"email\" = $1",
+    "parameters": ["ada"]
+  },
+  "prepared/by-id-composite": {
+    "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\"\nFROM \"records\" AS \"records\"\nWHERE \"records\".\"external_id\" = $1 AND \"records\".\"tenant_id\" = $2",
+    "parameters": ["r1", "acme"]
+  },
+  "prepared/update": {
+    "sql": "UPDATE \"users\" AS \"users\" SET \"settings\" = jsonb_set(\"users\".\"settings\", ARRAY[$1::text], COALESCE($2::text::jsonb, 'null'::jsonb), true)\nWHERE \"users\".\"id\" = $3",
+    "parameters": ["note", "\"say \\\"hi\\\"\"", 7]
+  },
+  "prepared/nullable": {
+    "sql": "SELECT \"posts\".\"id\" AS \"id\"\nFROM \"posts\" AS \"posts\"\nWHERE (CASE WHEN ($1)::integer IS NULL THEN \"posts\".\"editor_id\" IS NULL ELSE \"posts\".\"editor_id\" = $1 END)",
+    "parameters": [null]
+  },
+  "prepared/execute": {
+    "statements": [
+      {
+        "sql": "SELECT \"users\".\"id\" AS \"id\"\nFROM \"users\" AS \"users\"\nWHERE \"users\".\"id\" = $1",
+        "parameters": [3]
+      }
+    ]
+  },
+  "json/paths": {
+    "sql": "SELECT (\"users\".\"settings\" #> ARRAY[$1::text]) AS \"theme\", ((\"users\".\"settings\" #> ARRAY[$2::text]) #> ARRAY[$3::text]) AS \"email\", ((\"users\".\"settings\" #> ARRAY[$4::text]) #> ARRAY[$5::text]) AS \"firstTag\", jsonb_array_length(NULLIF(((\"users\".\"settings\" #> ARRAY[$6::text]))::jsonb, 'null'::jsonb)) AS \"next\"\nFROM \"users\" AS \"users\"\nWHERE (\"users\".\"settings\" #> ARRAY[$7::text]) = $8::text::jsonb AND (\"users\".\"settings\" #> ARRAY[$9::text]) IS NOT NULL AND (\"users\".\"settings\" #> ARRAY[$10::text]) IN ($11::text::jsonb, $12::text::jsonb) AND \"users\".\"settings\" @> $13::text::jsonb AND EXISTS (SELECT 1 FROM jsonb_array_elements(NULLIF(((\"users\".\"settings\" #> ARRAY[$14::text]))::jsonb, 'null'::jsonb)) AS \"__symmetria_element\"(\"value\") WHERE \"__symmetria_element\".\"value\" = COALESCE($15::text::jsonb, 'null'::jsonb))\nORDER BY (\"users\".\"settings\" #> ARRAY[$16::text]) ASC",
+    "parameters": [
+      "theme",
+      "notifications",
+      "email",
+      "tags",
+      "0",
+      "tags",
+      "theme",
+      "\"dark\"",
+      "note",
+      "theme",
+      "\"dark\"",
+      "\"light\"",
+      "{\"theme\":\"dark\"}",
+      "tags",
+      "\"sql\"",
+      "theme"
+    ]
+  },
+  "json/arithmetic-and-aggregates": {
+    "sql": "SELECT ((((((\"posts\".\"metadata\" #> ARRAY[$1::text]) #>> '{}')))::double precision) + $2::text::double precision) AS \"next\", SUM(((((\"posts\".\"metadata\" #> ARRAY[$3::text]) #>> '{}')))::numeric)::numeric AS \"total\", (MAX(ARRAY[(\"posts\".\"metadata\" #> ARRAY[$4::text])]) FILTER (WHERE (\"posts\".\"metadata\" #> ARRAY[$4::text]) <> 'null'::jsonb))[1] AS \"best\"\nFROM \"posts\" AS \"posts\"\nWHERE (\"posts\".\"metadata\" #> ARRAY[$5::text]) > $6::text::jsonb",
+    "parameters": ["rating", 1, "rating", "rating", "rating", "2"]
+  },
+  "json/set": {
+    "sql": "UPDATE \"users\" AS \"users\" SET \"settings\" = jsonb_set((jsonb_set((jsonb_set((jsonb_set(\"users\".\"settings\", ARRAY[$1::text, $2::text], $3::text::jsonb, true)), ARRAY[$4::text, $5::text], $6::text::jsonb, true)), ARRAY[$7::text], ('null'::jsonb), true)), ARRAY[$8::text], COALESCE(to_jsonb(\"users\".\"name\"), 'null'::jsonb), true)\nWHERE \"users\".\"id\" = $9\nRETURNING \"users\".\"settings\" AS \"settings\"",
+    "parameters": [
+      "notifications",
+      "email",
+      "true",
+      "tags",
+      "0",
+      "\"first\"",
+      "note",
+      "note",
+      1
+    ]
+  },
+  "json/set-projection": {
+    "sql": "SELECT jsonb_set(\"users\".\"settings\", ARRAY[$1::text], $2::text::jsonb, true) AS \"preview\"\nFROM \"users\" AS \"users\"",
+    "parameters": ["theme", "\"light\""]
+  },
+  "search/match-and-rank": {
+    "sql": "SELECT \"posts\".\"id\" AS \"id\", ts_rank(to_tsvector('english', \"posts\".\"title\"), websearch_to_tsquery('english', $1)) AS \"rank\", ts_headline('simple', \"posts\".\"body\", websearch_to_tsquery('simple', $2)) AS \"headline\", ts_rank(\"posts\".\"document\", websearch_to_tsquery('simple', $3)) AS \"stored\"\nFROM \"posts\" AS \"posts\"\nWHERE to_tsvector('simple', \"posts\".\"title\") @@ websearch_to_tsquery('simple', $4) AND \"posts\".\"document\" @@ websearch_to_tsquery('english', $5)\nORDER BY ts_rank(to_tsvector('simple', \"posts\".\"title\"), websearch_to_tsquery('simple', $6)) DESC",
+    "parameters": ["bun sql", "bun sql", "bun", "bun sql", "bun", "bun sql"]
+  },
+  "dates/trunc": {
+    "sql": "SELECT date_trunc('month', \"users\".\"created_at\") AS \"month\", date_trunc('week', \"users\".\"created_at\", $1::text) AS \"week\", COUNT(*) AS \"users\"\nFROM \"users\" AS \"users\"\nWHERE (date_trunc('week', \"users\".\"created_at\", $1::text)) >= $2\nGROUP BY date_trunc('month', \"users\".\"created_at\"), date_trunc('week', \"users\".\"created_at\", $1::text)\nORDER BY date_trunc('month', \"users\".\"created_at\") DESC",
+    "parameters": ["Europe/Berlin", "2024-01-01T00:00:00.000Z"]
+  },
+  "match/case": {
+    "sql": "SELECT (CASE \"posts\".\"status\" WHEN $1 THEN $2::text::text WHEN $3 THEN $4::text::text END) AS \"label\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"status\" = $5 AND \"posts\".\"id\" = $6",
+    "parameters": ["draft", "d", "published", "p", "published", 2]
+  },
+  "array/index-length-membership": {
+    "sql": "SELECT (\"posts\".\"labels\")[(CASE WHEN $1::bigint < cardinality(\"posts\".\"labels\") THEN array_lower(\"posts\".\"labels\", 1)::bigint + $1::bigint END)::integer] AS \"first\", cardinality(\"posts\".\"labels\") AS \"size\"\nFROM \"posts\" AS \"posts\"\nWHERE $2 = ANY(\"posts\".\"labels\") AND \"posts\".\"labels\" @> $3::text::text[] AND \"posts\".\"labels\" && $4::text::text[] AND (\"posts\".\"labels\")[(CASE WHEN $5::bigint < cardinality(\"posts\".\"labels\") THEN array_lower(\"posts\".\"labels\", 1)::bigint + $5::bigint END)::integer] = $6\nORDER BY (\"posts\".\"labels\")[(CASE WHEN $7::bigint < cardinality(\"posts\".\"labels\") THEN array_lower(\"posts\".\"labels\", 1)::bigint + $7::bigint END)::integer] ASC",
+    "parameters": [0, "a", ["a"], ["x", "y"], 1, "b", 0]
+  },
+  "search/document": {
+    "sql": "SELECT \"posts\".\"id\" AS \"id\", ts_rank((setweight(to_tsvector('english', coalesce(\"posts\".\"title\", '')), 'A') || setweight(to_tsvector('english', coalesce(\"posts\".\"body\", '')), 'B')), websearch_to_tsquery('english', $1)) AS \"rank\"\nFROM \"posts\" AS \"posts\"\nWHERE (setweight(to_tsvector('english', coalesce(\"posts\".\"title\", '')), 'A') || setweight(to_tsvector('english', coalesce(\"posts\".\"body\", '')), 'B')) @@ websearch_to_tsquery('english', $2)",
+    "parameters": ["bun", "bun"]
+  },
+  "subquery/exists-in-scalar": {
+    "sql": "SELECT \"users\".\"name\" AS \"name\"\nFROM \"users\" AS \"users\"\nWHERE EXISTS (SELECT \"posts\".\"id\" AS \"id\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"author_id\" = \"users\".\"id\" AND \"posts\".\"title\" ILIKE $1) AND \"users\".\"id\" IN (SELECT \"posts\".\"author_id\" AS \"authorId\"\nFROM \"posts\" AS \"posts\") AND \"users\".\"visits\" > (SELECT MAX(\"others\".\"visits\") AS \"maximum\"\nFROM \"users\" AS \"others\")",
+    "parameters": ["%sql%"]
+  },
+  "subquery/derived": {
+    "sql": "SELECT \"recent\".\"authorId\" AS \"authorId\"\nFROM (SELECT \"posts\".\"author_id\" AS \"authorId\"\nFROM \"posts\" AS \"posts\"\nWHERE \"posts\".\"views\" > $1) AS \"recent\"",
+    "parameters": ["9"]
+  },
+  "schema/snapshot": {
+    "sql": "{\"tables\":[{\"name\":\"aliases\",\"sqlName\":\"aliases\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"handleId\",\"sqlName\":\"handle_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"references\":{\"table\":\"handles\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"label\",\"sqlName\":\"label\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false}],\"relations\":[{\"name\":\"handle\",\"kind\":\"one\",\"target\":\"handles\",\"foreignKey\":\"handleId\",\"nullable\":false}],\"primaryKey\":[\"id\"]},{\"name\":\"categories\",\"sqlName\":\"categories\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"name\",\"sqlName\":\"name\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"parentId\",\"sqlName\":\"parent_id\",\"sqlType\":\"integer\",\"notNull\":false,\"unique\":false,\"primaryKey\":false,\"references\":{\"table\":\"categories\",\"column\":\"id\",\"onDelete\":\"restrict\"}}],\"relations\":[{\"name\":\"parent\",\"kind\":\"one\",\"target\":\"categories\",\"foreignKey\":\"parentId\",\"nullable\":true},{\"name\":\"children\",\"kind\":\"many\",\"target\":\"categories\",\"foreignKey\":\"parentId\",\"reverse\":true}],\"primaryKey\":[\"id\"]},{\"name\":\"comments\",\"sqlName\":\"comments\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"postId\",\"sqlName\":\"post_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"references\":{\"table\":\"posts\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"authorId\",\"sqlName\":\"author_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"references\":{\"table\":\"users\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"body\",\"sqlName\":\"body\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"score\",\"sqlName\":\"score\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":0}}],\"relations\":[{\"name\":\"post\",\"kind\":\"one\",\"target\":\"posts\",\"foreignKey\":\"postId\",\"nullable\":false},{\"name\":\"author\",\"kind\":\"one\",\"target\":\"users\",\"foreignKey\":\"authorId\",\"nullable\":false}],\"primaryKey\":[\"id\"],\"indexes\":[{\"name\":\"best\",\"sqlName\":\"comments_best_idx\",\"unique\":false,\"method\":\"btree\",\"keys\":[\"\\\"post_id\\\"\",\"\\\"score\\\" DESC\"],\"include\":[],\"where\":\"NOT (\\\"score\\\" < 5)\"}],\"checks\":[{\"name\":\"score\",\"sqlName\":\"comments_score_check\",\"expression\":\"\\\"score\\\" BETWEEN 0 AND 10\"},{\"name\":\"body\",\"sqlName\":\"comments_body_check\",\"expression\":\"(\\\"body\\\" <> E'' OR \\\"score\\\" IN (1, 2))\"}]},{\"name\":\"entries\",\"sqlName\":\"entries\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true},{\"name\":\"team\",\"sqlName\":\"team\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"parentId\",\"sqlName\":\"parent_id\",\"sqlType\":\"integer\",\"notNull\":false,\"unique\":false,\"primaryKey\":false},{\"name\":\"amount\",\"sqlName\":\"amount\",\"sqlType\":\"bigint\",\"notNull\":true,\"unique\":false,\"primaryKey\":false}],\"relations\":[],\"primaryKey\":[\"id\"]},{\"name\":\"groups\",\"sqlName\":\"groups\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"name\",\"sqlName\":\"name\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":true,\"primaryKey\":false}],\"relations\":[{\"name\":\"memberships\",\"kind\":\"many\",\"target\":\"memberships\",\"foreignKey\":\"groupId\",\"reverse\":true}],\"primaryKey\":[\"id\"]},{\"name\":\"handles\",\"sqlName\":\"handles\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"tenant\",\"sqlName\":\"tenant\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"handle\",\"sqlName\":\"handle\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"active\",\"sqlName\":\"active\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":false}],\"relations\":[{\"name\":\"aliases\",\"kind\":\"many\",\"target\":\"aliases\",\"foreignKey\":\"handleId\",\"reverse\":true}],\"primaryKey\":[\"id\"],\"indexes\":[{\"name\":\"identity\",\"sqlName\":\"handles_identity_idx\",\"unique\":true,\"method\":\"btree\",\"keys\":[\"\\\"tenant\\\"\",\"\\\"handle\\\"\"],\"include\":[]},{\"name\":\"partial\",\"sqlName\":\"handles_partial_idx\",\"unique\":true,\"method\":\"btree\",\"keys\":[\"\\\"handle\\\"\"],\"include\":[],\"where\":\"\\\"active\\\" = 1\"},{\"name\":\"expression\",\"sqlName\":\"handles_expression_idx\",\"unique\":true,\"method\":\"btree\",\"keys\":[\"(lower(\\\"handle\\\"))\"],\"include\":[]}]},{\"name\":\"memberships\",\"sqlName\":\"memberships\",\"junction\":false,\"columns\":[{\"name\":\"userId\",\"sqlName\":\"user_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"references\":{\"table\":\"users\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"groupId\",\"sqlName\":\"group_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"references\":{\"table\":\"groups\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"role\",\"sqlName\":\"role\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":\"member\"}}],\"relations\":[{\"name\":\"user\",\"kind\":\"one\",\"target\":\"users\",\"foreignKey\":\"userId\",\"nullable\":false},{\"name\":\"group\",\"kind\":\"one\",\"target\":\"groups\",\"foreignKey\":\"groupId\",\"nullable\":false}],\"primaryKey\":[\"group_id\",\"user_id\"]},{\"name\":\"notes\",\"sqlName\":\"notes\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"recordTenant\",\"sqlName\":\"record_tenant\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"recordExternalId\",\"sqlName\":\"record_external_id\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"authorEmail\",\"sqlName\":\"author_email\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"body\",\"sqlName\":\"body\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false}],\"relations\":[{\"name\":\"record\",\"kind\":\"condition\",\"target\":\"records\",\"many\":false,\"nullable\":true},{\"name\":\"author\",\"kind\":\"condition\",\"target\":\"users\",\"many\":false,\"nullable\":true},{\"name\":\"membership\",\"kind\":\"condition\",\"target\":\"memberships\",\"many\":false,\"nullable\":true}],\"primaryKey\":[\"id\"]},{\"name\":\"postTags\",\"sqlName\":\"post_tags\",\"junction\":true,\"columns\":[{\"name\":\"postId\",\"sqlName\":\"post_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"references\":{\"table\":\"posts\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"tagId\",\"sqlName\":\"tag_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"references\":{\"table\":\"tags\",\"column\":\"id\",\"onDelete\":\"restrict\"}}],\"relations\":[{\"name\":\"post\",\"kind\":\"one\",\"target\":\"posts\",\"foreignKey\":\"postId\",\"nullable\":false},{\"name\":\"tag\",\"kind\":\"one\",\"target\":\"tags\",\"foreignKey\":\"tagId\",\"nullable\":false}],\"indexes\":[{\"name\":\"tagId\",\"sqlName\":\"post_tags_tag_id_idx\",\"unique\":false,\"method\":\"btree\",\"keys\":[\"\\\"tag_id\\\"\"],\"include\":[]}]},{\"name\":\"posts\",\"sqlName\":\"posts\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"slug\",\"sqlName\":\"slug\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":true,\"primaryKey\":false},{\"name\":\"title\",\"sqlName\":\"title\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"body\",\"sqlName\":\"body\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":\"\"}},{\"name\":\"authorId\",\"sqlName\":\"author_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"references\":{\"table\":\"users\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"editorId\",\"sqlName\":\"editor_id\",\"sqlType\":\"integer\",\"notNull\":false,\"unique\":false,\"primaryKey\":false,\"references\":{\"table\":\"users\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"views\",\"sqlName\":\"views\",\"sqlType\":\"bigint\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":{\"bigint\":\"0\"}}},{\"name\":\"metadata\",\"sqlName\":\"metadata\",\"sqlType\":\"jsonb\",\"notNull\":false,\"unique\":false,\"primaryKey\":false},{\"name\":\"document\",\"sqlName\":\"document\",\"sqlType\":\"tsvector\",\"notNull\":false,\"unique\":false,\"primaryKey\":false},{\"name\":\"status\",\"sqlName\":\"status\",\"sqlType\":\"enum\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":\"draft\"},\"enumerationValues\":[\"draft\",\"published\"]},{\"name\":\"labels\",\"sqlName\":\"labels\",\"sqlType\":\"text[]\",\"notNull\":false,\"unique\":false,\"primaryKey\":false},{\"name\":\"createdAt\",\"sqlName\":\"created_at\",\"sqlType\":\"timestamptz\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"sql\",\"sql\":\"now()\"}}],\"relations\":[{\"name\":\"author\",\"kind\":\"one\",\"target\":\"users\",\"foreignKey\":\"authorId\",\"nullable\":false},{\"name\":\"editor\",\"kind\":\"one\",\"target\":\"users\",\"foreignKey\":\"editorId\",\"nullable\":true},{\"name\":\"comments\",\"kind\":\"many\",\"target\":\"comments\",\"foreignKey\":\"postId\",\"reverse\":true},{\"name\":\"postTags\",\"kind\":\"many\",\"target\":\"postTags\",\"foreignKey\":\"postId\",\"reverse\":true},{\"name\":\"tags\",\"kind\":\"through\",\"target\":\"tags\",\"junction\":\"postTags\",\"sourceForeignKey\":\"postId\",\"targetForeignKey\":\"tagId\"}],\"primaryKey\":[\"id\"],\"indexes\":[{\"name\":\"search\",\"sqlName\":\"posts_search_idx\",\"unique\":false,\"method\":\"gin\",\"keys\":[\"(setweight(to_tsvector('english', coalesce(\\\"title\\\", '')), 'A') || setweight(to_tsvector('english', coalesce(\\\"body\\\", '')), 'B'))\"],\"include\":[]},{\"name\":\"published\",\"sqlName\":\"posts_published_idx\",\"unique\":false,\"method\":\"btree\",\"keys\":[\"\\\"created_at\\\" DESC\"],\"include\":[],\"where\":\"(\\\"status\\\" = E'published' AND \\\"views\\\" BETWEEN E'1' AND E'100')\"}]},{\"name\":\"profiles\",\"sqlName\":\"profiles\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"userId\",\"sqlName\":\"user_id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":true,\"primaryKey\":false,\"references\":{\"table\":\"users\",\"column\":\"id\",\"onDelete\":\"restrict\"}},{\"name\":\"bio\",\"sqlName\":\"bio\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false}],\"relations\":[{\"name\":\"user\",\"kind\":\"one\",\"target\":\"users\",\"foreignKey\":\"userId\",\"nullable\":false}],\"primaryKey\":[\"id\"]},{\"name\":\"records\",\"sqlName\":\"records\",\"junction\":false,\"columns\":[{\"name\":\"tenantId\",\"sqlName\":\"tenant_id\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"references\":{\"table\":\"tenants\",\"column\":\"code\",\"onDelete\":\"restrict\"}},{\"name\":\"externalId\",\"sqlName\":\"external_id\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":true},{\"name\":\"title\",\"sqlName\":\"title\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"amount\",\"sqlName\":\"amount\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":0}}],\"relations\":[{\"name\":\"tenant\",\"kind\":\"one\",\"target\":\"tenants\",\"foreignKey\":\"tenantId\",\"nullable\":false}],\"primaryKey\":[\"external_id\",\"tenant_id\"]},{\"name\":\"tags\",\"sqlName\":\"tags\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"label\",\"sqlName\":\"label\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":true,\"primaryKey\":false}],\"relations\":[{\"name\":\"postTags\",\"kind\":\"many\",\"target\":\"postTags\",\"foreignKey\":\"tagId\",\"reverse\":true},{\"name\":\"posts\",\"kind\":\"through\",\"target\":\"posts\",\"junction\":\"postTags\",\"sourceForeignKey\":\"tagId\",\"targetForeignKey\":\"postId\"}],\"primaryKey\":[\"id\"]},{\"name\":\"tenants\",\"sqlName\":\"tenants\",\"junction\":false,\"columns\":[{\"name\":\"code\",\"sqlName\":\"code\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":true},{\"name\":\"title\",\"sqlName\":\"title\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false}],\"relations\":[{\"name\":\"users\",\"kind\":\"many\",\"target\":\"users\",\"foreignKey\":\"tenantId\",\"reverse\":true},{\"name\":\"records\",\"kind\":\"many\",\"target\":\"records\",\"foreignKey\":\"tenantId\",\"reverse\":true}],\"primaryKey\":[\"code\"]},{\"name\":\"users\",\"sqlName\":\"users\",\"junction\":false,\"columns\":[{\"name\":\"id\",\"sqlName\":\"id\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":true,\"default\":{\"kind\":\"sql\",\"sql\":\"identity\"}},{\"name\":\"email\",\"sqlName\":\"email\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":true,\"primaryKey\":false},{\"name\":\"name\",\"sqlName\":\"name\",\"sqlType\":\"text\",\"notNull\":true,\"unique\":false,\"primaryKey\":false},{\"name\":\"active\",\"sqlName\":\"active\",\"sqlType\":\"boolean\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":true}},{\"name\":\"visits\",\"sqlName\":\"visits\",\"sqlType\":\"integer\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":0}},{\"name\":\"balance\",\"sqlName\":\"balance\",\"sqlType\":\"numeric(20,2)\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"value\",\"value\":\"0\"}},{\"name\":\"settings\",\"sqlName\":\"settings\",\"sqlType\":\"jsonb\",\"notNull\":false,\"unique\":false,\"primaryKey\":false},{\"name\":\"tenantId\",\"sqlName\":\"tenant_id\",\"sqlType\":\"text\",\"notNull\":false,\"unique\":false,\"primaryKey\":false,\"references\":{\"table\":\"tenants\",\"column\":\"code\",\"onDelete\":\"restrict\"}},{\"name\":\"createdAt\",\"sqlName\":\"created_at\",\"sqlType\":\"timestamptz\",\"notNull\":true,\"unique\":false,\"primaryKey\":false,\"default\":{\"kind\":\"sql\",\"sql\":\"now()\"}}],\"relations\":[{\"name\":\"tenant\",\"kind\":\"one\",\"target\":\"tenants\",\"foreignKey\":\"tenantId\",\"nullable\":true},{\"name\":\"edited\",\"kind\":\"many\",\"target\":\"posts\",\"foreignKey\":\"editorId\",\"reverse\":true},{\"name\":\"notes\",\"kind\":\"condition\",\"target\":\"notes\",\"many\":true,\"nullable\":true,\"reverse\":true,\"inverseOf\":\"author\"},{\"name\":\"posts\",\"kind\":\"many\",\"target\":\"posts\",\"foreignKey\":\"authorId\",\"reverse\":true},{\"name\":\"comments\",\"kind\":\"many\",\"target\":\"comments\",\"foreignKey\":\"authorId\",\"reverse\":true},{\"name\":\"profiles\",\"kind\":\"one\",\"target\":\"profiles\",\"foreignKey\":\"userId\",\"reverse\":true},{\"name\":\"memberships\",\"kind\":\"many\",\"target\":\"memberships\",\"foreignKey\":\"userId\",\"reverse\":true}],\"primaryKey\":[\"id\"]}]}",
+    "parameters": []
+  },
+  "schema/create-indexes": {
+    "statements": [
+      {
+        "sql": "CREATE INDEX \"comments_best_idx\" ON \"comments\" USING btree (\"post_id\", \"score\" DESC) WHERE NOT (\"score\" < 5)",
+        "parameters": []
+      },
+      {
+        "sql": "CREATE UNIQUE INDEX \"handles_identity_idx\" ON \"handles\" USING btree (\"tenant\", \"handle\")",
+        "parameters": []
+      },
+      {
+        "sql": "CREATE UNIQUE INDEX \"handles_partial_idx\" ON \"handles\" USING btree (\"handle\") WHERE \"active\" = 1",
+        "parameters": []
+      },
+      {
+        "sql": "CREATE UNIQUE INDEX \"handles_expression_idx\" ON \"handles\" USING btree ((lower(\"handle\")))",
+        "parameters": []
+      },
+      {
+        "sql": "CREATE INDEX \"post_tags_tag_id_idx\" ON \"post_tags\" USING btree (\"tag_id\")",
+        "parameters": []
+      },
+      {
+        "sql": "CREATE INDEX \"posts_search_idx\" ON \"posts\" USING gin ((setweight(to_tsvector('english', coalesce(\"title\", '')), 'A') || setweight(to_tsvector('english', coalesce(\"body\", '')), 'B')))",
+        "parameters": []
+      },
+      {
+        "sql": "CREATE INDEX \"posts_published_idx\" ON \"posts\" USING btree (\"created_at\" DESC) WHERE (\"status\" = E'published' AND \"views\" BETWEEN E'1' AND E'100')",
+        "parameters": []
+      }
+    ]
+  },
+  "invalid/by-id-missing-field": {
+    "error": "symmetria: byId() requires exactly these key fields: externalId, tenantId"
+  },
+  "invalid/by-id-null": {
+    "error": "symmetria: primary key \"id\" cannot be null or undefined"
+  },
+  "invalid/by-unique-fields": {
+    "error": "symmetria: unique lookup requires exactly these key fields: tenant, handle"
+  },
+  "invalid/update-without-where": {
+    "error": "symmetria: update() on \"users\" has no where(); call .all() to update every row"
+  },
+  "invalid/delete-without-where": {
+    "error": "symmetria: delete() on \"users\" has no where(); call .all() to delete every row"
+  },
+  "invalid/unknown-column": {
+    "error": "symmetria: unknown column \"users.missing\""
+  },
+  "invalid/foreign-scope": {
+    "error": "symmetria: column \"__symmetria_path_0.name\" belongs to another query scope"
+  },
+  "invalid/foreign-scope-window": {
+    "error": "symmetria: column \"other.id\" belongs to another query scope"
+  },
+  "invalid/page-order": {
+    "error": "symmetria: page() ORDER BY must include a complete primary key or a non-null unique column"
+  },
+  "invalid/page-cursor": {
+    "error": "symmetria: invalid page cursor or cursor from another query"
+  },
+  "invalid/cte-table-name": {
+    "error": "symmetria: CTE \"users\" has the SQL name of table \"users\" and would hide it; choose another CTE name"
+  },
+  "invalid/cte-duplicate": {
+    "error": "symmetria: duplicate CTE name \"first\""
+  },
+  "invalid/cte-escaped": {
+    "error": "symmetria: recursive reference \"tree\" escaped its CTE"
+  },
+  "invalid/conflict-columns": {
+    "error": "symmetria: DO UPDATE requires conflict columns"
+  },
+  "invalid/missing-required": {
+    "error": "symmetria: missing required column \"users.email\""
+  },
+  "invalid/date-trunc": {
+    "error": "symmetria: dateTrunc() needs a timestamptz, timestamp or date value, not text"
+  },
+  "invalid/scope-unknown-table": {
+    "error": "symmetria: $scope() received unknown table \"missing\""
+  },
+  "invalid/scope-not-a-callback": {
+    "error": "symmetria: $scope() expects a predicate callback for \"users\""
+  },
+  "invalid/relation-path-without-key": {
+    "error": "symmetria: relation paths in update().where() require a primary key on \"items\""
+  },
+  "invalid/condition-one-without-key": {
+    "error": "symmetria: relation \"notes.person\" is one() and resolves to the first match by the primary key of \"people\", which has none; declare a primary key or use many()"
+  },
+  "invalid/by-id-without-key": {
+    "error": "symmetria: byId() requires a primary key on \"plain\""
+  },
+  "invalid/transaction-retries": {
+    "error": "symmetria: retries must be an integer between 0 and 20"
+  },
+  "invalid/transaction-retry-delay": {
+    "error": "symmetria: retryDelayMs must be a non-negative number"
+  },
+  "invalid/transaction-savepoint-options": {
+    "error": "symmetria: transaction options cannot be changed inside a savepoint"
+  },
+  "invalid-schema/nullable-key": {
+    "error": "symmetria: primary key \"records.value\" cannot be nullable"
+  },
+  "invalid-schema/conflicting-keys": {
+    "error": "symmetria: conflicting primary-key declarations"
+  },
+  "invalid-schema/composite-target": {
+    "error": "symmetria: \"children.parent\" must reference a table with a single scalar primary key"
+  },
+  "invalid-schema/reserved-name": {
+    "error": "symmetria: reserved table name \"$scope\""
+  },
+  "invalid-schema/reserved-name-before-nullable-key": {
+    "error": "symmetria: reserved table name \"then\""
+  },
+  "invalid-schema/nullable-key-before-unknown-target": {
+    "error": "symmetria: primary key \"first.id\" cannot be nullable"
+  },
+  "invalid-schema/builder-before-reserved-name": {
+    "error": "symmetria: reserved table name \"then\""
+  },
+  "invalid-schema/outside-table": {
+    "error": "symmetria: reference \"posts.author\" points to a table outside this schema"
+  },
+  "invalid-schema/ambiguous-reference": {
+    "error": "symmetria: ambiguous table reference \"third.owner\"; use a keyed callback"
+  },
+  "invalid-schema/by-not-unique": {
+    "error": "symmetria: \"posts.author\" references \"users.name\", which must be a unique column or the primary key"
+  },
+  "invalid-schema/junction-inverse": {
+    "error": "symmetria: junction inverse renaming is not implemented"
+  },
+  "invalid-schema/junction-inverse-before-composite-target": {
+    "error": "symmetria: junction inverse renaming is not implemented"
+  },
+  "invalid-schema/duplicate-inverse": {
+    "error": "symmetria: duplicate inverse \"users.written\""
+  },
+  "invalid-schema/duplicate-inverse-before-relation-clash": {
+    "error": "symmetria: duplicate inverse \"users.written\""
+  },
+  "invalid-schema/relation-clash": {
+    "error": "symmetria: relation \"posts.authorId\" clashes with a column of the same name"
+  },
+  "invalid-schema/relation-clash-before-casing": {
+    "error": "symmetria: relation \"posts.title\" clashes with a column of the same name"
+  },
+  "invalid-schema/relation-outside": {
+    "error": "symmetria: relation \"posts.other\" points to a table outside this schema (got a plain object)"
+  },
+  "invalid-schema/casing-before-extension": {
+    "error": "symmetria: casing must be \"snake_case\" or \"preserve\""
+  },
+  "invalid-schema/extension-before-executor": {
+    "error": "symmetria: extension names are lowercase identifiers, not \"Bad Name\""
+  },
+  "invalid-schema/executor-and-driver-before-index": {
+    "error": "symmetria: supply either driver or executor"
+  },
+  "invalid-schema/duplicate-index": {
+    "error": "symmetria: duplicate SQL index name \"users_name_idx\""
+  },
+  "invalid-schema/duplicate-index-before-duplicate-check": {
+    "error": "symmetria: duplicate SQL index name \"users_name_idx\""
+  },
+  "invalid-schema/duplicate-check": {
+    "error": "symmetria: duplicate check constraint \"users_same_check\""
+  },
+  "invalid-schema/duplicate-unique-lookup": {
+    "error": "symmetria: duplicate unique lookup \"users.email\""
+  },
+  "invalid-schema/check-with-aggregate": {
+    "error": "symmetria: schema expressions cannot contain aggregates"
+  },
+  "invalid-schema/check-with-array-length": {
+    "error": "symmetria: schema expressions cannot contain length()"
+  },
+  "invalid-schema/index-with-subquery": {
+    "error": "symmetria: schema expressions cannot contain subqueries"
+  },
+  "invalid-schema/index-with-search": {
+    "error": "symmetria: full-text predicates are not supported in schema expressions; index the document with searchDocument() instead"
+  },
+  "invalid-schema/table-in-two-schemas": {
+    "error": "(no error: undefined)"
+  },
+  "invalid-schema/same-sql-name": {
+    "error": "symmetria: tables \"userPosts\" and \"user_posts\" both map to SQL name \"user_posts\"; rename one or set it with .named()"
+  },
+  "invalid-schema/thunk-returns-column": {
+    "error": "symmetria: \"posts.author\": a thunk must return a table; declare the column directly (author: a integer column)"
+  },
+  "invalid-schema/keys-mismatch": {
+    "error": "symmetria: primary key for \"users\" does not match schema.keys()"
+  },
+  "invalid-schema/keys-unknown-table": {
+    "error": "symmetria: unknown schema.keys() table \"missing\""
+  }
+}

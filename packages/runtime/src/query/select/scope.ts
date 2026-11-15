@@ -27,6 +27,7 @@ import {
   type SourceDescription,
   type TableBinding,
 } from "../plan/types";
+import { childNodes, unhandledKind } from "../plan/traverse";
 import type { ProjectionObject, RuntimeScope } from "./types";
 import type { QueryContext } from "./registry";
 
@@ -201,6 +202,8 @@ export const validatePredicate = (
       break;
     case "exists":
       break;
+    default:
+      unhandledKind(description);
   }
 };
 
@@ -216,48 +219,10 @@ export const validateNode = (
         `symmetria: column "${binding.alias}.${column.name}" belongs to another query scope`,
       );
     }
-  } else if (node.kind === "raw") {
-    node.parts.forEach((part) => {
-      if (typeof part !== "string") {
-        validateNode(part, bindings);
-      }
-    });
-  } else if (node.kind === "binary") {
-    validateNode(node.left, bindings);
-    validateNode(node.right, bindings);
-  } else if (node.kind === "aggregate" && node.value) {
-    validateNode(node.value, bindings);
-  } else if (node.kind === "case") {
-    validateNode(node.value, bindings);
-    node.branches.forEach((branch) => {
-      validateNode(branch.when, bindings);
-      validateNode(branch.then, bindings);
-    });
-  } else if (node.kind === "coalesce") {
-    node.values.forEach((value) => validateNode(value, bindings));
-  } else if (node.kind === "jsonObject") {
-    node.selection.forEach((expression) =>
-      validateNode(expression.node, bindings),
-    );
-  } else if (
-    node.kind === "jsonPath" ||
-    node.kind === "arrayIndex" ||
-    node.kind === "arrayLength"
-  ) {
-    validateNode(node.value, bindings);
-  } else if (node.kind === "window") {
-    validateNode(node.expression, bindings);
-    node.partitionBy.forEach((value) => validateNode(value, bindings));
-    node.orderBy.forEach((ordering) =>
-      validateNode(ordering.expression.node, bindings),
-    );
-  } else if (node.kind === "searchRank" || node.kind === "searchHeadline") {
-    validateNode(node.value, bindings);
-    validateNode(node.query, bindings);
-  } else if (node.kind === "tsvector") {
-    node.parts.forEach((part) => validateNode(part.value, bindings));
   }
+
   // Subqueries validate both their local and correlated bindings during compilation.
+  childNodes(node).forEach((child) => validateNode(child, bindings));
 };
 
 export const readSelection = (
@@ -331,6 +296,14 @@ export const readSelection = (
           return description.outputName === name && Object.isFrozen(description)
             ? description
             : freeze({ ...description, outputName: name });
+        }
+
+        // An uncalled relation, an uncalled tool such as `count`, or a
+        // callback: none of them is a value or a set of fields yet.
+        if (typeof selected === "function") {
+          throw new Error(
+            `symmetria: projection field "${name}" is a function; call it (${name}(...)) or select one of its fields`,
+          );
         }
 
         const selection = readSelection(selected as ProjectionObject, bindings);

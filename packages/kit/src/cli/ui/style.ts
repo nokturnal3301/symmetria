@@ -154,19 +154,41 @@ export const formatError = (message: string, color = false): string => {
     .join("\n    ")}\n`;
 };
 
-export const wrapLines = (text: string, width = terminalWidth()): string[] => {
+/**
+ * Wraps text to the width, keeping ANSI styling across the rows. A row breaks
+ * after a space or a `/` when its last third has one, so a path or a sentence
+ * is not cut inside a word; otherwise, and always with `words` off, it breaks
+ * at the width.
+ */
+export const wrapLines = (
+  text: string,
+  width = terminalWidth(),
+  words = true,
+): string[] => {
   const lines: string[] = [];
   let activeStyle = "";
 
   for (const original of text.split("\n")) {
-    let line = activeStyle;
+    // The row so far: its graphemes, each with the style codes written right
+    // before it and the style in effect after them.
+    let cells: { text: string; size: number; codes: string; style: string }[] =
+      [];
+    let rowStyle = activeStyle;
+    let codes = "";
     let length = 0;
+
+    const row = (count: number): string =>
+      rowStyle +
+      cells
+        .slice(0, count)
+        .map((cell) => cell.codes + cell.text)
+        .join("");
 
     for (const part of original
       .replace(/[\r\t]/g, " ")
       .split(/(\u001b\[[\d;]*m)/)) {
       if (part.startsWith("\u001b[")) {
-        line += part;
+        codes += part;
         activeStyle = part === "\u001b[0m" ? "" : activeStyle + part;
         continue;
       }
@@ -175,17 +197,36 @@ export const wrapLines = (text: string, width = terminalWidth()): string[] => {
         const size = stringWidth(segment);
 
         if (length + size > width && length) {
-          lines.push(line + (activeStyle ? "\u001b[0m" : ""));
-          line = activeStyle;
-          length = 0;
+          let end = cells.length;
+          let kept = length;
+
+          for (let position = cells.length - 1; position > 0; position--) {
+            if (!words || kept * 3 < width * 2) {
+              break;
+            }
+
+            if (/^[ /]$/.test(cells[position]!.text)) {
+              end = position + 1;
+              break;
+            }
+
+            kept -= cells[position]!.size;
+          }
+
+          const last = cells[end - 1]!;
+          lines.push(row(end) + (last.style ? "\u001b[0m" : ""));
+          rowStyle = last.style;
+          cells = cells.slice(end);
+          length = cells.reduce((sum, cell) => sum + cell.size, 0);
         }
 
-        line += segment;
+        cells.push({ text: segment, size, codes, style: activeStyle });
+        codes = "";
         length += size;
       }
     }
 
-    lines.push(line + (activeStyle ? "\u001b[0m" : ""));
+    lines.push(row(cells.length) + codes + (activeStyle ? "\u001b[0m" : ""));
   }
 
   return lines;

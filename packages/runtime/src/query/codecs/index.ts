@@ -65,8 +65,37 @@ export const countCodec: Codec<number> = {
   },
 };
 
+/**
+ * What every supported PostgreSQL reads as a numeric: a sign, digits with an
+ * optional fraction and exponent, `NaN` or a signed `Infinity` (`inf`), in any
+ * letter case, between optional whitespace. The `0x1F` and `1_000` forms of
+ * PostgreSQL 16 are left out: versions 14 and 15 reject them.
+ */
+const NUMERIC_TEXT =
+  /^[ \t\n\v\f\r]*(?:[+-]?(?:(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?|inf(?:inity)?)|nan)[ \t\n\v\f\r]*$/i;
+
+/**
+ * Decimals are typed as strings, which `"abc"` satisfies as well: text that is
+ * not a number fails here, with the value in the message, instead of inside
+ * PostgreSQL. Numbers and bigints only arrive past the types; their text is
+ * exact, so they are sent as it.
+ */
 export const numericCodec: Codec<string> = {
-  encode: (value) => value,
+  encode: (value: unknown) => {
+    if (
+      typeof value === "string"
+        ? !NUMERIC_TEXT.test(value)
+        : typeof value !== "number" && typeof value !== "bigint"
+    ) {
+      throw new Error(
+        `symmetria: numeric values are decimal text such as "12.50", received ${
+          typeof value === "string" ? JSON.stringify(value) : typeof value
+        }`,
+      );
+    }
+
+    return value;
+  },
   decode: (value) => String(value),
 };
 

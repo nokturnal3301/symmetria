@@ -444,6 +444,82 @@ test("lintMigration flags destructive, blocking and cautionary changes with advi
   ).toEqual([]);
 });
 
+test("lintMigration follows renames into indexes and checks like the diff does", () => {
+  const version = (
+    name: "posts" | "articles",
+    column: "views" | "hits",
+    extra: boolean,
+  ) =>
+    schema({
+      [name]: table({ id: int.auto, slug: text, [column]: int })
+        .checks((posts) => ({
+          positive: sql<boolean>`${posts[column]!} >= 0`,
+          ...(extra ? { small: sql<boolean>`${posts[column]!} < 100` } : {}),
+        }))
+        .indexes((posts) => ({
+          slug: index(posts.slug!).unique,
+          popular: index(posts[column]!),
+          ...(extra ? { both: index(posts.slug!, posts[column]!) } : {}),
+        })),
+    }).$snapshot();
+  const lint = (
+    after: ReturnType<typeof version>,
+    renames: NonNullable<Parameters<typeof lintMigration>[1]>,
+  ) => {
+    const plan = diffSchemas(version("posts", "views", false), after, {
+      renames,
+    });
+
+    return {
+      up: plan.up,
+      findings: lintMigration(plan, renames).map(
+        (finding) => `${finding.level}: ${finding.message}`,
+      ),
+    };
+  };
+
+  // A table rename changes the derived index and check names only.
+  const table_ = lint(version("articles", "views", false), {
+    tables: { posts: "articles" },
+  });
+  expect(table_.up.join("\n")).not.toMatch(/CREATE|ADD CONSTRAINT/);
+  expect(table_.findings).toEqual([]);
+
+  // A column rename is followed into index keys and check expressions.
+  const column = lint(version("posts", "hits", false), {
+    columns: { posts: { views: "hits" } },
+  });
+  expect(column.up.join("\n")).not.toMatch(/CREATE|ADD CONSTRAINT/);
+  expect(column.findings).toEqual([]);
+
+  // What is really new next to the renames is still reported.
+  const added = lint(version("articles", "hits", true), {
+    tables: { posts: "articles" },
+    columns: { articles: { views: "hits" } },
+  });
+  expect(added.findings).toEqual([
+    'blocking: CHECK constraint "articles_small_check" is added; the statement fails when an existing row violates it.',
+    'caution: Index "articles_both_idx" is created inside the migration transaction and blocks writes while it builds.',
+  ]);
+
+  // The same check written the way PostgreSQL prints it is no new check.
+  const rendered = migrationSnapshot(version("posts", "views", false));
+  expect(
+    lintMigration(
+      diffSchemas(version("posts", "views", false), {
+        ...rendered,
+        tables: rendered.tables.map((entry) => ({
+          ...entry,
+          checks: (entry.checks ?? []).map((check) => ({
+            ...check,
+            expression: "(views >= 0)",
+          })),
+        })),
+      }),
+    ),
+  ).toEqual([]);
+});
+
 test("normalizeSqlType resolves PostgreSQL aliases for drift comparison", () => {
   expect(normalizeSqlType("timestamptz")).toBe("timestamp with time zone");
   expect(normalizeSqlType("timestamptz[]")).toBe("timestamp with time zone[]");
@@ -855,6 +931,36 @@ test("expression keys ignore rendering and keep meaning", () => {
   different(`"score"::text = E'1'`, `"score" = E'1'`);
   different('"ratio" < 0.1::text::real', '"ratio" < 0.1');
   same('"ratio" < 0.1::text::real', "(ratio < ((0.1)::text)::real)");
+  // A cast that changes the value is part of the expression: a length
+  // truncates, an integer type rounds and a scale rounds too.
+  different(`"code"::varchar(3) = E'abc'`, `"code" = E'abc'`);
+  different(`"label"::varchar(3) = E'abc'`, `"label" = E'abc'`);
+  different(`"code" = 'abc'::varchar(2)`, `"code" = 'abc'`);
+  different(`"code" = 'abc'::char(2)`, `"code" = 'abc'`);
+  different('"score" > 1.9::integer', '"score" > 1.9');
+  different(`"score" > '1.9'::integer`, '"score" > 1.9');
+  different('"score" > 1.25::numeric(3,1)', '"score" > 1.25');
+  // The same casts over a value they leave alone are still rendering.
+  same(`"code" = 'ab'::varchar(2)`, `"code" = 'ab'`);
+  same('"score" > 1.50::numeric(3,1)', '"score" > 1.50');
+  same('"score" > 2.0::integer', '"score" > 2.0');
+  same(`"label"::varchar(10) = E'a'`, `"label" = E'a'`);
+  // As PostgreSQL prints them back.
+  same(
+    `"code" = 'abc'::varchar(2)`,
+    "(code = ('abc'::character varying(2))::text)",
+  );
+  same(`"code" = 'abc'::char(2)`, "(code = ('abc'::character(2))::text)");
+  same(
+    `"label"::varchar(3) = E'abc'`,
+    "(((label)::character varying(3))::text = 'abc'::text)",
+  );
+  same('"ratio" > 1.25::numeric(3,1)', "(ratio > 1.25::numeric(3,1))");
+  same('"score" > 1.9::integer', "(score > (1.9)::integer)");
+  same(
+    `"code"::varchar(3) = E'abc'`,
+    "(((code)::character varying(3))::text = 'abc'::text)",
+  );
   // SQL the parser does not model is compared as text.
   same("x SIMILAR TO 'a'", "x  SIMILAR TO 'a'");
 });

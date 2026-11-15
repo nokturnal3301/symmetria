@@ -38,6 +38,36 @@ const literalSQL = (value: unknown): string => {
   );
 };
 
+/** What a schema expression cannot contain, in the words of the API that builds it. */
+const UNSUPPORTED: Record<
+  Exclude<
+    ValueNode["kind"],
+    | "column"
+    | "jsonPath"
+    | "arrayIndex"
+    | "parameter"
+    | "raw"
+    | "binary"
+    | "case"
+    | "coalesce"
+    | "tsvector"
+  >,
+  string
+> = {
+  placeholder: "prepared parameters",
+  aggregate: "aggregates",
+  tuple: "row values",
+  relativeWindow: "lag() or lead()",
+  window: "window functions",
+  subquery: "subqueries",
+  rowCount: "relation counts",
+  jsonObject: "nested objects",
+  jsonRows: "nested relations",
+  searchRank: "searchRank()",
+  searchHeadline: "searchHeadline()",
+  arrayLength: "length()",
+};
+
 /** Trusted schema expressions, with literal parameters and caller-owned column scope. */
 export const ddlExpressions = (
   columnSQL: (node: Extract<ValueNode, { kind: "column" }>) => string,
@@ -77,9 +107,10 @@ export const ddlExpressions = (
           })),
           node.language,
         );
+      // An allow-list: only what PostgreSQL accepts in DDL without parameters.
       default:
         throw new Error(
-          "symmetria: schema expressions cannot contain aggregates, subqueries or placeholders",
+          `symmetria: schema expressions cannot contain ${UNSUPPORTED[node.kind]}`,
         );
     }
   };
@@ -117,6 +148,7 @@ export const ddlExpressions = (
         throw new Error(
           "symmetria: full-text predicates are not supported in schema expressions; index the document with searchDocument() instead",
         );
+      // An allow-list, like valueSQL.
       default:
         throw new Error(
           "symmetria: schema expressions cannot contain subqueries",

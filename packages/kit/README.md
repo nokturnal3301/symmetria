@@ -56,38 +56,39 @@ export default defineMigrationConfig({
 | `repair <id>`      | Verify and resolve an incomplete migration                          |
 | `recover`          | Recover files after a crashed generator                             |
 
-| Flag                           | Commands                                     | Purpose                                                      |
-| ------------------------------ | -------------------------------------------- | ------------------------------------------------------------ |
-| `--config <file>`              | all                                          | Config module (default `symmetria.config.ts`)                |
-| `--dir <directory>`            | all with a project                           | Migrations directory, relative to the working directory      |
-| `--database-url <url>`         | database commands, `pull`, `lint`            | Connection; overrides `databaseUrl` and `DATABASE_URL`       |
-| `--json`                       | all                                          | One JSON object on stdout, `{"error": …}` on failure         |
-| `--sql`                        | `diff`                                       | Print executable SQL                                         |
-| `--diff <file.json>`           | `generate`, `diff`, `lint`                   | Rename hints and `USING` conversions                         |
-| `--empty`                      | `generate`                                   | An empty, editable SQL migration                             |
-| `--allow-destructive`          | `generate`                                   | Permit drops and narrowing type changes (`allowDestructive`) |
-| `--transaction <mode>`         | `generate`                                   | `batch` (default), `each` or `none` (`transaction`)          |
-| `--online`                     | `generate`, `diff`, `lint`                   | Concurrent indexes and phased validation (`online`)          |
-| `--allow-custom-sql`           | `squash`                                     | Drop SQL that generate did not write (`allowCustomSQL`)      |
-| `--pending`                    | `lint`                                       | Only migrations pending in the database                      |
-| `--strict`                     | `lint`, `drift`                              | Exit with code 1 for any finding                             |
-| `--to <id>`                    | `migrate`, `adopt`                           | Apply up to, or adopt through, a migration (`to`)            |
-| `--steps <n>`                  | `rollback`                                   | Number of migrations to revert (`steps`)                     |
-| `--plan`                       | `migrate`, `rollback`                        | Show SQL and transaction groups without running them         |
-| `--action <action>`            | `repair`                                     | `retry` or `complete` (`action`)                             |
-| `--verify-url <url>`           | `verify`, `adopt`, `repair`                  | Server for disposable databases (`verificationDatabaseUrl`)  |
-| `--ignore-table <name>`        | `pull`, `drift`, `adopt`, `repair`, `verify` | Leave an undeclared table out, repeatable (`ignoreTables`)   |
-| `--advisory-lock-timeout <ms>` | commands that run migrations                 | Migration lock wait (`advisoryLockTimeoutMs`, default 10000) |
-| `--lock-timeout <ms>`          | commands that run migrations                 | DDL lock wait (`lockTimeoutMs`, default 5000; 0 disables)    |
-| `--statement-timeout <ms>`     | commands that run migrations                 | Statement duration (`statementTimeoutMs`, default 600000)    |
-| `--force`                      | `pull`, `graph`                              | Overwrite the written file                                   |
-| `--compact`                    | `graph`                                      | Entities and relations without column lists                  |
-| `--relations`                  | `inspect`                                    | Start on, or list, the relations                             |
-| `--profile-url <url>`          | `profile`                                    | Profiler endpoint (default `http://127.0.0.1:7331`)          |
-| `--profile-token <token>`      | `profile`                                    | Profiler token (default `SYMMETRIA_PROFILE_TOKEN`)           |
-| `--no-interactive`             | all                                          | No dashboard, schema browser or rename questions             |
-| `--no-color`, `--no-animation` | all                                          | Plain output; no logo or spinner animation                   |
-| `--help`, `-h`                 | all                                          | Show the commands and flags                                  |
+| Flag                           | Commands                                     | Purpose                                                                                                         |
+| ------------------------------ | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `--config <file>`              | all                                          | Config module (default `symmetria.config.ts`)                                                                   |
+| `--dir <directory>`            | all with a project                           | Migrations directory, relative to the working directory                                                         |
+| `--database-url <url>`         | database commands, `pull`, `lint`            | Connection; overrides `databaseUrl` and `DATABASE_URL`                                                          |
+| `--json`                       | all                                          | One JSON object on stdout, `{"error": …}` on failure                                                            |
+| `--sql`                        | `diff`                                       | Print executable SQL                                                                                            |
+| `--diff <file.json>`           | `generate`, `diff`, `lint`                   | Rename hints and `USING` conversions                                                                            |
+| `--empty`                      | `generate`                                   | An empty, editable SQL migration                                                                                |
+| `--allow-destructive`          | `generate`                                   | Permit drops and narrowing type changes (`allowDestructive`)                                                    |
+| `--transaction <mode>`         | `generate`                                   | `batch` (default), `each` or `none` (`transaction`)                                                             |
+| `--online`                     | `generate`, `diff`, `lint`                   | Concurrent indexes and phased validation (`online`)                                                             |
+| `--allow-custom-sql`           | `squash`                                     | Drop SQL that generate did not write (`allowCustomSQL`)                                                         |
+| `--pending`                    | `lint`                                       | Only migrations pending in the database                                                                         |
+| `--strict`                     | `lint`, `drift`                              | Exit with code 1 for any finding                                                                                |
+| `--to <id>`                    | `migrate`, `adopt`                           | Apply up to, or adopt through, a migration (`to`)                                                               |
+| `--steps <n>`                  | `rollback`                                   | Number of migrations to revert (`steps`)                                                                        |
+| `--yes`                        | `rollback`                                   | Run `down.sql` without asking; required without a terminal                                                      |
+| `--plan`                       | `migrate`, `rollback`                        | Show SQL and transaction groups without running them                                                            |
+| `--action <action>`            | `repair`                                     | `retry` or `complete` (`action`)                                                                                |
+| `--verify-url <url>`           | `verify`, `adopt`, `repair`                  | Server for disposable databases (`verificationDatabaseUrl`)                                                     |
+| `--ignore-table <name>`        | `pull`, `drift`, `adopt`, `repair`, `verify` | Leave an undeclared table out, repeatable (`ignoreTables`)                                                      |
+| `--advisory-lock-timeout <ms>` | commands that run migrations                 | Migration lock wait (`advisoryLockTimeoutMs`, default 10000)                                                    |
+| `--lock-timeout <ms>`          | commands that run migrations                 | DDL lock wait (`lockTimeoutMs`, default 5000; 0 disables)                                                       |
+| `--statement-timeout <ms>`     | commands that run migrations                 | Statement duration (`statementTimeoutMs`, default 600000; no default limit in `transaction: "none"` migrations) |
+| `--force`                      | `pull`, `graph`                              | Overwrite the written file                                                                                      |
+| `--compact`                    | `graph`                                      | Entities and relations without column lists                                                                     |
+| `--relations`                  | `inspect`                                    | Start on, or list, the relations                                                                                |
+| `--profile-url <url>`          | `profile`                                    | Profiler endpoint (default `http://127.0.0.1:7331`)                                                             |
+| `--profile-token <token>`      | `profile`                                    | Profiler token (default `SYMMETRIA_PROFILE_TOKEN`)                                                              |
+| `--no-interactive`             | all                                          | No dashboard, schema browser or rename questions                                                                |
+| `--no-color`, `--no-animation` | all                                          | Plain output; no logo or spinner animation                                                                      |
+| `--help`, `-h`                 | all                                          | Show the commands and flags                                                                                     |
 
 `--help` prints the same list. A flag of particular commands (`--sql`, `--plan`,
 `--to`, `--ignore-table`, …) is refused by the others; connection, directory,
@@ -177,8 +178,14 @@ existing rows and drops the old sequence), types without a builder such as
 (declared as unique indexes), unique indexes that stand in for constraints (with
 the `ADD CONSTRAINT … USING INDEX` that converts them), composite or deferrable
 foreign keys, and the views, materialized views and triggers the schema does not
-manage. The same list is in `--json` output under `warnings`, each with a `code`
-and, when one exists, a `fix`. The file is never overwritten without `--force`.
+manage. Things that exist only in the database are listed too, so nothing
+disappears without a word: table inheritance (`inheritance`), row-level security
+and policies (`row-security`), functions and procedures (`function`), sequences
+no column owns or several columns share (`sequence`, without the identity fix,
+which would drop the shared sequence) and the number of tables in other schemas,
+which `pull` does not read (`other-schema`). The same list is in `--json` output
+under `warnings`, each with a `code` and, when one exists, a `fix`. The file is
+never overwritten without `--force`.
 
 Then point `symmetria.config.ts` at the module, run `drift` until the remaining
 findings are intended, generate the first migration with `generate initial` and
@@ -198,10 +205,10 @@ can stay until Prisma no longer deploys.
 
 - `generate` requires explicit rename hints or `--allow-destructive` for dropped
   tables/columns and for type changes that narrow existing values (a shorter
-  `varchar`, fewer decimal places). A shorter string type is altered without a
-  truncating cast, so PostgreSQL refuses values that do not fit instead of
-  cutting them. Declared column order is preserved; snapshot hashes are
-  order-independent.
+  `varchar`, fewer decimal places, a smaller integer type, an integer to
+  `boolean`). A shorter string type is altered without a truncating cast, so
+  PostgreSQL refuses values that do not fit instead of cutting them. Declared
+  column order is preserved; snapshot hashes are order-independent.
 - `lint` checks actual `up.sql` even after generation and fails for destructive
   or blocking findings, reviewing every action of an `ALTER TABLE` and ignoring
   comments and strings. `CHECK` and foreign keys added without `NOT VALID` are
@@ -226,9 +233,12 @@ can stay until Prisma no longer deploys.
   SIGINT/SIGTERM cancel CLI work; the API accepts an abort signal and
   statement-level events.
 - `drift` checks defaults, identities, PK/FK/UNIQUE/CHECK definitions, FK
-  actions, enums, indexes and validation state. `adopt` verifies the live schema
-  before rewriting history, and asks for `--to` when data-only migrations make
-  the baseline ambiguous.
+  actions, enums, indexes and validation state. On a database that is some
+  migrations behind the local chain (after `rollback`, say) it reports that
+  instead of listing the pending changes as drift, and with `--verify-url` it
+  checks the database against the last applied migration. `adopt` verifies the
+  live schema before rewriting history, and asks for `--to` when data-only
+  migrations make the baseline ambiguous.
 - `verify --verify-url "$VERIFY_DATABASE_URL"` uses real disposable PostgreSQL
   databases; the connection needs `CREATEDB`. Config/API hooks add
   representative rows and assert data invariants during upgrade, rollback and

@@ -11,7 +11,8 @@ import { normalizeSqlType } from "./drift";
 export type SqlExpression =
   /**
    * A number or string literal; `numeric` marks an unquoted number. `type` is
-   * the cast it carried before simplification, which comparison keys ignore.
+   * the cast it carried before simplification, which comparison keys ignore: a
+   * cast that changes the literal's value stays a `cast` node instead.
    */
   | {
       readonly kind: "constant";
@@ -973,6 +974,8 @@ const NUMERIC_TYPES =
  * same either way; not `char(n)`, which trims, or `citext`, which ignores case.
  */
 const TEXT_TYPES = /^(text|character varying)(\(|$)/;
+/** The text types without a length: a cast to one never truncates. */
+const UNBOUNDED_TEXT = /^(text|character varying)$/;
 const NEGATED_COMPARISON: Readonly<Record<string, string>> = {
   "=": "<>",
   "<>": "=",
@@ -1005,16 +1008,52 @@ const canonicalNumber = (text: string): string => {
   return /^-?\d+$/.test(value) ? BigInt(value).toString() : value.toLowerCase();
 };
 
+const INTEGER_TYPES = /^(integer|bigint|smallint)$/;
+const LENGTH_TYPES = /^(?:character varying|character|char)\((\d+)\)$/;
+const SCALE_TYPES = /^numeric\(\d+(?:,(\d+))?\)$/;
+
+/**
+ * Whether a cast gives a literal another value, so it is no rendering detail:
+ * `'abc'::varchar(2)` is `'ab'`, `1.9::integer` is `2` and `1.25::numeric(3,1)`
+ * is `1.3`. The casts PostgreSQL prints on its own (`'a'::text`,
+ * `'-100'::integer`) never do.
+ */
+const castChangesLiteral = (
+  literal: Extract<SqlExpression, { kind: "constant" }>,
+  type: string,
+): boolean => {
+  const length = LENGTH_TYPES.exec(type);
+
+  if (length) {
+    return [...literal.value].length > Number(length[1]);
+  }
+
+  const fraction = /^[+-]?\d*\.(\d*?)0*$/.exec(literal.value)?.[1];
+
+  if (fraction === undefined || fraction === "") {
+    return false;
+  }
+
+  if (INTEGER_TYPES.test(type)) {
+    return true;
+  }
+
+  const scale = SCALE_TYPES.exec(type);
+
+  return scale !== null && fraction.length > Number(scale[1] ?? 0);
+};
+
 const isLiteral = (node: SqlExpression): boolean =>
   node.kind === "constant" || node.kind === "boolean" || node.kind === "null";
 
 /**
  * Rewrites an expression into the form both renderings share, keeping its
- * meaning: casts on literals and PostgreSQL's implicit casts of text columns
- * (`(nick)::text` for a varchar) go, `IN` replaces `= ANY (ARRAY[…])`, `LIKE`
- * replaces `~~`, `BETWEEN` becomes its two comparisons, a literal moves to the
- * right of a comparison, `x = true` becomes `x`, `NOT` folds into the test it
- * negates and nested AND/OR flatten. `columns` maps column names to SQL types.
+ * meaning: casts that leave a literal's value alone and PostgreSQL's implicit
+ * casts of text columns (`(nick)::text` for a varchar) go, `IN` replaces
+ * `= ANY (ARRAY[…])`, `LIKE` replaces `~~`, `BETWEEN` becomes its two
+ * comparisons, a literal moves to the right of a comparison, `x = true`
+ * becomes `x`, `NOT` folds into the test it negates and nested AND/OR flatten.
+ * `columns` maps column names to SQL types.
  */
 export const simplifyExpression = (
   node: SqlExpression,
@@ -1036,6 +1075,10 @@ export const simplifyExpression = (
       const value = simplify(node.value);
 
       if (value.kind === "constant") {
+        if (castChangesLiteral(value, node.type)) {
+          return { ...node, value };
+        }
+
         return NUMERIC_TYPES.test(node.type) && /^[+-]?[\d.]/.test(value.value)
           ? {
               kind: "constant",
@@ -1054,6 +1097,18 @@ export const simplifyExpression = (
         return value;
       }
 
+      // PostgreSQL compares a length-limited string as text and prints that
+      // cast: `('abc'::character varying(2))::text`.
+      if (
+        value.kind === "cast" &&
+        UNBOUNDED_TEXT.test(node.type) &&
+        LENGTH_TYPES.test(value.type) &&
+        (value.value.kind === "constant" ||
+          value.type.startsWith("character varying"))
+      ) {
+        return value;
+      }
+
       if (value.kind === "column") {
         const type = columns.get(value.name);
         const own = type === undefined ? undefined : normalizeSqlType(type);
@@ -1061,7 +1116,7 @@ export const simplifyExpression = (
         if (
           own !== undefined &&
           (own === node.type ||
-            (TEXT_TYPES.test(own) && TEXT_TYPES.test(node.type)))
+            (TEXT_TYPES.test(own) && UNBOUNDED_TEXT.test(node.type)))
         ) {
           return value;
         }
@@ -1286,7 +1341,8 @@ const printKey = (node: SqlExpression): string => {
     case "column":
       return node.name === "*" ? "*" : quoted(node.name, '"');
     case "cast":
-      return `CAST(${printKey(node.value)} AS ${node.type})`;
+      // `char(2)` in code is `character(2)` when PostgreSQL prints it.
+      return `CAST(${printKey(node.value)} AS ${node.type.replace(/^char\(/, "character(")})`;
     case "call":
       return `${node.name}(${node.arguments.map(printKey).join(", ")})`;
     case "binary":

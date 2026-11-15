@@ -18,6 +18,13 @@ import {
   type Bindings,
   type Compilation,
 } from "./state";
+import {
+  searchHeadlineSql,
+  searchRankSql,
+  searchVectorSql,
+  tsquerySql,
+  tsvectorSql,
+} from "./postgres/search";
 
 /** bigint and numeric values travel as text inside JSON to keep their precision. */
 export const jsonPrecisionSql = (
@@ -123,7 +130,7 @@ export const searchVector = (
   bindings: Bindings,
   language: string,
 ): string => {
-  const rendered = compilation.renderer.searchVector(
+  const rendered = searchVectorSql(
     valueSql(compilation, node, bindings),
     language,
     expressionSqlType({ node, outputName: "value" }) === "tsvector",
@@ -297,9 +304,9 @@ const renderValue = (
     case "subquery":
       return `(${compilation.selectSql(node.query, bindings)})`;
     case "searchRank":
-      return renderer.searchRank(
+      return searchRankSql(
         searchVector(compilation, node.value, bindings, node.language),
-        renderer.searchQuery(
+        tsquerySql(
           valueSql(compilation, node.query, bindings),
           node.language,
           node.mode,
@@ -313,10 +320,10 @@ const renderValue = (
         },
       );
     case "searchHeadline":
-      return renderer.searchHeadline(
+      return searchHeadlineSql(
         node.language,
         valueSql(compilation, node.value, bindings),
-        renderer.searchQuery(
+        tsquerySql(
           valueSql(compilation, node.query, bindings),
           node.language,
           node.mode,
@@ -324,7 +331,7 @@ const renderValue = (
         node.options,
       );
     case "tsvector":
-      return renderer.searchDocument(
+      return tsvectorSql(
         node.parts.map((part) => ({
           value: valueSql(compilation, part.value, bindings),
           ...(part.weight ? { weight: part.weight } : {}),

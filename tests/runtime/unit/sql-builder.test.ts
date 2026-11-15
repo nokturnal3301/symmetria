@@ -391,6 +391,21 @@ test("raw SQL interpolation is parameterized and schema defaults remain serializ
   );
 });
 
+test("only a sql template is a raw SQL default; an object shaped like one is a JSON value", () => {
+  const lookalike = { kind: "sql", sql: "now()" } as const;
+  const local = schema({
+    events: {
+      id: int.auto,
+      payload: jsonb<{ kind: "sql"; sql: string }>().default(lookalike),
+      createdAt: timestamptz.default(sql`now()`),
+    },
+  });
+  const columns = local.$snapshot().tables[0]!.columns;
+
+  expect(columns[1]?.default).toEqual({ kind: "value", value: lookalike });
+  expect(columns[2]?.default).toEqual({ kind: "sql", sql: "now()" });
+});
+
 test("custom codecs propagate through modifiers, aliases, predicates and writes", async () => {
   const calls: CompiledQuery[] = [];
   const amount = customType<{ cents: bigint }>("bigint", {
@@ -1257,4 +1272,77 @@ test("duplicate DO UPDATE conflict keys and table-named CTEs fail before SQL run
   expect(() =>
     local.counters((counter) => ({ id: counter.id })).cte("counters"),
   ).toThrow(/CTE "counters" has the SQL name of table "counters"/);
+});
+
+test("column.is exposes enum labels as predicates and is otherwise a plain function", () => {
+  const local = schema({
+    records: {
+      id: int.auto,
+      title: text,
+      state: oneOf("draft", "published", "name", "length"),
+    },
+  });
+  const id = <Id>(records: { id: Id }) => ({ id: records.id });
+  let seen: Record<string, unknown> = {};
+
+  local.records((records) => {
+    const is = records.state.is as unknown as Record<string, unknown>;
+    const isNot = records.state.isNot as unknown as Record<string, unknown>;
+    const plain = records.id.is as unknown as Record<string, unknown>;
+
+    seen = {
+      then: is.then,
+      archived: is.archived,
+      call: is.call,
+      bind: is.bind,
+      apply: is.apply,
+      toString: is.toString,
+      notThen: isNot.then,
+      notCall: isNot.call,
+      plainName: plain.name,
+      plainLength: plain.length,
+      plainThen: plain.then,
+      called: records.state.is.call(undefined, "draft"),
+      direct: records.state.is("draft"),
+    };
+
+    return { id: records.id };
+  });
+
+  expect(seen.then).toBeUndefined();
+  expect(seen.archived).toBeUndefined();
+  expect(seen.call).toBe(Function.prototype.call);
+  expect(seen.bind).toBe(Function.prototype.bind);
+  expect(seen.apply).toBe(Function.prototype.apply);
+  expect(seen.toString).toBe(Function.prototype.toString);
+  expect(seen.notThen).toBeUndefined();
+  expect(seen.notCall).toBe(Function.prototype.call);
+  expect(typeof seen.plainName).toBe("string");
+  expect(seen.plainLength).toBe(1);
+  expect(seen.plainThen).toBeUndefined();
+  expect(seen.called).toEqual(seen.direct);
+
+  // Labels that share a name with a function property are still predicates.
+  for (const label of ["name", "length"] as const) {
+    const byMember = local
+      .records(id, { where: (records) => records.state.is[label] })
+      .toSQL();
+    const negated = local
+      .records(id, { where: (records) => records.state.isNot[label] })
+      .toSQL();
+
+    expect(byMember).toEqual(
+      local
+        .records(id, { where: (records) => records.state.is(label) })
+        .toSQL(),
+    );
+    expect(byMember.parameters).toEqual([label]);
+    expect(negated.sql).toContain('"records"."state" <> $1');
+  }
+
+  // Without an enum column the labels live only in the types.
+  const typed = local
+    .records(id, { where: () => sql<"a" | "b">`'a'`.is.b })
+    .toSQL();
+  expect(typed.parameters).toEqual(["b"]);
 });

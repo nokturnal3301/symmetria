@@ -4,7 +4,6 @@
 import { freeze } from "../plan/freeze";
 import { cloneParameter, type SchemaCodecs } from "../codecs";
 import { collectDataErrors } from "../codecs/deferred";
-import { quoteIdentifier } from "../compile";
 import {
   and,
   COLUMN_EXPRESSION,
@@ -14,7 +13,12 @@ import {
   type Predicate,
 } from "../expressions";
 import type { Projection, RuntimeScope } from "../select";
-import type { SchemaSnapshot, TableSnapshot } from "../../schema/assembly";
+import {
+  primaryKeyColumns,
+  uniqueColumnIndexes,
+  type SchemaSnapshot,
+  type TableSnapshot,
+} from "../../schema/assembly";
 import { returningProjection } from "../select/projections";
 
 type RuntimeQuery = {
@@ -49,36 +53,19 @@ type RunTransaction = <Result>(
 ) => Promise<Result>;
 type Selector = (row: RuntimeScope[string]) => Projection;
 
+/** Keys a row can be found by: the primary key first, then unique columns and indexes. */
 const uniqueKeys = (table: TableSnapshot): string[][] => {
-  const primary = table.columns
-    .filter((column) => column.primaryKey)
-    .map((column) => column.name);
+  const primary = primaryKeyColumns(table).map((column) => column.name);
 
-  const keys = primary.length ? [primary] : [];
-
-  keys.push(
+  return [
+    ...(primary.length ? [primary] : []),
     ...table.columns
       .filter((column) => column.unique)
       .map((column) => [column.name]),
-  );
-
-  for (const definition of table.indexes ?? []) {
-    if (!definition.unique || definition.where) {
-      continue;
-    }
-
-    const names = definition.keys.map(
-      (key) =>
-        table.columns.find((column) => quoteIdentifier(column.sqlName) === key)
-          ?.name,
-    );
-
-    if (names.every((name) => name !== undefined)) {
-      keys.push(names);
-    }
-  }
-
-  return keys;
+    ...uniqueColumnIndexes(table).map(({ columns }) =>
+      columns.map((column) => column.name),
+    ),
+  ];
 };
 
 const copyInput = (value: unknown, ancestors = new Set<object>()): unknown => {
@@ -223,7 +210,7 @@ export const createNestedInsert = (
       );
     }
 
-    const primary = table.columns.filter((column) => column.primaryKey);
+    const primary = primaryKeyColumns(table);
 
     if (scalarColumn !== undefined) {
       return scalar(name, scalarColumn, value);
@@ -304,12 +291,16 @@ export const createNestedInsert = (
         const mutate = (
           name: string,
           kind: "insert" | "update",
-          data: Record<string, unknown>,
+          data: Record<string, unknown> | readonly Record<string, unknown>[],
         ) => {
           // Use the transaction's table methods so codecs and transaction lifetime checks remain intact.
           const table = database[name] as Record<
             string,
-            (value: Record<string, unknown>) => RuntimeMutation
+            (
+              value:
+                | Record<string, unknown>
+                | readonly Record<string, unknown>[],
+            ) => RuntimeMutation
           >;
 
           return table[kind]!(data);
@@ -321,7 +312,7 @@ export const createNestedInsert = (
           scalarColumn?: string,
         ): Promise<Record<string, unknown>> => {
           const table = tableByName.get(name)!;
-          const primary = table.columns.filter((column) => column.primaryKey);
+          const primary = primaryKeyColumns(table);
           const fields =
             selection !== null &&
             typeof selection === "object" &&
@@ -384,9 +375,7 @@ export const createNestedInsert = (
           foreignKey: string,
           value: unknown,
         ) => {
-          const primary = tableByName
-            .get(name)!
-            .columns.filter((column) => column.primaryKey);
+          const primary = primaryKeyColumns(tableByName.get(name)!);
 
           if (!primary.length) {
             throw new Error(
@@ -466,17 +455,12 @@ export const createNestedInsert = (
             relations.push([relation, operations]);
           }
 
-          const resolveRow = async (
-            target: string,
+          /** The row a create or connectOrCreate writes: its values and the parent's key. */
+          const payloadOf = (
             operation: string,
             value: unknown,
-            extra: Record<string, unknown> = {},
-            scalarColumn?: string,
-          ) => {
-            if (operation === "connect") {
-              return find(target, value, scalarColumn);
-            }
-
+            extra: Record<string, unknown>,
+          ): Record<string, unknown> => {
             if (!value || typeof value !== "object" || Array.isArray(value)) {
               throw new Error(`symmetria: ${operation} requires a row object`);
             }
@@ -489,7 +473,21 @@ export const createNestedInsert = (
               );
             }
 
-            const payload = { ...value, ...extra };
+            return { ...value, ...extra };
+          };
+
+          const resolveRow = async (
+            target: string,
+            operation: string,
+            value: unknown,
+            extra: Record<string, unknown> = {},
+            scalarColumn?: string,
+          ) => {
+            if (operation === "connect") {
+              return find(target, value, scalarColumn);
+            }
+
+            const payload = payloadOf(operation, value, extra);
 
             if (operation === "create") {
               return (await insertRow(target, payload)).row;
@@ -593,11 +591,43 @@ export const createNestedInsert = (
                 );
               }
 
+              const related = tableByName.get(relation.target)!;
+              // Children without relations of their own need nothing read
+              // back, not even to tell them apart, so consecutive ones wait
+              // here for one multi-row INSERT. Any other entry writes them
+              // first: rows are inserted in the order they were given.
+              let siblings: Record<string, unknown>[] = [];
+
+              const insertSiblings = async () => {
+                if (siblings.length) {
+                  const rows = siblings;
+                  siblings = [];
+                  await mutate(relation.target, "insert", rows).execute();
+                }
+              };
+
+              const links: Record<string, unknown>[] = [];
+
               for (const entry of entries) {
                 const extra =
                   relation.kind === "through"
                     ? {}
                     : { [relation.foreignKey]: parentKey };
+
+                if (relation.kind !== "through" && operation === "create") {
+                  const payload = payloadOf(operation, entry, extra);
+
+                  if (
+                    !related.relations.some((nested) =>
+                      Object.hasOwn(payload, nested.name),
+                    )
+                  ) {
+                    siblings.push(payload);
+                    continue;
+                  }
+                }
+
+                await insertSiblings();
                 const target = await resolveRow(
                   relation.target,
                   operation,
@@ -607,7 +637,7 @@ export const createNestedInsert = (
                 );
 
                 if (relation.kind === "through") {
-                  await mutate(relation.junction, "insert", {
+                  links.push({
                     [relation.sourceForeignKey]: parentKey,
                     [relation.targetForeignKey]:
                       target[
@@ -617,13 +647,7 @@ export const createNestedInsert = (
                           relation.target,
                         )
                       ],
-                  })
-                    .onConflict(
-                      relation.sourceForeignKey,
-                      relation.targetForeignKey,
-                    )
-                    .doNothing()
-                    .execute();
+                  });
                 } else if (operation !== "create") {
                   await attach(
                     relation.target,
@@ -632,6 +656,19 @@ export const createNestedInsert = (
                     parentKey,
                   );
                 }
+              }
+
+              await insertSiblings();
+
+              // The junction rows of one operation are one INSERT, in input order.
+              if (relation.kind === "through" && links.length) {
+                await mutate(relation.junction, "insert", links)
+                  .onConflict(
+                    relation.sourceForeignKey,
+                    relation.targetForeignKey,
+                  )
+                  .doNothing()
+                  .execute();
               }
             }
           }

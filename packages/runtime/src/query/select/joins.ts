@@ -21,7 +21,7 @@ import {
   type TableSource,
 } from "../plan/types";
 import { shapeExpressions } from "./projections";
-import type { ColumnSnapshot, TableSnapshot } from "../../schema/assembly";
+import { primaryKeyColumns, type ColumnSnapshot } from "../../schema/assembly";
 import { createScope, initialPlan, validatePredicate } from "./scope";
 import { columnsOnly } from "./suggest";
 import {
@@ -57,13 +57,6 @@ export const columnNode = (
     description: freeze({ binding, column }),
   });
 };
-
-const primaryKeyColumns = (table: TableSnapshot): readonly ColumnSnapshot[] =>
-  table.primaryKey
-    ? table.primaryKey.map(
-        (name) => table.columns.find((column) => column.sqlName === name)!,
-      )
-    : table.columns.filter((column) => column.primaryKey);
 
 /**
  * A one() condition relation can match several rows. It resolves to the first

@@ -120,3 +120,28 @@ test("window parameters are bound, frames are validated and foreign-scope column
     })),
   ).toThrow(/scope/);
 });
+
+test("a CTE used only in an upsert's doUpdate condition is collected", () => {
+  const leaders = model
+    .entries((entries) => ({ id: entries.id }), {
+      where: (entries) => entries.amount.above(100n),
+    })
+    .cte("leaders");
+  const compiled = model.entries
+    .insert({ id: 1, team: "A", amount: 5n })
+    .onConflict("id")
+    .doUpdate(
+      { amount: 6n },
+      {
+        where: (current) =>
+          current.id.in(leaders((leader) => ({ id: leader.id }))),
+      },
+    )
+    .toSQL();
+
+  expect(compiled.sql).toStartWith('WITH "leaders" AS (');
+  expect(compiled.sql).toContain(
+    'WHERE "entries"."id" IN (SELECT "leaders"."id" AS "id"',
+  );
+  expect(compiled.parameters).toEqual(["100", 1, "A", "5", "6"]);
+});

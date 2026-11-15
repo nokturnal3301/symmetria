@@ -1,6 +1,3 @@
-export const isJsonType = (sqlType: string): boolean =>
-  /^(?:json|jsonb)$/.test(sqlType.toLowerCase().trim());
-
 /** PostgreSQL array literal, retaining null elements and codec-encoded JSON. */
 export const postgresArrayLiteral = (values: readonly unknown[]): string =>
   `{${values

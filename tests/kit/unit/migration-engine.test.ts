@@ -4,6 +4,8 @@ import {
   table,
   int,
   bigint,
+  smallint,
+  bool,
   text,
   varchar,
   numeric,
@@ -55,6 +57,11 @@ test("narrowing type changes never cut values and lint reports the lossy ones as
       state: oneOf("draft", "published"),
       mask: bits(8),
       flags: bits(4),
+      total: bigint,
+      rank: int,
+      tiny: bigint,
+      wide: smallint,
+      done: int,
     },
   });
   const after = schema({
@@ -77,6 +84,11 @@ test("narrowing type changes never cut values and lint reports the lossy ones as
       state: varchar(12),
       mask: bits(4),
       flags: bits(8),
+      total: int,
+      rank: smallint,
+      tiny: smallint,
+      wide: bigint,
+      done: bool,
     },
   });
   const plan = diffSchemas(before.$snapshot(), after.$snapshot());
@@ -123,6 +135,22 @@ test("narrowing type changes never cut values and lint reports the lossy ones as
       'caution: Column "state" changes type from users_state_enum to varchar(12).',
     mask: 'destructive: Column "mask" narrows from bit(8) to bit(4): values longer than 4 bits make the migration fail.',
     flags: 'caution: Column "flags" changes type from bit(4) to bit(8).',
+    // A smaller integer type refuses what does not fit, like a shorter string.
+    total:
+      'destructive: Column "total" narrows from bigint to integer: values outside the integer range make the migration fail.',
+    rank: 'destructive: Column "rank" narrows from integer to smallint: values outside the smallint range make the migration fail.',
+    tiny: 'destructive: Column "tiny" narrows from bigint to smallint: values outside the smallint range make the migration fail.',
+    wide: 'caution: Column "wide" changes type from smallint to bigint.',
+    done: 'destructive: Column "done" narrows from integer to boolean: every value other than 0 becomes true.',
+  });
+  expect(
+    Object.fromEntries(
+      lintMigration(plan).map((finding) => [finding.column, finding.advice]),
+    ),
+  ).toMatchObject({
+    total:
+      "Move or change the values that do not fit first, then generate with --allow-destructive; PostgreSQL refuses values that still do not fit.",
+    done: "Copy the column or back up the table if the lost precision matters, then generate with --allow-destructive.",
   });
 
   // An explicit hint is used as written; lint still reports the loss.
@@ -164,6 +192,39 @@ test("generation refuses a narrowing change unless destruction is allowed", () =
         allowDestructive: true,
       }))!.up,
     ).not.toContain("USING");
+  }));
+
+test("generation refuses integer narrowing and integer-to-boolean changes unless destruction is allowed", () =>
+  withMigrationDirectory(async (directory) => {
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: schema({
+        users: { id: int.auto, visits: bigint, active: int },
+      }).$snapshot(),
+    });
+    const narrower = schema({
+      users: { id: int.auto, visits: int, active: bool },
+    }).$snapshot();
+    const refusal = await generateMigration({
+      directory,
+      name: "narrow",
+      snapshot: narrower,
+    }).catch((error: unknown) => String(error));
+    expect(refusal).toContain(
+      'users.visits: Column "visits" narrows from bigint to integer',
+    );
+    expect(refusal).toContain(
+      'users.active: Column "active" narrows from integer to boolean',
+    );
+    expect(
+      (await generateMigration({
+        directory,
+        name: "narrow",
+        snapshot: narrower,
+        allowDestructive: true,
+      }))!.up,
+    ).toContain('ALTER COLUMN "visits" TYPE integer');
   }));
 
 test("a down migration retypes a renamed column before renaming it back", () => {
@@ -276,6 +337,60 @@ test("a batch group ends after a migration that adds enum labels", () => {
       migration("000002_next", {}),
     ]),
   ).toEqual([1, 1]);
+});
+
+test("only statements PostgreSQL refuses in a transaction require transaction none", () => {
+  const plan = (up: string, transaction?: "each" | "none") =>
+    executionPlan([migration("000001_step", { up }, transaction)], "up");
+
+  for (const statement of [
+    'CREATE INDEX CONCURRENTLY "posts_title_idx" ON "posts" ("title")',
+    "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS posts_slug_key ON posts (slug)",
+    "create index concurrently on posts (title)",
+    'DROP INDEX CONCURRENTLY IF EXISTS "posts_title_idx"',
+    "REINDEX INDEX CONCURRENTLY posts_title_idx",
+    "REINDEX (VERBOSE, CONCURRENTLY) TABLE posts",
+    "REINDEX (CONCURRENTLY true) TABLE posts",
+    "REINDEX (TABLESPACE fast) TABLE CONCURRENTLY posts",
+    'ALTER TABLE "events" DETACH PARTITION "events_2024" CONCURRENTLY',
+    "ALTER TABLE events DETACH PARTITION archive.events_2024 CONCURRENTLY",
+    "VACUUM",
+    "VACUUM (ANALYZE) posts",
+    "CREATE DATABASE reports",
+    'DROP DATABASE IF EXISTS "reports"',
+    "CREATE TABLESPACE fast LOCATION '/mnt/fast'",
+    "DROP TABLESPACE fast",
+    "ALTER SYSTEM SET work_mem = '64MB'",
+  ]) {
+    expect(() => plan(`${statement};`)).toThrow(
+      'symmetria: migration "000001_step" requires transaction: "none"',
+    );
+    expect(() => plan(`SELECT 1;\n${statement};`, "each")).toThrow(
+      /requires transaction: "none"/,
+    );
+    expect(plan(`${statement};`, "none")[0]!.transaction).toBe("none");
+  }
+
+  // The word alone decides nothing: it may be a name, and a materialized
+  // view refreshes concurrently inside a transaction.
+  for (const statement of [
+    "ALTER TABLE jobs ADD COLUMN concurrently boolean NOT NULL DEFAULT false",
+    "CREATE TABLE concurrently (id integer PRIMARY KEY)",
+    "CREATE INDEX concurrently_idx ON jobs (concurrently)",
+    "CREATE INDEX jobs_mode_idx ON jobs (concurrently)",
+    "DROP INDEX concurrently_idx",
+    "ALTER TABLE events DETACH PARTITION concurrently",
+    "ALTER TABLE concurrently DETACH PARTITION events_2024",
+    "ALTER TABLE events RENAME COLUMN vacuum TO concurrently",
+    "REINDEX TABLE posts",
+    "REINDEX (CONCURRENTLY false) TABLE posts",
+    "REFRESH MATERIALIZED VIEW CONCURRENTLY daily_totals",
+    "UPDATE jobs SET vacuum = true WHERE concurrently",
+    "COMMENT ON TABLE jobs IS 'CREATE INDEX CONCURRENTLY later'",
+    "CREATE TABLE tablespace_notes (database text)",
+  ]) {
+    expect(plan(`${statement};`)[0]!.transaction).toBe("batch");
+  }
 });
 
 test("the splitter keeps BEGIN ATOMIC bodies and parenthesized rule actions whole", () => {

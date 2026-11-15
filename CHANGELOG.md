@@ -1,5 +1,113 @@
 # Changelog
 
+## 2.0.0 — 2026-11-15
+
+### Changes to note when upgrading
+
+- `symmetria rollback` no longer runs unasked. In a terminal it lists the
+  statements of `down.sql` that remove data or database objects and waits for a
+  yes; a rollback that drops tables needs the database name typed out. Without a
+  terminal (scripts, CI) it exits with code 1 unless `--yes` is passed.
+- In the dashboard and in questions, a digit only moves the selection; Enter
+  runs the selected action.
+- `generate` asks for `--allow-destructive` when a column changes from an
+  integer type to `boolean` (every non-zero value becomes `true`) or to a
+  narrower integer type (`bigint` → `integer`, `bigint` / `integer` →
+  `smallint`), where values that no longer fit make the migration fail.
+- The default 10-minute statement timeout no longer applies to
+  `transaction: "none"` migrations, so it cannot cancel a long
+  `CREATE INDEX CONCURRENTLY` and leave an invalid index. A timeout set with
+  `--statement-timeout` or `statementTimeoutMs` still applies.
+- A plain object is no longer accepted as a raw SQL default: write
+  ``.default(sql`now()`)``. `.default({ kind: "sql", sql: "…" })` on a `jsonb`
+  column now stores that object as the JSON value it is.
+- A transaction no longer runs the `$scope()` callbacks of tables it does not
+  touch; `$scope()` itself still runs the callbacks it is given once, so a
+  callback that cannot be a filter fails there.
+- Tables named `$scope` or `then` are rejected as reserved names.
+
+### Runtime (`symmetria`)
+
+- Order, group and filter by a selected field without writing its expression
+  again: `orderBy`, `groupBy` and `having` callbacks receive the projection's
+  fields as a third argument
+  (`orderBy: (user, tools, selected) => selected.spent.descending`).
+- Nested inserts write sibling children in one statement: an order with three
+  items is 2 INSERTs instead of 4, and 22,000 children are 3 statements instead
+  of 22,001. Many-to-many link rows are batched as well.
+- `dateTrunc(unit, value, { timeZone })` buckets timestamps and dates by day,
+  week, month and the other PostgreSQL units.
+- `column.set(key, value)` on `jsonb` columns changes one key (or a nested path)
+  and keeps the rest of the document.
+- Text that is not a number (`"abc"`) for a `numeric` column is rejected before
+  the statement is sent, in writes, filters, lists, prepared parameters and
+  arithmetic, with a message that shows the value.
+- A scoped query built once and then used inside another `$scope()` callback
+  (`documents: (d) => d.organizationId.in(allowed)`) reads the current values of
+  its own scope on every execution. Before, it kept the values from the moment
+  it was built, so reads, updates and deletes could run for the previous tenant.
+- Starting a transaction or calling `$scope()` on a large schema is far cheaper:
+  about 50 times on 100 tables (an empty transaction went from 0.4 ms to under
+  0.01 ms of CPU). Table handles are created on first use.
+- A JSON default shaped like `{ kind: "sql", sql }` is stored as a value; only a
+  `sql` template is a raw SQL default.
+- `column.is` and `column.isNot` behave like ordinary functions (`.call`,
+  `.bind`, `.name`); on enum columns only the declared labels are predicates.
+- A page cursor is accepted or refused the same way whether the query object is
+  reused or built again; it no longer depends on the current `$scope()` values.
+- A CTE used only in `doUpdate(…, { where })` no longer fails with an internal
+  error.
+- A column of another query inside `lag()` / `lead()` is rejected when the query
+  is built.
+- A projection field left as an uncalled relation, tool or callback gets an
+  error that names the field and says to call it or select one of its fields.
+- `page()` notices a window function wrapped in `searchRank()`,
+  `searchHeadline()` or `searchDocument()`, so later pages no longer compute the
+  window only over the rows after the cursor.
+- On tables whose primary key is declared in a different order than its columns,
+  updates and deletes through a relation path, nested `connect` and
+  `connectOrCreate` list the key columns in the declared key order. The
+  statements are equivalent; only the column order in the SQL text changes.
+- A CHECK or index expression with an unsupported part names that part in its
+  error ("cannot contain length()") instead of always blaming aggregates,
+  subqueries or placeholders.
+- Schema error messages no longer say "experiment".
+- `@types/bun` is declared as an optional peer dependency for `symmetria/bun`.
+
+### Kit (`symmetria-kit`)
+
+- `rollback` asks before it runs (see above); `--yes` skips the question.
+- The dashboard's "Rollback latest migration" goes through the same question, so
+  one mistyped key can no longer drop a column or, after `squash`, every table.
+- A migration that failed outside a transaction can be fixed in its own files:
+  `status`, `migrate` and `repair` no longer answer "checksum mismatch" for an
+  incomplete migration whose `up.sql` or `down.sql` was edited. `migrate` still
+  refuses and names the incomplete migration, `repair` verifies the schema as
+  before, and the journal takes the checksum of the files that finally ran.
+  Applied migrations stay protected against edits.
+- Editing a CHECK or a partial-index condition by adding a cast that changes the
+  value (`::varchar(3)`, `1.9::integer`) is detected as a schema change instead
+  of "No schema changes".
+- SQL lint no longer skips statements that mention a table or column named
+  `rename`, and schema lint no longer reports the indexes and checks of a
+  renamed table or column as new.
+- A column, table or index named `concurrently` no longer forces
+  `transaction: "none"`; `REFRESH MATERIALIZED VIEW CONCURRENTLY` may run in a
+  transaction; `CREATE` / `DROP DATABASE`, `CREATE` / `DROP TABLESPACE` and
+  `ALTER SYSTEM` now require `transaction: "none"`.
+- `pull` reports what it cannot declare instead of leaving it out silently:
+  table inheritance, row-level security, functions and procedures, free-standing
+  or shared sequences, and tables in other schemas (codes `inheritance`,
+  `row-security`, `function`, `sequence`, `other-schema`). A sequence shared by
+  several columns no longer gets the identity fix that would drop it.
+- `drift` on a database that is behind the local chain (after `rollback`, or
+  before `migrate`) says so instead of listing the pending changes as drift, and
+  checks the applied state when `--verify-url` is set; JSON output gains
+  `behind`.
+- The live profiler shows the error message of a failed request.
+- "Created" shows the migrations directory relative to the working directory,
+  and long lines wrap after a space or `/` instead of in the middle of a word.
+
 ## 1.2.0 — 2026-11-14
 
 ### Runtime (`symmetria`)

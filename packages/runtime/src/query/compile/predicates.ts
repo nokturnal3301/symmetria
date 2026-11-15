@@ -2,7 +2,7 @@
  * Renders predicate nodes (comparisons, IN lists, JSON checks, subqueries) to SQL.
  */
 import { expressionSqlType } from "../plan/metadata";
-import { isJsonType } from "./postgres/values";
+import { tsquerySql } from "./postgres/search";
 import type {
   PredicateDescription,
   ScopePredicate,
@@ -16,8 +16,6 @@ import {
   type Compilation,
 } from "./state";
 import { jsonPrecisionSql, operandSql, searchVector, valueSql } from "./values";
-
-const JSON_COMPARISONS = new Set(["=", "<>", "IS", "IS NOT"]);
 
 const sqlTypeOf = (node: ValueNode): string =>
   expressionSqlType({ node, outputName: "value" });
@@ -47,6 +45,9 @@ const largeListType = (
     : undefined;
 };
 
+/** Stands for a $scope() filter in a shape-only compilation; never executed. */
+const SCOPE_MARKER = "<$scope>";
+
 /**
  * A $scope() filter renders like any predicate, and the compilation records
  * where it landed: its SQL, parameter range, bindings and aliases, so each
@@ -58,6 +59,10 @@ const scopeSql = (
   description: ScopePredicate,
   bindings: Bindings,
 ): string => {
+  if (compilation.shapeOnly) {
+    return SCOPE_MARKER;
+  }
+
   const current =
     compilation.scopeValues?.get(description) ?? description.predicate;
   const caches = compilation.expressionCaches;
@@ -105,22 +110,13 @@ export const predicateSql = (
     case "nullCheck":
       return `${operandSql(compilation, description.value, bindings)} IS ${description.negated ? "NOT " : ""}NULL`;
     case "comparison": {
-      const operator = renderer.comparisonOperator(description.operator);
-      const json =
-        JSON_COMPARISONS.has(operator) &&
-        isJsonType(sqlTypeOf(description.left));
+      const { operator } = description;
       const nullable =
         description.nullableParameter &&
         description.right.kind === "placeholder";
       const left = operandSql(compilation, description.left, bindings);
       const right = operandSql(compilation, description.right, bindings);
-      const comparison = json
-        ? renderer.jsonComparison(
-            left,
-            right,
-            operator as "=" | "<>" | "IS" | "IS NOT",
-          )
-        : `${left} ${operator} ${right}`;
+      const comparison = `${left} ${operator} ${right}`;
 
       if (!nullable || description.right.kind !== "placeholder") {
         return comparison;
@@ -129,7 +125,7 @@ export const predicateSql = (
       const type = sqlTypeOf(description.left);
 
       if (type === "enum") {
-        return `${left} ${renderer.comparisonOperator(operator === "<>" ? "IS DISTINCT FROM" : "IS NOT DISTINCT FROM")} ${right}`;
+        return `${left} ${operator === "<>" ? "IS DISTINCT FROM" : "IS NOT DISTINCT FROM"} ${right}`;
       }
 
       const checked = renderer.cast(right, {
@@ -179,7 +175,7 @@ export const predicateSql = (
           bindings,
           description.language,
         ),
-        renderer.searchQuery(
+        tsquerySql(
           valueSql(compilation, description.query, bindings),
           description.language,
           description.mode,
@@ -204,31 +200,12 @@ export const predicateSql = (
       }
 
       const operand = Array.isArray(description.values)
-        ? {
-            kind: "list" as const,
-            values: description.values.map((value) =>
-              operandSql(compilation, value, bindings),
-            ),
-          }
-        : {
-            kind: "subquery" as const,
-            sql: compilation.selectSql(
-              description.values as SelectPlan,
-              bindings,
-            ),
-            column: (description.values as SelectPlan).selection[0]!.outputName,
-          };
+        ? description.values
+            .map((value) => operandSql(compilation, value, bindings))
+            .join(", ")
+        : compilation.selectSql(description.values as SelectPlan, bindings);
 
-      if (isJsonType(sqlTypeOf(description.value))) {
-        return renderer.jsonMembership(
-          left,
-          operand,
-          description.negated,
-          renderContext(compilation, bindings),
-        );
-      }
-
-      return `${left} ${description.negated ? "NOT " : ""}IN (${operand.kind === "list" ? operand.values.join(", ") : operand.sql})`;
+      return `${left} ${description.negated ? "NOT " : ""}IN (${operand})`;
     }
   }
 };

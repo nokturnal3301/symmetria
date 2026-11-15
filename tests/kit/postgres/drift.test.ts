@@ -7,12 +7,14 @@ import {
   bool,
   timestamptz,
   varchar,
+  numeric,
   oneOf,
   index,
   sql,
 } from "../../../packages/runtime/src";
 import { normalizeResult } from "../../../packages/runtime/src/entries/internal";
 import { detectDrift } from "../../../packages/kit/src";
+import { expressionKey } from "../../../packages/kit/src/migrations/expressions";
 import { testDatabase } from "../../support/postgres";
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
@@ -178,6 +180,93 @@ describe.skipIf(!databaseUrl)("PostgreSQL drift definitions", () => {
           expect.objectContaining({ kind: "index-mismatch", table: "records" }),
         ]),
       );
+    } finally {
+      await fixture.close();
+    }
+  });
+  test("value-changing casts keep their key through PostgreSQL's own rendering", async () => {
+    const conditions = {
+      truncated_literal: `"code" = 'abc'::varchar(2)`,
+      padded_literal: `"code" = 'abc'::char(2)`,
+      rounded_literal: `"score" > 1.9::integer`,
+      scaled_literal: `"ratio" > 1.25::numeric(3,1)`,
+      truncated_text: `"code"::varchar(3) = 'abc'`,
+      truncated_varchar: `"label"::varchar(3) = 'abc'`,
+    };
+    const model = schema({
+      records: table({
+        id: int,
+        code: text,
+        label: varchar(10),
+        score: int,
+        ratio: numeric(6, 2),
+      })
+        .checks(() =>
+          Object.fromEntries(
+            Object.entries(conditions).map(([name, condition]) => [
+              name,
+              sql<boolean>([condition] as unknown as TemplateStringsArray),
+            ]),
+          ),
+        )
+        .indexes((records) => ({
+          short: index(records.id).where(
+            sql<boolean>`${records.code}::varchar(3) = 'abc'`,
+          ),
+        })),
+    });
+    const fixture = await testDatabase({ url: databaseUrl!, schema: model });
+
+    try {
+      const types = new Map([
+        ["code", "text"],
+        ["label", "varchar(10)"],
+        ["score", "integer"],
+        ["ratio", "numeric(6,2)"],
+      ]);
+      const printed = normalizeResult(
+        await fixture.driver.execute({
+          sql: `SELECT conname AS name, pg_get_expr(conbin, conrelid) AS expression
+                FROM pg_constraint
+                WHERE conrelid = 'records'::regclass AND contype = 'c'
+                UNION ALL
+                SELECT 'short', pg_get_expr(indpred, indrelid)
+                FROM pg_index
+                WHERE indrelid = 'records'::regclass AND indpred IS NOT NULL`,
+          parameters: [],
+        }),
+      ).rows as { name: string; expression: string }[];
+
+      expect(printed).toHaveLength(Object.keys(conditions).length + 1);
+
+      for (const { name, expression } of printed) {
+        const written =
+          name === "short"
+            ? conditions.truncated_text
+            : Object.entries(conditions).find(([key]) =>
+                name.includes(key),
+              )![1];
+
+        expect([name, expressionKey(expression, types)]).toEqual([
+          name,
+          expressionKey(written, types),
+        ]);
+        // The cast is why these are not the plain comparison.
+        expect(expressionKey(expression, types)).not.toBe(
+          expressionKey(
+            written.replace(/::[a-z]+\([\d,]+\)|::integer/, ""),
+            types,
+          ),
+        );
+      }
+
+      expect(
+        await detectDrift({
+          execute: fixture.driver.execute,
+          snapshot: model.$snapshot(),
+          schemaName: fixture.namespace,
+        }),
+      ).toEqual([]);
     } finally {
       await fixture.close();
     }

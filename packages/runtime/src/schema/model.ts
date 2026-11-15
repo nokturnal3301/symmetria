@@ -15,6 +15,8 @@ import {
 } from "./column";
 import {
   assembleSchema,
+  inferredPrimaryKey,
+  primaryKeyColumns,
   type Casing,
   type ConditionRelationInput,
   type SchemaOverrides,
@@ -53,6 +55,7 @@ import {
 import {
   and,
   createQueryTables,
+  createSchemaTables,
   createScope,
   type QueryTable,
   type QueryExecutor,
@@ -62,7 +65,13 @@ import {
   type RuntimeScope,
   type TableScopes,
 } from "../query/select";
-import { codecMap, encodeValue, type RuntimeCodec } from "../query/codecs";
+import {
+  codecMap,
+  encodeValue,
+  type RuntimeCodec,
+  type SchemaCodecs,
+} from "../query/codecs";
+import type { SchemaTables } from "../query/select/registry";
 import { quoteIdentifier } from "../query/compile";
 import {
   applyIndexes,
@@ -87,6 +96,8 @@ import { isRetryableTransactionError } from "../driver/errors";
 import type { Omittable, TableTraits, Writable } from "./infer";
 
 const LINK = Symbol("symmetria.schema.link");
+/** Where a bound database keeps the function that builds its table handles. */
+const TABLE_HANDLE = Symbol("symmetria.schema.tableHandle");
 /** The longest wait between two `$transaction` retries, unless retryDelayMs is longer. */
 const MAX_RETRY_DELAY_MS = 1000;
 export type LinkOptions = {
@@ -1157,6 +1168,689 @@ const describeValue = (value: unknown): string => {
   return typeof value;
 };
 
+type TableHandles = Record<string, TableHandle<Record<string, ColumnInput>>>;
+
+/** A reference renamed on its target with `.inverse()`. */
+type InverseRelation = {
+  target: string;
+  name: string;
+  source: string;
+  column: string;
+};
+
+/**
+ * Lowers table bodies to columns and keyed links: a table handle, a thunk or
+ * `self` in a column position becomes a link to the schema key it stands for.
+ */
+const linkDefinitions = (
+  rawDefinitions: Record<string, Record<string, unknown>>,
+  tableNamesByState: ReadonlyMap<TableState, readonly string[]>,
+): SchemaDefinitions => {
+  const tableDefinitions: SchemaDefinitions = {};
+
+  for (const [tableName, columns] of Object.entries(rawDefinitions)) {
+    tableDefinitions[tableName] = Object.fromEntries(
+      Object.entries(columns).map(([name, value]) => {
+        if (isColumn(value) || isLink(value)) {
+          return [name, value];
+        }
+
+        const example = builderExample(value);
+
+        if (example) {
+          throw new Error(
+            `symmetria: "${tableName}.${name}" is the ${(value as { name?: string }).name || "column"}() builder itself; call it: ${name}: ${example}`,
+          );
+        }
+
+        const input = isReferenceInput(value) ? value : undefined;
+        const target = input?.target ?? value;
+        const state =
+          target === "self"
+            ? undefined
+            : typeof target === "function"
+              ? tableState(
+                  resolveThunk(tableName, name, target as () => unknown),
+                )
+              : isTable(target)
+                ? tableState(target)
+                : target;
+        const targets = tableNamesByState.get(state as TableState);
+
+        if (targets && targets.length > 1) {
+          throw new Error(
+            `symmetria: ambiguous table reference "${tableName}.${name}"; use a keyed callback`,
+          );
+        }
+
+        const targetName = target === "self" ? tableName : targets?.[0];
+
+        if (!targetName) {
+          if (!isTable(target)) {
+            throw new Error(
+              `symmetria: "${tableName}.${name}" is not a column, table or reference (got ${describeValue(target)})`,
+            );
+          }
+
+          throw new Error(
+            `symmetria: reference "${tableName}.${name}" points to a table outside this schema`,
+          );
+        }
+
+        return [name, createLink(targetName, input?.flags ?? {})];
+      }),
+    );
+  }
+
+  return tableDefinitions;
+};
+
+/** Gives every table without `.primaryKey()` the key the assembler infers for it. */
+const inferPrimaryKeys = (
+  tableDefinitions: SchemaDefinitions,
+  primaryKeys: Map<string, readonly string[]>,
+  junctionTables: ReadonlySet<string>,
+): void => {
+  for (const [tableName, definition] of Object.entries(tableDefinitions)) {
+    if (primaryKeys.has(tableName)) {
+      continue;
+    }
+
+    const entries = Object.entries(definition);
+
+    primaryKeys.set(
+      tableName,
+      inferredPrimaryKey(
+        junctionTables.has(tableName),
+        entries.flatMap(([key, column]) =>
+          isColumn(column) ? [{ key, definition: column.definition }] : [],
+        ),
+        entries.filter(([, column]) => isLink(column)).map(([key]) => key),
+      ),
+    );
+  }
+};
+
+/** `.inverse()` names as assembler overrides: the reference each reverse relation is named after. */
+const inverseOverrides = (
+  inverseRelations: readonly InverseRelation[],
+  tableHandles: TableHandles,
+): SchemaOverrides<TableHandles> => {
+  const overrides: SchemaOverrides<TableHandles> = Object.create(null);
+
+  for (const inverseRelation of inverseRelations) {
+    const tableOverrides = (overrides[inverseRelation.target] ??=
+      Object.create(null));
+
+    if (Object.hasOwn(tableOverrides, inverseRelation.name)) {
+      throw new Error(
+        `symmetria: duplicate inverse "${inverseRelation.target}.${inverseRelation.name}"`,
+      );
+    }
+
+    tableOverrides[inverseRelation.name] =
+      tableHandles[inverseRelation.source]![inverseRelation.column]!;
+  }
+
+  return overrides;
+};
+
+/** The schema key of the table a condition relation's `to()` names. */
+const conditionTargetName = (
+  tableNamesByState: ReadonlyMap<TableState, readonly string[]>,
+  tableNamesByRecord: ReadonlyMap<object, readonly string[]>,
+  tableName: string,
+  relationName: string,
+  target: unknown,
+): string => {
+  if (isLink(target)) {
+    return target[LINK].target;
+  }
+
+  if (isReferenceInput(target)) {
+    throw new Error(
+      `symmetria: relation "${tableName}.${relationName}": to() expects a table, not a reference chain; write to(<table>) and compare the key column in the predicate`,
+    );
+  }
+
+  const resolved =
+    typeof target === "function"
+      ? resolveThunk(tableName, relationName, target as () => unknown)
+      : target;
+  const names = isTable(resolved)
+    ? tableNamesByState.get(tableState(resolved))
+    : resolved && typeof resolved === "object"
+      ? tableNamesByRecord.get(resolved)
+      : undefined;
+
+  if (names && names.length > 1) {
+    throw new Error(
+      `symmetria: ambiguous table reference in relation "${tableName}.${relationName}"; use a keyed callback`,
+    );
+  }
+
+  if (!names?.[0]) {
+    throw new Error(
+      `symmetria: relation "${tableName}.${relationName}" points to a table outside this schema (got ${describeValue(target)})`,
+    );
+  }
+
+  return names[0];
+};
+
+/**
+ * Condition relations: run the callbacks once against a draft binding to learn
+ * names, targets and cardinality; the predicates themselves run per JOIN.
+ */
+const declareConditions = (
+  tableRelations: ReadonlyMap<string, readonly TableRelationCallback[]>,
+  tableHandles: TableHandles,
+  tableDefinitions: SchemaDefinitions,
+  tableNamesByState: ReadonlyMap<TableState, readonly string[]>,
+  tableNamesByRecord: ReadonlyMap<object, readonly string[]>,
+): Record<string, ConditionRelationInput[]> => {
+  const conditions: Record<string, ConditionRelationInput[]> =
+    Object.create(null);
+
+  for (const [tableName, callbacks] of tableRelations) {
+    if (!callbacks.length) {
+      continue;
+    }
+
+    const draft = draftBinding(tableState(tableHandles[tableName]!));
+    const declared = declaredConditions(
+      callbacks,
+      createScope({ [draft.alias]: draft })[draft.alias]!,
+      tableName,
+    );
+    const definition = tableDefinitions[tableName]!;
+    conditions[tableName] = Object.entries(declared).map(([name, entry]) => {
+      const state = entry[CONDITION];
+
+      if (
+        Object.hasOwn(definition, name) ||
+        Object.keys(definition).some((column) => `${column}Id` === name)
+      ) {
+        throw new Error(
+          `symmetria: relation "${tableName}.${name}" clashes with a column of the same name`,
+        );
+      }
+
+      return {
+        name,
+        target: conditionTargetName(
+          tableNamesByState,
+          tableNamesByRecord,
+          tableName,
+          name,
+          state.target,
+        ),
+        many: state.many,
+        ...(state.inverse !== undefined ? { inverse: state.inverse } : {}),
+      };
+    });
+  }
+
+  return conditions;
+};
+
+/** The declared extensions, checked, without duplicates and sorted. */
+const declaredExtensions = (
+  extensions: readonly string[],
+): readonly string[] => {
+  for (const extension of extensions) {
+    if (!/^[a-z_][a-z0-9_]*$/.test(extension)) {
+      throw new Error(
+        `symmetria: extension names are lowercase identifiers, not "${extension}"`,
+      );
+    }
+  }
+
+  return Object.freeze([...new Set(extensions)].sort());
+};
+
+/** Codecs by table and column name; a foreign key takes the codec of the column it references. */
+const columnCodecs = (
+  tableDefinitions: SchemaDefinitions,
+  primaryKeys: ReadonlyMap<string, readonly string[]>,
+): Record<string, Record<string, RuntimeCodec>> =>
+  Object.fromEntries(
+    Object.entries(tableDefinitions).map(([tableName, definition]) => [
+      tableName,
+      codecMap(
+        Object.fromEntries(
+          Object.entries(definition).flatMap(([columnName, value]) => {
+            const column = isColumn(value)
+              ? value
+              : tableDefinitions[value[LINK].target]?.[
+                  value[LINK].flags.by ??
+                    primaryKeys.get(value[LINK].target)?.[0] ??
+                    "id"
+                ];
+            const codec =
+              column && isColumn(column) ? column[COLUMN_CODEC] : undefined;
+
+            return codec
+              ? [[isColumn(value) ? columnName : `${columnName}Id`, codec]]
+              : [];
+          }),
+        ),
+      ),
+    ]),
+  );
+
+/** Persist storage defaults; codecs themselves remain outside the snapshot. */
+const encodeDefaults = (
+  snapshot: SchemaSnapshot,
+  codecs: SchemaCodecs,
+): void => {
+  for (const table of snapshot.tables) {
+    for (const column of table.columns) {
+      const codec = codecs[table.name]?.[column.name];
+
+      if (codec && column.default?.kind === "value") {
+        const encoded = encodeValue(column.default.value, codec);
+
+        column.default = {
+          kind: "value",
+          // JSON codecs validate and serialize; keep the JSON value itself, as plain jsonb() does.
+          value:
+            ["json", "jsonb"].includes(column.sqlType) &&
+            typeof encoded === "string"
+              ? JSON.parse(encoded)
+              : encoded,
+        };
+      }
+    }
+  }
+};
+
+/** Adds the indexes and checks declared on tables, then the indexes of the schema options. */
+const applyDeclarations = (
+  snapshot: SchemaSnapshot,
+  codecs: SchemaCodecs,
+  tableIndexes: ReadonlyMap<string, readonly TableIndexCallback[]>,
+  tableChecks: ReadonlyMap<string, readonly TableCheckCallback[]>,
+  schemaIndexes:
+    | ((scope: RuntimeScope) => Record<string, IndexDefinition>)
+    | undefined,
+): void => {
+  for (const [tableName, callbacks] of tableIndexes) {
+    for (const callback of callbacks) {
+      applyIndexes(
+        snapshot,
+        codecs,
+        (scope) => callback(scope[tableName]!),
+        tableName,
+      );
+    }
+  }
+
+  for (const [tableName, callbacks] of tableChecks) {
+    for (const callback of callbacks) {
+      applyChecks(snapshot, codecs, tableName, callback);
+    }
+  }
+
+  if (schemaIndexes) {
+    applyIndexes(snapshot, codecs, schemaIndexes);
+  }
+};
+
+/**
+ * Junctions are traversed from both sides: unless a declared index already
+ * leads with it, the second key column (not covered by the PK) gets its own index.
+ */
+const indexJunctionSecondKeys = (
+  snapshot: SchemaSnapshot,
+  codecs: SchemaCodecs,
+): void => {
+  for (const table of snapshot.tables) {
+    const column = table.junction ? primaryKeyColumns(table)[1] : undefined;
+
+    if (!column) {
+      continue;
+    }
+
+    const leading = quoteIdentifier(column.sqlName);
+
+    if (
+      !table.indexes?.some(
+        ({ keys: [first] }) =>
+          first === leading || first?.startsWith(`${leading} `),
+      )
+    ) {
+      applyIndexes(
+        snapshot,
+        codecs,
+        (scope) => ({
+          [column.name]: index(scope[table.name]![column.name]!),
+        }),
+        table.name,
+        true,
+      );
+    }
+  }
+};
+
+/**
+ * Starts a transaction, and starts it again after a retryable failure. Each
+ * attempt gets a fresh connection, BEGIN and bound database; the callback must
+ * therefore be safe to run again.
+ */
+const retryTransaction = async <Result>(
+  begin: (settings: TransactionOptions | undefined) => Promise<Result>,
+  options: TransactionOptions | undefined,
+): Promise<Result> => {
+  const { retries = 0, retryDelayMs = 10, ...settings } = options ?? {};
+
+  if (!Number.isSafeInteger(retries) || retries < 0 || retries > 20) {
+    throw new Error("symmetria: retries must be an integer between 0 and 20");
+  }
+
+  if (!Number.isFinite(retryDelayMs) || retryDelayMs < 0) {
+    throw new Error("symmetria: retryDelayMs must be a non-negative number");
+  }
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await begin(options === undefined ? undefined : settings);
+    } catch (error) {
+      if (attempt >= retries || !isRetryableTransactionError(error)) {
+        throw error;
+      }
+
+      // The wait doubles per attempt up to a second (or retryDelayMs when
+      // larger), so twenty retries under contention never wait for hours.
+      const delay =
+        Math.random() *
+        Math.min(
+          retryDelayMs * 2 ** attempt,
+          Math.max(retryDelayMs, MAX_RETRY_DELAY_MS),
+        );
+
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+};
+
+type ScopeInput = Readonly<
+  Record<string, ((columns: never) => Predicate) | undefined>
+>;
+
+/** The scopes in force after `$scope(next)`: a table filtered before keeps its filter, ANDed with the new one. */
+const mergeScopes = (
+  tablesByName: ReadonlyMap<string, unknown>,
+  scopes: TableScopes,
+  next: ScopeInput,
+): TableScopes =>
+  Object.fromEntries(
+    [...new Set([...Object.keys(scopes), ...Object.keys(next)])].map(
+      (tableName) => {
+        if (!tablesByName.has(tableName)) {
+          throw new Error(
+            `symmetria: $scope() received unknown table "${tableName}"`,
+          );
+        }
+
+        const previous = scopes[tableName];
+        const added = next[tableName] as TableScopes[string] | undefined;
+
+        if (added !== undefined && typeof added !== "function") {
+          throw new Error(
+            `symmetria: $scope() expects a predicate callback for "${tableName}"`,
+          );
+        }
+
+        return [
+          tableName,
+          previous && added
+            ? (columns: RuntimeScope[string]) =>
+                and(previous(columns), added(columns))
+            : (previous ?? added)!,
+        ];
+      },
+    ),
+  );
+
+/**
+ * What every bound database of a schema shares. It depends on the schema
+ * alone, so it is built once and used by each transaction and each $scope().
+ */
+type SchemaRuntime = {
+  readonly snapshot: SchemaSnapshot;
+  readonly codecs: SchemaCodecs;
+  readonly schemaTables: SchemaTables;
+  readonly relationNames: ReadonlyMap<string, readonly string[]>;
+  /**
+   * Tables are own, enumerable members of a database, as `Object.keys()` and
+   * spreads expect; reading one asks that database for the handle.
+   */
+  readonly tableAccessors: PropertyDescriptorMap;
+};
+
+const schemaRuntime = (
+  snapshot: SchemaSnapshot,
+  codecs: SchemaCodecs,
+): SchemaRuntime => ({
+  snapshot,
+  codecs,
+  schemaTables: createSchemaTables(snapshot, codecs),
+  relationNames: new Map(
+    snapshot.tables.map((table) => [
+      table.name,
+      table.relations.map((relation) => relation.name),
+    ]),
+  ),
+  tableAccessors: Object.fromEntries(
+    snapshot.tables.map((table) => [
+      table.name,
+      {
+        enumerable: true,
+        get(this: { [TABLE_HANDLE]: (tableName: string) => object }) {
+          return this[TABLE_HANDLE](table.name);
+        },
+      },
+    ]),
+  ),
+});
+
+/** A table of a bound database: its query table, with an insert() that also takes related rows. */
+const createTableHandle = (
+  { snapshot, codecs, schemaTables, relationNames }: SchemaRuntime,
+  tableName: string,
+  queryTable: object,
+  runTransaction: Parameters<typeof createNestedInsert>[3],
+): object => {
+  const tableSnapshot = schemaTables.tablesByName.get(tableName)!;
+  const relations = relationNames.get(tableName)!;
+
+  return extendBuilder(queryTable, {
+    $name: tableSnapshot.sqlName,
+    insert: (
+      values: Record<string, unknown> | readonly Record<string, unknown>[],
+    ) => {
+      const rows = Array.isArray(values) ? values : [values];
+
+      if (
+        rows.some(
+          (row) =>
+            row &&
+            relations.some(
+              (name) => (row as Record<string, unknown>)[name] !== undefined,
+            ),
+        )
+      ) {
+        return createNestedInsert(
+          snapshot,
+          tableSnapshot.name,
+          values,
+          runTransaction,
+          codecs,
+        );
+      }
+
+      // An omitted (undefined) relation keeps the flat, single-statement INSERT.
+      const flat = (row: Record<string, unknown>) =>
+        row && relations.some((name) => name in row)
+          ? Object.fromEntries(
+              Object.entries(row).filter(([name]) => !relations.includes(name)),
+            )
+          : row;
+
+      return (
+        queryTable as {
+          insert: (values: unknown) => object;
+        }
+      ).insert(
+        Array.isArray(values)
+          ? rows.map(flat)
+          : flat(values as Record<string, unknown>),
+      );
+    },
+  });
+};
+
+/** A database object over one executor: the schema itself, a transaction, a savepoint or a `$scope()`. */
+const bindDatabase = (
+  runtime: SchemaRuntime,
+  executor: QueryExecutor | undefined,
+  transactionDriver: TransactionDriver | undefined,
+  driver: Driver | undefined,
+  scopes: TableScopes = {},
+  addedScopes?: readonly string[],
+): object => {
+  const { snapshot, schemaTables } = runtime;
+  // Atomic multi-statement work (chunked bulk inserts): a savepoint inside a
+  // transaction, otherwise a transaction of the configured driver.
+  const atomicDriver = transactionDriver ?? driver;
+  // Streams hold a connection for the whole iteration: the current
+  // transaction's connection when there is one (a savepoint would block the
+  // caller), otherwise a transaction of the configured driver.
+  const hold: ConnectionHold | undefined = transactionDriver
+    ? (run) => run(transactionDriver.execute)
+    : driver?.transaction
+      ? (run) => driver.transaction!((connection) => run(connection.execute))
+      : undefined;
+  const queryTables = createQueryTables(
+    schemaTables,
+    executor,
+    scopes,
+    atomicDriver?.transaction
+      ? (run) =>
+          atomicDriver.transaction!((connection) => run(connection.execute))
+      : undefined,
+    hold,
+  );
+  const profile = executorProfiling(executor);
+
+  // A callback $scope() was just given runs once now, so one that cannot
+  // be a filter fails $scope() itself, not the first query on its table.
+  addedScopes?.forEach(queryTables.checkScope);
+
+  const runTransaction = async <Result>(
+    callback: (database: Record<string, unknown>) => PromiseLike<Result>,
+    options?: TransactionOptions,
+  ): Promise<Result> => {
+    const run = async (connection: TransactionDriver) =>
+      callback(
+        bindDatabase(
+          runtime,
+          connection.execute,
+          connection,
+          driver,
+          scopes,
+        ) as Record<string, unknown>,
+      );
+
+    if (transactionDriver) {
+      if (options !== undefined) {
+        throw new Error(
+          "symmetria: transaction options cannot be changed inside a savepoint",
+        );
+      }
+
+      return transactionDriver.transaction(run);
+    }
+
+    if (!driver?.transaction) {
+      throw new Error(
+        "symmetria: the configured driver does not support transactions",
+      );
+    }
+
+    return retryTransaction(
+      (settings) => driver.transaction!(run, settings),
+      options,
+    );
+  };
+
+  // A transaction usually touches a few tables of many: handles are built
+  // on first use and kept, so a table reads as the same object every time.
+  const tableHandles = new Map<string, object>();
+
+  const tableHandle = (tableName: string): object => {
+    let handle = tableHandles.get(tableName);
+
+    if (!handle) {
+      const table = createTableHandle(
+        runtime,
+        tableName,
+        queryTables.table(tableName),
+        runTransaction,
+      );
+
+      handle = profile ? profile.trackBuilder(table) : table;
+      tableHandles.set(tableName, handle);
+    }
+
+    return handle;
+  };
+
+  const database = Object.create(Object.prototype, runtime.tableAccessors);
+
+  Object.defineProperty(database, TABLE_HANDLE, { value: tableHandle });
+
+  return Object.freeze(
+    Object.assign(database, {
+      ...(!transactionDriver
+        ? {
+            [SCHEMA_BIND]: (connection: Driver) =>
+              bindDatabase(
+                runtime,
+                connection.execute,
+                undefined,
+                connection,
+                scopes,
+              ),
+          }
+        : {}),
+      $scope: (next: ScopeInput) =>
+        bindDatabase(
+          runtime,
+          executor,
+          transactionDriver,
+          driver,
+          mergeScopes(schemaTables.tablesByName, scopes, next),
+          Object.keys(next).filter((tableName) => next[tableName]),
+        ),
+      $snapshot: () => structuredClone(snapshot),
+      $createIndexes: (settings?: CreateIndexesOptions) =>
+        createIndexQuery(snapshot, executor, settings, !!transactionDriver),
+      $transaction: runTransaction,
+      ...(transactionDriver
+        ? {}
+        : {
+            $close: async () => {
+              await driver?.close();
+            },
+          }),
+    }),
+  );
+};
+
 const createSchema = <
   const TableNames extends string,
   const KeyValues extends Record<TableNames, unknown>,
@@ -1252,110 +1946,30 @@ const createSchema = <
       return [tableName, state.columns];
     }),
   ) as Record<string, Record<string, unknown>>;
-  const tableDefinitions: SchemaDefinitions = {};
+  const tableDefinitions = linkDefinitions(rawDefinitions, tableNamesByState);
 
-  for (const [tableName, columns] of Object.entries(rawDefinitions)) {
-    tableDefinitions[tableName] = Object.fromEntries(
-      Object.entries(columns).map(([name, value]) => {
-        if (isColumn(value) || isLink(value)) {
-          return [name, value];
-        }
+  inferPrimaryKeys(tableDefinitions, primaryKeys, junctionTables);
 
-        const example = builderExample(value);
-
-        if (example) {
-          throw new Error(
-            `symmetria: "${tableName}.${name}" is the ${(value as { name?: string }).name || "column"}() builder itself; call it: ${name}: ${example}`,
-          );
-        }
-
-        const input = isReferenceInput(value) ? value : undefined;
-        const target = input?.target ?? value;
-        const state =
-          target === "self"
-            ? undefined
-            : typeof target === "function"
-              ? tableState(
-                  resolveThunk(tableName, name, target as () => unknown),
-                )
-              : isTable(target)
-                ? tableState(target)
-                : target;
-        const targets = tableNamesByState.get(state as TableState);
-
-        if (targets && targets.length > 1) {
-          throw new Error(
-            `symmetria: ambiguous table reference "${tableName}.${name}"; use a keyed callback`,
-          );
-        }
-
-        const targetName = target === "self" ? tableName : targets?.[0];
-
-        if (!targetName) {
-          if (!isTable(target)) {
-            throw new Error(
-              `symmetria: "${tableName}.${name}" is not a column, table or reference (got ${describeValue(target)})`,
-            );
-          }
-
-          throw new Error(
-            `symmetria: reference "${tableName}.${name}" points to a table outside this schema`,
-          );
-        }
-
-        return [name, createLink(targetName, input?.flags ?? {})];
-      }),
-    );
-  }
-
-  for (const [tableName, definition] of Object.entries(tableDefinitions)) {
-    if (!primaryKeys.has(tableName)) {
-      const explicit = Object.entries(definition)
-        .filter(
-          ([, column]) => isColumn(column) && column.definition.primaryKey,
-        )
-        .map(([name]) => name);
-      primaryKeys.set(
-        tableName,
-        junctionTables.has(tableName)
-          ? Object.entries(definition)
-              .filter(([, column]) => isLink(column))
-              .map(([name]) => `${name}Id`)
-          : explicit.length
-            ? explicit
-            : isColumn(definition.id)
-              ? ["id"]
-              : [],
-      );
-    }
-  }
-
-  const tableHandles: Record<
-    string,
-    TableHandle<Record<string, ColumnInput>>
-  > = Object.create(null);
-  const inverseRelations: Array<{
-    target: string;
-    name: string;
-    source: string;
-    column: string;
-  }> = [];
+  const tableHandles: TableHandles = Object.create(null);
+  const inverseRelations: InverseRelation[] = [];
 
   for (const [tableName, tableDefinition] of Object.entries(tableDefinitions)) {
+    // Database methods a table of the same name would replace or be replaced
+    // by, and `then`, which would make the database object awaitable.
     if (
       [
+        "$scope",
         "$snapshot",
         "$close",
         "$transaction",
         "$createIndexes",
+        "then",
         "__proto__",
         "constructor",
         "prototype",
       ].includes(tableName)
     ) {
-      throw new Error(
-        `symmetria experiment: reserved table name "${tableName}"`,
-      );
+      throw new Error(`symmetria: reserved table name "${tableName}"`);
     }
 
     const columns: Record<string, ColumnInput> = Object.create(null);
@@ -1379,7 +1993,7 @@ const createSchema = <
 
       if (!isLink(value)) {
         throw new Error(
-          `symmetria experiment: invalid column "${tableName}.${columnName}"`,
+          `symmetria: invalid column "${tableName}.${columnName}"`,
         );
       }
 
@@ -1419,7 +2033,7 @@ const createSchema = <
       if (flags.inverse !== undefined) {
         if (isJunction) {
           throw new Error(
-            "symmetria experiment: junction inverse renaming is not implemented",
+            "symmetria: junction inverse renaming is not implemented",
           );
         }
 
@@ -1464,98 +2078,14 @@ const createSchema = <
     }
   }
 
-  const overrides: SchemaOverrides<typeof tableHandles> = Object.create(null);
-
-  for (const inverseRelation of inverseRelations) {
-    const tableOverrides = (overrides[inverseRelation.target] ??=
-      Object.create(null));
-
-    if (Object.hasOwn(tableOverrides, inverseRelation.name)) {
-      throw new Error(
-        `symmetria experiment: duplicate inverse "${inverseRelation.target}.${inverseRelation.name}"`,
-      );
-    }
-
-    tableOverrides[inverseRelation.name] =
-      tableHandles[inverseRelation.source]![inverseRelation.column]!;
-  }
-
-  // Condition relations: run the callbacks once against a draft binding to learn
-  // names, targets and cardinality; the predicates themselves run per JOIN.
-  const conditionTargetName = (
-    tableName: string,
-    relationName: string,
-    target: unknown,
-  ): string => {
-    if (isLink(target)) {
-      return target[LINK].target;
-    }
-
-    if (isReferenceInput(target)) {
-      throw new Error(
-        `symmetria: relation "${tableName}.${relationName}": to() expects a table, not a reference chain; write to(<table>) and compare the key column in the predicate`,
-      );
-    }
-
-    const resolved =
-      typeof target === "function"
-        ? resolveThunk(tableName, relationName, target as () => unknown)
-        : target;
-    const names = isTable(resolved)
-      ? tableNamesByState.get(tableState(resolved))
-      : resolved && typeof resolved === "object"
-        ? tableNamesByRecord.get(resolved)
-        : undefined;
-
-    if (names && names.length > 1) {
-      throw new Error(
-        `symmetria: ambiguous table reference in relation "${tableName}.${relationName}"; use a keyed callback`,
-      );
-    }
-
-    if (!names?.[0]) {
-      throw new Error(
-        `symmetria: relation "${tableName}.${relationName}" points to a table outside this schema (got ${describeValue(target)})`,
-      );
-    }
-
-    return names[0];
-  };
-  const conditions: Record<string, ConditionRelationInput[]> =
-    Object.create(null);
-
-  for (const [tableName, callbacks] of tableRelations) {
-    if (!callbacks.length) {
-      continue;
-    }
-
-    const draft = draftBinding(tableState(tableHandles[tableName]!));
-    const declared = declaredConditions(
-      callbacks,
-      createScope({ [draft.alias]: draft })[draft.alias]!,
-      tableName,
-    );
-    const definition = tableDefinitions[tableName]!;
-    conditions[tableName] = Object.entries(declared).map(([name, entry]) => {
-      const state = entry[CONDITION];
-
-      if (
-        Object.hasOwn(definition, name) ||
-        Object.keys(definition).some((column) => `${column}Id` === name)
-      ) {
-        throw new Error(
-          `symmetria: relation "${tableName}.${name}" clashes with a column of the same name`,
-        );
-      }
-
-      return {
-        name,
-        target: conditionTargetName(tableName, name, state.target),
-        many: state.many,
-        ...(state.inverse !== undefined ? { inverse: state.inverse } : {}),
-      };
-    });
-  }
+  const overrides = inverseOverrides(inverseRelations, tableHandles);
+  const conditions = declareConditions(
+    tableRelations,
+    tableHandles,
+    tableDefinitions,
+    tableNamesByState,
+    tableNamesByRecord,
+  );
 
   if (
     options.casing !== undefined &&
@@ -1573,17 +2103,7 @@ const createSchema = <
   );
 
   if (options.extensions?.length) {
-    for (const extension of options.extensions) {
-      if (!/^[a-z_][a-z0-9_]*$/.test(extension)) {
-        throw new Error(
-          `symmetria: extension names are lowercase identifiers, not "${extension}"`,
-        );
-      }
-    }
-
-    snapshot.extensions = Object.freeze(
-      [...new Set(options.extensions)].sort(),
-    );
+    snapshot.extensions = declaredExtensions(options.extensions);
   }
 
   for (const table of snapshot.tables) {
@@ -1595,341 +2115,26 @@ const createSchema = <
     throw new Error("symmetria: supply either driver or executor");
   }
 
-  const codecs: Record<
-    string,
-    Record<string, RuntimeCodec>
-  > = Object.fromEntries(
-    Object.entries(tableDefinitions).map(([tableName, definition]) => [
-      tableName,
-      codecMap(
-        Object.fromEntries(
-          Object.entries(definition).flatMap(([columnName, value]) => {
-            const column = isColumn(value)
-              ? value
-              : tableDefinitions[value[LINK].target]?.[
-                  value[LINK].flags.by ??
-                    primaryKeys.get(value[LINK].target)?.[0] ??
-                    "id"
-                ];
-            const codec =
-              column && isColumn(column) ? column[COLUMN_CODEC] : undefined;
+  const codecs = columnCodecs(tableDefinitions, primaryKeys);
 
-            return codec
-              ? [[isColumn(value) ? columnName : `${columnName}Id`, codec]]
-              : [];
-          }),
-        ),
-      ),
-    ]),
+  encodeDefaults(snapshot, codecs);
+  applyDeclarations(
+    snapshot,
+    codecs,
+    tableIndexes,
+    tableChecks,
+    options.indexes as unknown as
+      | ((scope: RuntimeScope) => Record<string, IndexDefinition>)
+      | undefined,
   );
+  indexJunctionSecondKeys(snapshot, codecs);
 
-  // Persist storage defaults; codecs themselves remain outside the snapshot.
-  for (const table of snapshot.tables) {
-    for (const column of table.columns) {
-      const codec = codecs[table.name]?.[column.name];
-
-      if (codec && column.default?.kind === "value") {
-        const encoded = encodeValue(column.default.value, codec);
-
-        column.default = {
-          kind: "value",
-          // JSON codecs validate and serialize; keep the JSON value itself, as plain jsonb() does.
-          value:
-            ["json", "jsonb"].includes(column.sqlType) &&
-            typeof encoded === "string"
-              ? JSON.parse(encoded)
-              : encoded,
-        };
-      }
-    }
-  }
-
-  for (const [tableName, callbacks] of tableIndexes) {
-    for (const callback of callbacks) {
-      applyIndexes(
-        snapshot,
-        codecs,
-        (scope) => callback(scope[tableName]!),
-        tableName,
-      );
-    }
-  }
-
-  for (const [tableName, callbacks] of tableChecks) {
-    for (const callback of callbacks) {
-      applyChecks(snapshot, codecs, tableName, callback);
-    }
-  }
-
-  if (options.indexes) {
-    applyIndexes(
-      snapshot,
-      codecs,
-      options.indexes as unknown as (
-        scope: import("../query/select").RuntimeScope,
-      ) => Record<string, IndexDefinition>,
-    );
-  }
-
-  // Junctions are traversed from both sides: unless a declared index already
-  // leads with it, the second key column (not covered by the PK) gets its own index.
-  for (const table of snapshot.tables) {
-    const second = table.junction
-      ? (table.primaryKey ??
-          table.columns
-            .filter((column) => column.primaryKey)
-            .map((column) => column.name))[1]
-      : undefined;
-    const column = table.columns.find((column) => column.name === second);
-
-    if (!second || !column) {
-      continue;
-    }
-
-    const leading = quoteIdentifier(column.sqlName);
-
-    if (
-      !table.indexes?.some(
-        ({ keys: [first] }) =>
-          first === leading || first?.startsWith(`${leading} `),
-      )
-    ) {
-      applyIndexes(
-        snapshot,
-        codecs,
-        (scope) => ({ [second]: index(scope[table.name]![second]!) }),
-        table.name,
-        true,
-      );
-    }
-  }
-
-  const bindDatabase = (
-    executor?: QueryExecutor,
-    transactionDriver?: TransactionDriver,
-    driver: Driver | undefined = options.driver,
-    scopes: TableScopes = {},
-  ): object => {
-    // Atomic multi-statement work (chunked bulk inserts): a savepoint inside a
-    // transaction, otherwise a transaction of the configured driver.
-    const atomicDriver = transactionDriver ?? driver;
-    // Streams hold a connection for the whole iteration: the current
-    // transaction's connection when there is one (a savepoint would block the
-    // caller), otherwise a transaction of the configured driver.
-    const hold: ConnectionHold | undefined = transactionDriver
-      ? (run) => run(transactionDriver.execute)
-      : driver?.transaction
-        ? (run) => driver.transaction!((connection) => run(connection.execute))
-        : undefined;
-    const queryTables = createQueryTables(
-      snapshot,
-      executor,
-      codecs,
-      scopes,
-      atomicDriver?.transaction
-        ? (run) =>
-            atomicDriver.transaction!((connection) => run(connection.execute))
-        : undefined,
-      hold,
-    );
-    const profile = executorProfiling(executor);
-
-    const runTransaction = async <Result>(
-      callback: (database: Record<string, unknown>) => PromiseLike<Result>,
-      options?: TransactionOptions,
-    ): Promise<Result> => {
-      const run = async (connection: TransactionDriver) =>
-        callback(
-          bindDatabase(
-            connection.execute,
-            connection,
-            driver,
-            scopes,
-          ) as Record<string, unknown>,
-        );
-
-      if (transactionDriver) {
-        if (options !== undefined) {
-          throw new Error(
-            "symmetria: transaction options cannot be changed inside a savepoint",
-          );
-        }
-
-        return transactionDriver.transaction(run);
-      }
-
-      if (!driver?.transaction) {
-        throw new Error(
-          "symmetria: the configured driver does not support transactions",
-        );
-      }
-
-      const { retries = 0, retryDelayMs = 10, ...settings } = options ?? {};
-
-      if (!Number.isSafeInteger(retries) || retries < 0 || retries > 20) {
-        throw new Error(
-          "symmetria: retries must be an integer between 0 and 20",
-        );
-      }
-
-      if (!Number.isFinite(retryDelayMs) || retryDelayMs < 0) {
-        throw new Error(
-          "symmetria: retryDelayMs must be a non-negative number",
-        );
-      }
-
-      // Each attempt gets a fresh connection, BEGIN and bound database; the
-      // callback must therefore be safe to run again.
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          return await driver.transaction(
-            run,
-            options === undefined ? undefined : settings,
-          );
-        } catch (error) {
-          if (attempt >= retries || !isRetryableTransactionError(error)) {
-            throw error;
-          }
-
-          // The wait doubles per attempt up to a second (or retryDelayMs when
-          // larger), so twenty retries under contention never wait for hours.
-          const delay =
-            Math.random() *
-            Math.min(
-              retryDelayMs * 2 ** attempt,
-              Math.max(retryDelayMs, MAX_RETRY_DELAY_MS),
-            );
-
-          if (delay > 0) {
-            await new Promise((resolve) => setTimeout(resolve, delay));
-          }
-        }
-      }
-    };
-
-    const databaseTables = Object.fromEntries(
-      snapshot.tables.map((tableSnapshot) => {
-        const relationNames = tableSnapshot.relations.map(
-          (relation) => relation.name,
-        );
-        const table = extendBuilder(queryTables[tableSnapshot.name]!, {
-          $name: tableSnapshot.sqlName,
-          insert: (
-            values:
-              | Record<string, unknown>
-              | readonly Record<string, unknown>[],
-          ) => {
-            const rows = Array.isArray(values) ? values : [values];
-
-            if (
-              rows.some(
-                (row) =>
-                  row &&
-                  relationNames.some(
-                    (name) =>
-                      (row as Record<string, unknown>)[name] !== undefined,
-                  ),
-              )
-            ) {
-              return createNestedInsert(
-                snapshot,
-                tableSnapshot.name,
-                values,
-                runTransaction,
-                codecs,
-              );
-            }
-
-            // An omitted (undefined) relation keeps the flat, single-statement INSERT.
-            const flat = (row: Record<string, unknown>) =>
-              row && relationNames.some((name) => name in row)
-                ? Object.fromEntries(
-                    Object.entries(row).filter(
-                      ([name]) => !relationNames.includes(name),
-                    ),
-                  )
-                : row;
-
-            return (
-              queryTables[tableSnapshot.name] as {
-                insert: (values: unknown) => object;
-              }
-            ).insert(
-              Array.isArray(values)
-                ? rows.map(flat)
-                : flat(values as Record<string, unknown>),
-            );
-          },
-        });
-
-        return [
-          tableSnapshot.name,
-          profile ? profile.trackBuilder(table) : table,
-        ];
-      }),
-    );
-
-    type ScopeInput = Readonly<
-      Record<string, ((columns: never) => Predicate) | undefined>
-    >;
-
-    const mergeScopes = (next: ScopeInput): TableScopes =>
-      Object.fromEntries(
-        [...new Set([...Object.keys(scopes), ...Object.keys(next)])].map(
-          (tableName) => {
-            if (!snapshot.tables.some((table) => table.name === tableName)) {
-              throw new Error(
-                `symmetria: $scope() received unknown table "${tableName}"`,
-              );
-            }
-
-            const previous = scopes[tableName];
-            const added = next[tableName] as TableScopes[string] | undefined;
-
-            if (added !== undefined && typeof added !== "function") {
-              throw new Error(
-                `symmetria: $scope() expects a predicate callback for "${tableName}"`,
-              );
-            }
-
-            return [
-              tableName,
-              previous && added
-                ? (columns: RuntimeScope[string]) =>
-                    and(previous(columns), added(columns))
-                : (previous ?? added)!,
-            ];
-          },
-        ),
-      );
-
-    return Object.freeze({
-      ...databaseTables,
-      ...(!transactionDriver
-        ? {
-            [SCHEMA_BIND]: (connection: Driver) =>
-              bindDatabase(connection.execute, undefined, connection, scopes),
-          }
-        : {}),
-      $scope: (next: ScopeInput) =>
-        bindDatabase(executor, transactionDriver, driver, mergeScopes(next)),
-      $snapshot: () => structuredClone(snapshot),
-      $createIndexes: (settings?: CreateIndexesOptions) =>
-        createIndexQuery(snapshot, executor, settings, !!transactionDriver),
-      $transaction: runTransaction,
-      ...(transactionDriver
-        ? {}
-        : {
-            $close: async () => {
-              await driver?.close();
-            },
-          }),
-    });
-  };
-
-  return bindDatabase(options.executor ?? options.driver?.execute) as Database<
-    NormalizeDefinitions<Definition>
-  >;
+  return bindDatabase(
+    schemaRuntime(snapshot, codecs),
+    options.executor ?? options.driver?.execute,
+    undefined,
+    options.driver,
+  ) as Database<NormalizeDefinitions<Definition>>;
 };
 
 type KeyValuesOf<Keys extends Record<string, Column<ColumnTypeMetadata>>> = {

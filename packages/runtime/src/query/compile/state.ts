@@ -44,6 +44,11 @@ export type Compilation = {
     | ReadonlyMap<ScopePredicate, PredicateDescription>
     | undefined;
   scopes: ScopeSlot[] | undefined;
+  /**
+   * Renders every $scope() filter as a fixed marker without parameters, so
+   * the result describes the query whatever the callbacks currently return.
+   */
+  readonly shapeOnly: boolean;
   readonly commonTables: Map<string, CommonTableExpression>;
   readonly visiting: Set<object>;
   readonly references: Map<object, string>;
@@ -66,6 +71,7 @@ export const createCompilation = (
   placeholder: ((node: PlaceholderNode) => unknown) | undefined,
   selectSql: Compilation["selectSql"],
   scopeValues?: Compilation["scopeValues"],
+  shapeOnly = false,
 ): Compilation => ({
   plan,
   renderer,
@@ -73,6 +79,7 @@ export const createCompilation = (
   parameters: [],
   scopeValues,
   scopes: undefined,
+  shapeOnly,
   commonTables: new Map(),
   visiting: new Set(),
   references: new Map(),
@@ -155,5 +162,4 @@ export const renderContext = (
 ): RenderContext => ({
   parameter: (value) => parameter(compilation, value),
   nestedAlias: (prefix) => nestedAlias(compilation, prefix, bindings),
-  quote: quoteIdentifier,
 });

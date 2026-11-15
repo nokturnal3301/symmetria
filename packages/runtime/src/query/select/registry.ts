@@ -1,6 +1,10 @@
 /** Per-schema table registry: snapshots, codecs and $scope() predicates for bindings. */
 import { freeze } from "../plan/freeze";
-import type { SchemaSnapshot, TableSnapshot } from "../../schema/assembly";
+import {
+  uniqueColumnIndexes,
+  type SchemaSnapshot,
+  type TableSnapshot,
+} from "../../schema/assembly";
 import { codecFor, codecMap, type SchemaCodecs } from "../codecs";
 import { collectDataErrors } from "../codecs/deferred";
 import { quoteIdentifier } from "../compile";
@@ -30,6 +34,84 @@ export type TableRegistry = {
   readonly scopedPlan: (binding: TableBinding) => SelectPlan;
 };
 
+/**
+ * What the query tables need from the schema alone. Built once per schema:
+ * every bound database (each transaction, each `$scope()`) shares it.
+ */
+export type SchemaTables = {
+  readonly snapshot: SchemaSnapshot;
+  readonly tablesByName: ReadonlyMap<string, TableSnapshot>;
+  /** A table's codecs by column name, resolved on first use. */
+  readonly codecsFor: (table: TableSnapshot) => TableBinding["codecs"];
+  /** `by` lookups per table: a unique column or index name and its columns. */
+  readonly uniqueKeys: ReadonlyMap<
+    string,
+    ReadonlyMap<string, readonly string[]>
+  >;
+};
+
+export const createSchemaTables = (
+  snapshot: SchemaSnapshot,
+  codecs: SchemaCodecs = {},
+): SchemaTables => {
+  const tableCodecs = new Map<string, TableBinding["codecs"]>();
+
+  const codecsFor = (table: TableSnapshot): TableBinding["codecs"] => {
+    let resolved = tableCodecs.get(table.name);
+
+    if (!resolved) {
+      resolved = freeze(
+        codecMap(
+          Object.fromEntries(
+            table.columns.flatMap((column) => {
+              const codec =
+                codecs[table.name]?.[column.name] ?? codecFor(column.sqlType);
+
+              return codec ? [[column.name, codec]] : [];
+            }),
+          ),
+        ),
+      );
+      tableCodecs.set(table.name, resolved);
+    }
+
+    return resolved;
+  };
+
+  // Resolved up front, so a duplicate lookup name fails schema() itself.
+  const uniqueKeys = new Map(
+    snapshot.tables.map((table) => {
+      const keys = new Map<string, readonly string[]>(
+        table.columns
+          .filter((column) => column.unique)
+          .map((column) => [column.name, [column.name]]),
+      );
+
+      for (const { name, columns } of uniqueColumnIndexes(table)) {
+        if (keys.has(name)) {
+          throw new Error(
+            `symmetria: duplicate unique lookup "${table.name}.${name}"`,
+          );
+        }
+
+        keys.set(
+          name,
+          columns.map((column) => column.name),
+        );
+      }
+
+      return [table.name, keys];
+    }),
+  );
+
+  return Object.freeze({
+    snapshot,
+    tablesByName: new Map(snapshot.tables.map((table) => [table.name, table])),
+    codecsFor,
+    uniqueKeys,
+  });
+};
+
 /** State of one shape callback: the plan it builds, its column views and merged bindings. */
 export type QueryContext = {
   readonly registry: TableRegistry;
@@ -41,14 +123,9 @@ export type QueryContext = {
 };
 
 export const createTableRegistry = (
-  snapshot: SchemaSnapshot,
-  codecs: SchemaCodecs = {},
+  { snapshot, tablesByName, codecsFor }: SchemaTables,
   scopes: TableScopes = {},
 ): TableRegistry => {
-  const tablesByName = new Map(
-    snapshot.tables.map((table) => [table.name, table]),
-  );
-  const tableCodecs = new Map<string, TableBinding["codecs"]>();
   // One evaluator per table, so equal scope filters compare as equal.
   const evaluators = new Map<string, ScopePredicate["evaluate"]>();
 
@@ -114,28 +191,10 @@ export const createTableRegistry = (
       throw new Error(`symmetria: unknown table "${tableName}"`);
     }
 
-    let resolvedCodecs = tableCodecs.get(tableName);
-
-    if (!resolvedCodecs) {
-      resolvedCodecs = freeze(
-        codecMap(
-          Object.fromEntries(
-            table.columns.flatMap((column) => {
-              const codec =
-                codecs[tableName]?.[column.name] ?? codecFor(column.sqlType);
-
-              return codec ? [[column.name, codec]] : [];
-            }),
-          ),
-        ),
-      );
-      tableCodecs.set(tableName, resolvedCodecs);
-    }
-
     return freeze({
       table,
       alias,
-      codecs: resolvedCodecs,
+      codecs: codecsFor(table),
     });
   };
 

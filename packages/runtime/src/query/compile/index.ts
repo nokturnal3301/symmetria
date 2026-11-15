@@ -37,6 +37,7 @@ const compileStatement = (
   plan: SelectPlan | MutationPlan,
   placeholder?: Placeholder,
   scopeValues?: ReadonlyMap<ScopePredicate, PredicateDescription>,
+  shapeOnly = false,
 ): CompiledStatement => {
   const compilation = createCompilation(
     plan,
@@ -45,6 +46,7 @@ const compileStatement = (
     (query, outerBindings, jsonValues, jsonOutput) =>
       selectSql(compilation, query, outerBindings, jsonValues, jsonOutput),
     scopeValues,
+    shapeOnly,
   );
 
   collectCommonTables(compilation);
@@ -68,14 +70,18 @@ const renderScope = (
   plan: SelectPlan | MutationPlan,
   slot: ScopeSlot,
   predicate: PredicateDescription,
+  values: ReadonlyMap<ScopePredicate, PredicateDescription>,
   placeholder?: Placeholder,
 ): CompiledQuery | undefined => {
+  // The current values reach filters nested in this one, such as a scoped
+  // query built earlier and used inside another $scope() callback.
   const compilation = createCompilation(
     plan,
     postgresRenderer,
     placeholder,
     (query, outerBindings, jsonValues, jsonOutput) =>
       selectSql(compilation, query, outerBindings, jsonValues, jsonOutput),
+    values,
   );
 
   // Numbering continues from the slot, so equal SQL means equal parameter positions.
@@ -132,6 +138,7 @@ export const currentScopes = (
       plan,
       slot,
       values.get(slot.description)!,
+      values,
       placeholder,
     );
 
@@ -168,6 +175,20 @@ export const compileTemplate = (
   plan: SelectPlan | MutationPlan,
   placeholder: Placeholder,
 ): CompiledStatement => compileStatement(plan, placeholder);
+
+/**
+ * What a plan asks for, apart from its $scope() filters: the SQL with a marker
+ * where each filter sits, and the parameters outside them. It is the same
+ * whatever the callbacks return now or returned when the query was built, so
+ * it can identify the query (a page cursor's fingerprint); it cannot run.
+ */
+export const compileShape = (
+  plan: SelectPlan | MutationPlan,
+): CompiledQuery => {
+  const statement = compileStatement(plan, undefined, undefined, true);
+
+  return { sql: statement.sql, parameters: statement.parameters };
+};
 
 type CachedCompilation = CompiledStatement & {
   /** Object-backed parameters must be re-cloned for every caller. */

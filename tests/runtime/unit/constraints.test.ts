@@ -3,6 +3,7 @@ import {
   schema,
   table,
   index,
+  and,
   int,
   text,
   uuid,
@@ -182,6 +183,77 @@ test("explicit primary keys retain ordering and support single non-id reference 
       children: ({ parents }) => ({ id: int, parent: parents }),
     }),
   ).toThrow(/single scalar primary key/);
+});
+
+test("a key declared out of column order keeps its declared order in lookups, first matches and key subqueries", () => {
+  const tenants = table({ code: text, title: text }).primaryKey((tenants) => [
+    tenants.code,
+  ]);
+  const records = table({
+    tenant: tenants,
+    externalId: text,
+    title: text,
+  }).primaryKey((records) => [records.externalId, records.tenantId]);
+  const notes = table({
+    id: int.auto,
+    tenantCode: text,
+    recordId: text,
+  }).relations((note, { to }) => ({
+    record: to(records).one((record) =>
+      and(
+        note.tenantCode.is(record.tenantId),
+        note.recordId.is(record.externalId),
+      ),
+    ),
+  }));
+  const database = schema({ tenants, records, notes });
+
+  expect(
+    database.records.byId({ tenantId: "acme", externalId: "r1" }).toSQL(),
+  ).toEqual({
+    sql: [
+      'SELECT "records"."tenant_id" AS "tenantId", "records"."external_id" AS "externalId", "records"."title" AS "title"',
+      'FROM "records" AS "records"',
+      'WHERE "records"."external_id" = $1 AND "records"."tenant_id" = $2',
+    ].join("\n"),
+    parameters: ["r1", "acme"],
+  });
+
+  const firstMatch = (column: string, name: string) =>
+    [
+      `(SELECT "__symmetria_path_0_2"."${column}" AS "${name}"`,
+      'FROM "records" AS "__symmetria_path_0_2"',
+      'WHERE ("notes"."tenant_code" = "__symmetria_path_0_2"."tenant_id" AND "notes"."record_id" = "__symmetria_path_0_2"."external_id")',
+      'ORDER BY "__symmetria_path_0_2"."external_id" ASC, "__symmetria_path_0_2"."tenant_id" ASC',
+      "LIMIT 1)",
+    ].join("\n");
+
+  expect(
+    database.notes((note) => ({ title: note.record.title })).toSQL().sql,
+  ).toBe(
+    [
+      'SELECT "__symmetria_path_0"."title" AS "title"',
+      'FROM "notes" AS "notes"',
+      `LEFT JOIN "records" AS "__symmetria_path_0" ON ("__symmetria_path_0"."external_id" = ${firstMatch("external_id", "externalId")} AND "__symmetria_path_0"."tenant_id" = ${firstMatch("tenant_id", "tenantId")})`,
+    ].join("\n"),
+  );
+
+  // Both sides of the row comparison list the key in the same, declared order.
+  expect(
+    database.records
+      .update({ title: "x" })
+      .where((record) => record.tenant.title.is("Acme"))
+      .toSQL(),
+  ).toEqual({
+    sql: [
+      'UPDATE "records" AS "records" SET "title" = $1',
+      'WHERE ("records"."external_id", "records"."tenant_id") IN (SELECT "records"."external_id" AS "externalId", "records"."tenant_id" AS "tenantId"',
+      'FROM "records" AS "records"',
+      'INNER JOIN "tenants" AS "__symmetria_path_0" ON "records"."tenant_id" = "__symmetria_path_0"."code"',
+      'WHERE "__symmetria_path_0"."title" = $2)',
+    ].join("\n"),
+    parameters: ["x", "Acme"],
+  });
 });
 
 test("a partial FK primary key does not introduce junction relations", () => {

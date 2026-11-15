@@ -363,6 +363,21 @@ describe("errors", () => {
     const other = table({ id: uuid.v7, reference: withoutPrimaryKey });
     expect(() => schema({ withoutPrimaryKey, other })).toThrow(/primary key/);
   });
+
+  test("table names that would shadow the database's own members are reserved", () => {
+    for (const name of [
+      "$scope",
+      "$snapshot",
+      "$close",
+      "$transaction",
+      "$createIndexes",
+      "then",
+    ]) {
+      expect(() => schema({ [name]: { id: uuid.v7 } } as never)).toThrow(
+        `symmetria: reserved table name "${name}"`,
+      );
+    }
+  });
 });
 
 describe("snapshot is plain data", () => {

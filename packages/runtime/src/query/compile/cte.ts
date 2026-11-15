@@ -7,6 +7,7 @@ import {
 } from "../plan/types";
 import { quoteIdentifier, type Compilation } from "./state";
 import { selectSql } from "./select";
+import { childNodes } from "../plan/traverse";
 
 /**
  * Collects common table expressions before rendering, visiting the plan in the
@@ -19,83 +20,17 @@ export const collectCommonTables = (compilation: Compilation): void => {
   const tables = new Set<string>();
 
   const walkValue = (node: ValueNode): void => {
-    switch (node.kind) {
-      case "jsonPath":
-      case "arrayIndex":
-      case "arrayLength":
-        walkValue(node.value);
+    if (
+      node.kind === "subquery" ||
+      node.kind === "rowCount" ||
+      node.kind === "jsonRows"
+    ) {
+      walkSelect(node.query);
 
-        return;
-      case "jsonObject":
-        node.selection.forEach((expression) => walkValue(expression.node));
-
-        return;
-      case "raw":
-        node.parts.forEach((part) => {
-          if (typeof part !== "string") {
-            walkValue(part);
-          }
-        });
-
-        return;
-      case "binary":
-        walkValue(node.left);
-        walkValue(node.right);
-
-        return;
-      case "aggregate":
-        if (node.value) {
-          walkValue(node.value);
-        }
-
-        return;
-      case "case":
-        walkValue(node.value);
-        node.branches.forEach((branch) => {
-          walkValue(branch.when);
-          walkValue(branch.then);
-        });
-
-        return;
-      case "coalesce":
-      case "tuple":
-        node.values.forEach(walkValue);
-
-        return;
-      case "relativeWindow":
-        walkValue(node.value);
-        walkValue(node.offset);
-
-        if (node.fallback) {
-          walkValue(node.fallback);
-        }
-
-        return;
-      case "window":
-        walkValue(node.expression);
-        node.partitionBy.forEach(walkValue);
-        node.orderBy.forEach((ordering) => walkValue(ordering.expression.node));
-
-        return;
-      case "searchRank":
-      case "searchHeadline":
-        walkValue(node.value);
-        walkValue(node.query);
-
-        return;
-      case "tsvector":
-        node.parts.forEach((part) => walkValue(part.value));
-
-        return;
-      case "subquery":
-      case "rowCount":
-      case "jsonRows":
-        walkSelect(node.query);
-
-        return;
-      default:
-        return;
+      return;
     }
+
+    childNodes(node).forEach(walkValue);
   };
 
   const walkPredicate = (description: PredicateDescription): void => {
@@ -110,6 +45,11 @@ export const collectCommonTables = (compilation: Compilation): void => {
 
         return;
       case "scope":
+        // A shape-only compilation renders a marker instead of the filter.
+        if (compilation.shapeOnly) {
+          return;
+        }
+
         walkPredicate(
           compilation.scopeValues?.get(description) ?? description.predicate,
         );
@@ -255,6 +195,11 @@ export const collectCommonTables = (compilation: Compilation): void => {
 
       if (query.conflict?.action === "update") {
         walkAssignments(query.conflict.values);
+
+        // The `doUpdate(values, { where })` condition, rendered after SET.
+        if (query.conflict.condition) {
+          walkPredicate(query.conflict.condition);
+        }
       }
     } else if (query.kind === "update") {
       walkAssignments(query.values[0]!);

@@ -28,6 +28,7 @@ export type {
   RootScope,
   RuntimeScope,
   ScopedColumn,
+  SelectedFields,
   ShapeControls,
   ShapeJoins,
   ShapeTools,
@@ -39,4 +40,8 @@ export {
   readSelection,
   validateNode,
 } from "./scope";
-export { createQueryTables, type TableScopes } from "./tables";
+export {
+  createQueryTables,
+  createSchemaTables,
+  type TableScopes,
+} from "./tables";

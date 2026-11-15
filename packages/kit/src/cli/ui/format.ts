@@ -1,6 +1,7 @@
 /**
  * Plain-text formatters for CLI output: diffs, schemas, status, dashboard, created files, execution logs and help.
  */
+import { isAbsolute, relative } from "node:path";
 import type { PullWarning } from "../../introspection/model";
 import type { ColumnSnapshot, SchemaSnapshot, TableSnapshot } from "symmetria";
 import {
@@ -531,9 +532,15 @@ export const formatCreated = (
   color = false,
 ): string => {
   const { style } = theme(color);
+  // Inside the working directory the relative path says the same in less room.
+  const inside = relative(process.cwd(), directory);
+  const shown =
+    inside && !inside.startsWith("..") && !isAbsolute(inside)
+      ? inside
+      : directory;
 
   return [
-    `\n  ${style("✓", "success")} ${style("Created", "strong")} ${style(directory, "accent")}`,
+    `\n  ${style("✓", "success")} ${style("Created", "strong")} ${style(shown, "accent")}`,
     "",
     ...files.map(
       (file, position) =>

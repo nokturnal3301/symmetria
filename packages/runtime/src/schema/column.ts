@@ -14,6 +14,18 @@ import {
 
 export const COLUMN_CODEC = Symbol("symmetria.column.codec");
 
+/**
+ * Marks a `sql` template as a raw SQL default. `.default()` looks for this
+ * brand, never for a shape: `{ kind: "sql", sql }` is a legitimate JSON value.
+ */
+export const SQL_DEFAULT: unique symbol = Symbol("symmetria.column.sqlDefault");
+
+/** What `.default()` reads off a `sql` template; `sql` throws on interpolations. */
+export type SqlDefault = {
+  readonly [SQL_DEFAULT]: true;
+  readonly sql: string;
+};
+
 /** Type-level metadata carried by every column. Kept flat and minimal on purpose:
  *  every extra field here multiplies type instantiations across the whole schema. */
 export type ColumnMetadata = {
@@ -152,7 +164,7 @@ export interface Column<Metadata extends ColumnMetadata = ColumnMetadata> {
     value:
       | ColumnInputType<Metadata>
       | (Metadata["notNull"] extends false ? null : never)
-      | { kind: "sql"; sql: string },
+      | SqlDefault,
   ): Column<
     Omit<Metadata, "hasDefault" | "generated"> & {
       hasDefault: true;
@@ -331,15 +343,15 @@ const makeColumn = (
 
   Object.defineProperty(column, "default", {
     value: (value: unknown) => {
+      // Only a branded `sql` template is raw SQL; a plain object of the
+      // same shape is a value, as a jsonb column may well store one.
       const isSql =
-        typeof value === "object" &&
-        value !== null &&
-        (value as { kind?: string }).kind === "sql";
+        typeof value === "object" && value !== null && SQL_DEFAULT in value;
 
       return chain({
         ...definition,
         default: isSql
-          ? { kind: "sql", sql: (value as { sql: string }).sql }
+          ? { kind: "sql", sql: (value as SqlDefault).sql }
           : { kind: "value", value },
       });
     },
@@ -357,16 +369,6 @@ const base = (
     { sqlType, notNull: true, unique: false, primaryKey: false },
     extras,
   );
-};
-
-/** Internal literal-only SQL defaults, used by uuid and timestamp builders. */
-export const sql = (
-  strings: TemplateStringsArray,
-  ...values: never[]
-): { kind: "sql"; sql: string } => {
-  void values;
-
-  return { kind: "sql", sql: strings.join("") };
 };
 
 // ---------------------------------------------------------------------------

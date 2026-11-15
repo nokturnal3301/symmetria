@@ -54,7 +54,12 @@ export type PullWarningCode =
   | "name"
   | "partition"
   | "exclusion"
-  | "extension";
+  | "extension"
+  | "inheritance"
+  | "row-security"
+  | "function"
+  | "sequence"
+  | "other-schema";
 
 export type PullWarning = {
   readonly code: PullWarningCode;
@@ -272,6 +277,9 @@ const customValueType = (sqlType: string): string => {
   return "string";
 };
 
+/** How many names a warning that covers many objects spells out. */
+const LISTED_NAMES = 10;
+
 const renameFix = (table: string, from: string, to: string) =>
   `ALTER TABLE ${quoteSql(table)} RENAME CONSTRAINT ${quoteSql(from)} TO ${quoteSql(to)};`;
 
@@ -333,17 +341,123 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       conventionalNames.enumeration(column.table_name, column.column_name);
 
   // Views, materialized views and triggers have no declaration; list each one.
+  const quotedList = (names: readonly string[]): string =>
+    names.map((name) => `"${name}"`).join(", ");
+  const routines: string[] = [];
+
   for (const object of catalog.undeclared ?? []) {
+    switch (object.kind) {
+      case "inheritance":
+        warn({
+          code: "inheritance",
+          table: object.name,
+          object: object.definition,
+          message: `"${object.name}" inherits from "${object.definition}"; the schema has no inheritance, so both are declared as separate plain tables: a database built from this schema does not show the rows of "${object.name}" in "${object.definition}"`,
+        });
+        break;
+      case "row security": {
+        const [state, ...policies] = object.definition.split("\n");
+        const listed = policies.length
+          ? ` with ${policies.length === 1 ? "policy" : "policies"} ${quotedList(policies)}`
+          : " without policies";
+
+        warn({
+          code: "row-security",
+          table: object.name,
+          message:
+            state === "enabled"
+              ? `"${object.name}" has row-level security enabled${listed}; the schema declares neither, so a database built from this schema leaves every row of the table visible and writable`
+              : `"${object.name}" has ${policies.length === 1 ? "policy" : "policies"} ${quotedList(policies)} but row-level security is not enabled; the schema does not declare policies and migrations neither create nor drop them`,
+        });
+        break;
+      }
+      case "function":
+        routines.push(object.name);
+        break;
+      default:
+        warn({
+          code: object.kind === "trigger" ? "trigger" : "view",
+          table: object.table_name ?? object.name,
+          object: object.name,
+          message:
+            object.kind === "trigger"
+              ? `trigger "${object.name}" on "${object.table_name}" is not declared; the schema does not manage triggers, so migrations neither create nor drop it`
+              : `${object.kind} "${object.name}" is not declared; queries cannot reach it through the schema and migrations neither create nor drop it`,
+        });
+    }
+  }
+
+  // One entry for all routines: a schema can hold hundreds.
+  const listedNames = (names: readonly string[]): string =>
+    names.length > LISTED_NAMES
+      ? `${quotedList(names.slice(0, LISTED_NAMES))} and ${names.length - LISTED_NAMES} more`
+      : quotedList(names);
+  const uniqueRoutines = [...new Set(routines)];
+
+  if (uniqueRoutines.length) {
     warn({
-      code: object.kind === "trigger" ? "trigger" : "view",
-      table: object.table_name ?? object.name,
-      object: object.name,
-      message:
-        object.kind === "trigger"
-          ? `trigger "${object.name}" on "${object.table_name}" is not declared; the schema does not manage triggers, so migrations neither create nor drop it`
-          : `${object.kind} "${object.name}" is not declared; queries cannot reach it through the schema and migrations neither create nor drop it`,
+      code: "function",
+      message: `${uniqueRoutines.length === 1 ? "function or procedure" : `${uniqueRoutines.length} functions and procedures`} ${listedNames(uniqueRoutines)} ${uniqueRoutines.length === 1 ? "is" : "are"} not declared; the schema does not manage routines, so migrations neither create nor drop them and a database built from this schema lacks them`,
     });
   }
+
+  // A serial column owns its sequence and an identity column hides its own;
+  // any other sequence exists only in the database.
+  const standalone = (catalog.sequences ?? [])
+    .filter((sequence) => sequence.owner_table === null)
+    .map((sequence) => sequence.name);
+
+  if (standalone.length) {
+    warn({
+      code: "sequence",
+      message: `${standalone.length === 1 ? "sequence" : `${standalone.length} sequences`} ${listedNames(standalone)} ${standalone.length === 1 ? "is" : "are"} not owned by a column and not declared; migrations neither create nor drop ${standalone.length === 1 ? "it" : "them"} and a database built from this schema lacks ${standalone.length === 1 ? "it" : "them"}`,
+    });
+  }
+
+  const otherSchemas = catalog.otherSchemas ?? [];
+
+  if (otherSchemas.length) {
+    const total = otherSchemas.reduce((sum, entry) => sum + entry.tables, 0);
+
+    warn({
+      code: "other-schema",
+      message: `${total} ${total === 1 ? "table" : "tables"} in ${otherSchemas.length === 1 ? "another schema was" : "other schemas were"} not read: ${otherSchemas
+        .slice(0, LISTED_NAMES)
+        .map((entry) => `"${entry.schema}" (${entry.tables})`)
+        .join(
+          ", ",
+        )}${otherSchemas.length > LISTED_NAMES ? ` and ${otherSchemas.length - LISTED_NAMES} more` : ""}; pull reads one schema, here "${catalog.schemaName}"`,
+    });
+  }
+
+  /**
+   * The sequence a nextval() default names, when the column owns it and no
+   * other default draws from it: only then can the column become an identity
+   * and the sequence be dropped.
+   */
+  const serialSequence = (
+    column: CatalogColumn,
+    reference: string,
+  ): { exclusive: boolean; reason: string } => {
+    const sequence = (catalog.sequences ?? []).find(
+      (entry) => entry.reference === reference || entry.name === reference,
+    );
+
+    if (
+      sequence?.owner_table !== column.table_name ||
+      sequence.owner_column !== column.column_name
+    ) {
+      return {
+        exclusive: false,
+        reason: "is not owned by the column",
+      };
+    }
+
+    return {
+      exclusive: sequence.defaults <= 1,
+      reason: `is also the default of ${sequence.defaults - 1} other ${sequence.defaults === 2 ? "column" : "columns"}`,
+    };
+  };
 
   // -- pass 1: tables that can be declared, with their catalog facts ----------
   const facts = new Map<string, TableFacts>();
@@ -901,6 +1015,7 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       const member = columnMember(column, key, table, {
         ownsEnum,
         enumValues: (name) => enumLabels.get(name),
+        serialSequence,
         warn,
         uniqueFor,
         indexFor,
@@ -1085,6 +1200,10 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
 type ColumnTools = {
   ownsEnum: (column: CatalogColumn) => boolean;
   enumValues: (name: string) => string[] | undefined;
+  serialSequence: (
+    column: CatalogColumn,
+    reference: string,
+  ) => { exclusive: boolean; reason: string };
   warn: (warning: PullWarning) => void;
   uniqueFor: (columnName: string) => { unique: boolean; comments: string[] };
   indexFor: (columnName: string, unique: boolean) => boolean;
@@ -1344,6 +1463,25 @@ const columnDefault = (
   const serial = /^nextval\('((?:[^']|'')*)'::regclass\)$/.exec(text);
 
   if (serial) {
+    const sequence = unescapeLiteral(serial[1]!);
+    const { exclusive, reason } = tools.serialSequence(column, sequence);
+
+    // Dropping a sequence other columns draw from would break their defaults.
+    if (!exclusive) {
+      comments.push(
+        "default from a shared sequence; migrations will not create the sequence",
+      );
+      tools.warn({
+        code: "sequence",
+        table: table.sqlName,
+        column: column.column_name,
+        object: sequence,
+        message: `"${name}" takes its default from sequence ${sequence}, which ${reason}; the schema keeps the nextval() default but migrations from this schema will not create the sequence, and no identity fix is offered because it would drop a sequence something else may use`,
+      });
+
+      return { kind: "sql", sql: text };
+    }
+
     comments.push("serial column; migrations will not create the sequence");
     tools.warn({
       code: "serial",
@@ -1353,13 +1491,7 @@ const columnDefault = (
         ? `"${name}" is a serial column; the schema keeps its nextval() default but migrations from this schema will not create the sequence. The fix makes it an identity column (.auto.byDefault) that continues the sequence`
         : `"${name}" is a serial column; the schema keeps its nextval() default but migrations from this schema will not create the sequence`,
       ...(integer
-        ? {
-            fix: serialFix(
-              table.sqlName,
-              column.column_name,
-              unescapeLiteral(serial[1]!),
-            ),
-          }
+        ? { fix: serialFix(table.sqlName, column.column_name, sequence) }
         : {}),
     });
 

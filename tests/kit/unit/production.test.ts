@@ -201,6 +201,27 @@ test("SQL lint passes safe column additions and renames, and downgrades rebuilt 
   );
 });
 
+test("SQL lint reviews statements whose table or column is called rename", () => {
+  const findings = lintMigrationSQL(`
+    ALTER TABLE "posts" ADD COLUMN rename text NOT NULL;
+    ALTER TABLE rename DROP COLUMN "title";
+    ALTER TABLE rename ALTER COLUMN "views" SET NOT NULL;
+    ALTER INDEX rename SET TABLESPACE fast;
+    ALTER TABLE rename RENAME TO "renamed";
+    ALTER TABLE "posts" RENAME COLUMN rename TO "drop";
+    ALTER TYPE "posts_state_enum" RENAME VALUE 'draft' TO 'rename';
+    ALTER INDEX IF EXISTS rename RENAME TO "posts_rename_idx";
+  `);
+  expect(findings.map((finding) => [finding.statement, finding.level])).toEqual(
+    [
+      [1, "blocking"],
+      [2, "destructive"],
+      [3, "blocking"],
+      [4, "caution"],
+    ],
+  );
+});
+
 test("SQL lint sees anonymous table constraints, including those added next to a column", () => {
   const findings = lintMigrationSQL(`
     ALTER TABLE "posts" ADD PRIMARY KEY ("id");

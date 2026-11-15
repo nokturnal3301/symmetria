@@ -44,6 +44,36 @@ const addsEnumLabel = (words: readonly string[]): boolean =>
     (word, position) => word === "ADD" && words[position + 1] === "VALUE",
   );
 
+const NAME = String.raw`(?:"|[A-Z_][A-Z_0-9$]*)`;
+const NONTRANSACTIONAL = [
+  /^CREATE (?:UNIQUE )?INDEX CONCURRENTLY(?: |$)/,
+  /^DROP INDEX CONCURRENTLY(?: |$)/,
+  // REINDEX (VERBOSE, CONCURRENTLY) … and REINDEX TABLE CONCURRENTLY …
+  /^REINDEX \( (?:[^)]* , )?CONCURRENTLY(?! (?:FALSE|OFF) )/,
+  /^REINDEX (?:\( [^)]*\) )?(?:INDEX|TABLE|SCHEMA|DATABASE|SYSTEM) CONCURRENTLY(?: |$)/,
+  new RegExp(
+    String.raw`^ALTER TABLE .* DETACH PARTITION ${NAME}(?: \. ${NAME})* CONCURRENTLY$`,
+  ),
+  /^VACUUM(?: |$)/,
+  /^(?:CREATE|DROP) (?:DATABASE|TABLESPACE) /,
+  /^ALTER SYSTEM /,
+];
+
+/**
+ * A statement PostgreSQL refuses inside a transaction block. The keyword has
+ * to stand where the grammar puts it: a column, table or index may be called
+ * `concurrently`, and REFRESH MATERIALIZED VIEW CONCURRENTLY runs in a
+ * transaction. `code` is a statement without comments and string literals.
+ */
+const nontransactional = (code: string): boolean => {
+  // Quoted identifiers become a bare `"`, so no name reads as a keyword.
+  const text = (code.match(/"(?:[^"]|"")*"|[A-Za-z_][\w$]*|[().,]/g) ?? [])
+    .map((token) => (token.startsWith('"') ? '"' : token.toUpperCase()))
+    .join(" ");
+
+  return NONTRANSACTIONAL.some((pattern) => pattern.test(text));
+};
+
 /**
  * Adjacent batch migrations share one transaction, except that a migration
  * adding enum labels ends its group: PostgreSQL refuses a label in the
@@ -71,9 +101,7 @@ export const executionPlan = (
 
     if (
       transaction !== "none" &&
-      parsed.some(
-        ({ words }) => words.includes("CONCURRENTLY") || words[0] === "VACUUM",
-      )
+      parsed.some(({ code }) => nontransactional(code))
     ) {
       throw new Error(
         `symmetria: migration "${migration.id}" requires transaction: "none"`,
@@ -213,6 +241,13 @@ export type MigrationConnection = {
   readonly pooled?: boolean;
 };
 
+/**
+ * The statement timeout when none is configured. It guards transactions, which
+ * hold their locks until they end; the runner lifts it for the statements of a
+ * `transaction: "none"` migration.
+ */
+export const DEFAULT_STATEMENT_TIMEOUT_MS = 600000;
+
 const LOCK_SETTINGS =
   "SELECT set_config('lock_timeout', $1, $4), set_config('statement_timeout', $2, $4), set_config('standard_conforming_strings', $3, $4)";
 
@@ -304,7 +339,7 @@ export const withMigrationConnection = async <Result>(
 ): Promise<Result> => {
   const advisory = options.advisoryLockTimeoutMs ?? 10000;
   const ddl = options.lockTimeoutMs ?? 5000;
-  const statement = options.statementTimeoutMs ?? 600000;
+  const statement = options.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS;
 
   for (const value of [advisory, ddl, statement]) {
     if (!Number.isSafeInteger(value) || value < 0 || value > 2147483647) {

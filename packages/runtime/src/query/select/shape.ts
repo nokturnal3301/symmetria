@@ -1,6 +1,8 @@
 /** applyShape(): evaluates one projection callback with its options into a plan. */
 import { freeze } from "../plan/freeze";
 import {
+  COLUMN_EXPRESSION,
+  createExpression,
   notNullPredicate,
   readColumn,
   type Ordering,
@@ -47,6 +49,73 @@ const queryOptionNames = new Set<keyof QueryOptions<never, never>>([
   "forUpdate",
   "forShare",
 ]);
+
+/**
+ * The options that also receive the projection's fields. A WHERE runs before
+ * aggregates and windows exist, so `where` reads the source columns only.
+ */
+const selectedOptionNames: ReadonlySet<string> = new Set([
+  "orderBy",
+  "groupBy",
+  "having",
+]);
+
+/** A nested object, collection or relation: several values, not one to sort or group by. */
+const nestedField = (value: unknown): boolean => {
+  if (!value || typeof value !== "object" || !(COLUMN_EXPRESSION in value)) {
+    return true;
+  }
+
+  const { kind } = readColumn(value as SelectedColumn).node;
+
+  return kind === "jsonRows" || kind === "jsonObject";
+};
+
+/**
+ * The third argument of `orderBy`, `groupBy` and `having` callbacks: the
+ * fields the projection callback returned, as the same expressions, so a
+ * computed field is written once. Without new fields it is the selection the
+ * query already has. Nested results and unknown names fail when they are read.
+ */
+const selectedFields = (
+  projection: unknown,
+  plan: SelectPlan,
+): Record<string, unknown> => {
+  const returned =
+    projection && typeof projection === "object" && !Array.isArray(projection)
+      ? (projection as Record<string, unknown>)
+      : {};
+  const fields: Record<string, unknown> = Object.keys(returned).length
+    ? returned
+    : Object.fromEntries(
+        plan.selection.map((expression) => [
+          expression.outputName,
+          createExpression(expression),
+        ]),
+      );
+
+  return new Proxy(fields, {
+    get: (target, name) => {
+      if (typeof name !== "string") {
+        return Reflect.get(target, name);
+      }
+
+      if (!Object.hasOwn(target, name)) {
+        throw new Error(
+          `symmetria: "${name}" is not a selected field; the third callback argument holds the projection's fields: ${Object.keys(target).join(", ") || "none"}`,
+        );
+      }
+
+      if (nestedField(target[name])) {
+        throw new Error(
+          `symmetria: selected field "${name}" is a nested result; orderBy, groupBy and having take scalar fields`,
+        );
+      }
+
+      return target[name];
+    },
+  });
+};
 
 export const applyShape = (
   context: QueryContext,
@@ -141,6 +210,8 @@ export const applyShape = (
       const projection = callback(columns, tools);
 
       if (options !== undefined) {
+        let selected: object | undefined;
+
         controls = Object.entries(options).map(([name, value]) => {
           if (!queryOptionNames.has(name as keyof QueryOptions<never, never>)) {
             throw new Error(`symmetria: unknown query option "${name}"`);
@@ -148,7 +219,15 @@ export const applyShape = (
 
           return [
             name,
-            typeof value === "function" ? value(columns, tools) : value,
+            typeof value !== "function"
+              ? value
+              : selectedOptionNames.has(name)
+                ? value(
+                    columns,
+                    tools,
+                    (selected ??= selectedFields(projection, context.plan)),
+                  )
+                : value(columns, tools),
           ];
         });
       }

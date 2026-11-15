@@ -7,9 +7,17 @@ import {
   formatDriftFindings,
   loadMigrationState,
   migrator,
+  snapshotHash,
   verifyMigrations,
 } from "../../index";
+import { boundaryDifferences } from "../../migrations/verify";
 import { formatExecution, formatStatus } from "../ui/format";
+import { ask } from "../ui/terminal";
+import {
+  confirmRollback,
+  databaseName,
+  rollbackSummary,
+} from "../screens/rollback-prompt";
 import {
   withCancellation,
   withDatabase,
@@ -45,15 +53,21 @@ export const verify = async (
   });
 };
 
-/** `drift`: compare the live catalog with the latest snapshot or the declared schema. */
+/**
+ * `drift`: compare the live catalog with the latest snapshot or the declared
+ * schema. A database that is some migrations behind the local chain, after a
+ * rollback or before a deploy, is not compared with the latest snapshot: every
+ * pending change would read as drift. There are no older snapshots, so its own
+ * boundary is checked by replaying the chain on the verification server, when
+ * one is configured.
+ */
 export const drift = async (
   context: CliContext,
   project: Project,
 ): Promise<void> =>
-  withDatabase(project, async (driver) => {
-    const { migrations, snapshot } = await loadMigrationState(
-      project.directory,
-    );
+  withDatabase(project, async (driver, signal) => {
+    const state = await loadMigrationState(project.directory);
+    const { migrations, snapshot } = state;
     const expected =
       (migrations.length ? snapshot : undefined) ?? project.snapshot();
 
@@ -64,7 +78,76 @@ export const drift = async (
     }
 
     const { metadataSchema, metadataTable } = project.config;
-    const { ignoreTables } = project.runnerOptions;
+    const { ignoreTables, verificationDatabaseUrl } = project.runnerOptions;
+    const history = migrations.length
+      ? await migrator({ ...project.runnerOptions, driver, signal }).status()
+      : [];
+    const applied = history.findLastIndex(
+      (entry) => entry.status === "applied",
+    );
+
+    // A database with no applied migration is compared with the latest
+    // snapshot, as before `adopt`; so is one whose pending migrations leave
+    // the schema as it is.
+    if (
+      applied >= 0 &&
+      applied < migrations.length - 1 &&
+      migrations[applied]!.manifest.after !== snapshotHash(snapshot)
+    ) {
+      const lastApplied = migrations[applied]!.id;
+      const pending = migrations.slice(applied + 1).map(({ id }) => id);
+      const differences = verificationDatabaseUrl
+        ? await context.progress("Replaying the applied migrations", () =>
+            boundaryDifferences({
+              ...project.runnerOptions,
+              execute: driver.execute,
+              state,
+              target: applied,
+              url: verificationDatabaseUrl,
+              signal,
+            }),
+          )
+        : undefined;
+      const summary = `The database is ${pending.length} ${pending.length === 1 ? "migration" : "migrations"} behind the local chain (last applied: ${lastApplied}); drift is checked against the latest snapshot only.`;
+
+      context.emit({
+        json: {
+          findings: [],
+          behind: {
+            migrations: pending.length,
+            lastApplied,
+            pending,
+            verified: differences ? differences.length === 0 : null,
+            ...(differences?.length ? { differences } : {}),
+          },
+        },
+        indent: 2,
+        plain: () =>
+          [
+            summary,
+            ...(differences === undefined
+              ? [
+                  `Run migrate, or verify the database against ${lastApplied} with --verify-url.`,
+                ]
+              : differences.length
+                ? [
+                    `Replaying the chain up to ${lastApplied} on the verification server gives a different schema:`,
+                    ...differences.map((line) => `  ${line}`),
+                  ]
+                : [
+                    `Replaying the chain up to ${lastApplied} on the verification server gives the same schema: no schema drift detected.`,
+                  ]),
+          ].join("\n"),
+      });
+
+      // Being behind is not drift; a boundary that does not match is.
+      if (context.values.strict && differences?.length) {
+        process.exitCode = 1;
+      }
+
+      return;
+    }
+
     const findings = await context.progress("Inspecting the database", () =>
       detectDrift({
         execute: driver.execute,
@@ -222,11 +305,44 @@ export const rollback = (
       return plan(context, runner, "down");
     }
 
+    const steps = values.steps === undefined ? 1 : Number(values.steps);
+
+    // down.sql usually removes columns or tables, so it never runs unasked.
+    if (
+      !values.yes &&
+      (await runner.status()).some((entry) => entry.status !== "pending")
+    ) {
+      if (!context.interactive) {
+        throw new Error(
+          "symmetria: rollback runs down.sql, which can remove data; review it with --plan and pass --yes to run it",
+        );
+      }
+
+      const confirmed = await confirmRollback(
+        rollbackSummary(await runner.plan({ steps, direction: "down" })),
+        databaseName(project.databaseUrl),
+        {
+          write: (text) => process.stdout.write(text),
+          select: context.select,
+          ask: (question) => ask(question, context.color),
+        },
+      );
+
+      if (!confirmed) {
+        context.emit({
+          json: { reverted: [], cancelled: true },
+          pretty: () =>
+            `\n  ${context.style("○", "muted")} Rollback cancelled; nothing was changed.\n`,
+          plain: () => "Rollback cancelled; nothing was changed.",
+        });
+
+        return;
+      }
+    }
+
     const started = performance.now();
     const reverted = await context.progress("Rolling back migrations", () =>
-      runner.rollback(
-        values.steps === undefined ? {} : { steps: Number(values.steps) },
-      ),
+      runner.rollback(values.steps === undefined ? {} : { steps }),
     );
     const durationMs = Math.round(performance.now() - started);
     context.emit({

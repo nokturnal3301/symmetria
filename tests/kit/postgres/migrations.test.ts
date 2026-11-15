@@ -1106,7 +1106,12 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       (await execute("SELECT to_regclass('cli_records')::text AS name"))[0]
         ?.name,
     ).toBe("cli_records");
-    expect(await run("rollback")).toMatchObject({
+    // down.sql never runs unasked: without a terminal it needs --yes.
+    const refused = await run("rollback");
+
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("pass --yes");
+    expect(await run("rollback", "--yes")).toMatchObject({
       exitCode: 0,
       stdout: "Reverted 000001_cli\n",
     });
@@ -1222,6 +1227,83 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     );
   });
 
+  test("CLI drift on a database behind the chain reports that, and verifies the applied boundary on request", async () => {
+    const config = join(directory, "config.ts");
+    const url = new URL(databaseUrl!);
+    url.searchParams.set("options", `-c search_path=${namespace}`);
+    const configure = (model: { $snapshot: () => unknown }) =>
+      writeFile(
+        config,
+        `export default ${JSON.stringify({ schema: model.$snapshot(), directory: "files", databaseUrl: url.toString(), metadataSchema: namespace })};\n`,
+      );
+    const run = (...argumentsList: string[]) =>
+      runCli(config, ...argumentsList);
+    const report = async (...argumentsList: string[]) => {
+      const result = await run("drift", "--strict", "--json", ...argumentsList);
+
+      return { exitCode: result.exitCode, ...JSON.parse(result.stdout) };
+    };
+
+    await configure(schema({ notes: { id: int.auto, title: text } }));
+    expect((await run("generate", "initial")).exitCode).toBe(0);
+    await configure(
+      schema({ notes: { id: int.auto, title: text, body: text.nullable } }),
+    );
+    expect((await run("generate", "body")).exitCode).toBe(0);
+    expect((await run("migrate")).exitCode).toBe(0);
+    expect(await report()).toEqual({ exitCode: 0, findings: [] });
+
+    // One migration back on purpose: the missing column is not drift.
+    expect((await run("rollback", "--yes")).exitCode).toBe(0);
+    const behind = {
+      migrations: 1,
+      lastApplied: "000001_initial",
+      pending: ["000002_body"],
+    };
+    expect(await report()).toEqual({
+      exitCode: 0,
+      findings: [],
+      behind: { ...behind, verified: null },
+    });
+    expect((await run("drift", "--strict")).stdout).toBe(
+      "The database is 1 migration behind the local chain (last applied: 000001_initial); drift is checked against the latest snapshot only.\nRun migrate, or verify the database against 000001_initial with --verify-url.\n",
+    );
+    expect(await report("--verify-url", databaseUrl!)).toEqual({
+      exitCode: 0,
+      findings: [],
+      behind: { ...behind, verified: true },
+    });
+    expect((await run("drift", "--verify-url", databaseUrl!)).stdout).toContain(
+      "Replaying the chain up to 000001_initial on the verification server gives the same schema: no schema drift detected.",
+    );
+
+    // A manual change on top of the older boundary is drift again.
+    await execute("ALTER TABLE notes ADD COLUMN manual text");
+    expect(await report()).toMatchObject({
+      exitCode: 0,
+      behind: { verified: null },
+    });
+    const drifted = await report("--verify-url", databaseUrl!);
+    expect(drifted).toMatchObject({
+      exitCode: 1,
+      findings: [],
+      behind: { ...behind, verified: false },
+    });
+    expect(drifted.behind.differences).toEqual([
+      expect.stringMatching(/^unexpected columns: .*"manual"/),
+    ]);
+    expect((await run("drift", "--verify-url", databaseUrl!)).stdout).toMatch(
+      /gives a different schema:\n {2}unexpected columns: /,
+    );
+
+    // Caught up, the latest snapshot is the reference again.
+    expect((await run("migrate")).exitCode).toBe(0);
+    expect(await report()).toEqual({
+      exitCode: 1,
+      findings: [{ kind: "extra-column", table: "notes", column: "manual" }],
+    });
+  });
+
   test("CLI creates a separate metadata schema and checks drift in the application schema", async () => {
     const metadataSchema = `${namespace}_meta`;
     const model = schema({
@@ -1269,7 +1351,7 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
           { kind: "extra-column", table: "history", column: "manual" },
         ],
       });
-      expect((await runCli(config, "rollback")).exitCode).toBe(0);
+      expect((await runCli(config, "rollback", "--yes")).exitCode).toBe(0);
       expect(
         await execute(`SELECT id FROM "${metadataSchema}".history`),
       ).toEqual([]);

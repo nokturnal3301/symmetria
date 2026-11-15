@@ -5,13 +5,100 @@ import { emitKeypressEvents } from "node:readline";
 import type { ProfiledRequest, ProfiledQuery } from "symmetria";
 import { fitLine, terminalWidth, theme, wrapLines } from "../ui/style";
 import { withScreen } from "../ui/terminal";
-import { explainLines, wrapExplainLines } from "./query-inspector";
+import {
+  explainLines,
+  terminalText,
+  wrapExplainLines,
+} from "./query-inspector";
 
 /** Why the profiler endpoint refused a request, with the fix for a wrong token. */
 export const profilerHttpError = (status: number): string =>
   status === 403
     ? "symmetria: the profiler rejected the token; pass --profile-token or set SYMMETRIA_PROFILE_TOKEN to the value used by profiler.serve()"
     : `symmetria: profiler returned HTTP ${status}`;
+
+const milliseconds = (value: number) => `${value.toFixed(3)} ms`;
+
+/**
+ * The lines of one request's view: its timings, the error that ended it and
+ * its queries, with the selected one marked. A request can fail before it runs
+ * a query; then the error stands where the list would be.
+ */
+export const requestLines = (
+  request: ProfiledRequest,
+  selectedQuery: number,
+  view: {
+    width: number;
+    height: number;
+    style: ReturnType<typeof theme>["style"];
+  },
+): string[] => {
+  const { width, height, style } = view;
+  // Narrow terminals drop columns rather than cutting the timings off.
+  const compact = width < 72;
+  const lines = [
+    style(
+      `${request.label} · build ${milliseconds(request.buildMs)} · total ${milliseconds(request.durationMs)}`,
+      "pink",
+    ),
+  ];
+
+  if (request.error) {
+    // Half the screen at most, so the queries that led to it stay visible.
+    const message = wrapLines(
+      style(`Error: ${terminalText(request.error)}`, "danger"),
+      width,
+    );
+    const limit = request.queries.length
+      ? Math.max(1, Math.floor(height / 2) - 1)
+      : Math.max(1, height - 2);
+
+    lines.push(
+      ...message.slice(0, limit),
+      ...(message.length > limit ? [style("…", "danger")] : []),
+    );
+  }
+
+  if (!request.queries.length) {
+    lines.push(
+      style(
+        request.error
+          ? "The request ran no queries before it failed."
+          : "The request ran no queries.",
+        "muted",
+      ),
+    );
+
+    return lines;
+  }
+
+  lines.push(
+    style(
+      compact
+        ? `${"Query".padEnd(18)}${"Database".padStart(10)} ${"Rows".padStart(6)}`
+        : "Query                       Compile       Database       Decode    Rows",
+      "muted",
+    ),
+  );
+  const rows = Math.max(1, height - lines.length);
+  const start = Math.max(0, selectedQuery - rows + 1);
+
+  for (const [position, entry] of request.queries
+    .slice(start, start + rows)
+    .entries()) {
+    const marker = start + position === selectedQuery ? "›" : " ";
+    lines.push(
+      style(
+        compact
+          ? `${marker} ${entry.kind.padEnd(7)} #${String(entry.id).padEnd(6)} ${entry.databaseMs.toFixed(3).padStart(10)} ${String(entry.rows).padStart(6)}${entry.error ? " ERROR" : ""}`
+          : `${marker} ${entry.kind.padEnd(9)} #${String(entry.id).padEnd(10)} ${entry.compileMs.toFixed(3).padStart(9)} ${entry.databaseMs.toFixed(3).padStart(14)} ${entry.decodeMs.toFixed(3).padStart(12)} ${String(entry.rows).padStart(7)}${entry.error ? " ERROR" : ""}`,
+        start + position === selectedQuery ? "selected" : "text",
+      ),
+    );
+  }
+
+  return lines;
+};
 
 export const profileScreen = async (
   address: string,
@@ -35,8 +122,6 @@ export const profileScreen = async (
         let activeRequest: ProfiledRequest | undefined;
         const wasRaw = process.stdin.isRaw;
 
-        const milliseconds = (value: number) => `${value.toFixed(3)} ms`;
-
         const query = (): ProfiledQuery | undefined =>
           activeRequest?.queries[selectedQuery];
 
@@ -49,7 +134,6 @@ export const profileScreen = async (
           // cutting the timings off.
           const width = terminalWidth();
           const labelWidth = Math.max(12, Math.min(42, width - 35));
-          const compact = width < 72;
 
           if (mode === "requests") {
             lines.push(
@@ -81,34 +165,12 @@ export const profileScreen = async (
             }
           } else if (mode === "queries") {
             lines.push(
-              style(
-                `${activeRequest!.label} · build ${milliseconds(activeRequest!.buildMs)} · total ${milliseconds(activeRequest!.durationMs)}`,
-                "pink",
-              ),
+              ...requestLines(activeRequest!, selectedQuery, {
+                width,
+                height,
+                style,
+              }),
             );
-            lines.push(
-              style(
-                compact
-                  ? `${"Query".padEnd(18)}${"Database".padStart(10)} ${"Rows".padStart(6)}`
-                  : "Query                       Compile       Database       Decode    Rows",
-                "muted",
-              ),
-            );
-            const start = Math.max(0, selectedQuery - height + 3);
-
-            for (const [position, entry] of activeRequest!.queries
-              .slice(start, start + height - 2)
-              .entries()) {
-              const marker = start + position === selectedQuery ? "›" : " ";
-              lines.push(
-                style(
-                  compact
-                    ? `${marker} ${entry.kind.padEnd(7)} #${String(entry.id).padEnd(6)} ${entry.databaseMs.toFixed(3).padStart(10)} ${String(entry.rows).padStart(6)}${entry.error ? " ERROR" : ""}`
-                    : `${marker} ${entry.kind.padEnd(9)} #${String(entry.id).padEnd(10)} ${entry.compileMs.toFixed(3).padStart(9)} ${entry.databaseMs.toFixed(3).padStart(14)} ${entry.decodeMs.toFixed(3).padStart(12)} ${String(entry.rows).padStart(7)}${entry.error ? " ERROR" : ""}`,
-                  start + position === selectedQuery ? "selected" : "text",
-                ),
-              );
-            }
           } else {
             const wrapped =
               mode === "plan"

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { compilePlan, executePlan } from "../compile";
+import { compileShape, executePlan } from "../compile";
 import { type PredicateDescription, type ValueNode } from "../expressions";
 import type {
   OrderingDescription,
@@ -10,6 +10,8 @@ import type {
 import { derivedBinding } from "../plan/derived";
 import { postgresRenderer } from "../compile/postgres/render";
 import { expressionSqlType } from "../plan/metadata";
+import { childNodes, containsNode } from "../plan/traverse";
+import { primaryKeyColumns } from "../../schema/assembly";
 
 /** What a cursor needs to know about each ORDER BY position. */
 type CursorColumn = {
@@ -28,69 +30,23 @@ const rootExpression = (node: ValueNode, root: TableBinding): boolean => {
       return node.description.binding === root;
     case "parameter":
     case "placeholder":
-      return true;
     case "case":
-      return (
-        rootExpression(node.value, root) &&
-        node.branches.every(
-          (branch) =>
-            rootExpression(branch.when, root) &&
-            rootExpression(branch.then, root),
-        )
-      );
     case "coalesce":
     case "tuple":
-      return node.values.every((value) => rootExpression(value, root));
     case "binary":
-      return (
-        rootExpression(node.left, root) && rootExpression(node.right, root)
-      );
     case "raw":
-      return node.parts.every(
-        (part) => typeof part === "string" || rootExpression(part, root),
-      );
     case "jsonPath":
     case "arrayIndex":
     case "arrayLength":
-      return rootExpression(node.value, root);
+      return childNodes(node).every((child) => rootExpression(child, root));
+    // An allow-list: any other kind is not known to be a per-row expression.
     default:
       return false;
   }
 };
 
-const containsWindow = (node: ValueNode): boolean => {
-  switch (node.kind) {
-    case "window":
-      return true;
-    case "jsonObject":
-      return node.selection.some((expression) =>
-        containsWindow(expression.node),
-      );
-    case "case":
-      return (
-        containsWindow(node.value) ||
-        node.branches.some(
-          (branch) =>
-            containsWindow(branch.when) || containsWindow(branch.then),
-        )
-      );
-    case "coalesce":
-    case "tuple":
-      return node.values.some(containsWindow);
-    case "binary":
-      return containsWindow(node.left) || containsWindow(node.right);
-    case "raw":
-      return node.parts.some(
-        (part) => typeof part !== "string" && containsWindow(part),
-      );
-    case "jsonPath":
-    case "arrayIndex":
-    case "arrayLength":
-      return containsWindow(node.value);
-    default:
-      return false;
-  }
-};
+const containsWindow = (node: ValueNode): boolean =>
+  containsNode(node, (candidate) => candidate.kind === "window");
 
 /** Apply keyset predicates after windows have seen the complete filtered input. */
 const windowPagePlan = (plan: SelectPlan): SelectPlan => {
@@ -288,7 +244,7 @@ export const executePage = async (
     };
   });
   const names = columns.map((column) => column.name);
-  const keys = plan.root.table.columns.filter((column) => column.primaryKey);
+  const keys = primaryKeyColumns(plan.root.table);
 
   if (
     !names.length ||
@@ -303,12 +259,15 @@ export const executePage = async (
     );
   }
 
+  // The fingerprint names the query, not the $scope() values in force: a
+  // cursor is accepted or refused the same way for a reused and a rebuilt
+  // query, and the filters themselves still apply when the page runs.
   let fingerprint = fingerprints.get(plan);
 
   if (!fingerprint) {
     fingerprint = createHash("sha256")
       .update(
-        JSON.stringify(compilePlan(plan), (_name, value) =>
+        JSON.stringify(compileShape(plan), (_name, value) =>
           typeof value === "bigint" ? { bigint: String(value) } : value,
         ),
       )

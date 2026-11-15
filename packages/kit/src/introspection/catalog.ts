@@ -1,6 +1,8 @@
 /**
  * Catalog queries that only introspection needs on top of readCatalog: column
- * declaration order, generated columns, partitioning and structured index details.
+ * declaration order, generated columns, partitioning, structured index details
+ * and what the schema cannot declare (views, triggers, inheritance, row-level
+ * security, routines, sequences, tables of other schemas).
  */
 import { normalizeResult } from "symmetria/internal";
 import {
@@ -119,14 +121,32 @@ export const readIndexDetails = (options: CatalogOptions) =>
     ORDER BY relation.relname COLLATE "C", indexrelation.relname COLLATE "C"`,
   );
 
-/** Objects `pull` cannot declare but must report: views, materialized views and triggers. */
+/**
+ * Objects `pull` cannot declare but must report: views, materialized views,
+ * triggers, inheritance children, row-level security and routines.
+ */
 export type UndeclaredObjectRow = {
-  kind: "view" | "materialized view" | "trigger";
+  kind:
+    | "view"
+    | "materialized view"
+    | "trigger"
+    | "inheritance"
+    | "row security"
+    | "function";
   name: string;
-  /** The table a trigger belongs to. */
+  /** The table a trigger, inheritance link or policy set belongs to. */
   table_name: string | null;
+  /**
+   * The view or trigger definition; the parent of an inheritance child; the
+   * policy names of a table, one per line, prefixed with `enabled` or
+   * `disabled` for its row-security switch; `function` or `procedure`.
+   */
   definition: string;
 };
+
+const notExtensionMember = (catalog: string, oid: string): string =>
+  `NOT EXISTS (SELECT 1 FROM pg_depend dependency
+    WHERE dependency.classid = '${catalog}'::regclass AND dependency.objid = ${oid} AND dependency.deptype = 'e')`;
 
 export const readUndeclaredObjects = (options: CatalogOptions) =>
   query<UndeclaredObjectRow>(
@@ -144,8 +164,80 @@ export const readUndeclaredObjects = (options: CatalogOptions) =>
       FROM pg_trigger trigger JOIN pg_class relation ON relation.oid = trigger.tgrelid
       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
       WHERE ${filter} AND NOT trigger.tgisinternal
+      UNION ALL
+      SELECT 'inheritance', relation.relname, relation.relname, parent.relname::text
+      FROM pg_inherits inheritance JOIN pg_class relation ON relation.oid = inheritance.inhrelid
+      JOIN pg_class parent ON parent.oid = inheritance.inhparent
+      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE ${filter} AND relation.relkind = 'r' AND NOT relation.relispartition
+      UNION ALL
+      SELECT 'row security', relation.relname, relation.relname,
+        array_to_string(ARRAY[CASE WHEN relation.relrowsecurity THEN 'enabled' ELSE 'disabled' END]
+          || ARRAY(SELECT policy.polname::text FROM pg_policy policy
+            WHERE policy.polrelid = relation.oid ORDER BY policy.polname COLLATE "C"), chr(10))
+      FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE ${filter} AND relation.relkind IN ('r', 'p')
+        AND (relation.relrowsecurity OR EXISTS (SELECT 1 FROM pg_policy policy WHERE policy.polrelid = relation.oid))
+      UNION ALL
+      SELECT DISTINCT 'function', routine.proname, NULL::name,
+        CASE routine.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END
+      FROM pg_proc routine JOIN pg_namespace namespace ON namespace.oid = routine.pronamespace
+      WHERE namespace.nspname = COALESCE($1, current_schema())
+        AND ${notExtensionMember("pg_proc", "routine.oid")}
     ) objects
-    ORDER BY kind, name COLLATE "C"`,
+    ORDER BY kind, name COLLATE "C", table_name COLLATE "C"`,
+  );
+
+/** A sequence of the schema, with the column that owns it and how many column defaults draw from it. */
+export type SequenceRow = {
+  name: string;
+  /** The name as a nextval() default prints it: quoted, and qualified outside the search path. */
+  reference: string;
+  /** Set for a serial or identity column of this schema; null for a standalone sequence. */
+  owner_table: string | null;
+  owner_column: string | null;
+  /** True for the internal sequence of an identity column. */
+  identity: boolean;
+  defaults: number;
+};
+
+export const readSequences = (options: CatalogOptions) =>
+  query<SequenceRow>(
+    options,
+    `SELECT relation.relname AS name, relation.oid::regclass::text AS reference,
+      owner.relname AS owner_table, attribute.attname AS owner_column,
+      COALESCE(ownership.deptype = 'i', false) AS identity,
+      (SELECT count(*)::integer FROM pg_depend usage
+        WHERE usage.classid = 'pg_attrdef'::regclass AND usage.refclassid = 'pg_class'::regclass
+          AND usage.refobjid = relation.oid) AS defaults
+    FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    LEFT JOIN pg_depend ownership ON ownership.classid = 'pg_class'::regclass AND ownership.objid = relation.oid
+      AND ownership.refclassid = 'pg_class'::regclass AND ownership.refobjsubid > 0 AND ownership.deptype IN ('a', 'i')
+      AND (SELECT owner.relnamespace FROM pg_class owner WHERE owner.oid = ownership.refobjid) = relation.relnamespace
+    LEFT JOIN pg_class owner ON owner.oid = ownership.refobjid
+    LEFT JOIN pg_attribute attribute ON attribute.attrelid = ownership.refobjid AND attribute.attnum = ownership.refobjsubid
+    WHERE ${filter} AND relation.relkind = 'S'
+      AND ${notExtensionMember("pg_class", "relation.oid")}
+    ORDER BY relation.relname COLLATE "C"`,
+  );
+
+/** User tables outside the schema being read, counted per schema. */
+export type OtherSchemaRow = { schema: string; tables: number };
+
+export const readOtherSchemas = (options: CatalogOptions) =>
+  query<OtherSchemaRow>(
+    options,
+    `SELECT namespace.nspname AS schema, count(*)::integer AS tables
+    FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname <> COALESCE($1, current_schema())
+      AND NOT (namespace.nspname = $2 AND relation.relname = $3)
+      AND namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND namespace.nspname !~ '^pg_(toast|temp)'
+      AND relation.relkind IN ('r', 'p') AND NOT relation.relispartition
+      AND relation.relpersistence <> 't'
+      AND ${notExtensionMember("pg_class", "relation.oid")}
+    GROUP BY namespace.nspname
+    ORDER BY namespace.nspname COLLATE "C"`,
   );
 
 export type PullCatalog = Awaited<ReturnType<typeof readCatalog>> & {
@@ -157,6 +249,8 @@ export type PullCatalog = Awaited<ReturnType<typeof readCatalog>> & {
   indexDetails: IndexDetailRow[];
   extensions: { name: string; schema: string }[];
   undeclared: UndeclaredObjectRow[];
+  sequences: SequenceRow[];
+  otherSchemas: OtherSchemaRow[];
 };
 
 /**
@@ -178,6 +272,8 @@ export const readPullCatalog = async (
   const indexDetails = await readIndexDetails(options);
   const extensions = await readExtensions(options);
   const undeclared = await readUndeclaredObjects(options);
+  const sequences = await readSequences(options);
+  const otherSchemas = await readOtherSchemas(options);
   const ignoreTables = new Set(options.ignoreTables ?? []);
 
   const kept = <Row extends { table_name?: string | null; name?: string }>(
@@ -213,6 +309,13 @@ export const readPullCatalog = async (
     details: kept(details),
     indexDetails: kept(indexDetails),
     extensions,
-    undeclared: kept(undeclared),
+    // A routine is not a table's: one named like an ignored table stays listed.
+    undeclared: undeclared.filter(
+      (row) =>
+        row.kind === "function" ||
+        !ignoreTables.has(row.table_name ?? row.name),
+    ),
+    sequences,
+    otherSchemas,
   };
 };

@@ -154,7 +154,11 @@ describe.skipIf(!url)("moving from Prisma", () => {
         "posts_authorId_published_idx: index(posts.authorId, posts.published),",
       );
       expect(
-        pulled.warnings.map((warning) => String(warning.code)).sort(),
+        pulled.warnings
+          .map((warning) => String(warning.code))
+          // The shared test database holds other suites' schemas.
+          .filter((code) => code !== "other-schema")
+          .sort(),
       ).toEqual(
         [
           "view",
@@ -214,7 +218,11 @@ describe.skipIf(!url)("moving from Prisma", () => {
         module: runtime,
       });
       expect(
-        repulled.warnings.map((warning) => String(warning.code)).sort(),
+        repulled.warnings
+          .map((warning) => String(warning.code))
+          // The shared test database holds other suites' schemas.
+          .filter((code) => code !== "other-schema")
+          .sort(),
       ).toEqual(["migration-table", "view"]);
       expect(repulled.source).toContain("id: int.auto.byDefault,");
 

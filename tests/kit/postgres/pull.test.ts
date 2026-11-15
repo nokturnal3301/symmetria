@@ -39,9 +39,24 @@ import {
   generateMigration,
   loadMigrationState,
   migrator,
-  pullSchema,
+  pullSchema as pullWholeDatabase,
+  type PullWarning,
 } from "../../../packages/kit/src";
 import { migrationDirectory } from "../../support/directories";
+
+/**
+ * The test database is shared: the schemas of other suites come and go, so the
+ * `other-schema` entry is left out here and checked in a test of its own.
+ */
+const ownSchema = <Warning extends Pick<PullWarning, "code">>(
+  warnings: readonly Warning[],
+): Warning[] => warnings.filter((warning) => warning.code !== "other-schema");
+
+const pullSchema = async (options: Parameters<typeof pullWholeDatabase>[0]) => {
+  const result = await pullWholeDatabase(options);
+
+  return { ...result, warnings: ownSchema(result.warnings) };
+};
 
 const url = process.env.SYMMETRIA_TEST_DATABASE_URL;
 const runtime = resolve("packages/runtime/src/index.ts");
@@ -642,6 +657,125 @@ describe.skipIf(!url)("pull", () => {
       ).toEqual([{ sequence: null }]);
     }));
 
+  test("inheritance, row-level security, routines, loose and shared sequences and other schemas are reported", () =>
+    sandbox(async ({ driver, namespace, run }) => {
+      const neighbour = `${namespace}_neighbour`;
+
+      for (const statement of [
+        `CREATE TABLE people (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text NOT NULL)`,
+        `CREATE TABLE staff (salary integer NOT NULL, PRIMARY KEY (id)) INHERITS (people)`,
+        `CREATE TABLE events (id integer NOT NULL, at date NOT NULL, PRIMARY KEY (id, at)) PARTITION BY RANGE (at)`,
+        `CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')`,
+        `ALTER TABLE people ENABLE ROW LEVEL SECURITY`,
+        `CREATE POLICY people_read ON people FOR SELECT USING (true)`,
+        `CREATE POLICY staff_all ON staff USING (true)`,
+        `CREATE FUNCTION full_name(first text, last text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT first || ' ' || last $$`,
+        `CREATE FUNCTION full_name(single text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT single $$`,
+        `CREATE PROCEDURE cleanup() LANGUAGE sql AS $$ DELETE FROM staff WHERE salary < 0 $$`,
+        `CREATE SEQUENCE invoice_numbers`,
+        `CREATE SEQUENCE document_ids`,
+        `CREATE TABLE invoices (id integer PRIMARY KEY DEFAULT nextval('document_ids'), number integer NOT NULL DEFAULT nextval('invoice_numbers'))`,
+        `CREATE TABLE receipts (id integer PRIMARY KEY DEFAULT nextval('document_ids'))`,
+        `CREATE TABLE tickets (id serial PRIMARY KEY)`,
+        `CREATE TABLE refunds (id serial PRIMARY KEY, ticket integer NOT NULL DEFAULT nextval('tickets_id_seq'))`,
+        `CREATE SCHEMA "${neighbour}"`,
+        `CREATE TABLE "${neighbour}".audit_log (id integer PRIMARY KEY)`,
+        `CREATE TABLE "${neighbour}".audit_users (id integer PRIMARY KEY)`,
+      ]) {
+        await run(statement);
+      }
+
+      try {
+        const result = await pullWholeDatabase({
+          execute: driver.execute,
+          module: runtime,
+        });
+        const summary = result.warnings.map((warning) =>
+          [
+            warning.code,
+            warning.table ?? "",
+            warning.column ?? "",
+            warning.fix === undefined ? "" : "fix",
+          ]
+            .join(" ")
+            .trim(),
+        );
+
+        expect(summary.sort()).toEqual(
+          [
+            "inheritance staff",
+            "row-security people",
+            "row-security staff",
+            "function",
+            "sequence",
+            "other-schema",
+            "partition events",
+            "partition events_2024",
+            // Borrowed or free-standing sequences keep their default, unfixed.
+            "sequence invoices id",
+            "sequence invoices number",
+            "sequence receipts id",
+            "sequence tickets id",
+            "sequence refunds ticket",
+            // Only a sequence nothing else draws from becomes an identity.
+            "serial refunds id fix",
+          ].sort(),
+        );
+
+        const message = (code: string, table?: string) =>
+          result.warnings.find(
+            (warning) => warning.code === code && warning.table === table,
+          )!.message;
+
+        expect(message("function")).toContain(
+          '2 functions and procedures "cleanup", "full_name" are not declared',
+        );
+        expect(message("sequence")).toContain(
+          '2 sequences "document_ids", "invoice_numbers" are not owned by a column',
+        );
+        expect(message("row-security", "people")).toContain(
+          'row-level security enabled with policy "people_read"',
+        );
+        expect(message("row-security", "staff")).toContain(
+          'has policy "staff_all" but row-level security is not enabled',
+        );
+        expect(message("inheritance", "staff")).toContain(
+          '"staff" inherits from "people"',
+        );
+        expect(message("sequence", "tickets")).toContain(
+          "is also the default of 1 other column",
+        );
+        expect(message("other-schema")).toMatch(
+          /^\d+ tables? in (?:another schema was|other schemas were) not read: /,
+        );
+        expect(message("other-schema")).toContain(`"${neighbour}" (2)`);
+        expect(message("other-schema")).toEndWith(
+          `pull reads one schema, here "${namespace}"`,
+        );
+
+        // The one fix leaves the shared sequences and their defaults alone.
+        await run(
+          result.warnings.find((warning) => warning.fix !== undefined)!.fix!,
+        );
+        await run(`INSERT INTO invoices DEFAULT VALUES`);
+        await run(`INSERT INTO receipts DEFAULT VALUES`);
+        await run(`INSERT INTO refunds DEFAULT VALUES`);
+        const again = await pullSchema({
+          execute: driver.execute,
+          module: runtime,
+        });
+        expect(again.source).toContain("id: int.auto.byDefault,");
+        expect(
+          again.warnings.filter((warning) => warning.code === "serial"),
+        ).toEqual([]);
+        expect(
+          again.warnings.filter((warning) => warning.fix !== undefined),
+        ).toEqual([]);
+      } finally {
+        await run(`DROP SCHEMA "${neighbour}" CASCADE`);
+      }
+    }));
+
   test("uuid.v7 needs PostgreSQL 18, where it generates, drifts clean and pulls back", () =>
     sandbox(async ({ driver, directory, run }) => {
       const appSchema = schema({
@@ -733,7 +867,8 @@ describe.skipIf(!url)("pull", () => {
       );
       expect(first.exitCode).toBe(0);
       expect(first.stdout).toContain("Created");
-      expect(first.stdout).toContain("Nothing needs review");
+      // Other suites' schemas may be listed; nothing of this schema is.
+      expect(first.stdout).not.toMatch(/^ +\[(?!other-schema\])/m);
       expect(await readFile(target, "utf8")).toContain(
         "author: users.onDelete.cascade,",
       );
@@ -758,12 +893,15 @@ describe.skipIf(!url)("pull", () => {
         "--json",
       );
       expect(third.exitCode).toBe(0);
-      expect(JSON.parse(third.stdout)).toMatchObject({
-        path: target,
-        tables: ["posts", "users"],
-        enumerations: [],
-        warnings: [],
-      });
+      const report = JSON.parse(third.stdout);
+      expect({ ...report, warnings: ownSchema(report.warnings) }).toMatchObject(
+        {
+          path: target,
+          tables: ["posts", "users"],
+          enumerations: [],
+          warnings: [],
+        },
+      );
     }));
 });
 
@@ -1099,10 +1237,13 @@ describe.skipIf(!url)("pull round trip", () => {
         "--json",
       );
       expect(pulled.exitCode).toBe(0);
-      expect(JSON.parse(pulled.stdout)).toMatchObject({
-        tables: ["places"],
-        warnings: [{ code: "migration-table" }, { code: "foreign-key" }],
-      });
+      const report = JSON.parse(pulled.stdout);
+      expect({ ...report, warnings: ownSchema(report.warnings) }).toMatchObject(
+        {
+          tables: ["places"],
+          warnings: [{ code: "migration-table" }, { code: "foreign-key" }],
+        },
+      );
       const flagged = await cli(
         directory,
         "pull",

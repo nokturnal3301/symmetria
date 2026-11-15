@@ -231,3 +231,58 @@ test("raw SQL in a nested query only blocks pagination within that scope", () =>
   expect(compiled.sql).toContain('FROM (SELECT "users"');
   expect(compiled.sql).not.toContain('FROM (SELECT "__symmetria_aggregate_0"');
 });
+
+test("a page cursor identifies the query, not the $scope() values in force", async () => {
+  let tenants = [1];
+  const statements: { sql: string; parameters: readonly unknown[] }[] = [];
+  const local = schema(
+    { documents: { id: int.auto, tenantId: int, title: text } },
+    {
+      executor: async (statement) => {
+        statements.push(statement);
+
+        // The hidden column carries the ordering key a cursor is made of.
+        return [
+          { id: 1, __symmetria_cursor_0: "1" },
+          { id: 2, __symmetria_cursor_0: "2" },
+        ];
+      },
+    },
+  );
+  const scoped = local.$scope({
+    documents: (document) => document.tenantId.in(tenants),
+  });
+  const build = (minimum = 0) =>
+    scoped.documents((document) => ({ id: document.id }), {
+      where: (document) => document.id.above(minimum),
+      orderBy: (document) => document.id.ascending,
+    });
+  const reused = build();
+  const { nextCursor } = await reused.page({ size: 1 });
+
+  expect(nextCursor).not.toBeNull();
+
+  // Another tenant, and a filter that now renders different SQL.
+  tenants = [2, 3];
+  await reused.page({ size: 1, after: nextCursor });
+  await build().page({ size: 1, after: nextCursor });
+
+  // Both ran under the current scope, after the cursor.
+  for (const statement of statements.slice(-2)) {
+    expect(statement.sql).toContain('"documents"."tenant_id" IN ($1, $2)');
+    expect(statement.parameters).toEqual([2, 3, 0, "1"]);
+  }
+
+  // The same cursor on an unscoped or differently filtered query is refused.
+  await expect(build(5).page({ size: 1, after: nextCursor })).rejects.toThrow(
+    /another query/,
+  );
+  await expect(
+    local
+      .documents((document) => ({ id: document.id }), {
+        where: (document) => document.id.above(0),
+        orderBy: (document) => document.id.ascending,
+      })
+      .page({ size: 1, after: nextCursor }),
+  ).rejects.toThrow(/another query/);
+});

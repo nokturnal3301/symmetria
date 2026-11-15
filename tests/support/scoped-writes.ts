@@ -295,6 +295,73 @@ export const scopedWriteTests = (): void => {
           })
           .execute(),
       ).rejects.toEqual(outOfScope("notes"));
+      // Siblings share one multi-row INSERT: one row outside the scope, in
+      // any position, fails the statement and with it the whole insert.
+      await expect(
+        scoped.members
+          .insert({
+            id: 4,
+            tenantId: 1,
+            name: "Dan",
+            notes: {
+              create: [
+                { tenantId: 1, title: "first" },
+                { tenantId: 2, title: "second" },
+                { tenantId: 1, title: "third" },
+              ],
+            },
+          })
+          .execute(),
+      ).rejects.toEqual(outOfScope("notes"));
+      await expect(
+        scoped.notes
+          .insert({
+            tenantId: 1,
+            title: "labelled",
+            authorId: 1,
+            labels: {
+              create: [
+                { tenantId: 1, label: "green" },
+                { tenantId: 2, label: "blue" },
+              ],
+            },
+          })
+          .execute(),
+      ).rejects.toEqual(outOfScope("labels"));
+      expect(await rows()).toEqual(before);
+      expect(await database.members.count()).toBe(2);
+      expect(await database.labels.count()).toBe(0);
+      expect(
+        await scoped.members
+          .insert({
+            id: 8,
+            tenantId: 1,
+            name: "Ivy",
+            notes: {
+              create: [
+                { tenantId: 1, title: "batch 1" },
+                { tenantId: 1, title: "batch 2", version: 7 },
+                { tenantId: 1, title: "batch 3" },
+              ],
+            },
+          })
+          .returning((member) => ({ id: member.id })),
+      ).toEqual({ id: 8 });
+      expect(
+        await database.notes(
+          (note) => ({ title: note.title, version: note.version }),
+          {
+            where: (note) => note.authorId.is(8),
+            orderBy: (note) => note.id.ascending,
+          },
+        ),
+      ).toEqual([
+        { title: "batch 1", version: 1 },
+        { title: "batch 2", version: 7 },
+        { title: "batch 3", version: 1 },
+      ]);
+      await database.notes.delete().where((note) => note.authorId.is(8));
+      await database.members.delete().where((member) => member.id.is(8));
       await expect(
         scoped.notes
           .insert({

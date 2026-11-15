@@ -10,8 +10,16 @@ import {
   customType,
   sql,
   prepare,
+  count,
+  lag,
+  lead,
   type SelectedColumn,
 } from "../../../packages/runtime/src";
+import {
+  COLUMN_EXPRESSION,
+  type ValueNode,
+} from "../../../packages/runtime/src/query/expressions";
+import { validateNode } from "../../../packages/runtime/src/query/select/scope";
 
 type Equal<Actual, Expected> = [Actual] extends [Expected]
   ? [Expected] extends [Actual]
@@ -236,4 +244,67 @@ test("byId follows non-id, composite and inferred junction primary keys and enco
     // @ts-expect-error extra components are rejected
     keyed.memberships.byId({ tenantId: 2, personId: 4, role: "admin" }),
   ).toThrow(/exactly/);
+});
+
+test("columns of another query are rejected inside lag(), lead() and tuples when the query is built", () => {
+  let foreign: SelectedColumn<bigint> | undefined;
+  database.posts((posts) => {
+    foreign = posts.views;
+
+    return { id: posts.id };
+  });
+  // Built, never compiled: the compiler has its own, later check.
+  expect(() =>
+    database.users((users) => ({
+      value: lag(foreign!).over({ orderBy: [users.id.ascending] }),
+    })),
+  ).toThrow(/"posts\.views" belongs to another query scope$/);
+  expect(() =>
+    database.users((users) => ({
+      value: lead(users.id, 1, foreign as never).over({
+        orderBy: [users.id.ascending],
+      }),
+    })),
+  ).toThrow(/"posts\.views" belongs to another query scope$/);
+
+  // Tuples are built internally (composite keys); their members are checked too.
+  const column = (
+    foreign as never as { [COLUMN_EXPRESSION]: { node: ValueNode } }
+  )[COLUMN_EXPRESSION].node;
+
+  expect(() => validateNode({ kind: "tuple", values: [column] }, {})).toThrow(
+    /"posts\.views" belongs to another query scope$/,
+  );
+});
+
+test("a projection field left as a function names the field and the fix", () => {
+  const message = (name: string) =>
+    `symmetria: projection field "${name}" is a function; call it (${name}(...)) or select one of its fields`;
+
+  expect(() =>
+    database.users((users) => ({ id: users.id, posts: users.posts as never })),
+  ).toThrow(message("posts"));
+  expect(() =>
+    database.users((users) => ({
+      id: users.id,
+      posts: users.posts.count as never,
+    })),
+  ).toThrow(message("posts"));
+  expect(() =>
+    database.users((users) => ({ id: users.id, total: count as never })),
+  ).toThrow(message("total"));
+  expect(() =>
+    database.users((users) => ({
+      id: users.id,
+      nested: { later: (() => users.id) as never },
+    })),
+  ).toThrow(message("later"));
+
+  // Fields that are really empty keep their own message.
+  expect(() =>
+    database.users((users) => ({ id: users.id, empty: {} as never })),
+  ).toThrow("symmetria: a projection requires at least one field");
+  expect(() =>
+    database.users((users) => ({ id: users.id, empty: [] as never })),
+  ).toThrow("symmetria: a projection requires at least one field");
 });

@@ -18,6 +18,7 @@ import {
 } from "./snapshot";
 import {
   applyStatements,
+  DEFAULT_STATEMENT_TIMEOUT_MS,
   executeSQL,
   executionPlan,
   withMigrationConnection,
@@ -203,10 +204,14 @@ export const migrator = (options: MigratorOptions) => {
         );
       }
 
-      if (
+      const edited =
         !checksumMatches(migration, entry.checksum) ||
-        migration.manifest.after !== entry.snapshotHash
-      ) {
+        migration.manifest.after !== entry.snapshotHash;
+
+      // An incomplete migration may be fixed in place: its files are checked
+      // again when repair verifies the schema, so an edit must not lock out
+      // status and repair.
+      if (edited && entry.state !== "incomplete") {
         throw new Error(
           `symmetria: checksum mismatch for applied migration "${entry.id}"`,
         );
@@ -214,7 +219,7 @@ export const migrator = (options: MigratorOptions) => {
 
       if (!incomplete && entry.state === "incomplete") {
         throw new Error(
-          `symmetria: migration "${entry.id}" is incomplete (${entry.direction}, ${entry.statement} confirmed statements); inspect the database and use repair`,
+          `symmetria: migration "${entry.id}" is incomplete (${entry.direction}, ${entry.statement} confirmed statements${edited ? "; its files changed since it ran" : ""}); inspect the database and use repair`,
         );
       }
 
@@ -249,7 +254,7 @@ export const migrator = (options: MigratorOptions) => {
     if (direction === "up") {
       await executeSQL(
         execute,
-        `INSERT INTO ${qualifiedName} (id, checksum, snapshot_hash) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET state = 'applied', direction = 'up', statement = 0, error = NULL, applied_at = clock_timestamp()`,
+        `INSERT INTO ${qualifiedName} (id, checksum, snapshot_hash) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET checksum = EXCLUDED.checksum, snapshot_hash = EXCLUDED.snapshot_hash, state = 'applied', direction = 'up', statement = 0, error = NULL, applied_at = clock_timestamp()`,
         [migration.id, migration.checksum, migration.manifest.after],
       );
     } else {
@@ -403,8 +408,20 @@ export const migrator = (options: MigratorOptions) => {
         // Statements of a "none" migration commit one by one on the session.
         const session = link.session!;
         const migration = next.migrations[0]!;
+        // The default statement timeout would cancel a long CREATE INDEX
+        // CONCURRENTLY and leave an invalid index behind; nothing here holds a
+        // transaction open, so only a configured timeout applies.
+        const statementTimeout = (milliseconds: number) =>
+          options.statementTimeoutMs === undefined
+            ? executeSQL(
+                session.execute,
+                "SELECT set_config('statement_timeout', $1, false)",
+                [`${milliseconds}ms`],
+              )
+            : undefined;
 
         try {
+          await statementTimeout(0);
           await applyStatements(
             session.execute,
             migration,
@@ -429,6 +446,11 @@ export const migrator = (options: MigratorOptions) => {
             ],
           );
           throw error;
+        } finally {
+          // A session that failed cannot be set back, and is not used again.
+          await Promise.resolve(
+            statementTimeout(DEFAULT_STATEMENT_TIMEOUT_MS),
+          ).catch(() => {});
         }
       }
 

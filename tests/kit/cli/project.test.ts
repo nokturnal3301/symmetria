@@ -13,6 +13,12 @@ import {
   formatSchema,
 } from "../../../packages/kit/src/cli/ui/format";
 import { resolveRenames } from "../../../packages/kit/src/cli/screens/rename-prompt";
+import {
+  confirmRollback,
+  databaseName,
+  rollbackPreview,
+  rollbackSummary,
+} from "../../../packages/kit/src/cli/screens/rollback-prompt";
 import { withMigrationDirectory } from "../../support/directories";
 
 const run = async (directory: string, ...argumentsList: string[]) => {
@@ -291,6 +297,75 @@ test("interactive rename decisions generate actual renames and support cancellat
   expect(diffSchemas(before, renamedTable, tables).up.join("\n")).toContain(
     'RENAME TO "articles"',
   );
+});
+
+test("rollback asks before down.sql runs and wants the database name before dropping tables", async () => {
+  const column = rollbackSummary([
+    {
+      id: "000002_reference",
+      statements: [
+        'ALTER TABLE "products" RENAME COLUMN "name" TO "title"',
+        'ALTER TABLE "orders" DROP COLUMN "reference"',
+      ],
+    },
+  ]);
+
+  expect(column).toEqual({
+    migrations: ["000002_reference"],
+    statements: 2,
+    destructive: ['ALTER TABLE "orders" DROP COLUMN "reference"'],
+    droppedTables: 0,
+  });
+  expect(rollbackPreview(column, "shop")).toContain(
+    'Rollback on "shop": 000002_reference',
+  );
+
+  const written: string[] = [];
+  const prompts = (choice: number | undefined, typed = "") => ({
+    write: (text: string) => void written.push(text),
+    select: async (question: string, choices: readonly string[]) => {
+      expect(question).toBe('Roll back 1 migration on "shop"?');
+      // Cancel comes first, so Enter alone changes nothing.
+      expect(choices).toEqual(["Cancel", "Roll back"]);
+
+      return choice;
+    },
+    ask: async () => typed,
+  });
+
+  expect(await confirmRollback(column, "shop", prompts(1))).toBe(true);
+  expect(await confirmRollback(column, "shop", prompts(0))).toBe(false);
+  expect(await confirmRollback(column, "shop", prompts(undefined))).toBe(false);
+  expect(written.join("")).toContain('DROP COLUMN "reference"');
+
+  const baseline = rollbackSummary([
+    {
+      id: "000001_baseline",
+      statements: ['DROP TABLE "orders"', 'DROP TABLE "users"'],
+    },
+  ]);
+
+  expect(baseline.droppedTables).toBe(2);
+  // Dropping tables never goes through the two-item menu.
+  const typed = (answer: string) =>
+    confirmRollback(baseline, "shop", {
+      write: () => {},
+      select: async () => {
+        throw new Error("the menu must not be used");
+      },
+      ask: async (question) => {
+        expect(question).toContain('Type the database name "shop"');
+
+        return answer;
+      },
+    });
+
+  expect(await typed("shop")).toBe(true);
+  expect(await typed("")).toBe(false);
+  expect(await typed("yes")).toBe(false);
+  expect(
+    databaseName("postgres://u:p@127.0.0.1:5432/shop?sslmode=require"),
+  ).toBe("shop");
 });
 
 test("schema display includes physical names and expression index details", () => {

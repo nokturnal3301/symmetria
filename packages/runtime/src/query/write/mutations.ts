@@ -40,7 +40,7 @@ import {
   type SelectedColumn,
   type ValueNode,
 } from "../expressions";
-import type { ColumnSnapshot } from "../../schema/assembly";
+import { primaryKeyColumns, type ColumnSnapshot } from "../../schema/assembly";
 import {
   createScope,
   initialPlan,
@@ -434,7 +434,7 @@ export const createMutation = (
       return description;
     }
 
-    const keys = root.table.columns.filter((column) => column.primaryKey);
+    const keys = primaryKeyColumns(root.table);
 
     if (!keys.length) {
       throw new Error(

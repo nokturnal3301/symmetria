@@ -19,6 +19,7 @@ import {
   index,
   sql,
   customType,
+  createProfiler,
 } from "../../../packages/runtime/src";
 import { postgres, searchPathURL } from "../../support/postgres";
 import { createSchemaSQL } from "../../../packages/kit/src";
@@ -62,8 +63,29 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
   const driver = postgres({ url: searchPathURL(namespace), max: 1 });
   const database = createDatabase({ schema: model, driver });
 
+  const profiler = createProfiler();
+  const profiled = createDatabase({
+    schema: model,
+    driver: profiler.driver(driver),
+  });
+
   const run = (statement: string) =>
     driver.execute({ sql: statement, parameters: [] });
+
+  /** The statements one operation sent, as the profiler recorded them. */
+  const statements = async (
+    operation: () => PromiseLike<unknown>,
+  ): Promise<string[]> => {
+    await profiler.trace("nested insert", async () => {
+      await operation();
+    });
+
+    // Requests are kept in the order they finished.
+    return profiler
+      .snapshot()
+      .at(-1)!
+      .queries.map((query) => query.sql.split("\n")[0]!);
+  };
 
   beforeAll(async () => {
     await run(`CREATE SCHEMA "${namespace}"`);
@@ -465,6 +487,272 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
         { orderBy: (tags) => tags.label.ascending },
       ),
     ).toEqual([{ label: "acme-only" }, { label: "shared" }]);
+  });
+
+  test("sibling children are one multi-row INSERT, in input order", async () => {
+    const insert = (table: string) => `INSERT INTO "${table}" AS "${table}"`;
+    let created: unknown;
+
+    // A parent with three children: two statements, not four.
+    expect(
+      await statements(async () => {
+        created = await profiled.users
+          .insert({
+            email: "ada",
+            name: "Ada",
+            posts: {
+              create: [
+                { slug: "c", title: "C" },
+                { slug: "a", title: "A" },
+                { slug: "b", title: "B" },
+              ],
+            },
+          })
+          .returning((users) => ({ id: users.id, visits: users.visits }));
+      }),
+    ).toEqual([insert("users"), insert("posts")]);
+    expect(created).toEqual({ id: 1, visits: 9007199254740993n });
+    expect(
+      await database.posts(
+        (posts) => ({
+          id: posts.id,
+          slug: posts.slug,
+          authorId: posts.authorId,
+        }),
+        { orderBy: (posts) => posts.id.ascending },
+      ),
+    ).toEqual([
+      { id: 1, slug: "c", authorId: 1 },
+      { id: 2, slug: "a", authorId: 1 },
+      { id: 3, slug: "b", authorId: 1 },
+    ]);
+
+    // A child with relations of its own is written alone, between the runs
+    // of plain siblings around it, so identities still follow the input.
+    const sent = await statements(() =>
+      profiled.users.insert([
+        {
+          email: "bob",
+          name: "Bob",
+          posts: {
+            create: [
+              { slug: "d", title: "D" },
+              { slug: "e", title: "E" },
+              {
+                slug: "f",
+                title: "F",
+                tags: { create: [{ label: "x" }, { label: "y" }] },
+              },
+              { slug: "g", title: "G" },
+              { slug: "h", title: "H" },
+            ],
+          },
+        },
+        { email: "cy", name: "Cy", posts: { create: [] } },
+      ]),
+    );
+    expect(sent.filter((sql) => sql.startsWith("INSERT"))).toEqual([
+      insert("users"),
+      // d and e
+      insert("posts"),
+      // f, its two tags and both junction rows
+      insert("posts"),
+      insert("tags"),
+      insert("tags"),
+      `INSERT INTO "post_tags" AS "postTags"`,
+      // g and h
+      insert("posts"),
+      insert("users"),
+    ]);
+    expect(sent).toHaveLength(8);
+    expect(
+      await database.posts((posts) => ({ id: posts.id, slug: posts.slug }), {
+        where: (posts) => posts.authorId.is(2),
+        orderBy: (posts) => posts.id.ascending,
+      }),
+    ).toEqual(
+      ["d", "e", "f", "g", "h"].map((slug, position) => ({
+        id: position + 4,
+        slug,
+      })),
+    );
+    expect(
+      await database.postTags(
+        (postTags) => ({ postId: postTags.postId, tagId: postTags.tagId }),
+        { orderBy: (postTags) => postTags.tagId.ascending },
+      ),
+    ).toEqual([
+      { postId: 6, tagId: 1 },
+      { postId: 6, tagId: 2 },
+    ]);
+
+    // Connected and upserted targets are still resolved one by one; their
+    // junction rows are one INSERT per operation, duplicates included.
+    const linked = await statements(() =>
+      profiled.posts.insert({
+        slug: "i",
+        title: "I",
+        author: { connect: { email: "ada" } },
+        tags: {
+          connect: [{ label: "x" }, { label: "y" }, { label: "x" }],
+          connectOrCreate: [{ label: "y" }, { label: "z" }],
+        },
+      }),
+    );
+    // The author and three tags are looked up, two tags upserted: 1 + 1 + 3 + 1 + 2 + 1.
+    expect(linked).toHaveLength(9);
+    expect(linked.filter((sql) => sql.startsWith("SELECT"))).toHaveLength(4);
+    expect(
+      linked.filter((sql) => sql.startsWith('INSERT INTO "post_tags"')),
+    ).toHaveLength(2);
+    expect(linked.filter((sql) => sql.startsWith(insert("tags")))).toHaveLength(
+      2,
+    );
+    expect(
+      await database.postTags((postTags) => ({ tagId: postTags.tagId }), {
+        where: (postTags) => postTags.postId.is(9),
+        orderBy: (postTags) => postTags.tagId.ascending,
+      }),
+      // The upsert of the existing "y" used up identity 3.
+    ).toEqual([{ tagId: 1 }, { tagId: 2 }, { tagId: 4 }]);
+  });
+
+  test("a batch of siblings keeps defaults, codecs, value errors and rolls back as a whole", async () => {
+    const cents = (value: bigint) => ({ cents: () => value });
+
+    // Each relation is one statement; custom codecs encode every row's values.
+    expect(
+      await statements(() =>
+        profiled.users.insert({
+          email: "ada",
+          name: "Ada",
+          wallets: {
+            create: [
+              { amount: cents(9007199254740993n) },
+              { amount: cents(2n) },
+            ],
+          },
+          posts: {
+            create: [
+              { slug: "a", title: "A" },
+              { slug: "b", title: "B" },
+            ],
+          },
+        }),
+      ),
+    ).toHaveLength(3);
+    expect(
+      (
+        await database.wallets((wallets) => ({ amount: wallets.amount }), {
+          orderBy: (wallets) => wallets.id.ascending,
+        })
+      ).map((wallet) => wallet.amount.cents()),
+    ).toEqual([9007199254740993n, 2n]);
+    expect(
+      await database.posts((posts) => ({ id: posts.id, slug: posts.slug }), {
+        orderBy: (posts) => posts.slug.ascending,
+      }),
+    ).toEqual([
+      { id: 1, slug: "a" },
+      { id: 2, slug: "b" },
+    ]);
+
+    // A missing value in any sibling rejects the promise and writes nothing.
+    const invalid = database.users.insert({
+      email: "bob",
+      name: "Bob",
+      posts: {
+        create: [
+          { slug: "c", title: "C" },
+          { slug: "d" } as { slug: string; title: string },
+        ],
+      },
+    });
+    await expect(invalid.execute()).rejects.toThrow(
+      'symmetria: missing required column "posts.title"',
+    );
+    await expect(
+      database.users
+        .insert({
+          email: "bob",
+          name: "Bob",
+          posts: {
+            create: [
+              { slug: "c", title: "C" },
+              { slug: "e", title: "E", authorId: 1 } as never,
+            ],
+          },
+        })
+        .execute(),
+    ).rejects.toThrow(
+      "symmetria: nested reverse create cannot supply its parent foreign key",
+    );
+    // The second sibling breaks a unique constraint inside the statement.
+    await expect(
+      database.users
+        .insert({
+          email: "bob",
+          name: "Bob",
+          posts: {
+            create: [
+              { slug: "c", title: "C" },
+              { slug: "a", title: "Again" },
+            ],
+          },
+        })
+        .execute(),
+    ).rejects.toThrow(/unique/);
+    expect(await database.users.by.email("bob").maybeOne()).toBeNull();
+    expect(await database.posts.by.slug("c").maybeOne()).toBeNull();
+  });
+
+  test("siblings above the wire-protocol parameter limit are written in chunks, atomically", async () => {
+    const children = Array.from({ length: 22_000 }, (_, position) => ({
+      slug: `slug-${position}`,
+      title: `Title ${position}`,
+    }));
+    const sent = await statements(() =>
+      profiled.users.insert({
+        email: "ada",
+        name: "Ada",
+        posts: { create: children },
+      }),
+    );
+
+    // Three parameters a row: two statements for the children instead of 22,000.
+    expect(sent).toHaveLength(3);
+    expect(
+      await database.posts((posts) => ({ id: posts.id, slug: posts.slug }), {
+        where: (posts) => posts.id.in([1, 11_000, 11_001, 22_000]),
+        orderBy: (posts) => posts.id.ascending,
+      }),
+    ).toEqual([
+      { id: 1, slug: "slug-0" },
+      { id: 11_000, slug: "slug-10999" },
+      { id: 11_001, slug: "slug-11000" },
+      { id: 22_000, slug: "slug-21999" },
+    ]);
+
+    // A failure in the last chunk leaves nothing behind.
+    await expect(
+      database.users
+        .insert({
+          email: "bob",
+          name: "Bob",
+          posts: {
+            create: [
+              ...children.map((child) => ({
+                ...child,
+                slug: `other-${child.slug}`,
+              })),
+              { slug: "slug-0", title: "Duplicate" },
+            ],
+          },
+        })
+        .execute(),
+    ).rejects.toThrow(/unique/);
+    expect(await database.users.by.email("bob").maybeOne()).toBeNull();
+    expect(await database.posts.count()).toBe(22_000);
   });
 
   test("nested inputs are snapshotted and missing connects cannot create orphans", async () => {

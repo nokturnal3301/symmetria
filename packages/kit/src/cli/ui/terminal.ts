@@ -168,7 +168,8 @@ export const choose = (
       } else if (key.name === "end") {
         selected = choices.length - 1;
       } else if (/^[1-9]$/.test(input) && Number(input) <= choices.length) {
-        return finish(Number(input) - 1);
+        // A digit only moves the selection: one mistyped key never runs an action.
+        selected = Number(input) - 1;
       } else {
         return;
       }

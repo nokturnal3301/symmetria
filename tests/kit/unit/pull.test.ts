@@ -58,6 +58,7 @@ const catalog = (
   tables: Table[],
   enumerations: { name: string; values: string[] }[] = [],
   undeclared: PullCatalog["undeclared"] = [],
+  extra: Partial<Pick<PullCatalog, "sequences" | "otherSchemas">> = {},
 ): PullCatalog => {
   const constraints: CatalogConstraint[] = [];
   const constraint = (
@@ -227,6 +228,30 @@ const catalog = (
     ]),
     enumerations,
     extensions: [],
+    // Every nextval() default reads as a serial column's own sequence.
+    sequences:
+      extra.sequences ??
+      sorted.flatMap((table) =>
+        table.columns.flatMap((column) => {
+          const name = /^nextval\('(.*)'::regclass\)$/.exec(
+            column.default ?? "",
+          )?.[1];
+
+          return name === undefined
+            ? []
+            : [
+                {
+                  name,
+                  reference: name,
+                  owner_table: table.name,
+                  owner_column: column.name,
+                  identity: false,
+                  defaults: 1,
+                },
+              ];
+        }),
+      ),
+    otherSchemas: extra.otherSchemas ?? [],
   };
 };
 
@@ -529,6 +554,231 @@ describe("pull: columns", () => {
     expect(source).toContain(
       'other: oneOf("happy", "sad").typeName("mood").nullable,',
     );
+  });
+});
+
+describe("pull: what the schema cannot declare", () => {
+  test("inheritance, row-level security, routines, loose sequences and other schemas are listed", () => {
+    const model = buildPulledSchema(
+      catalog(
+        [
+          {
+            name: "people",
+            primaryKey: ["id"],
+            columns: [{ name: "id", type: "integer", identity: "a" }],
+          },
+          {
+            name: "staff",
+            primaryKey: ["id"],
+            columns: [{ name: "id", type: "integer", identity: "a" }],
+          },
+          {
+            name: "notes",
+            primaryKey: ["id"],
+            columns: [{ name: "id", type: "integer", identity: "a" }],
+          },
+        ],
+        [],
+        [
+          {
+            kind: "inheritance",
+            name: "staff",
+            table_name: "staff",
+            definition: "people",
+          },
+          {
+            kind: "row security",
+            name: "notes",
+            table_name: "notes",
+            definition: "enabled\nnotes_owner\nnotes_read",
+          },
+          {
+            kind: "row security",
+            name: "people",
+            table_name: "people",
+            definition: "enabled",
+          },
+          {
+            kind: "row security",
+            name: "staff",
+            table_name: "staff",
+            definition: "disabled\nstaff_all",
+          },
+          ...Array.from({ length: 12 }, (_, position) => ({
+            kind: "function" as const,
+            name: `fn_${String(position + 1).padStart(2, "0")}`,
+            table_name: null,
+            definition: "function",
+          })),
+          // Overloads share a name and are listed once.
+          {
+            kind: "function",
+            name: "fn_01",
+            table_name: null,
+            definition: "procedure",
+          },
+        ],
+        {
+          sequences: [
+            {
+              name: "invoice_numbers",
+              reference: "invoice_numbers",
+              owner_table: null,
+              owner_column: null,
+              identity: false,
+              defaults: 0,
+            },
+            {
+              name: "people_id_seq",
+              reference: "people_id_seq",
+              owner_table: "people",
+              owner_column: "id",
+              identity: true,
+              defaults: 0,
+            },
+          ],
+          otherSchemas: [
+            { schema: "audit", tables: 2 },
+            { schema: "billing", tables: 1 },
+          ],
+        },
+      ),
+    );
+
+    expect(
+      model.warnings.map((warning) => [
+        warning.code,
+        warning.table ?? "",
+        warning.message,
+      ]),
+    ).toEqual([
+      [
+        "inheritance",
+        "staff",
+        '"staff" inherits from "people"; the schema has no inheritance, so both are declared as separate plain tables: a database built from this schema does not show the rows of "staff" in "people"',
+      ],
+      [
+        "row-security",
+        "notes",
+        '"notes" has row-level security enabled with policies "notes_owner", "notes_read"; the schema declares neither, so a database built from this schema leaves every row of the table visible and writable',
+      ],
+      [
+        "row-security",
+        "people",
+        '"people" has row-level security enabled without policies; the schema declares neither, so a database built from this schema leaves every row of the table visible and writable',
+      ],
+      [
+        "row-security",
+        "staff",
+        '"staff" has policy "staff_all" but row-level security is not enabled; the schema does not declare policies and migrations neither create nor drop them',
+      ],
+      [
+        "function",
+        "",
+        '12 functions and procedures "fn_01", "fn_02", "fn_03", "fn_04", "fn_05", "fn_06", "fn_07", "fn_08", "fn_09", "fn_10" and 2 more are not declared; the schema does not manage routines, so migrations neither create nor drop them and a database built from this schema lacks them',
+      ],
+      [
+        "sequence",
+        "",
+        'sequence "invoice_numbers" is not owned by a column and not declared; migrations neither create nor drop it and a database built from this schema lacks it',
+      ],
+      [
+        "other-schema",
+        "",
+        '3 tables in other schemas were not read: "audit" (2), "billing" (1); pull reads one schema, here "public"',
+      ],
+    ]);
+    // Both tables of an inheritance pair are still declared.
+    expect(model.tables.map((table) => table.sqlName)).toEqual([
+      "notes",
+      "people",
+      "staff",
+    ]);
+  });
+
+  test("a sequence shared between columns keeps its default and gets no identity fix", () => {
+    const sequenced = (name: string) => ({
+      name,
+      primaryKey: ["id"],
+      columns: [
+        {
+          name: "id",
+          type: "integer",
+          default: "nextval('document_ids'::regclass)",
+        },
+      ],
+    });
+    const warnings = (sequences: PullCatalog["sequences"]) => {
+      const model = buildPulledSchema(
+        catalog([sequenced("invoices"), sequenced("receipts")], [], [], {
+          sequences,
+        }),
+      );
+
+      expect(column(model, "invoices", "id").default).toEqual({
+        kind: "sql",
+        sql: "nextval('document_ids'::regclass)",
+      });
+
+      return model.warnings.map((warning) => [
+        warning.code,
+        warning.table ?? "",
+        warning.fix === undefined ? warning.message : "fix",
+      ]);
+    };
+    const shared = {
+      name: "document_ids",
+      reference: "document_ids",
+      identity: false,
+      defaults: 2,
+    };
+
+    // Created on its own and used by two tables.
+    expect(
+      warnings([{ ...shared, owner_table: null, owner_column: null }]),
+    ).toEqual([
+      [
+        "sequence",
+        "",
+        'sequence "document_ids" is not owned by a column and not declared; migrations neither create nor drop it and a database built from this schema lacks it',
+      ],
+      [
+        "sequence",
+        "invoices",
+        '"invoices.id" takes its default from sequence document_ids, which is not owned by the column; the schema keeps the nextval() default but migrations from this schema will not create the sequence, and no identity fix is offered because it would drop a sequence something else may use',
+      ],
+      [
+        "sequence",
+        "receipts",
+        '"receipts.id" takes its default from sequence document_ids, which is not owned by the column; the schema keeps the nextval() default but migrations from this schema will not create the sequence, and no identity fix is offered because it would drop a sequence something else may use',
+      ],
+    ]);
+
+    // A serial column whose sequence a second table borrowed.
+    expect(
+      warnings([{ ...shared, owner_table: "invoices", owner_column: "id" }]),
+    ).toEqual([
+      [
+        "sequence",
+        "invoices",
+        '"invoices.id" takes its default from sequence document_ids, which is also the default of 1 other column; the schema keeps the nextval() default but migrations from this schema will not create the sequence, and no identity fix is offered because it would drop a sequence something else may use',
+      ],
+      [
+        "sequence",
+        "receipts",
+        '"receipts.id" takes its default from sequence document_ids, which is not owned by the column; the schema keeps the nextval() default but migrations from this schema will not create the sequence, and no identity fix is offered because it would drop a sequence something else may use',
+      ],
+    ]);
+
+    // Owned by its column alone: the ordinary serial, with the fix.
+    expect(
+      warnings([
+        { ...shared, defaults: 1, owner_table: "invoices", owner_column: "id" },
+      ]),
+    ).toEqual([
+      ["serial", "invoices", "fix"],
+      expect.arrayContaining(["sequence", "receipts"]),
+    ]);
   });
 });
 

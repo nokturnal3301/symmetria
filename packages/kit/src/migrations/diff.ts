@@ -127,6 +127,94 @@ const comparable = (
 const escapedJSON = (value: string): string =>
   JSON.stringify(value).slice(1, -1);
 
+/** What comparing a table's previous and next checks and indexes needs to know. */
+export type DefinitionScope = Pick<TablePair, "affected" | "renamed" | "types">;
+
+/**
+ * Applies column renames (quoted old name to quoted new name) to every
+ * expression of a definition.
+ */
+export const renamedDefinitions =
+  (columnRenames: ReadonlyMap<string, string>): TablePair["renamed"] =>
+  (definition) =>
+    columnRenames.size
+      ? JSON.parse(
+          JSON.stringify(definition, (_name, value) =>
+            typeof value === "string"
+              ? renameExpressionIdentifiers(value, columnRenames)
+              : value,
+          ),
+        )
+      : definition;
+
+/** A definition survives when only renamed columns changed and no column it uses is retyped or dropped. */
+export const changedDefinition = (
+  pair: DefinitionScope,
+  previous: unknown,
+  next: unknown,
+): boolean => {
+  if (!previous || !next) {
+    return true;
+  }
+
+  const text = canonicalJSON(previous);
+
+  return (
+    pair.affected.some((name) => text.includes(escapedJSON(name))) ||
+    !equal(
+      comparable(pair.renamed(previous), pair.types),
+      comparable(next, pair.types),
+    )
+  );
+};
+
+/**
+ * The definition each previous index or check continues as: the one with the
+ * same SQL name, or else the single one equal to it apart from names. Renamed
+ * tables and columns change SQL names, and snapshots keep no declared key.
+ */
+export const counterparts = <Definition extends { sqlName: string }>(
+  pair: DefinitionScope,
+  previous: readonly Definition[],
+  next: readonly Definition[],
+): Map<string, Definition> => {
+  const matches = new Map<string, Definition>();
+  const taken = new Set<string>();
+
+  for (const definition of previous) {
+    const same = next.find(
+      (candidate) => candidate.sqlName === definition.sqlName,
+    );
+
+    if (same) {
+      matches.set(definition.sqlName, same);
+      taken.add(same.sqlName);
+    }
+  }
+
+  for (const definition of previous) {
+    if (matches.has(definition.sqlName)) {
+      continue;
+    }
+
+    const shape = canonicalJSON(
+      comparable(pair.renamed(definition), pair.types),
+    );
+    const candidates = next.filter(
+      (candidate) =>
+        !taken.has(candidate.sqlName) &&
+        canonicalJSON(comparable(candidate, pair.types)) === shape,
+    );
+
+    if (candidates.length === 1) {
+      matches.set(definition.sqlName, candidates[0]!);
+      taken.add(candidates[0]!.sqlName);
+    }
+  }
+
+  return matches;
+};
+
 const direction = (
   before: MigrationSnapshot,
   after: MigrationSnapshot,
@@ -416,16 +504,7 @@ const direction = (
       types: new Map(
         next.columns.map((column) => [column.name, column.sqlType]),
       ),
-      renamed: (definition) =>
-        columnRenames.size
-          ? JSON.parse(
-              JSON.stringify(definition, (_name, value) =>
-                typeof value === "string"
-                  ? renameExpressionIdentifiers(value, columnRenames)
-                  : value,
-              ),
-            )
-          : definition,
+      renamed: renamedDefinitions(columnRenames),
     });
   }
 
@@ -461,74 +540,6 @@ const direction = (
     (table) => !nextPairs.has(table.name),
   );
   const droppedIndexes = new Set<string>();
-
-  /** A definition survives when only renamed columns changed and no column it uses is retyped or dropped. */
-  const changedDefinition = (
-    pair: TablePair,
-    previous: unknown,
-    next: unknown,
-  ): boolean => {
-    if (!previous || !next) {
-      return true;
-    }
-
-    const text = canonicalJSON(previous);
-
-    return (
-      pair.affected.some((name) => text.includes(escapedJSON(name))) ||
-      !equal(
-        comparable(pair.renamed(previous), pair.types),
-        comparable(next, pair.types),
-      )
-    );
-  };
-
-  /**
-   * The definition each previous index or check continues as: the one with the
-   * same SQL name, or else the single one equal to it apart from names. Renamed
-   * tables and columns change SQL names, and snapshots keep no declared key.
-   */
-  const counterparts = <Definition extends { sqlName: string }>(
-    pair: TablePair,
-    previous: readonly Definition[],
-    next: readonly Definition[],
-  ): Map<string, Definition> => {
-    const matches = new Map<string, Definition>();
-    const taken = new Set<string>();
-
-    for (const definition of previous) {
-      const same = next.find(
-        (candidate) => candidate.sqlName === definition.sqlName,
-      );
-
-      if (same) {
-        matches.set(definition.sqlName, same);
-        taken.add(same.sqlName);
-      }
-    }
-
-    for (const definition of previous) {
-      if (matches.has(definition.sqlName)) {
-        continue;
-      }
-
-      const shape = canonicalJSON(
-        comparable(pair.renamed(definition), pair.types),
-      );
-      const candidates = next.filter(
-        (candidate) =>
-          !taken.has(candidate.sqlName) &&
-          canonicalJSON(comparable(candidate, pair.types)) === shape,
-      );
-
-      if (candidates.length === 1) {
-        matches.set(definition.sqlName, candidates[0]!);
-        taken.add(candidates[0]!.sqlName);
-      }
-    }
-
-    return matches;
-  };
 
   const indexMatches = new Map(
     pairs.map(

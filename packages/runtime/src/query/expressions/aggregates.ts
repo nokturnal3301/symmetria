@@ -4,6 +4,7 @@
 import type { PredicateDescription, ValueNode } from ".";
 import type { SelectPlan } from "../plan/types";
 import { sameExpression } from "../plan/equivalence";
+import { containsNode } from "../plan/traverse";
 
 type AggregateQuery = Extract<ValueNode, { kind: "subquery" }>;
 type SharedAggregate = {
@@ -215,58 +216,6 @@ export const sharedAggregates = (query: SelectPlan): SharedAggregate[] => {
     (group) => group.filtered && group.references.length > 1,
   );
 };
-
-/** Direct child value nodes; nested plans of subqueries are not entered. */
-const childNodes = (node: ValueNode): readonly ValueNode[] => {
-  switch (node.kind) {
-    case "binary":
-      return [node.left, node.right];
-    case "coalesce":
-    case "tuple":
-      return node.values;
-    case "case":
-      return [
-        node.value,
-        ...node.branches.flatMap((branch) => [branch.when, branch.then]),
-      ];
-    case "raw":
-      return node.parts.filter(
-        (part): part is ValueNode => typeof part !== "string",
-      );
-    case "jsonObject":
-      return node.selection.map((expression) => expression.node);
-    case "jsonPath":
-    case "arrayIndex":
-    case "arrayLength":
-      return [node.value];
-    case "searchRank":
-    case "searchHeadline":
-      return [node.value, node.query];
-    case "tsvector":
-      return node.parts.map((part) => part.value);
-    case "relativeWindow":
-      return node.fallback
-        ? [node.value, node.offset, node.fallback]
-        : [node.value, node.offset];
-    case "window":
-      return [
-        node.expression,
-        ...node.partitionBy,
-        ...node.orderBy.map((ordering) => ordering.expression.node),
-      ];
-    case "aggregate":
-      return node.value ? [node.value] : [];
-    default:
-      return [];
-  }
-};
-
-const containsNode = (
-  node: ValueNode,
-  matches: (node: ValueNode) => boolean,
-): boolean =>
-  matches(node) ||
-  childNodes(node).some((child) => containsNode(child, matches));
 
 /** Subqueries evaluated once per outer row: nested collections, aggregates, EXISTS. */
 const containsCorrelatedSubquery = (node: ValueNode): boolean =>

@@ -77,7 +77,10 @@ Names come from object keys; camelCase maps to snake_case. Columns are non-null
 by default. `author: users` creates `authorId` and the `author` relationship;
 `users.unique` represents 1:1. `junction({ post: posts, tag: tags })` declares a
 many-to-many link table: both foreign keys form its primary key and each side
-gains an M:N relation. `.inverse("edited")` resolves ambiguous reverse names.
+gains an M:N relation. The primary key already serves lookups by its first key
+(`post_id`), so `junction()` also creates an index on the second one
+(`post_tags_tag_id_idx`) for the other direction. `.inverse("edited")` resolves
+ambiguous reverse names.
 
 A reference targets the primary key and creates a `<key>_id` column by default.
 `users.by("email")` references a unique column instead (the foreign-key column
@@ -97,6 +100,13 @@ collection. A self-reference has no automatic reverse relation; name it with
 `.inverse()` when you need one. `.onUpdate.cascade`, `.onUpdate.restrict` and
 `.onUpdate.noAction` set the foreign key's `ON UPDATE` action (the default is
 PostgreSQL's `NO ACTION`); databases created by Prisma use `.onUpdate.cascade`.
+
+Every foreign key, a junction's included, is created `ON DELETE RESTRICT` unless
+the reference says otherwise: deleting a row that other rows still point to
+fails, and nothing is deleted or set to NULL on its own. `.onDelete.cascade`
+deletes the referencing rows with it, `.onDelete.setNull` (the column becomes
+nullable) clears the reference, and `.onDelete.noAction` is PostgreSQL's own
+default, which checks at the end of the statement instead of immediately.
 
 ### SQL names
 
@@ -395,8 +405,48 @@ Every option accepts the listed value or a synchronous
 `(source, tools) => value` callback. Callbacks receive the projection's full
 source and SQL tools, including columns that are not selected. `undefined`
 values are ignored. Empty predicate arrays add no restriction; unknown option
-names are rejected. The exported `QueryOptions<Source, Tools>` type can describe
-shared options.
+names are rejected. The exported `QueryOptions<Source, Tools, Selected>` type
+can describe shared options.
+
+`orderBy`, `groupBy` and `having` callbacks receive a third argument: the fields
+the projection returned, under their names, so a computed field is written once
+and then ordered, grouped or filtered by name.
+
+```ts
+database.users(
+  (user) => ({
+    name: user.name,
+    spent: user.orders.sum((order) => order.quantity.multiply(order.price)),
+  }),
+  { orderBy: (user, tools, selected) => selected.spent.descending.nullsLast },
+);
+
+database.posts(
+  (post, { sql, count }) => ({
+    month: sql<string>`to_char(${post.createdAt}, 'YYYY-MM')`,
+    posts: count(),
+  }),
+  {
+    groupBy: (post, tools, selected) => [selected.month],
+    orderBy: (post, tools, selected) => selected.month.ascending,
+  },
+);
+```
+
+A selected field is the same expression as in the projection, not a reference to
+its alias: the SQL repeats the expression, and in a grouped or `distinct` query
+it is the same text with the same parameters, as PostgreSQL requires. Only
+fields that are one value are offered: a nested object, a nested collection or a
+relation selected with a shape is a type error, and an error when the query is
+built for untyped code. `where` receives no third argument, because a WHERE runs
+before aggregates and window functions exist; filter on source columns there and
+on aggregates in `having`. The fields also reach a relation's own options
+(`user.posts(shape, { orderBy })`), reusable shapes, prepared queries, and
+options added later to a selected query
+(`feed({ orderBy: (post, tools, selected) => … })`), where they are the
+selection the query already has. `page()` accepts a selected field in `orderBy`
+under its usual rule: an expression over the root table's columns, next to the
+primary key; an aggregate over a relation is not one.
 
 A projection holds fields only; a `$`-prefixed key in it is rejected. Option
 callbacks run after the projection on the same source, so they can reach the
@@ -567,30 +617,30 @@ with their original types. They also remain available as named imports:
 | ----------------------- | ----------------------------------------------------------- |
 | Predicates              | `and`, `or`, `not`, `when`, `exists`, `notExists`           |
 | Aggregates and fallback | `count`, `sum`, `average`, `minimum`, `maximum`, `coalesce` |
+| Dates                   | `dateTrunc`                                                 |
 | Windows                 | `rowNumber`, `rank`, `denseRank`, `lag`, `lead`, `over`     |
 | SQL template            | `sql`                                                       |
 | Local narrowing         | `whereNotNull`                                              |
 
 ```ts
 database.posts(
-  (post, { join, count, sum }) => {
-    const author = join(post.author);
-    const publications = count();
-
-    return {
-      author: author.name,
-      publications,
-      views: sum(post.views),
-    };
-  },
+  (post, { join, count, sum }) => ({
+    author: join(post.author).name,
+    publications: count(),
+    views: sum(post.views),
+  }),
   {
-    where: (post, { join, count, sum }) => post.state.is.published,
-    groupBy: (post, { join, count, sum }) => [author.name],
-    having: (post, { join, count, sum }) => publications.above(2),
-    orderBy: (post, { join, count, sum }) => publications.descending,
+    where: (post) => post.state.is.published,
+    groupBy: (post, tools, selected) => [selected.author],
+    having: (post, tools, selected) => selected.publications.above(2),
+    orderBy: (post, tools, selected) => selected.publications.descending,
   },
 );
 ```
+
+Variables of the projection callback are out of scope in the option callbacks;
+their third argument carries the returned fields instead (see
+[query options](#shape-first-queries)).
 
 `whereNotNull(column)` adds `IS NOT NULL` to the current query and returns a
 non-null typed expression; on a JSON value it also leaves out JSON `null`, which
@@ -1246,6 +1296,16 @@ inserts are multi-statement operations with `.returning()`/`.execute()`; they do
 not expose `.toSQL()`, `.prepare()` or root `.onConflict()`. Ordinary flat
 inserts keep the full SQL builder.
 
+Children created under a one-to-many relation are written together: an order
+with three `items: { create: [...] }` is two INSERTs, one for the order and one
+multi-row INSERT for its items, split into several only above PostgreSQL's limit
+of 65,535 parameters. Rows are inserted in the order given, so generated
+identities follow the input. A child that has nested relations of its own is
+written by itself, between the groups of plain children before and after it.
+`connect` and `connectOrCreate` still resolve each target with its own
+statement, and so does every target created through a junction; the junction
+rows of one operation are then one multi-row INSERT.
+
 ## CTEs and window functions
 
 ```ts
@@ -1501,6 +1561,52 @@ It also computes and compares as that column: ``sql.of(int)`…`.divide(2)`` is 
 `Decimal`, ``sql.of(real)`…`.divide(2)`` a `number`. Raw fragments are
 parenthesized wherever they are operands.
 
+Pass JSON to a raw fragment as text and cast it `::text::jsonb`, not `::jsonb`:
+``sql`${JSON.stringify(value)}::text::jsonb` ``. With Bun's native driver a JSON
+string bound to a bare `$1::jsonb` is stored as a JSON _string_ that contains
+the JSON text (`"{\"theme\":\"dark\"}"`, whose `jsonb_typeof` is `string`),
+while node-postgres stores the object; with `::text::jsonb` both drivers store
+the object. Symmetria casts its own JSON parameters this way.
+
+### Date buckets
+
+```ts
+import { dateTrunc } from "symmetria";
+
+database.orders(
+  (order, { dateTrunc, count }) => ({
+    month: dateTrunc("month", order.createdAt, { timeZone: "Europe/Berlin" }),
+    orders: count(),
+  }),
+  {
+    groupBy: (order, tools, selected) => [selected.month],
+    orderBy: (order, tools, selected) => selected.month.ascending,
+  },
+);
+// date_trunc('month', "orders"."created_at", $1::text)
+```
+
+`dateTrunc(unit, value, options?)` is PostgreSQL's `date_trunc`: the start of
+the hour, day, week, month or other unit a value falls in. It works in
+projections, `where`, `groupBy` and `orderBy`, on `timestamptz`, `timestamp` and
+`date` columns and expressions (raw SQL as ``sql.of(timestamptz)`…` ``). The
+unit is one of `microseconds`, `milliseconds`, `second`, `minute`, `hour`,
+`day`, `week`, `month`, `quarter`, `year`, `decade`, `century` and `millennium`;
+it is checked when the query is built and written into the SQL, never taken from
+a parameter.
+
+The result is a `Date`, `null` where the input is NULL. A `timestamptz` stays a
+`timestamptz` and a `timestamp` a `timestamp` (read as UTC, like its column). A
+`date` becomes a `timestamptz`, as in PostgreSQL: the midnight that starts the
+unit in the session's time zone. Where a day or month begins depends on the time
+zone: for a `timestamptz` it is the session's zone unless
+`{ timeZone: "Europe/Berlin" }` names one, which compiles to the three-argument
+`date_trunc(unit, value, zone)` with the zone as a bound parameter (a string or
+a prepared parameter). `timeZone` applies to `timestamptz` values only; with a
+`timestamp` or `date` it is rejected when the query is built. Text and other
+types are rejected there as well; the types cannot tell a `date` from `text`,
+both being strings.
+
 ## Nested relations
 
 ```ts
@@ -1546,7 +1652,21 @@ scope. Raw expressions inside a nested query block only that query's rewrite.
   `string` everywhere one is expected). Writes, filters and prepared parameters
   accept any string for decimal columns and safe integers for `bigint` columns;
   an enum whose labels look like numbers (`oneOf("1", "2")`) stays text and
-  accepts only its labels. `sum()` and `average()` return `Decimal | null`.
+  accepts only its labels. `sum()` and `average()` return `Decimal | null`. The
+  type is `string` because decimals usually arrive as text from a request; the
+  text itself is checked when the query runs, before anything is sent: digits
+  with an optional sign, fraction and exponent (`"12.50"`, `"-.5"`, `"1e3"`),
+  `NaN`, `Infinity` and `-Infinity` (`inf` too, in any letter case), with spaces
+  around it allowed, as PostgreSQL reads them. Anything else, such as `"abc"`,
+  `""` or `"1,5"`, rejects the query with
+  `numeric values are decimal text such as "12.50", received "abc"` (see
+  [when errors surface](#when-errors-surface)), in writes, filters, arithmetic
+  operands and prepared parameters alike. PostgreSQL 16's `0x1F` and `1_000`
+  forms are refused too, since versions 14 and 15 do not read them. A JavaScript
+  `number` is a type error on purpose: it is a binary float, so `0.1 + 0.2` is
+  `0.30000000000000004` and integers above 2^53 lose digits before they would
+  reach the column. Write money and other exact values as text
+  (`price: "19.99"`, or `amount.toFixed(2)` when a number is all there is).
 - `jsonb<Value>()` → `Value`, `timestamptz` → `Date`. JSON `null` follows the
   column: on a non-nullable jsonb column (`jsonb<string | null>()`) a JS `null`
   is written as the JSON value `null` (`'null'::jsonb`), reads back as `null`
@@ -1619,15 +1739,15 @@ carries reject its promise when it runs (`await`, `.execute()`, `.then()`,
 is sent: `null` for a NOT NULL column, a missing required value, an `update()`
 with no values, input a `jsonb(schema)` rejects, fractional or out-of-range
 `int` / `smallint` numbers (also as arithmetic operands), unsafe `bigint`
-numbers, invalid `Date`s, NULL array elements, a null lookup key, duplicate
-upsert conflict keys and values a custom codec rejects. PostgreSQL itself
-rejects unknown enum labels when the statement runs. So
-`insert(body).catch(handle)` and `try { await … } catch` see every value error
-the same way, and building a query never throws because of its values. `toSQL()`
-returns SQL rather than a promise, so it throws value errors directly, as does
-`prepare()` for values fixed in the query; parameters of a prepared query and
-`$scope()` values are checked at every execution. Messages and codes are the
-same in every case.
+numbers, text that is not a number for a `numeric` column, invalid `Date`s, NULL
+array elements, a null lookup key, duplicate upsert conflict keys and values a
+custom codec rejects. PostgreSQL itself rejects unknown enum labels when the
+statement runs. So `insert(body).catch(handle)` and `try { await … } catch` see
+every value error the same way, and building a query never throws because of its
+values. `toSQL()` returns SQL rather than a promise, so it throws value errors
+directly, as does `prepare()` for values fixed in the query; parameters of a
+prepared query and `$scope()` values are checked at every execution. Messages
+and codes are the same in every case.
 
 ### PostgreSQL adapters
 
@@ -2023,6 +2143,41 @@ null. `is(null)` tests SQL NULL (including a missing path); a present JSON null
 is a JSON value, while `coalesce()` and `whereNotNull()` treat it as null, as
 its type says. `contains()` uses `@>` and accepts partial objects/subarrays.
 
+`set(key, value)` changes one key of a jsonb value and keeps the rest, where
+assigning the column would replace the whole document:
+
+```ts
+// settings: jsonb<{ theme: "dark" | "light"; notifications: { email: boolean } }>()
+await database.users
+  .update(({ settings }) => ({
+    settings: settings
+      .set("theme", "dark")
+      .set(["notifications", "email"], true),
+  }))
+  .where((user) => user.id.is(1));
+// SET "settings" = jsonb_set(jsonb_set("users"."settings", ARRAY[$1::text],
+//   $2::text::jsonb, true), ARRAY[$3::text, $4::text], $5::text::jsonb, true)
+```
+
+The first argument is a key or, as an array, a path of keys and array positions;
+both are checked against the column's JSON type, as for `path()`, and the value
+must be what that type holds there (`null` only where the type allows it, stored
+as JSON `null`). The value is bound as JSON text, the keys as text parameters. A
+column or expression is accepted as the value too and stored in its JSON form
+(`to_jsonb`), SQL NULL as JSON `null`. Calls chain, and the result is a jsonb
+expression like the column: it can be assigned in `update()` or selected.
+
+`set()` compiles to `jsonb_set(…, true)` and behaves like it:
+
+- The last key of the path is added when it is missing; a missing parent is not
+  created, and the JSON is then left unchanged
+  (`set(["notifications", "email"], true)` does nothing in a row that has no
+  `notifications` object).
+- A NULL column stays NULL: there is no JSON to set a key in. When the column is
+  nullable, start from a value: `coalesce(draft, { step: 0 }).set("step", 1)`.
+- A `jsonb(schema)` column's schema validates whole values, so it does not run
+  for the value of a single key.
+
 A path into a jsonb column is a jsonb value, and PostgreSQL has no LIKE,
 arithmetic, SUM or MAX for jsonb. Symmetria converts where the meaning is clear:
 `is()`, `in()`, `above()`, `between()` and the other comparisons compare JSON
@@ -2054,6 +2209,11 @@ reference actions. A single-column PK or `.unique` already has an index, so
 `.index` does not create a redundant one. The index is named after the SQL
 column, like the foreign key: `name: text.named("Name").index` creates
 `users_Name_idx`.
+
+A unique rule over several columns is declared as a unique index,
+`index(posts.tenant, posts.slug).unique` in `.indexes()`, and is created with
+`CREATE UNIQUE INDEX`, not as a table `UNIQUE` constraint. It enforces the same
+rule, and `by` lookups, `onConflict()` and nested `connect` accept it as a key.
 
 Declare indexes next to their table with `table(columns).indexes(callback)`. The
 callback receives that table's columns, including generated FK columns.
@@ -2351,38 +2511,39 @@ connection, directory, verification-server, timeout and display flags are
 accepted everywhere and used where they apply. The names in parentheses are the
 matching config and API options.
 
-| Flag                           | Commands                                     | Purpose                                                      |
-| ------------------------------ | -------------------------------------------- | ------------------------------------------------------------ |
-| `--config <file>`              | all                                          | Config module (default `symmetria.config.ts`)                |
-| `--dir <directory>`            | all with a project                           | Migrations directory, relative to the working directory      |
-| `--database-url <url>`         | database commands, `pull`, `lint`            | Connection; overrides `databaseUrl` and `DATABASE_URL`       |
-| `--json`                       | all                                          | One JSON object on stdout, `{"error": …}` on failure         |
-| `--sql`                        | `diff`                                       | Print executable SQL                                         |
-| `--diff <file.json>`           | `generate`, `diff`, `lint`                   | Rename hints and `USING` conversions                         |
-| `--empty`                      | `generate`                                   | An empty, editable SQL migration                             |
-| `--allow-destructive`          | `generate`                                   | Permit drops and narrowing type changes (`allowDestructive`) |
-| `--transaction <mode>`         | `generate`                                   | `batch` (default), `each` or `none` (`transaction`)          |
-| `--online`                     | `generate`, `diff`, `lint`                   | Concurrent indexes and phased validation (`online`)          |
-| `--allow-custom-sql`           | `squash`                                     | Drop SQL that generate did not write (`allowCustomSQL`)      |
-| `--pending`                    | `lint`                                       | Only migrations pending in the database                      |
-| `--strict`                     | `lint`, `drift`                              | Exit with code 1 for any finding                             |
-| `--to <id>`                    | `migrate`, `adopt`                           | Apply up to, or adopt through, a migration (`to`)            |
-| `--steps <n>`                  | `rollback`                                   | Number of migrations to revert (`steps`)                     |
-| `--plan`                       | `migrate`, `rollback`                        | Show SQL and transaction groups without running them         |
-| `--action <action>`            | `repair`                                     | `retry` or `complete` (`action`)                             |
-| `--verify-url <url>`           | `verify`, `adopt`, `repair`                  | Server for disposable databases (`verificationDatabaseUrl`)  |
-| `--ignore-table <name>`        | `pull`, `drift`, `adopt`, `repair`, `verify` | Leave an undeclared table out, repeatable (`ignoreTables`)   |
-| `--advisory-lock-timeout <ms>` | commands that run migrations                 | Migration lock wait (`advisoryLockTimeoutMs`, default 10000) |
-| `--lock-timeout <ms>`          | commands that run migrations                 | DDL lock wait (`lockTimeoutMs`, default 5000; 0 disables)    |
-| `--statement-timeout <ms>`     | commands that run migrations                 | Statement duration (`statementTimeoutMs`, default 600000)    |
-| `--force`                      | `pull`, `graph`                              | Overwrite the written file                                   |
-| `--compact`                    | `graph`                                      | Entities and relations without column lists                  |
-| `--relations`                  | `inspect`                                    | Start on, or list, the relations                             |
-| `--profile-url <url>`          | `profile`                                    | Profiler endpoint (default `http://127.0.0.1:7331`)          |
-| `--profile-token <token>`      | `profile`                                    | Profiler token (default `SYMMETRIA_PROFILE_TOKEN`)           |
-| `--no-interactive`             | all                                          | No dashboard, schema browser or rename questions             |
-| `--no-color`, `--no-animation` | all                                          | Plain output; no logo or spinner animation                   |
-| `--help`, `-h`                 | all                                          | Show the commands and flags                                  |
+| Flag                           | Commands                                     | Purpose                                                                                                         |
+| ------------------------------ | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `--config <file>`              | all                                          | Config module (default `symmetria.config.ts`)                                                                   |
+| `--dir <directory>`            | all with a project                           | Migrations directory, relative to the working directory                                                         |
+| `--database-url <url>`         | database commands, `pull`, `lint`            | Connection; overrides `databaseUrl` and `DATABASE_URL`                                                          |
+| `--json`                       | all                                          | One JSON object on stdout, `{"error": …}` on failure                                                            |
+| `--sql`                        | `diff`                                       | Print executable SQL                                                                                            |
+| `--diff <file.json>`           | `generate`, `diff`, `lint`                   | Rename hints and `USING` conversions                                                                            |
+| `--empty`                      | `generate`                                   | An empty, editable SQL migration                                                                                |
+| `--allow-destructive`          | `generate`                                   | Permit drops and narrowing type changes (`allowDestructive`)                                                    |
+| `--transaction <mode>`         | `generate`                                   | `batch` (default), `each` or `none` (`transaction`)                                                             |
+| `--online`                     | `generate`, `diff`, `lint`                   | Concurrent indexes and phased validation (`online`)                                                             |
+| `--allow-custom-sql`           | `squash`                                     | Drop SQL that generate did not write (`allowCustomSQL`)                                                         |
+| `--pending`                    | `lint`                                       | Only migrations pending in the database                                                                         |
+| `--strict`                     | `lint`, `drift`                              | Exit with code 1 for any finding                                                                                |
+| `--to <id>`                    | `migrate`, `adopt`                           | Apply up to, or adopt through, a migration (`to`)                                                               |
+| `--steps <n>`                  | `rollback`                                   | Number of migrations to revert (`steps`)                                                                        |
+| `--yes`                        | `rollback`                                   | Run `down.sql` without asking; required without a terminal                                                      |
+| `--plan`                       | `migrate`, `rollback`                        | Show SQL and transaction groups without running them                                                            |
+| `--action <action>`            | `repair`                                     | `retry` or `complete` (`action`)                                                                                |
+| `--verify-url <url>`           | `verify`, `adopt`, `repair`                  | Server for disposable databases (`verificationDatabaseUrl`)                                                     |
+| `--ignore-table <name>`        | `pull`, `drift`, `adopt`, `repair`, `verify` | Leave an undeclared table out, repeatable (`ignoreTables`)                                                      |
+| `--advisory-lock-timeout <ms>` | commands that run migrations                 | Migration lock wait (`advisoryLockTimeoutMs`, default 10000)                                                    |
+| `--lock-timeout <ms>`          | commands that run migrations                 | DDL lock wait (`lockTimeoutMs`, default 5000; 0 disables)                                                       |
+| `--statement-timeout <ms>`     | commands that run migrations                 | Statement duration (`statementTimeoutMs`, default 600000; no default limit in `transaction: "none"` migrations) |
+| `--force`                      | `pull`, `graph`                              | Overwrite the written file                                                                                      |
+| `--compact`                    | `graph`                                      | Entities and relations without column lists                                                                     |
+| `--relations`                  | `inspect`                                    | Start on, or list, the relations                                                                                |
+| `--profile-url <url>`          | `profile`                                    | Profiler endpoint (default `http://127.0.0.1:7331`)                                                             |
+| `--profile-token <token>`      | `profile`                                    | Profiler token (default `SYMMETRIA_PROFILE_TOKEN`)                                                              |
+| `--no-interactive`             | all                                          | No dashboard, schema browser or rename questions                                                                |
+| `--no-color`, `--no-animation` | all                                          | Plain output; no logo or spinner animation                                                                      |
+| `--help`, `-h`                 | all                                          | Show the commands and flags                                                                                     |
 
 The dashboard stays in one terminal screen, with a softly animated logo, schema
 counts, connection state and pending SQL changes. Set `DATABASE_URL` or pass
@@ -2400,18 +2561,21 @@ changes that narrow existing values unless `--allow-destructive` is explicitly
 supplied; the refusal lists each destructive operation. Narrowing means a value
 can change or stop fitting: a shorter `varchar`/`char` or `bit` length, fewer
 `numeric` decimal places (values are rounded), `numeric` or floating point to an
-integer type, fewer fractional-second digits on `timestamp`/`time`/`interval`, a
-timestamp to `date` or `time`, or a number into a floating-point type that keeps
-fewer digits. A change to a length-limited string type is generated without a
-`USING` cast: an explicit `::varchar(5)` would silently cut `Alexandria` to
-`Alexa`, while PostgreSQL's own assignment cast refuses the long value, so the
-migration fails and rolls back with the data intact. The same holds for the
-`down.sql` of a widening change: a rollback to the shorter type fails on values
-that no longer fit instead of cutting them. A rename needs a `--diff` hint; it
-is never guessed from similar names. The API uses `allowDestructive: true` for
-intentional removals. Column declarations keep their order in `CREATE TABLE`;
-snapshot hashes ignore column order so reordering source declarations does not
-create a migration.
+integer type, a smaller integer type (`bigint` to `integer`, either to
+`smallint`: the migration fails while a value is out of range), an integer type
+to `boolean` (every value other than 0 becomes true), fewer fractional-second
+digits on `timestamp`/`time`/`interval`, a timestamp to `date` or `time`, or a
+number into a floating-point type that keeps fewer digits. A change to a
+length-limited string type is generated without a `USING` cast: an explicit
+`::varchar(5)` would silently cut `Alexandria` to `Alexa`, while PostgreSQL's
+own assignment cast refuses the long value, so the migration fails and rolls
+back with the data intact. The same holds for the `down.sql` of a widening
+change: a rollback to the shorter type fails on values that no longer fit
+instead of cutting them. A rename needs a `--diff` hint; it is never guessed
+from similar names. The API uses `allowDestructive: true` for intentional
+removals. Column declarations keep their order in `CREATE TABLE`; snapshot
+hashes ignore column order so reordering source declarations does not create a
+migration.
 
 `diff` compares the current declaration to the latest local snapshot, not to the
 live database. CHECK expressions, partial-index predicates and index key
@@ -2523,6 +2687,12 @@ appends a journal entry without changing the snapshot.
 - `migrate --to <id>` applies through a target; `rollback --steps 2` reverts the
   latest two applied migrations in reverse order. A target that is already
   applied changes nothing, and the output says where the database stands.
+- `rollback` runs `down.sql`, which usually removes columns or tables, so it
+  asks first: it lists the statements that remove data or database objects and
+  waits for a yes, and a rollback that drops tables (the first migration, or a
+  squashed baseline) needs the database name typed out. Without a terminal it
+  refuses unless `--yes` is passed; `rollback --plan` prints the SQL without
+  running it. In menus a digit only moves the selection; Enter runs the action.
 - `lint` inspects saved `up.sql` files and any ungenerated schema diff. It exits
   with code 1 for destructive or blocking findings by default; `--strict` also
   fails on cautionary findings. `--pending` uses database history to select only
@@ -2554,17 +2724,26 @@ appends a journal entry without changing the snapshot.
   constraints; FK actions; enum labels and their order; invalid indexes and
   unvalidated constraints; index operator classes, key collations and storage
   parameters; declared extensions that are not installed. Use `--strict` for CI.
-  It inspects the connection's `current_schema()`, independently of
-  `metadataSchema`, and excludes the journal in its configured schema and the
-  undeclared tables listed in `ignoreTables` (config) or `--ignore-table <name>`
-  (repeatable): tables of another tool or service, or PostGIS `spatial_ref_sys`.
-  `adopt`, `repair` and `verify` leave the same tables out of every comparison,
-  including replayed historical boundaries, and the CLI always adds Prisma's
-  `_prisma_migrations`. A table the schema declares is compared even when the
-  list names it. `pull` takes the same list (without the automatic
-  `_prisma_migrations`, which it reports). `detectDrift`, `migrator`,
-  `verifyMigrations` and `pullSchema` take the same `ignoreTables` option, with
-  nothing ignored by default.
+  When the database is some migrations behind the local chain (after a
+  `rollback`, or before a deploy), the pending changes are not drift and are not
+  listed: `drift` says how many migrations the database is behind and which one
+  was applied last. Only the latest snapshot is stored, so the older state is
+  checked only with `--verify-url` (or `verificationDatabaseUrl`): the applied
+  migrations are replayed in a disposable database and the two catalogs are
+  compared. `--json` then carries `behind` (`migrations`, `lastApplied`,
+  `pending`, `verified`: `true`, `false` or `null` when nothing was checked, and
+  `differences`) next to an empty `findings`; `--strict` exits with 1 only when
+  that check finds a difference. It inspects the connection's
+  `current_schema()`, independently of `metadataSchema`, and excludes the
+  journal in its configured schema and the undeclared tables listed in
+  `ignoreTables` (config) or `--ignore-table <name>` (repeatable): tables of
+  another tool or service, or PostGIS `spatial_ref_sys`. `adopt`, `repair` and
+  `verify` leave the same tables out of every comparison, including replayed
+  historical boundaries, and the CLI always adds Prisma's `_prisma_migrations`.
+  A table the schema declares is compared even when the list names it. `pull`
+  takes the same list (without the automatic `_prisma_migrations`, which it
+  reports). `detectDrift`, `migrator`, `verifyMigrations` and `pullSchema` take
+  the same `ignoreTables` option, with nothing ignored by default.
 - `squash <name>` replaces the chain with one baseline migration that creates
   the latest snapshot; databases that applied the old chain run `adopt`, which
   verifies the live schema before rewriting recorded history (`adopt --to <id>`
@@ -2714,7 +2893,12 @@ each with a `code` and often a `fix`):
   is handed out twice on a table that already has rows. `BY DEFAULT` rather than
   `ALWAYS` keeps inserts that give their own id working, as they did with
   `serial`; switch to `int.auto` later with a migration (`SET GENERATED ALWAYS`)
-  once nothing writes ids.
+  once nothing writes ids. The fix is offered only when the column owns the
+  sequence and no other column takes its default from it. A column whose default
+  comes from a sequence it shares with other columns, or from one created on its
+  own with `CREATE SEQUENCE`, keeps the `nextval()` default and is listed under
+  `sequence` without a fix, because dropping that sequence would break the other
+  users.
 - Types without a builder (`money`, ranges, …), enums of other schemas and
   arrays of enums go through `customType()` with a passthrough codec, which
   hands over driver-native values.
@@ -2732,6 +2916,22 @@ each with a `code` and often a `fix`):
   expressions and partitions are reported but not declared.
 - Views, materialized views and triggers are listed: the schema neither declares
   nor manages them, so migrations leave them alone.
+- More that exists only in the database is listed, each under its own code, so
+  nothing disappears without a word:
+  - `inheritance`: a table created with `INHERITS`. Parent and child are
+    declared as two separate plain tables, so a database built from the schema
+    does not show the child's rows in the parent.
+  - `row-security`: a table with row-level security switched on, or with
+    policies. The schema declares neither, so a database built from it leaves
+    every row visible and writable.
+  - `function`: functions and procedures of the schema that no extension owns,
+    in one entry that names them (the first ten when there are more).
+  - `sequence`: sequences no column owns, in one entry, and each column whose
+    default draws from a shared or free-standing sequence.
+  - `other-schema`: how many tables live in other schemas, per schema. `pull`
+    reads one schema (the connection's current one), so those tables are not in
+    the generated module. System schemas and tables owned by extensions are not
+    counted.
 - Prisma's `_prisma_migrations` history table is skipped and listed.
 - Tables named in `ignoreTables` (config) or `--ignore-table <name>` are left
   out with their indexes, triggers and the enum types only they use, without a
@@ -2832,9 +3032,13 @@ Plans include SQL, migration IDs, execution modes and transaction group numbers;
 they do not execute migrations. Config/API settings `advisoryLockTimeoutMs`,
 `lockTimeoutMs` and `statementTimeoutMs` use milliseconds and default to 10,000,
 5,000 and 600,000 respectively. A zero advisory timeout tries the lock once;
-zero disables the PostgreSQL DDL or statement timeout. Session settings are
-restored when the operation finishes. The CLI cancels work on SIGINT/SIGTERM;
-the API accepts an `AbortSignal`.
+zero disables the PostgreSQL DDL or statement timeout. The default statement
+timeout does not apply to the statements of a `transaction: "none"` migration:
+it would cancel a long `CREATE INDEX CONCURRENTLY` after ten minutes and leave
+an invalid index and an incomplete migration behind. A `statementTimeoutMs` or
+`--statement-timeout` you set yourself applies to those statements too. Session
+settings are restored when the operation finishes. The CLI cancels work on
+SIGINT/SIGTERM; the API accepts an `AbortSignal`.
 
 `status` reads the journal without taking the migration lock, so it reports
 while another process is migrating; it exits with code 1 when an incomplete

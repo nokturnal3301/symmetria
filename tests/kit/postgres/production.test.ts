@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { writeFile, rm } from "node:fs/promises";
+import { readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   schema,
@@ -10,6 +10,7 @@ import {
   oneOf,
   index,
 } from "../../../packages/runtime/src";
+import { normalizeResult } from "../../../packages/runtime/src/entries/internal";
 import {
   postgres,
   transactionPooling,
@@ -287,6 +288,82 @@ describe.skipIf(!url)("production migrations", () => {
       }),
   );
 
+  test.skipIf(transactionPooling)(
+    "a failed online migration can be fixed in its file and retried",
+    () =>
+      sandbox(async ({ driver, directory, namespace }) => {
+        const first = schema({ records: { id: int.auto, name: text } });
+        const second = schema({
+          records: table({ id: int.auto, name: text }).indexes((record) => ({
+            name: index(record.name).unique,
+          })),
+        });
+        await generateMigration({
+          directory,
+          name: "initial",
+          snapshot: first.$snapshot(),
+        });
+        const runner = migrator({
+          driver,
+          directory,
+          metadataSchema: namespace,
+          verificationDatabaseUrl: url!,
+        });
+        await runner.migrate();
+        await driver.execute({
+          sql: "INSERT INTO records(name) VALUES ('same'), ('same')",
+          parameters: [],
+        });
+        const migration = (await generateMigration({
+          directory,
+          name: "unique",
+          snapshot: second.$snapshot(),
+          online: true,
+        }))!;
+        await expect(runner.migrate()).rejects.toMatchObject({
+          sqlState: "23505",
+        });
+
+        // The natural fix: remove the duplicates in the migration itself.
+        const file = join(directory, migration.id, "up.sql");
+        await writeFile(
+          file,
+          `DELETE FROM records WHERE id = 2;\n\n${await readFile(file, "utf8")}`,
+        );
+
+        // The edit does not lock the journal: status still reads it, and
+        // migrate still names the incomplete migration instead of a checksum.
+        expect((await runner.status()).at(-1)).toMatchObject({
+          status: "incomplete",
+        });
+        await expect(runner.migrate()).rejects.toThrow(
+          /incomplete .*its files changed since it ran.*use repair/,
+        );
+        await driver.execute({
+          sql: "DROP INDEX records_name_idx",
+          parameters: [],
+        });
+        await runner.repair({ id: migration.id, action: "retry" });
+        expect(await runner.migrate()).toEqual([migration.id]);
+        expect(await runner.status()).toMatchObject([
+          { status: "applied" },
+          { status: "applied" },
+        ]);
+        // The edited SQL is what ran.
+        expect(
+          JSON.stringify(
+            await driver.execute({
+              sql: "SELECT count(*)::int AS count FROM records",
+              parameters: [],
+            }),
+          ),
+        ).toContain('"count":1');
+        // An applied migration is still protected against edits.
+        await writeFile(file, `${await readFile(file, "utf8")}\n-- edited\n`);
+        await expect(runner.status()).rejects.toThrow(/checksum mismatch/);
+      }),
+  );
+
   test("each commits its predecessor while a failing default batch remains atomic", () =>
     sandbox(async ({ driver, directory, namespace }) => {
       const initial = (await generateMigration({
@@ -441,6 +518,70 @@ describe.skipIf(!url)("production migrations", () => {
             metadataSchema: namespace,
           }).status(),
         ).toEqual([{ id: migration.id, status: "pending" }]);
+      }),
+  );
+
+  // A session lock and nontransactional statements need a pinned server.
+  test.skipIf(transactionPooling)(
+    "the default statement timeout does not apply to transaction none migrations",
+    () =>
+      sandbox(async ({ driver, directory, namespace }) => {
+        const record = (table: string) =>
+          `CREATE TABLE ${table} AS SELECT current_setting('statement_timeout') AS value;`;
+        const batch = (await generateMigration({
+          directory,
+          name: "batch",
+          empty: true,
+        }))!;
+        await writeFile(join(directory, batch.id, "up.sql"), record("batch"));
+        const online = (await generateMigration({
+          directory,
+          name: "online",
+          empty: true,
+          transaction: "none",
+        }))!;
+        await writeFile(join(directory, online.id, "up.sql"), record("online"));
+        await writeFile(
+          join(directory, online.id, "down.sql"),
+          "DROP TABLE online;",
+        );
+        const after = (await generateMigration({
+          directory,
+          name: "after",
+          empty: true,
+        }))!;
+        await writeFile(join(directory, after.id, "up.sql"), record("after"));
+        const seen = async (table: string) =>
+          normalizeResult(
+            await driver.execute({
+              sql: `SELECT value FROM ${table}`,
+              parameters: [],
+            }),
+          ).rows[0]!.value;
+
+        await migrator({
+          driver,
+          directory,
+          metadataSchema: namespace,
+        }).migrate();
+        // A long CREATE INDEX CONCURRENTLY is not cancelled after ten minutes;
+        // the transactions around it keep the default.
+        expect(await seen("batch")).toBe("10min");
+        expect(await seen("online")).toBe("0");
+        expect(await seen("after")).toBe("10min");
+
+        // A configured timeout applies to every migration.
+        const configured = migrator({
+          driver,
+          directory,
+          metadataSchema: namespace,
+          statementTimeoutMs: 25000,
+        });
+        await configured.rollback({ steps: 2 });
+        await driver.execute({ sql: "DROP TABLE after", parameters: [] });
+        await configured.migrate();
+        expect(await seen("online")).toBe("25s");
+        expect(await seen("after")).toBe("25s");
       }),
   );
 

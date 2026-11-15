@@ -17,6 +17,11 @@ export type TypeConversion = {
   readonly lossy: boolean;
   /** What happens to existing values, as a sentence fragment (lossy conversions only). */
   readonly effect?: string;
+  /**
+   * Nothing is cut or rounded: PostgreSQL refuses the values that do not fit,
+   * so the migration fails until they are moved or changed.
+   */
+  readonly refused?: boolean;
 };
 
 type ParsedType = {
@@ -159,6 +164,24 @@ export const typeConversion = (
           effect: `values longer than ${limit} bits make the migration fail`,
         }
       : undefined;
+  }
+
+  if (source.base in INTEGER_DIGITS) {
+    // Any number but 0 reads as true, and the numbers cannot be told apart again.
+    if (target.base === "boolean") {
+      return lossy("every value other than 0 becomes true");
+    }
+
+    // A smaller integer type holds fewer values and PostgreSQL does not wrap
+    // around, the way a shorter bit(n) refuses longer values.
+    if (INTEGER_DIGITS[target.base]! < INTEGER_DIGITS[source.base]!) {
+      return {
+        ...lossy(
+          `values outside the ${target.base} range make the migration fail`,
+        ),
+        refused: true,
+      };
+    }
   }
 
   const targetScale = scaleOf(target);

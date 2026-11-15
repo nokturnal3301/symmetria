@@ -14,6 +14,8 @@ import {
   text,
   timestamp,
   timestamptz,
+  numeric,
+  prepare,
 } from "../../../packages/runtime/src";
 import { codecFor } from "../../../packages/runtime/src/query/codecs";
 import { postgresArrayLiteral } from "../../../packages/runtime/src/query/compile/postgres/values";
@@ -268,6 +270,117 @@ test("integer columns reject fractional and out-of-range numbers on every driver
       where: (rows) => rows.n.above(6),
     }),
   ).not.toThrow();
+});
+
+test("numeric columns reject text that is not a number before it reaches PostgreSQL", async () => {
+  const decimal = codecFor("numeric(12,2)")!;
+
+  // What PostgreSQL 14 and later read as numeric, surrounding whitespace included.
+  for (const value of [
+    "1",
+    "+1",
+    "-1.5",
+    ".5",
+    "5.",
+    "1e5",
+    "1E-3",
+    "1.e2",
+    " 12 ",
+    "\t1\n",
+    "NaN",
+    "nan",
+    "Infinity",
+    "+Infinity",
+    "-Infinity",
+    "inf",
+    "-INF",
+  ]) {
+    expect(decimal.encode(value as never)).toBe(value);
+  }
+
+  for (const value of [
+    "",
+    "  ",
+    "abc",
+    "1 2",
+    "1,5",
+    "1e",
+    "1e+",
+    "e5",
+    ".",
+    "+",
+    "--1",
+    "+NaN",
+    "-NaN",
+    "Infinit",
+    "infinityx",
+    "1\u00a0",
+    "١",
+    // PostgreSQL 16 reads these; 14 and 15 do not.
+    "0x1F",
+    "1_000",
+  ]) {
+    expect(() => decimal.encode(value as never)).toThrow(
+      `symmetria: numeric values are decimal text such as "12.50", received ${JSON.stringify(value)}`,
+    );
+  }
+
+  // Past the types: a number's text is exact, anything else is not a number.
+  expect(decimal.encode(12.5 as never)).toBe(12.5);
+  expect(decimal.encode(12n as never)).toBe(12n);
+  expect(() => decimal.encode(true as never)).toThrow(/received boolean/);
+  expect(() => codecFor("numeric[]")!.encode(["1", "x"] as never)).toThrow(
+    /received "x"/,
+  );
+
+  const model = schema({
+    rows: { id: int.auto, price: numeric(12, 2), tax: numeric.nullable },
+  });
+  const invalid = /numeric values are decimal text such as "12.50", received/;
+
+  await expectDataError(() => model.rows.insert({ price: "abc" }), invalid);
+  await expectDataError(
+    () => model.rows.insert([{ price: "1" }, { price: "1", tax: "12,5" }]),
+    /received "12,5"/,
+  );
+  await expectDataError(
+    () => model.rows.update({ price: "" }).where((row) => row.id.is(1)),
+    invalid,
+  );
+  await expectDataError(
+    () =>
+      model.rows((row) => ({ id: row.id }), {
+        where: (row) => row.price.above("ten"),
+      }),
+    /received "ten"/,
+  );
+  await expectDataError(
+    () =>
+      model.rows((row) => ({ id: row.id }), {
+        where: (row) => row.price.in(["1", "1.0.0"]),
+      }),
+    /received "1.0.0"/,
+  );
+  await expectDataError(
+    () => model.rows((row) => ({ total: row.price.multiply("x") })),
+    /received "x"/,
+  );
+  expect(() =>
+    model
+      .rows((row) => ({ total: row.price.multiply("1.2") }), {
+        where: (row) => row.price.above(" 10 "),
+      })
+      .toSQL(),
+  ).not.toThrow();
+
+  // A prepared parameter is checked when it is bound.
+  const cheaper = prepare({ limit: numeric }, (parameters) =>
+    model.rows((row) => ({ id: row.id }), {
+      where: (row) => row.price.below(parameters.limit),
+    }),
+  );
+  expect(() => cheaper.toSQL({ limit: "abc" })).toThrow(/received "abc"/);
+  expect(cheaper.toSQL({ limit: "9.99" }).parameters).toEqual(["9.99"]);
 });
 
 test("arrays accept Bun's typed arrays and reject NULL elements their type cannot hold", () => {

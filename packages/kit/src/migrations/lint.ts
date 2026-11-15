@@ -3,9 +3,15 @@
  * fail on populated tables or need deploy planning.
  */
 import { quoteIdentifier } from "symmetria/internal";
-import type { MigrationPlan, RenameHints } from "./diff";
+import {
+  changedDefinition,
+  counterparts,
+  renamedDefinitions,
+  type DefinitionScope,
+  type MigrationPlan,
+  type RenameHints,
+} from "./diff";
 import { conversionMessage, typeConversion } from "./conversions";
-import { renameExpressionIdentifiers } from "./expression-tokens";
 import type { MigrationColumn, MigrationTable } from "./snapshot";
 
 /**
@@ -135,19 +141,45 @@ export const lintMigration = (
       }
     }
 
-    // CHECK constraints validate every existing row, like NOT NULL.
-    const columnNames = new Map(
-      Object.entries(renamedColumns).map(([previous, next]) => [
-        quoteIdentifier(previous),
-        quoteIdentifier(next),
-      ]),
-    );
-    const previousChecks = (before.checks ?? []).map((check) =>
-      renameExpressionIdentifiers(check.expression, columnNames),
-    );
+    // Checks and indexes are matched the way the diff matches them, so one
+    // that only follows a renamed table or column, or is written differently,
+    // is not reported as new.
+    const scope: DefinitionScope = {
+      affected: [],
+      renamed: renamedDefinitions(
+        new Map(
+          Object.entries(renamedColumns).map(([previous, next]) => [
+            quoteIdentifier(previous),
+            quoteIdentifier(next),
+          ]),
+        ),
+      ),
+      types: new Map(
+        after.columns.map((column) => [column.name, column.sqlType]),
+      ),
+    };
+    const kept = <Definition extends { sqlName: string }>(
+      previous: readonly Definition[],
+      next: readonly Definition[],
+    ): Set<string> => {
+      const matches = counterparts(scope, previous, next);
 
+      return new Set(
+        previous.flatMap((definition) => {
+          const match = matches.get(definition.sqlName);
+
+          return match && !changedDefinition(scope, definition, match)
+            ? [match.sqlName]
+            : [];
+        }),
+      );
+    };
+    const keptChecks = kept(before.checks ?? [], after.checks ?? []);
+    const keptIndexes = kept(before.indexes, after.indexes);
+
+    // CHECK constraints validate every existing row, like NOT NULL.
     for (const definition of after.checks ?? []) {
-      if (!previousChecks.includes(definition.expression)) {
+      if (!keptChecks.has(definition.sqlName)) {
         report(
           "blocking",
           after.name,
@@ -187,13 +219,7 @@ export const lintMigration = (
     }
 
     for (const definition of after.indexes) {
-      if (
-        before.indexes.some(
-          (existing) =>
-            existing.sqlName === definition.sqlName &&
-            JSON.stringify(existing) === JSON.stringify(definition),
-        )
-      ) {
+      if (keptIndexes.has(definition.sqlName)) {
         continue;
       }
 
@@ -239,7 +265,9 @@ export const lintMigration = (
         conversionMessage(before, after, change),
         change.assignmentCast
           ? "Shorten or move longer values first, then generate with --allow-destructive; the SQL has no truncating cast, so PostgreSQL refuses values that still do not fit."
-          : "Copy the column or back up the table if the lost precision matters, then generate with --allow-destructive.",
+          : change.refused
+            ? "Move or change the values that do not fit first, then generate with --allow-destructive; PostgreSQL refuses values that still do not fit."
+            : "Copy the column or back up the table if the lost precision matters, then generate with --allow-destructive.",
         after.name,
       );
     } else if (retyped) {

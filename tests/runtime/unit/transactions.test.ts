@@ -272,3 +272,69 @@ test("retry waits double up to a second, or retryDelayMs when it is longer", asy
   ]);
   expect(waits.slice(20)).toEqual(Array(20).fill(3000));
 });
+
+test("a bound database builds table handles on first use and still lists every table", async () => {
+  const calls = { users: 0, posts: 0 };
+  const connection: TransactionDriver = {
+    execute: async () => [],
+    transaction: async (callback) => callback(connection),
+  };
+  const model = schema(
+    {
+      users: { id: int.auto, name: text },
+      posts: { id: int.auto, title: text },
+    },
+    {
+      driver: {
+        execute: async () => [],
+        transaction: async (callback) => callback(connection),
+        close: async () => {},
+      },
+    },
+  );
+  // Tables come first, in the snapshot's (sorted) order.
+  const members = [
+    "posts",
+    "users",
+    "$scope",
+    "$snapshot",
+    "$createIndexes",
+    "$transaction",
+  ];
+
+  expect(Object.keys(model)).toEqual([...members, "$close"]);
+  expect(Object.isFrozen(model)).toBe(true);
+  expect(model.users).toBe(model.users);
+  expect({ ...model }.posts).toBe(model.posts);
+  expect(Object.hasOwn(model, "users")).toBe(true);
+
+  const scoped = model.$scope({
+    users: (user) => {
+      calls.users += 1;
+
+      return user.id.is(1);
+    },
+    posts: (post) => {
+      calls.posts += 1;
+
+      return post.id.is(1);
+    },
+  });
+
+  // $scope() ran each callback it was given once; binding a transaction runs
+  // none, and a query runs only the callback of the table it reads.
+  expect(calls).toEqual({ users: 1, posts: 1 });
+
+  await scoped.$transaction(async (transaction) => {
+    expect(Object.keys(transaction)).toEqual(members);
+    expect(calls).toEqual({ users: 1, posts: 1 });
+    expect(transaction.users).toBe(transaction.users);
+    expect(transaction.users).not.toBe(scoped.users);
+    await transaction.users((user) => ({ id: user.id }));
+  });
+  expect(calls.posts).toBe(1);
+  expect(calls.users).toBeGreaterThan(1);
+
+  // A callback that cannot be a filter still fails $scope() itself.
+  expect(() => model.$scope({ users: (() => 1) as never })).toThrow();
+});

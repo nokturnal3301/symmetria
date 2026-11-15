@@ -287,3 +287,71 @@ test("$scope() filters inside subqueries and CTEs are refreshed too", async () =
   await fromCte;
   expect(last().parameters).toEqual([3]);
 });
+
+test("a scoped query built earlier and used inside another $scope() reads the current scope", async () => {
+  let userId = 1;
+  const statements: { sql: string; parameters: readonly unknown[] }[] = [];
+  const organizations = table({ id: int.auto, name: text });
+  const memberships = table({
+    id: int.auto,
+    userId: int,
+    organization: organizations,
+  });
+  const documents = table({
+    id: int.auto,
+    organization: organizations,
+    title: text,
+  });
+  const database = schema(
+    { organizations, memberships, documents },
+    {
+      executor: async (statement) => {
+        statements.push(statement);
+
+        return [];
+      },
+    },
+  );
+  const members = database.$scope({
+    memberships: (membership) => membership.userId.is(userId),
+  });
+  // Built once while user 1 is current, then embedded in a second scope.
+  const allowed = members.memberships((membership) => ({
+    organizationId: membership.organizationId,
+  }));
+  const scoped = members.$scope({
+    documents: (document) => document.organizationId.in(allowed),
+  });
+  const reused = scoped.documents((document) => ({ id: document.id }));
+  const snapshot = () => ({
+    reused: reused.toSQL().parameters,
+    fresh: scoped.documents((document) => ({ id: document.id })).toSQL()
+      .parameters,
+    update: scoped.documents
+      .update({ title: "x" })
+      .where((document) => document.id.is(7))
+      .toSQL().parameters,
+    remove: scoped.documents
+      .delete()
+      .where((document) => document.id.is(7))
+      .toSQL().parameters,
+  });
+
+  expect(snapshot()).toEqual({
+    reused: [1],
+    fresh: [1],
+    update: ["x", 1, 7, 1],
+    remove: [1, 7],
+  });
+
+  userId = 2;
+  expect(snapshot()).toEqual({
+    reused: [2],
+    fresh: [2],
+    update: ["x", 2, 7, 2],
+    remove: [2, 7],
+  });
+
+  await reused;
+  expect(statements.at(-1)!.parameters).toEqual([2]);
+});

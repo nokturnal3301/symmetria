@@ -16,6 +16,7 @@ import {
   minimum,
   maximum,
   coalesce,
+  dateTrunc,
   sql,
   rowNumber,
   rank,
@@ -23,7 +24,9 @@ import {
   lag,
   lead,
   over,
+  type ValueNode,
 } from "../expressions";
+import { childNodes } from "../plan/traverse";
 import type { TableSnapshot } from "../../schema/assembly";
 import type { Projection, RuntimeScope } from ".";
 
@@ -48,6 +51,7 @@ export const shapeExpressions = Object.freeze({
   minimum,
   maximum,
   coalesce,
+  dateTrunc,
   sql,
   rowNumber,
   rank,
@@ -64,6 +68,7 @@ export const returningTools = Object.freeze({
   not,
   when,
   coalesce,
+  dateTrunc,
   sql,
 });
 export type ReturningTools = typeof returningTools;
@@ -123,35 +128,23 @@ export const returningProjection = (
     );
   }
 
-  const validateNode = (value: unknown): void => {
-    if (!value || typeof value !== "object") {
-      return;
+  const validateNode = (node: ValueNode): void => {
+    if (
+      node.kind === "aggregate" ||
+      node.kind === "window" ||
+      node.kind === "relativeWindow" ||
+      node.kind === "subquery" ||
+      node.kind === "rowCount" ||
+      node.kind === "jsonRows"
+    ) {
+      unsupported();
     }
 
-    if ("kind" in value) {
-      if (["column", "parameter", "placeholder"].includes(String(value.kind))) {
-        return;
-      }
+    childNodes(node).forEach(validateNode);
 
-      if (
-        [
-          "aggregate",
-          "window",
-          "relativeWindow",
-          "subquery",
-          "rowCount",
-          "jsonRows",
-          "exists",
-        ].includes(String(value.kind))
-      ) {
-        unsupported();
-      }
-    }
-
-    for (const [key, child] of Object.entries(value)) {
-      if (key !== "codec") {
-        validateNode(child);
-      }
+    // The element a path reads is described by an expression of its own.
+    if (node.kind === "jsonPath" && node.target) {
+      validateNode(node.target.node);
     }
   };
 

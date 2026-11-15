@@ -97,6 +97,7 @@ export {
   minimum,
   maximum,
   coalesce,
+  dateTrunc,
   searchDocument,
   sql,
   defaultValue,
@@ -113,6 +114,7 @@ export type {
   Ordering,
   ShapeControls,
   QueryOptions,
+  SelectedFields,
   ShapeJoins,
   ShapeTools,
   CompiledQuery,
@@ -148,6 +150,8 @@ export { prepare, type PreparedQuery } from "./query/select/prepared";
 
 export type {
   Parameter,
+  DateTruncUnit,
+  DateTruncOptions,
   SearchOptions,
   SearchMode,
   SearchWeight,

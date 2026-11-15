@@ -1,6 +1,6 @@
 {
   "name": "symmetria",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "description": "Type-safe, SQL-first PostgreSQL query builder for Node.js and Bun.",
   "homepage": "https://github.com/nokturnal3301/symmetria#readme",
   "repository": {
@@ -57,9 +57,13 @@
     "node": ">=24.11.0"
   },
   "peerDependencies": {
+    "@types/bun": ">=1.4.3",
     "pg": "^8.0.0"
   },
   "peerDependenciesMeta": {
+    "@types/bun": {
+      "optional": true
+    },
     "pg": {
       "optional": true
     }

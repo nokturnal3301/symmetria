@@ -3,6 +3,8 @@ import {
   schema,
   table,
   prepare,
+  lag,
+  searchDocument,
   int,
   text,
   bool,
@@ -195,6 +197,44 @@ test("page({ before }) runs the reversed order and returns both cursors", async 
       before: forward.nextCursor,
     }),
   ).rejects.toThrow(/either after or before/);
+});
+
+test("page() finds a window inside a search expression and filters after it", async () => {
+  const { database, last } = recording();
+
+  for (const feed of [
+    database.posts(
+      (post) => ({
+        id: post.id,
+        value: lag(post.title)
+          .over({ orderBy: post.id.ascending })
+          .searchRank("bun"),
+      }),
+      { orderBy: (post) => post.id.ascending },
+    ),
+    database.posts(
+      (post) => ({
+        id: post.id,
+        value: lag(post.title)
+          .over({ orderBy: post.id.ascending })
+          .searchHeadline("bun"),
+      }),
+      { orderBy: (post) => post.id.ascending },
+    ),
+    database.posts(
+      (post) => ({
+        id: post.id,
+        value: searchDocument(
+          lag(post.title).over({ orderBy: post.id.ascending }),
+        ),
+      }),
+      { orderBy: (post) => post.id.ascending },
+    ),
+  ]) {
+    await feed.page({ size: 2 });
+    // The window sees every row; the page is cut from its result.
+    expect(last().sql).toContain(') AS "__symmetria_page"\nORDER BY');
+  }
 });
 
 test("doUpdate() accepts a where condition over the current and proposed rows", () => {

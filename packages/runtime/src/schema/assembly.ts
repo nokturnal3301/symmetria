@@ -113,6 +113,45 @@ export type TableSnapshot = {
   primaryKey?: readonly string[];
 };
 
+/**
+ * A table's primary-key columns in declared key order: the order given to
+ * `.primaryKey()` when there is one (the snapshot keeps it as SQL names),
+ * otherwise the order of the columns.
+ */
+export const primaryKeyColumns = (
+  table: TableSnapshot,
+): readonly ColumnSnapshot[] =>
+  table.primaryKey
+    ? table.primaryKey.map(
+        (name) => table.columns.find((column) => column.sqlName === name)!,
+      )
+    : table.columns.filter((column) => column.primaryKey);
+
+/**
+ * The unique indexes that identify a row by column values, each with its
+ * columns in key order: a partial index covers only some rows, and an
+ * expression key has no column to compare a value with.
+ */
+export const uniqueColumnIndexes = (
+  table: TableSnapshot,
+): readonly {
+  readonly name: string;
+  readonly columns: readonly ColumnSnapshot[];
+}[] =>
+  (table.indexes ?? []).flatMap((definition) => {
+    if (!definition.unique || definition.where) {
+      return [];
+    }
+
+    const columns = definition.keys.map((key) =>
+      table.columns.find((column) => quoteIdentifier(column.sqlName) === key),
+    );
+
+    return columns.every((column) => column !== undefined)
+      ? [{ name: definition.name, columns }]
+      : [];
+  });
+
 export type SchemaSnapshot = {
   tables: TableSnapshot[];
   /** Extensions the schema relies on, sorted; absent when none are declared. */
@@ -149,6 +188,34 @@ export type SchemaConditions<SchemaDefinition> = Partial<
 
 export const snakeCase = (name: string): string => {
   return name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+};
+
+/**
+ * The key of a table that declares none with `.primaryKey()`: the foreign keys
+ * of a junction, else the columns marked as primary key, else a column named
+ * `id`. Reference keys are the declared ones (`author`, not `authorId`).
+ */
+export const inferredPrimaryKey = (
+  junction: boolean,
+  scalars: readonly {
+    readonly key: string;
+    readonly definition: ColumnDefinition;
+  }[],
+  references: readonly string[],
+): readonly string[] => {
+  if (junction) {
+    return references.map((key) => `${key}Id`);
+  }
+
+  const marked = scalars
+    .filter((column) => column.definition.primaryKey)
+    .map((column) => column.key);
+
+  return marked.length
+    ? marked
+    : scalars.some((column) => column.key === "id")
+      ? ["id"]
+      : [];
 };
 
 type ResolvedReference = {
@@ -347,13 +414,11 @@ export const assembleSchema = <
       .map((column) => column.key);
     const keys =
       analyzedTable.state.primaryKey ??
-      (analyzedTable.isJunction
-        ? analyzedTable.references.map((reference) => `${reference.key}Id`)
-        : marked.length
-          ? marked
-          : analyzedTable.scalars.some((column) => column.key === "id")
-            ? ["id"]
-            : []);
+      inferredPrimaryKey(
+        analyzedTable.isJunction,
+        analyzedTable.scalars,
+        analyzedTable.references.map((reference) => reference.key),
+      );
     analyzedTable.keys = keys;
 
     if (

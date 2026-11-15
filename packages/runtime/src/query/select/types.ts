@@ -162,7 +162,8 @@ type RelationQuery<
     shape: ReusableShape<Target, Shape>,
     options?: QueryOptions<
       RelatedColumns<Rows, Relations, Target>,
-      ShapeTools<Rows, Relations>
+      ShapeTools<Rows, Relations>,
+      SelectedFields<ShapeSelection<Shape>>
     >,
   ): QueryColumn<
     Many extends true
@@ -170,12 +171,14 @@ type RelationQuery<
       : ProjectionRow<ShapeSelection<Shape>> | null,
     Alias,
     ProjectionTraits<ShapeSelection<Shape>>
-  >;
+  > &
+    NestedResult;
   <
     const Shape extends Record<string, unknown>,
     const Options extends QueryOptions<
       RelatedColumns<Rows, Relations, Target>,
-      ShapeTools<Rows, Relations>
+      ShapeTools<Rows, Relations>,
+      SelectedFields<ShapeSelection<Shape>>
     > = {},
   >(
     shape: (
@@ -184,7 +187,8 @@ type RelationQuery<
     ) => Shape & ValidShape<Shape>,
     options?: QueryOptions<
       RelatedColumns<Rows, Relations, Target>,
-      ShapeTools<Rows, Relations>
+      ShapeTools<Rows, Relations>,
+      SelectedFields<ShapeSelection<Shape>>
     > &
       Options &
       ValidQueryOptions<Options>,
@@ -207,7 +211,8 @@ type RelationQuery<
           : ProjectionRow<ShapeSelection<Shape>> | null,
         Alias,
         ProjectionTraits<ShapeSelection<Shape>>
-      >;
+      > &
+        NestedResult;
   readonly count: () => QueryColumn<number, "count">;
   readonly sum: (<
     Expression extends SelectedColumn<number | bigint | Decimal | null>,
@@ -458,12 +463,36 @@ export type ShapeControls = {
   readonly forUpdate?: boolean | RowLockOptions;
   readonly forShare?: boolean | RowLockOptions;
 };
-export type QueryOptions<Columns, Tools> = {
+/**
+ * `orderBy`, `groupBy` and `having` callbacks also receive the projection's
+ * fields, so a computed field is not written twice. `where` does not: it runs
+ * before aggregates and windows exist.
+ */
+export type QueryOptions<Columns, Tools, Selected = {}> = {
   readonly [Name in keyof ShapeControls]?:
     | undefined
     | ShapeControls[Name]
-    | ((columns: Columns, tools: Tools) => ShapeControls[Name]);
+    | (Name extends "orderBy" | "groupBy" | "having"
+        ? (
+            columns: Columns,
+            tools: Tools,
+            selected: Selected,
+          ) => ShapeControls[Name]
+        : (columns: Columns, tools: Tools) => ShapeControls[Name]);
 };
+declare const NESTED_RESULT: unique symbol;
+/** Marks a relation selected with a shape: rows or an object, not a value to sort or group by. */
+type NestedResult = { readonly [NESTED_RESULT]: true };
+/** The scalar fields of a projection, as its option callbacks receive them. */
+export type SelectedFields<Selection> = Selection extends ProjectionObject
+  ? {
+      readonly [Name in keyof Selection as Selection[Name] extends SelectedColumn
+        ? Selection[Name] extends NestedResult
+          ? never
+          : Name
+        : never]: Selection[Name];
+    }
+  : {};
 type ValidQueryOptions<Options> = {
   [Name in Exclude<keyof Options, keyof QueryOptions<never, never>>]: never;
 };
@@ -593,14 +622,16 @@ export type Query<
   (
     options: QueryOptions<
       RootColumns<Scope, Rows, Relations>,
-      ShapeTools<Rows, Relations>
+      ShapeTools<Rows, Relations>,
+      SelectedFields<Selection>
     >,
   ): Query<Rows, Relations, RootTable, Scope, Selection>;
   <Shape extends Record<string, unknown>>(
     shape: ReusableShape<RootTable, Shape>,
     options?: QueryOptions<
       RootColumns<Scope, Rows, Relations>,
-      ShapeTools<Rows, Relations>
+      ShapeTools<Rows, Relations>,
+      SelectedFields<ShapeSelection<Shape>>
     >,
   ): Query<Rows, Relations, RootTable, Scope, ShapeSelection<Shape>>;
   <const Shape extends Record<string, unknown>>(
@@ -610,7 +641,12 @@ export type Query<
     ) => Shape & ValidShape<Shape>,
     options?: QueryOptions<
       RootColumns<Scope, Rows, Relations>,
-      ShapeTools<Rows, Relations>
+      ShapeTools<Rows, Relations>,
+      SelectedFields<
+        keyof ShapeSelection<Shape> extends never
+          ? Selection
+          : ShapeSelection<Shape>
+      >
     >,
   ): Query<
     Rows,

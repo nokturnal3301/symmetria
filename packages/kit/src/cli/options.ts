@@ -39,10 +39,11 @@ export const help = `symmetria <command>
   --verify-url <url>   Administrative PostgreSQL URL for disposable verification databases
   --advisory-lock-timeout <ms>  Migration lock wait (default: 10000)
   --lock-timeout <ms>   DDL lock wait (default: 5000; 0 disables)
-  --statement-timeout <ms>  Statement duration (default: 600000; 0 disables)
+  --statement-timeout <ms>  Statement duration (default: 600000, no default in transaction none migrations; 0 disables)
   --to <migration-id>   Apply up to a migration
   --ignore-table <name> pull/drift/adopt/repair/verify: leave an undeclared table out (repeatable)
   --steps <number>      Number of migrations to rollback (default: 1)
+  --yes                rollback: run down.sql without asking (required without a terminal)
   --strict             Exit with code 1 when lint or drift report findings
   --force              Overwrite the file written by pull or graph
   --compact            graph: entities and relations without column lists
@@ -103,6 +104,7 @@ export const FLAGS = {
   "statement-timeout": { type: "string" },
   to: { type: "string" },
   steps: { type: "string" },
+  yes: { type: "boolean" },
   help: { type: "boolean", short: "h" },
   sql: { type: "boolean" },
   json: { type: "boolean" },
@@ -213,6 +215,11 @@ const SCOPED_FLAGS: readonly {
     flags: ["steps"],
     commands: ["rollback"],
     message: "symmetria: --steps is a rollback option",
+  },
+  {
+    flags: ["yes"],
+    commands: ["rollback"],
+    message: "symmetria: --yes is a rollback option",
   },
   {
     flags: ["force"],

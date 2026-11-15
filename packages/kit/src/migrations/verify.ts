@@ -133,19 +133,21 @@ const catalogMatches = (expected: unknown, actual: unknown, label: string) => {
   }
 };
 
+type BoundaryOptions = ExecutionOptions & {
+  execute: QueryExecutor;
+  state: MigrationState;
+  target: number;
+  url: string;
+  directory: string;
+  metadataSchema?: string;
+  metadataTable?: string;
+  ignoreTables?: readonly string[];
+};
+
 /** Reconstruct an older boundary by replaying SQL; no historical snapshots are persisted. */
-export const verifyBoundary = async (
-  options: ExecutionOptions & {
-    execute: QueryExecutor;
-    state: MigrationState;
-    target: number;
-    url: string;
-    directory: string;
-    metadataSchema?: string;
-    metadataTable?: string;
-    ignoreTables?: readonly string[];
-  },
-): Promise<void> => {
+const readBoundary = async (
+  options: BoundaryOptions,
+): Promise<{ expected: unknown; actual: unknown }> => {
   const schemaName = String(
     (await executeSQL(options.execute, "SELECT current_schema() AS name"))
       .rows[0]!.name,
@@ -155,25 +157,56 @@ export const verifyBoundary = async (
     options.state.snapshot,
   );
   const actual = await readCatalog({ ...options, schemaName, ignoreTables });
-  await disposableDatabase(options.url, schemaName, async (driver) => {
-    if (options.target >= 0) {
-      await migrator({ ...options, driver }).migrate({
-        to: options.state.migrations[options.target]!.id,
-      });
-    }
+  const expected = await disposableDatabase(
+    options.url,
+    schemaName,
+    async (driver) => {
+      if (options.target >= 0) {
+        await migrator({ ...options, driver }).migrate({
+          to: options.state.migrations[options.target]!.id,
+        });
+      }
 
-    const expected = await readCatalog({
-      ...options,
-      execute: driver.execute,
-      schemaName,
-      ignoreTables,
-    });
-    catalogMatches(
-      expected,
-      actual,
-      "schema does not match the adoption/recovery target",
-    );
-  });
+      return readCatalog({
+        ...options,
+        execute: driver.execute,
+        schemaName,
+        ignoreTables,
+      });
+    },
+  );
+
+  return { expected, actual };
+};
+
+/** Refuses a database whose catalog is not what the chain up to `target` builds. */
+export const verifyBoundary = async (
+  options: BoundaryOptions,
+): Promise<void> => {
+  const { expected, actual } = await readBoundary(options);
+  catalogMatches(
+    expected,
+    actual,
+    "schema does not match the adoption/recovery target",
+  );
+};
+
+/**
+ * What the database has more or less than the chain up to `target` builds, one
+ * line each; empty when they match. For `drift` on a database that is
+ * intentionally behind the latest snapshot.
+ */
+export const boundaryDifferences = async (
+  options: BoundaryOptions,
+): Promise<string[]> => {
+  const { expected, actual } = await readBoundary(options);
+
+  return canonicalJSON(expected) === canonicalJSON(actual)
+    ? []
+    : catalogDifferences(
+        expected as Record<string, readonly unknown[]>,
+        actual as Record<string, readonly unknown[]>,
+      ).map((line) => line.trim());
 };
 
 /** Exercise fresh installation, populated upgrades, rollback and reapplication on real PostgreSQL. */

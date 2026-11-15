@@ -18,12 +18,17 @@ import {
   inspectTableSQL,
   matchingTables,
 } from "../../../packages/kit/src/cli/screens/schema-browser-data";
+import { join } from "node:path";
 import {
+  formatCreated,
   formatDashboard,
   formatDiff,
   formatSchema,
 } from "../../../packages/kit/src/cli/ui/format";
-import { numberedLines } from "../../../packages/kit/src/cli/ui/style";
+import {
+  numberedLines,
+  wrapLines,
+} from "../../../packages/kit/src/cli/ui/style";
 
 const snapshot = schema({
   userProfiles: { id: int.auto, displayName: text.unique },
@@ -246,6 +251,60 @@ test("SQL line numbers follow source lines when long lines wrap", () => {
     "...  _name",
     "..3  ;",
   ]);
+});
+
+test("wrapped rows break after a space or a slash near the end, else at the width", () => {
+  // A path keeps its segments whole.
+  expect(
+    wrapLines("  ✓ Created /srv/apps/storefront/database/migrations", 36),
+  ).toEqual(["  ✓ Created /srv/apps/storefront/", "database/migrations"]);
+  expect(wrapLines("apply the pending migrations first", 20)).toEqual([
+    "apply the pending ",
+    "migrations first",
+  ]);
+  // No break point in the last third of the row: it fills the width.
+  expect(wrapLines("a_rather_long_table_name", 12)).toEqual([
+    "a_rather_lon",
+    "g_table_name",
+  ]);
+  expect(wrapLines("id customer_subscription", 12)).toEqual([
+    "id customer_",
+    "subscription",
+  ]);
+  expect(wrapLines("apply the pending migrations", 20, false)).toEqual([
+    "apply the pending mi",
+    "grations",
+  ]);
+  // Styling carries over a word break as it does over a hard one.
+  expect(
+    wrapLines("\u001b[1mapply the pending\u001b[0m migrations first", 20),
+  ).toEqual(["\u001b[1mapply the pending\u001b[0m ", "migrations first"]);
+  expect(
+    wrapLines("\u001b[1mapply the pending migrations\u001b[0m", 20),
+  ).toEqual([
+    "\u001b[1mapply the pending \u001b[0m",
+    "\u001b[1mmigrations\u001b[0m",
+  ]);
+});
+
+test("created files are listed under a path relative to the working directory", () => {
+  const inside = join(process.cwd(), "database", "migrations");
+
+  expect(formatCreated(inside, ["a.sql", "b.sql"]).split("\n")).toEqual([
+    "",
+    `  ✓ Created ${join("database", "migrations")}`,
+    "",
+    "    ├─ a.sql",
+    "    └─ b.sql",
+    "",
+  ]);
+  // Outside it, and for the directory itself, the full path is the clear one.
+  expect(formatCreated("/srv/elsewhere/migrations", [])).toContain(
+    "Created /srv/elsewhere/migrations",
+  );
+  expect(formatCreated(process.cwd(), [])).toContain(
+    `Created ${process.cwd()}`,
+  );
 });
 
 test("the compact dashboard header fits a short, narrow terminal", () => {

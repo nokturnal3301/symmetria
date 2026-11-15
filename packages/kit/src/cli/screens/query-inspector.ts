@@ -19,7 +19,7 @@ import { withScreen } from "../ui/terminal";
 const tabs = ["SQL", "Parameters", "Results", "Explain"] as const;
 type Tab = (typeof tabs)[number];
 
-const terminalText = (text: string): string =>
+export const terminalText = (text: string): string =>
   stripVTControlCharacters(text).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
 
 export const inspectValue = (value: unknown, expanded = false): string =>
@@ -47,13 +47,15 @@ export const wrapExplainLines = (
     const gutter = /^[ │├╰─]*/.exec(line)![0];
     const indent = `${gutter.replace(/├─ /g, "│  ").replace(/╰─ /g, "   ")}  `;
 
+    // Plan rows fill the width: the gutter already takes part of it.
     if (stringWidth(indent) > width / 2) {
-      return wrapLines(line, width);
+      return wrapLines(line, width, false);
     }
 
     return wrapLines(
       line.slice(gutter.length),
       width - stringWidth(indent),
+      false,
     ).map((row, index) => `${index ? indent : gutter}${row}`);
   });
 

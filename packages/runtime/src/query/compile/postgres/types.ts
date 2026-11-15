@@ -1,22 +1,9 @@
-import type { PredicateDescription, SearchMode } from "../../expressions";
-import type {
-  SearchDocumentPart,
-  SearchHeadlineRendering,
-  SearchRankRendering,
-} from "./search";
-
-export type ComparisonOperator = Extract<
-  PredicateDescription,
-  { kind: "comparison" }
->["operator"];
-
 /** Compiler services used while rendering PostgreSQL expressions. */
 export type RenderContext = {
   /** Registers a parameter value and returns its placeholder text. */
   readonly parameter: (value: unknown) => string;
   /** A quoted alias that no binding in scope occupies. */
   readonly nestedAlias: (prefix: string) => string;
-  readonly quote: (identifier: string) => string;
 };
 
 type CastTarget =
@@ -40,13 +27,6 @@ type JsonHasOptions = {
   /** The element with precision casts applied, for array overlap operands. */
   readonly operand: string;
 };
-type JsonMembershipOperand =
-  | { readonly kind: "list"; readonly values: readonly string[] }
-  | {
-      readonly kind: "subquery";
-      readonly sql: string;
-      readonly column: string;
-    };
 type RowLock = {
   readonly mode: "UPDATE" | "SHARE";
   /** Already quoted aliases. */
@@ -62,11 +42,8 @@ type ExplainStatement = {
 };
 /** Internal PostgreSQL rendering operations, independent of the transport. */
 export type PostgresRenderer = {
-  readonly name: "postgres";
-
   readonly placeholder: (position: number) => string;
   readonly cast: (value: string, target: CastTarget) => string;
-  readonly comparisonOperator: (operator: ComparisonOperator) => string;
   readonly limitOffset: (
     limit: string | undefined,
     offset: string | undefined,
@@ -74,7 +51,6 @@ export type PostgresRenderer = {
   readonly rowLock: (lock: RowLock) => string;
   /** Wrapping that casts an expression to text in cursor columns. */
   readonly textCast: { readonly prefix: string; readonly suffix: string };
-  readonly jsonArray: (value: string) => string;
   readonly jsonObject: (
     entries: readonly JsonObjectEntry[],
     jsonOutput: boolean,
@@ -97,17 +73,6 @@ export type PostgresRenderer = {
   ) => string;
   readonly arrayLength: (value: string, json: boolean) => string;
 
-  readonly jsonComparison: (
-    left: string,
-    right: string,
-    operator: "=" | "<>" | "IS" | "IS NOT",
-  ) => string;
-  readonly jsonMembership: (
-    left: string,
-    operand: JsonMembershipOperand,
-    negated: boolean,
-    context: RenderContext,
-  ) => string;
   readonly jsonHas: (
     value: string,
     element: string,
@@ -115,33 +80,7 @@ export type PostgresRenderer = {
     context: RenderContext,
   ) => string;
   readonly arrayHas: (value: string, element: string) => string;
-  /** The document side of a match: a tsvector as is, or text wrapped in to_tsvector(). */
-  readonly searchVector: (
-    value: string,
-    language: string,
-    isVector: boolean,
-  ) => string;
-  readonly searchQuery: (
-    query: string,
-    language: string,
-    mode: SearchMode,
-  ) => string;
   readonly search: (vector: string, query: string) => string;
-  readonly searchRank: (
-    vector: string,
-    query: string,
-    options: SearchRankRendering,
-  ) => string;
-  readonly searchHeadline: (
-    language: string,
-    text: string,
-    query: string,
-    options: SearchHeadlineRendering,
-  ) => string;
-  readonly searchDocument: (
-    parts: readonly SearchDocumentPart[],
-    language: string,
-  ) => string;
 
   readonly recursiveUnion: (
     anchor: string,
@@ -149,7 +88,6 @@ export type PostgresRenderer = {
     options: { readonly unionAll: boolean },
   ) => string;
 
-  readonly parameterValue: (value: unknown) => unknown;
   readonly explain: (sql: string, analyze: boolean) => ExplainStatement;
   readonly nullsDefault: (direction: "ASC" | "DESC") => "FIRST" | "LAST";
 };
