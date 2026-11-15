@@ -3,6 +3,7 @@
  * `exists()` over any SELECT plan, selected or not. Derived plans are cached per
  * source plan so compiled SQL and row decoders stay cached too.
  */
+import { NotFoundError, TooManyRowsError } from "../../errors";
 import { freeze } from "../plan/freeze";
 import { count, readColumn } from "../expressions";
 import { derivedBinding } from "../plan/derived";
@@ -133,17 +134,9 @@ export const rowCountError = (
   received: number,
   required: boolean,
 ): Error =>
-  Object.assign(
-    new Error(
-      `symmetria: expected ${required ? "exactly one" : "at most one"} row from "${plan.root.table.name}", received ${received}`,
-    ),
-    {
-      code:
-        received === 0
-          ? "SYMMETRIA_RECORD_NOT_FOUND"
-          : "SYMMETRIA_TOO_MANY_ROWS",
-      table: plan.root.table.name,
-    },
+  new (received === 0 ? NotFoundError : TooManyRowsError)(
+    `symmetria: expected ${required ? "exactly one" : "at most one"} row from "${plan.root.table.name}", received ${received}`,
+    plan.root.table.name,
   );
 
 export const readCount = (rows: readonly Record<string, unknown>[]): number =>

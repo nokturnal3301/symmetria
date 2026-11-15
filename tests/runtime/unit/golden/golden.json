@@ -499,7 +499,7 @@
         "parameters": ["bob"]
       },
       {
-        "sql": "INSERT INTO \"comments\" AS \"comments\"\n(\"post_id\", \"author_id\", \"body\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"comments\".\"id\", 'postId', \"comments\".\"post_id\", 'authorId', \"comments\".\"author_id\", 'body', \"comments\".\"body\", 'score', \"comments\".\"score\") AS \"row\"",
+        "sql": "INSERT INTO \"comments\" AS \"comments\"\n(\"post_id\", \"author_id\", \"body\") VALUES ($1, $2, $3)",
         "parameters": [1, 1, "c"]
       }
     ]
@@ -511,7 +511,7 @@
         "parameters": [1]
       },
       {
-        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
+        "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)",
         "parameters": ["a", "A", 1]
       },
       {
@@ -527,8 +527,8 @@
   "nested-insert/self-reference": {
     "statements": [
       {
-        "sql": "SELECT \"categories\".\"id\" AS \"id\", \"categories\".\"name\" AS \"name\", \"categories\".\"parent_id\" AS \"parentId\"\nFROM \"categories\" AS \"categories\"\nWHERE (\"categories\".\"id\" = $1)\nLIMIT 2",
-        "parameters": [1]
+        "sql": "SELECT \"categories\".\"id\" AS \"id\", \"categories\".\"name\" AS \"name\", \"categories\".\"parent_id\" AS \"parentId\"\nFROM \"categories\" AS \"categories\"\nWHERE \"categories\".\"id\" IN ($1, $2)",
+        "parameters": [5, 1]
       },
       {
         "sql": "INSERT INTO \"categories\" AS \"categories\"\n(\"name\", \"parent_id\") VALUES ($1, $2)\nRETURNING json_build_object('id', \"categories\".\"id\", 'name', \"categories\".\"name\", 'parentId', \"categories\".\"parent_id\") AS \"row\"",
@@ -1162,5 +1162,109 @@
   },
   "invalid-schema/keys-unknown-table": {
     "error": "symmetria: unknown schema.keys() table \"missing\""
+  },
+  "slots/nested-both-sides": {
+    "sql": "SELECT \"authors\".\"name\" AS \"name\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\", \"__symmetria_path_1_0\".\"name\" AS \"editor\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_1\".\"label\" AS \"label\"\nFROM \"books_genres\" AS \"__symmetria_junction_0\"\nINNER JOIN \"genres\" AS \"__symmetria_aggregate_1\" ON \"__symmetria_junction_0\".\"genres_id\" = \"__symmetria_aggregate_1\".\"id\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_junction_0\".\"books_id\") AS \"__symmetria_row\") AS \"genres\"\nFROM \"books\" AS \"__symmetria_aggregate_0\"\nLEFT JOIN \"authors\" AS \"__symmetria_path_1_0\" ON \"__symmetria_aggregate_0\".\"editor_id\" = \"__symmetria_path_1_0\".\"id\"\nWHERE \"authors\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_row\") AS \"books\", (SELECT COUNT(*) AS \"count\"\nFROM \"books\" AS \"__symmetria_aggregate_0\"\nWHERE \"authors\".\"id\" = \"__symmetria_aggregate_0\".\"editor_id\") AS \"drafts\", (SELECT row_to_json(\"__symmetria_row\") FROM (SELECT \"__symmetria_aggregate_0\".\"id\" AS \"id\"\nFROM \"profiles\" AS \"__symmetria_aggregate_0\"\nWHERE \"authors\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_row\") AS \"profile\"\nFROM \"authors\" AS \"authors\"\nWHERE \"authors\".\"name\" = $1\nORDER BY (SELECT COUNT(*) AS \"count\"\nFROM \"books\" AS \"__symmetria_aggregate_0\"\nWHERE \"authors\".\"id\" = \"__symmetria_aggregate_0\".\"editor_id\") DESC, \"authors\".\"id\" ASC",
+    "parameters": ["Ada"]
+  },
+  "slots/many-to-many-reverse": {
+    "sql": "SELECT \"genres\".\"label\" AS \"label\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\"\nFROM \"books_genres\" AS \"__symmetria_junction_0\"\nINNER JOIN \"books\" AS \"__symmetria_aggregate_0\" ON \"__symmetria_junction_0\".\"books_id\" = \"__symmetria_aggregate_0\".\"id\"\nWHERE \"genres\".\"id\" = \"__symmetria_junction_0\".\"genres_id\") AS \"__symmetria_row\") AS \"books\"\nFROM \"genres\" AS \"genres\"",
+    "parameters": []
+  },
+  "slots/self-tree": {
+    "sql": "SELECT \"__symmetria_path_0\".\"id\" AS \"parent\", (SELECT COUNT(*) AS \"count\"\nFROM \"chapters\" AS \"__symmetria_aggregate_0\"\nWHERE \"chapters\".\"id\" = \"__symmetria_aggregate_0\".\"parent_id\") AS \"sections\", \"__symmetria_path_1\".\"title\" AS \"book\"\nFROM \"chapters\" AS \"chapters\"\nLEFT JOIN \"chapters\" AS \"__symmetria_path_0\" ON \"chapters\".\"parent_id\" = \"__symmetria_path_0\".\"id\"\nINNER JOIN \"books\" AS \"__symmetria_path_1\" ON \"chapters\".\"book_id\" = \"__symmetria_path_1\".\"id\"",
+    "parameters": []
+  },
+  "slots/nested-insert": {
+    "statements": [
+      {
+        "sql": "INSERT INTO \"authors\" AS \"authors\"\n(\"name\") VALUES ($1)\nRETURNING json_build_object('id', \"authors\".\"id\", 'name', \"authors\".\"name\") AS \"row\"",
+        "parameters": ["Ada"]
+      },
+      {
+        "sql": "INSERT INTO \"books\" AS \"books\"\n(\"title\", \"price\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"books\".\"id\", 'title', \"books\".\"title\", 'price', (\"books\".\"price\")::text, 'authorId', \"books\".\"author_id\", 'editorId', \"books\".\"editor_id\") AS \"row\"",
+        "parameters": ["Notes", "10.00", 1]
+      },
+      {
+        "sql": "INSERT INTO \"genres\" AS \"genres\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"genres\".\"id\" AS \"id\", \"genres\".\"label\" AS \"label\"",
+        "parameters": ["math"]
+      },
+      {
+        "sql": "INSERT INTO \"books_genres\" AS \"booksGenres\"\n(\"books_id\", \"genres_id\") VALUES ($1, $2)\nON CONFLICT (\"books_id\", \"genres_id\") DO NOTHING",
+        "parameters": [1, 1]
+      }
+    ]
+  },
+  "shortcuts/whole-row": {
+    "sql": "SELECT \"books\".\"id\" AS \"id\", \"books\".\"title\" AS \"title\", \"books\".\"price\" AS \"price\", \"books\".\"author_id\" AS \"authorId\", \"books\".\"editor_id\" AS \"editorId\"\nFROM \"books\" AS \"books\"\nWHERE \"books\".\"title\" = $1 AND \"books\".\"editor_id\" IS NULL\nLIMIT 5",
+    "parameters": ["Notes"]
+  },
+  "shortcuts/row-spread": {
+    "sql": "SELECT \"books\".\"id\" AS \"id\", \"books\".\"title\" AS \"title\", \"books\".\"price\" AS \"price\", \"books\".\"author_id\" AS \"authorId\", \"books\".\"editor_id\" AS \"editorId\", \"__symmetria_path_0\".\"name\" AS \"author\"\nFROM \"books\" AS \"books\"\nINNER JOIN \"authors\" AS \"__symmetria_path_0\" ON \"books\".\"author_id\" = \"__symmetria_path_0\".\"id\"",
+    "parameters": []
+  },
+  "shortcuts/predicate-chain": {
+    "sql": "SELECT \"books\".\"id\" AS \"id\"\nFROM \"books\" AS \"books\"\nWHERE (\"books\".\"price\" > $1 AND (\"books\".\"title\" = $2 OR \"books\".\"editor_id\" IS NULL))",
+    "parameters": ["5", "Notes"]
+  },
+  "shortcuts/selected-in-tools": {
+    "sql": "SELECT \"authors\".\"name\" AS \"name\", (SELECT COUNT(*) AS \"count\"\nFROM \"books\" AS \"__symmetria_aggregate_0\"\nWHERE \"authors\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"written\"\nFROM \"authors\" AS \"authors\"\nGROUP BY \"authors\".\"id\", \"authors\".\"name\"\nHAVING (SELECT COUNT(*) AS \"count\"\nFROM \"books\" AS \"__symmetria_aggregate_0\"\nWHERE \"authors\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") > $1",
+    "parameters": [1]
+  },
+  "shortcuts/get-find-aggregate": {
+    "statements": [
+      {
+        "sql": "SELECT \"books\".\"id\" AS \"id\", \"books\".\"title\" AS \"title\", \"books\".\"price\" AS \"price\", \"books\".\"author_id\" AS \"authorId\", \"books\".\"editor_id\" AS \"editorId\"\nFROM \"books\" AS \"books\"\nWHERE \"books\".\"id\" = $1\nLIMIT 2",
+        "parameters": [1]
+      },
+      {
+        "sql": "SELECT \"books\".\"title\" AS \"title\"\nFROM \"books\" AS \"books\"\nWHERE \"books\".\"id\" = $1\nLIMIT 2",
+        "parameters": [1]
+      },
+      {
+        "sql": "SELECT MAX(\"books\".\"title\") AS \"last\"\nFROM \"books\" AS \"books\"\nLIMIT 2",
+        "parameters": []
+      }
+    ]
+  },
+  "shortcuts/batch": {
+    "statements": [
+      {
+        "sql": "SELECT (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"books\".\"id\" AS \"id\", \"books\".\"title\" AS \"title\", (\"books\".\"price\")::text AS \"price\", \"books\".\"author_id\" AS \"authorId\", \"books\".\"editor_id\" AS \"editorId\"\nFROM \"books\" AS \"books\"\nWHERE \"books\".\"author_id\" = $1\nLIMIT 2) AS \"__symmetria_row\") AS \"q0\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"genres\".\"label\" AS \"label\"\nFROM \"genres\" AS \"genres\") AS \"__symmetria_row\") AS \"q1\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"books\".\"id\" AS \"id\", \"books\".\"title\" AS \"title\", (\"books\".\"price\")::text AS \"price\", \"books\".\"author_id\" AS \"authorId\", \"books\".\"editor_id\" AS \"editorId\"\nFROM \"books\" AS \"books\"\nWHERE \"books\".\"id\" = $2) AS \"__symmetria_row\") AS \"q2\"",
+        "parameters": [1, 1]
+      }
+    ]
+  },
+  "shortcuts/update-option": {
+    "sql": "UPDATE \"books\" AS \"books\" SET \"title\" = $1\nWHERE \"books\".\"id\" = $2",
+    "parameters": ["x", 1]
+  },
+  "shortcuts/delete-option": {
+    "sql": "DELETE FROM \"books\" AS \"books\"\nWHERE \"books\".\"id\" IN (SELECT \"books\".\"id\" AS \"id\"\nFROM \"books\" AS \"books\"\nINNER JOIN \"authors\" AS \"__symmetria_path_0\" ON \"books\".\"author_id\" = \"__symmetria_path_0\".\"id\"\nWHERE \"__symmetria_path_0\".\"name\" = $1)",
+    "parameters": ["Ada"]
+  },
+  "shortcuts/upsert": {
+    "sql": "INSERT INTO \"genres\" AS \"genres\"\n(\"label\") VALUES ($1), ($2)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"",
+    "parameters": ["math", "sql"]
+  },
+  "shortcuts/upsert-update-returning": {
+    "sql": "INSERT INTO \"genres\" AS \"genres\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"genres\".\"id\" AS \"id\", \"genres\".\"label\" AS \"label\"",
+    "parameters": ["math"]
+  },
+  "shortcuts/returning-whole-row": {
+    "sql": "UPDATE \"books\" AS \"books\" SET \"title\" = $1\nWHERE \"books\".\"id\" = $2\nRETURNING \"books\".\"id\" AS \"id\", \"books\".\"title\" AS \"title\", \"books\".\"price\" AS \"price\", \"books\".\"author_id\" AS \"authorId\", \"books\".\"editor_id\" AS \"editorId\"",
+    "parameters": ["x", 1]
+  },
+  "shortcuts/delete-empty-object": {
+    "error": "symmetria: delete() where: {} names no column; call .all() to delete every row"
+  },
+  "shortcuts/bare-table": {
+    "error": "symmetria: select fields in a shape before compiling or executing a query"
+  },
+  "invalid-schema/slot-unclaimed": {
+    "error": "symmetria: slot \"authors.books\" is never claimed; the table on the other side declares it: one(authors.books), maybe(authors.books) or many(authors.books)"
+  },
+  "invalid-schema/slot-reserved-name": {
+    "error": "symmetria: a slot cannot be named \"index\": every table has .index of its own; choose another name"
   }
 }

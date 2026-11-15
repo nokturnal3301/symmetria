@@ -56,6 +56,8 @@ package versions.
 import {
   schema,
   table,
+  one,
+  many,
   int,
   text,
   bigint,
@@ -67,12 +69,13 @@ const users = table({
   id: int.auto,
   name: text,
   email: text.unique,
+  posts: many,
 });
 
 const posts = table({
   id: int.auto,
   title: text,
-  author: users.index,
+  author: one(users.posts),
   views: bigint.default(0n),
   state: oneOf("draft", "published").default("draft"),
   createdAt: timestamptz.now,
@@ -81,9 +84,12 @@ const posts = table({
 export const appSchema = schema({ users, posts });
 ```
 
-Each table can live in its own module. `author: users.index` declares a foreign
-key, its index and the `posts.author` / `users.posts` relationships. Columns are
-non-null by default. Property names map from camelCase to snake_case.
+Each table can live in its own module. `author: one(users.posts)` declares a
+foreign key, its index and the `posts.author` relationship, and claims the slot
+`posts: many` that `users` declares for the other side; `maybe()` is the
+optional form, `many(tags.posts)` a many-to-many relation with its junction
+table. `author: users.index` is the earlier spelling of the same key. Columns
+are non-null by default. Property names map from camelCase to snake_case.
 `users.by("email")` references a unique column instead of the primary key and
 `users.column("created_by")` keeps a legacy column name. Tables that relate
 through plain columns declare the join predicate instead:
@@ -275,6 +281,14 @@ UPDATE or DELETE without `where()` is refused unless `.all()` confirms it.
 
 ## Capabilities
 
+- Relations declared on both sides (`posts: many`, `author: one(users.posts)`,
+  `tags: many(tags.posts)`), checked by the types and when the schema is built.
+- `$batch()`: several reads as one statement, with one snapshot of the data.
+- `get(id)` / `find(id)`, whole-row reads
+  (`users({ where: { active: true } })`), object filters and ordering,
+  `aggregate()`, `upsert()`, and write filters as options.
+- Error classes for `instanceof`: `NotFoundError`, `UniqueViolation`,
+  `ForeignKeyViolation` and the rest, with the constraint, table and column.
 - Shape-first projections, explicit or FK-inferred JOINs, `some`/`none`/`every`.
 - CRUD, bulk writes, upserts, unique-key lookups with direct writes, reusable
   RETURNING projections and atomic nested inserts.

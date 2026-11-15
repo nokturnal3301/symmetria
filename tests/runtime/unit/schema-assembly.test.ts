@@ -367,6 +367,7 @@ describe("errors", () => {
   test("table names that would shadow the database's own members are reserved", () => {
     for (const name of [
       "$scope",
+      "$batch",
       "$snapshot",
       "$close",
       "$transaction",

@@ -2,11 +2,14 @@
  * Database-backed CLI commands: verify, drift, repair, adopt, status, migrate and rollback.
  * Each one opens a connection through the shared context and prints or emits JSON.
  */
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import {
   detectDrift,
   formatDriftFindings,
   loadMigrationState,
   migrator,
+  parseMigrationSnapshot,
   snapshotHash,
   verifyMigrations,
 } from "../../index";
@@ -210,7 +213,16 @@ export const repair = (
 ): Promise<void> =>
   withRunner(project, async (runner) => {
     const action = context.values.action as "retry" | "complete";
-    await runner.repair({ id, action });
+    // The snapshot file of the boundary, such as meta/snapshot.json as it was
+    // before the migration was generated; the runner checks its hash.
+    const file = context.values.snapshot;
+    const snapshot =
+      file === undefined
+        ? undefined
+        : parseMigrationSnapshot(
+            JSON.parse(await readFile(resolve(file), "utf8")),
+          );
+    await runner.repair({ id, action, ...(snapshot ? { snapshot } : {}) });
     context.emit({
       json: { repaired: id, action },
       plain: () => `Repaired ${id}: ${action}`,
@@ -306,6 +318,7 @@ export const rollback = (
     }
 
     const steps = values.steps === undefined ? 1 : Number(values.steps);
+    let expected: string[] | undefined;
 
     // down.sql usually removes columns or tables, so it never runs unasked.
     if (
@@ -318,8 +331,13 @@ export const rollback = (
         );
       }
 
+      const planned = await runner.plan({ steps, direction: "down" });
+
+      // What was shown is what runs: another process may roll back in between.
+      expected = [...new Set(planned.map((step) => step.id))];
+
       const confirmed = await confirmRollback(
-        rollbackSummary(await runner.plan({ steps, direction: "down" })),
+        rollbackSummary(planned),
         databaseName(project.databaseUrl),
         {
           write: (text) => process.stdout.write(text),
@@ -342,7 +360,10 @@ export const rollback = (
 
     const started = performance.now();
     const reverted = await context.progress("Rolling back migrations", () =>
-      runner.rollback(values.steps === undefined ? {} : { steps }),
+      runner.rollback({
+        ...(values.steps === undefined ? {} : { steps }),
+        ...(expected ? { expected } : {}),
+      }),
     );
     const durationMs = Math.round(performance.now() - started);
     context.emit({

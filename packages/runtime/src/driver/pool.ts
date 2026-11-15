@@ -13,6 +13,7 @@ import { transactionOptionsSQL, runTransaction } from "./transactions";
 import { runPostgresSession } from "./session";
 import { createPendingTasks } from "./pending";
 import type { QueryProfiler } from "../observability/profiling";
+import { queryError } from "./errors";
 
 export type PostgresConnection = {
   readonly execute: (query: CompiledQuery) => Promise<ExecutionResult>;
@@ -40,11 +41,35 @@ export type PostgresDriver = Driver & {
   ) => Promise<Result>;
 };
 
+const rethrow = (error: unknown): never => {
+  throw queryError(error);
+};
+
+/**
+ * The pool whose database failures are `QueryError`s. The adapters see their
+ * own driver errors first (to discard a broken connection); everything above
+ * them, and the application, gets the class.
+ */
+const classified = (pool: PostgresPool): PostgresPool => ({
+  execute: (query) => pool.execute(query).catch(rethrow),
+  connect: async () => {
+    const connection = await pool.connect().catch(rethrow);
+
+    return {
+      ...connection,
+      execute: (query) => connection.execute(query).catch(rethrow),
+    };
+  },
+  cancel: (pid) => pool.cancel(pid),
+  close: () => pool.close(),
+});
+
 /** SQL compilation and row codecs are shared; adapters own only the transport. */
 export const createPostgresDriver = (
-  pool: PostgresPool,
+  adapter: PostgresPool,
   profiler?: QueryProfiler,
 ): PostgresDriver => {
+  const pool = classified(adapter);
   const pending = createPendingTasks();
   let closing: Promise<void> | undefined;
 

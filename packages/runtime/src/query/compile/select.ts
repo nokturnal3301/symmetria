@@ -194,6 +194,10 @@ const renderSelect = (
     );
 
   const projection = `SELECT ${query.distinct ? "DISTINCT " : ""}${projectionSql(compilation, query.selection, bindings, jsonValues, terminalJSON)}`;
+  if (query.rootless) {
+    return projection;
+  }
+
   const source = `FROM ${tableSql(compilation, query.root, outerBindings)}`;
   const fragments: string[] = [];
 

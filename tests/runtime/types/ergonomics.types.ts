@@ -34,8 +34,10 @@ const db = schema({
     })),
 });
 const published = db.posts({ where: ({ live }) => live.is(true) });
-// @ts-expect-error an unselected query does not execute
+// Options without fields read the table's own columns.
 published.execute();
+// @ts-expect-error a bare table does not execute
+db.posts.execute();
 const selected = published(({ title }) => ({ title }))({ limit: 3 });
 type Selected = Expect<Equal<Awaited<typeof selected>, { title: string }[]>>;
 const grouped = db.users(({ name, posts }) => {

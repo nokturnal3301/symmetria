@@ -138,6 +138,8 @@ export type SelectPlan = {
   readonly limit?: number | PlaceholderNode;
   readonly offset?: number | PlaceholderNode;
   readonly locking?: RowLockOptions & { readonly mode: "UPDATE" | "SHARE" };
+  /** A `$batch()` statement: its fields are subqueries and there is no FROM. */
+  readonly rootless?: true;
   /** A data error found while building; compiling the plan throws it. */
   readonly failure?: DeferredError;
 };

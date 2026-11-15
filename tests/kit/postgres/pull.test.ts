@@ -301,19 +301,27 @@ describe.skipIf(!url)("pull", () => {
       // and as a predicate rather than SQL text.
       expect(result.source).toContain("score: users.score.above(-100),");
       expect(result.source).toContain(
-        'editor: users.nullable.onDelete.setNull.inverse("postsByEditor"),',
+        'editor: maybe(users.inverse("postsByEditor")).noIndex.setNull,',
       );
       expect(result.source).toContain(
-        "reviewer: users.nullable.onDelete.noAction",
+        'reviewer: maybe(users.inverse("postsByReviewer")).noIndex.onDelete.noAction,',
       );
       expect(result.source).toContain(
-        'createdBy: users.column("created_by").nullable.onDelete.cascade.inverse("postsByCreatedBy"),',
+        'createdBy: maybe(users.column("created_by").inverse("postsByCreatedBy")).noIndex.cascade,',
       );
       expect(result.source).toContain(
-        'authorEmail: users.by("email").column("author_email").onDelete.noAction.inverse("postsByAuthorEmail"),',
+        'authorEmail: one(users.by("email").column("author_email").inverse("postsByAuthorEmail")).noIndex.onDelete.noAction,',
       );
       expect(result.source).toContain("postTags: ({ posts, tags }) =>");
-      expect(result.source).toContain("junction({");
+      // Both keys cascade: a link.
+      expect(result.source).toContain("link({");
+      expect(result.source).toContain("        post: posts,\n");
+      expect(result.source).toContain("author: one(users).cascade,");
+      // Each referenced table lists its reverse sides, a self reference too.
+      expect(result.source).toContain("postsByEditor: many,");
+      expect(result.source).toContain(
+        'parent: maybe(categories.inverse("categoriesByParent")).noIndex.cascade,\n        categoriesByParent: many,',
+      );
       expect(result.source).toContain(
         ".primaryKey((audit) => [audit.code, audit.seq])",
       );
@@ -870,7 +878,7 @@ describe.skipIf(!url)("pull", () => {
       // Other suites' schemas may be listed; nothing of this schema is.
       expect(first.stdout).not.toMatch(/^ +\[(?!other-schema\])/m);
       expect(await readFile(target, "utf8")).toContain(
-        "author: users.onDelete.cascade,",
+        "author: one(users).noIndex.cascade,",
       );
 
       const second = await cli(

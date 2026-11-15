@@ -37,6 +37,8 @@ import {
   resultRows,
   shapeFrame,
   type QueryHandle,
+  createScope,
+  readSelection,
 } from "./scope";
 import {
   countPlan,
@@ -199,6 +201,33 @@ export const createQueryFactory = (
     }
 
     return name;
+  };
+
+  /**
+   * The plan a terminal runs. A query that was given options but no fields
+   * (`users({ where })`) reads the root's own columns, computed fields
+   * included. A bare table or alias is not such a query: awaiting `db.users`
+   * by accident must not read a whole table.
+   */
+  const runnable = (state: QueryHandle[typeof QUERY_STATE]): SelectPlan => {
+    const { plan } = state;
+
+    if (
+      plan.selection.length ||
+      state.freshSource ||
+      plan.grouping.length ||
+      plan.root.projection
+    ) {
+      return plan;
+    }
+
+    return (state.whole ??= freeze({
+      ...plan,
+      selection: readSelection(
+        createScope({ [plan.root.alias]: plan.root })[plan.root.alias]!,
+        plan.bindings,
+      ),
+    }));
   };
 
   // Top-level queries share their table's root binding, so a query placed inside
@@ -392,43 +421,63 @@ export const createQueryFactory = (
           });
         },
         toSQL(this: QueryHandle) {
-          return compilePlan(this[QUERY_STATE].plan);
+          return compilePlan(runnable(this[QUERY_STATE]));
         },
         prepare(this: QueryHandle) {
-          return preparePlan(this[QUERY_STATE].plan, executor);
+          return preparePlan(runnable(this[QUERY_STATE]), executor);
         },
         [PREPARE_QUERY](
           this: QueryHandle,
           scope: object,
           names: readonly string[],
         ) {
-          return preparePlan(this[QUERY_STATE].plan, executor, scope, names);
+          return preparePlan(
+            runnable(this[QUERY_STATE]),
+            executor,
+            scope,
+            names,
+          );
         },
         async execute(this: QueryHandle) {
-          return (await executePlan(this[QUERY_STATE].plan, executor)).rows;
+          return (await executePlan(runnable(this[QUERY_STATE]), executor))
+            .rows;
         },
         then(
           this: QueryHandle,
           onFulfilled?: ((rows: Record<string, unknown>[]) => unknown) | null,
           onRejected?: ((reason: unknown) => unknown) | null,
         ) {
-          return executePlan(this[QUERY_STATE].plan, executor).then(
+          return executePlan(runnable(this[QUERY_STATE]), executor).then(
             onFulfilled ? (result) => onFulfilled(result.rows) : resultRows,
             onRejected,
           );
         },
+        catch(
+          this: QueryHandle,
+          onRejected?: ((reason: unknown) => unknown) | null,
+        ) {
+          return executePlan(runnable(this[QUERY_STATE]), executor).then(
+            resultRows,
+            onRejected,
+          );
+        },
+        finally(this: QueryHandle, onFinally?: (() => void) | null) {
+          return executePlan(runnable(this[QUERY_STATE]), executor)
+            .then(resultRows)
+            .finally(onFinally);
+        },
         async inspect(this: QueryHandle, options?: InspectQueryOptions) {
           return (await import("../../observability/inspection")).inspectQuery(
-            this[QUERY_STATE].plan,
+            runnable(this[QUERY_STATE]),
             executor,
             options,
           );
         },
         one(this: QueryHandle) {
-          return single(this[QUERY_STATE].plan, true);
+          return single(runnable(this[QUERY_STATE]), true);
         },
         maybeOne(this: QueryHandle) {
-          return single(this[QUERY_STATE].plan, false);
+          return single(runnable(this[QUERY_STATE]), false);
         },
         page(
           this: QueryHandle,
@@ -438,13 +487,13 @@ export const createQueryFactory = (
             before?: string | null | undefined;
           },
         ) {
-          return executePage(this[QUERY_STATE].plan, options, executor);
+          return executePage(runnable(this[QUERY_STATE]), options, executor);
         },
         pages(
           this: QueryHandle,
           options: { size: number; after?: string | null | undefined },
         ) {
-          const state = this[QUERY_STATE].plan;
+          const state = runnable(this[QUERY_STATE]);
 
           return {
             [Symbol.asyncIterator]: () => {
@@ -470,7 +519,7 @@ export const createQueryFactory = (
           };
         },
         stream(this: QueryHandle, options: { size?: number } = {}) {
-          const plan = this[QUERY_STATE].plan;
+          const plan = runnable(this[QUERY_STATE]);
           const size = options.size ?? 1000;
 
           if (!Number.isSafeInteger(size) || size < 1) {
@@ -489,8 +538,16 @@ export const createQueryFactory = (
             [Symbol.asyncIterator]: () => streamRows(hold, plan, size),
           };
         },
+        /** The shape's single row: aggregates over the source, as one object. */
+        async aggregate(this: QueryHandle, shape: ShapeCallback) {
+          return (
+            this as unknown as (shape: ShapeCallback) => {
+              one: () => Promise<Record<string, unknown>>;
+            }
+          )(shape).one();
+        },
         async first(this: QueryHandle) {
-          const state = this[QUERY_STATE].plan;
+          const state = runnable(this[QUERY_STATE]);
 
           if (typeof state.limit === "object") {
             throw new Error(

@@ -3,6 +3,19 @@
  * conflict classes a transaction may retry and failed `$scope()` write checks.
  */
 
+import {
+  CheckViolation,
+  ConnectionError,
+  DeadlockDetected,
+  ExclusionViolation,
+  ForeignKeyViolation,
+  NotNullViolation,
+  OutOfScopeError,
+  QueryError,
+  SerializationFailure,
+  UniqueViolation,
+} from "../errors";
+
 /** The five-character SQLSTATE of a server error (`code` on pg, `errno` on Bun). */
 export const sqlState = (error: unknown): string | undefined => {
   if (!error || typeof error !== "object") {
@@ -50,14 +63,12 @@ export const scopeViolation = (error: unknown): unknown => {
 
   const table = decodeURIComponent(failed[2]!);
 
-  return Object.assign(
-    new Error(
-      failed[1] === "conflict"
-        ? `symmetria: upsert on "${table}" conflicted with a row outside the database scope`
-        : `symmetria: ${failed[1]} on "${table}" would write a row outside the database scope`,
-      { cause: error },
-    ),
-    { code: "SYMMETRIA_OUT_OF_SCOPE", table },
+  return new OutOfScopeError(
+    failed[1] === "conflict"
+      ? `symmetria: upsert on "${table}" conflicted with a row outside the database scope`
+      : `symmetria: ${failed[1]} on "${table}" would write a row outside the database scope`,
+    table,
+    error,
   );
 };
 
@@ -202,4 +213,36 @@ export const databaseError = (error: unknown): DatabaseError | undefined => {
     ...(constraint ? { constraint } : {}),
     ...(detail ? { detail } : {}),
   });
+};
+
+const CLASSES: Partial<Record<DatabaseErrorKind, typeof QueryError>> = {
+  unique: UniqueViolation,
+  "foreign-key": ForeignKeyViolation,
+  "not-null": NotNullViolation,
+  check: CheckViolation,
+  exclusion: ExclusionViolation,
+  serialization: SerializationFailure,
+  deadlock: DeadlockDetected,
+  connection: ConnectionError,
+};
+
+/**
+ * A driver's database error as its `QueryError` class, with the driver error
+ * as the cause; anything that did not come from the database, and an error
+ * that is wrapped already, passes through unchanged.
+ */
+export const queryError = (error: unknown): unknown => {
+  if (error instanceof QueryError) {
+    return error;
+  }
+
+  const described = databaseError(error);
+
+  if (!described) {
+    return error;
+  }
+
+  const { message, ...fields } = described;
+
+  return new (CLASSES[fields.kind] ?? QueryError)(message, fields, error);
 };

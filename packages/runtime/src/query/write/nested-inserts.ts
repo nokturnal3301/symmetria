@@ -2,24 +2,18 @@
  * Nested inserts: writes a parent row and its related rows in one transaction, resolving generated keys.
  */
 import { freeze } from "../plan/freeze";
-import { cloneParameter, type SchemaCodecs } from "../codecs";
+import { NotFoundError } from "../../errors";
+import { encodeValue, type SchemaCodecs } from "../codecs";
 import { collectDataErrors } from "../codecs/deferred";
-import {
-  and,
-  COLUMN_EXPRESSION,
-  readColumn,
-  createExpression,
-  valueNode,
-  type Predicate,
-} from "../expressions";
+import { and, readColumn, type Predicate } from "../expressions";
 import type { Projection, RuntimeScope } from "../select";
 import {
   primaryKeyColumns,
-  uniqueColumnIndexes,
   type SchemaSnapshot,
   type TableSnapshot,
 } from "../../schema/assembly";
-import { returningProjection } from "../select/projections";
+import { returningProjection, returningSelector } from "../select/projections";
+import { conditionWrite, nestedInput, uniqueKeys } from "./nested-input";
 
 type RuntimeQuery = {
   (
@@ -27,6 +21,7 @@ type RuntimeQuery = {
     options?: {
       readonly where?: (columns: RuntimeScope[string]) => Predicate;
       readonly limit?: number;
+      readonly orderBy?: never;
     },
   ): RuntimeQuery;
   execute: () => Promise<Record<string, unknown>[]>;
@@ -53,63 +48,6 @@ type RunTransaction = <Result>(
 ) => Promise<Result>;
 type Selector = (row: RuntimeScope[string]) => Projection;
 
-/** Keys a row can be found by: the primary key first, then unique columns and indexes. */
-const uniqueKeys = (table: TableSnapshot): string[][] => {
-  const primary = primaryKeyColumns(table).map((column) => column.name);
-
-  return [
-    ...(primary.length ? [primary] : []),
-    ...table.columns
-      .filter((column) => column.unique)
-      .map((column) => [column.name]),
-    ...uniqueColumnIndexes(table).map(({ columns }) =>
-      columns.map((column) => column.name),
-    ),
-  ];
-};
-
-const copyInput = (value: unknown, ancestors = new Set<object>()): unknown => {
-  if (!value || typeof value !== "object" || COLUMN_EXPRESSION in value) {
-    return value;
-  }
-
-  if (
-    value instanceof Date ||
-    ArrayBuffer.isView(value) ||
-    value instanceof ArrayBuffer
-  ) {
-    return cloneParameter(value);
-  }
-
-  if (ancestors.has(value)) {
-    throw new Error("symmetria: cyclic nested insert input");
-  }
-
-  ancestors.add(value);
-  const result = Array.isArray(value)
-    ? value.map((entry) => copyInput(entry, ancestors))
-    : Object.fromEntries(
-        Object.entries(value).map(([name, entry]) => [
-          name,
-          copyInput(entry, ancestors),
-        ]),
-      );
-  ancestors.delete(value);
-
-  return freeze(result);
-};
-
-/** Write payloads treat `undefined` as an omitted field or operation. */
-const definedEntries = (value: object): [string, unknown][] =>
-  Object.entries(value).filter(([, entry]) => entry !== undefined);
-
-/** Relational inserts are multi-statement operations and execute atomically. */
-/** Condition relations have no foreign key, so nested writes cannot target them. */
-const conditionWrite = (table: string, field: string): Error =>
-  new Error(
-    `symmetria: "${table}.${field}" is a condition relation; it has no foreign key to write`,
-  );
-
 export const createNestedInsert = (
   snapshot: SchemaSnapshot,
   tableName: string,
@@ -117,165 +55,15 @@ export const createNestedInsert = (
   transaction: RunTransaction,
   codecs: SchemaCodecs,
 ): object => {
-  const tableByName = new Map(
-    snapshot.tables.map((table) => [table.name, table]),
-  );
-
-  // Capture encoded scalar values before cloning the graph, including custom
-  // class instances whose prototypes/private state structuredClone cannot retain.
-  const scalar = (name: string, column: string, value: unknown): unknown => {
-    const codec = codecs[name]?.[column];
-
-    if (
-      !codec ||
-      value === null ||
-      value === undefined ||
-      typeof value === "symbol"
-    ) {
-      return copyInput(value);
-    }
-
-    return createExpression({
-      outputName: column,
-      node: valueNode(value, codec),
-    });
-  };
-
-  /** The target column a foreign key points at, by TypeScript name. */
-  const referencedName = (
-    sourceName: string,
-    foreignKey: string,
-    targetName: string,
-  ): string => {
-    const column = tableByName
-      .get(sourceName)!
-      .columns.find((entry) => entry.name === foreignKey);
-    const target = tableByName
-      .get(targetName)!
-      .columns.find((entry) => entry.sqlName === column?.references?.column);
-
-    if (!target) {
-      throw new Error(
-        `symmetria: missing foreign key metadata for "${sourceName}.${foreignKey}"`,
-      );
-    }
-
-    return target.name;
-  };
-
-  /**
-   * The column a scalar connect value names: the referenced column of a forward
-   * reference or of the junction's target key; children of reverse relations
-   * connect by their primary key.
-   */
-  const scalarKey = (
-    sourceName: string,
-    relation: TableSnapshot["relations"][number],
-  ): string | undefined =>
-    relation.kind === "through"
-      ? referencedName(
-          relation.junction,
-          relation.targetForeignKey,
-          relation.target,
-        )
-      : relation.kind === "one" && !relation.reverse
-        ? referencedName(sourceName, relation.foreignKey, relation.target)
-        : undefined;
-
-  const connect = (
-    name: string,
-    value: unknown,
-    scalarColumn?: string,
-  ): unknown => {
-    const table = tableByName.get(name)!;
-
-    if (
-      value &&
-      typeof value === "object" &&
-      !(COLUMN_EXPRESSION in value) &&
-      uniqueKeys(table).some(
-        (key) =>
-          key.length === definedEntries(value).length &&
-          key.every(
-            (column) =>
-              (value as Record<string, unknown>)[column] !== undefined,
-          ),
-      )
-    ) {
-      return Object.fromEntries(
-        definedEntries(value).map(([column, entry]) => [
-          column,
-          scalar(name, column, entry),
-        ]),
-      );
-    }
-
-    const primary = primaryKeyColumns(table);
-
-    if (scalarColumn !== undefined) {
-      return scalar(name, scalarColumn, value);
-    }
-
-    return primary.length === 1
-      ? scalar(name, primary[0]!.name, value)
-      : copyInput(value);
-  };
-
-  const ancestors = new Set<object>();
-
-  const capture = (name: string, value: unknown): unknown => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      return copyInput(value);
-    }
-
-    if (ancestors.has(value)) {
-      throw new Error("symmetria: cyclic nested insert input");
-    }
-
-    ancestors.add(value);
-    const table = tableByName.get(name)!;
-    const result = Object.fromEntries(
-      definedEntries(value).map(([field, entry]) => {
-        const relation = table.relations.find(
-          (relation) => relation.name === field,
-        );
-
-        if (relation?.kind === "condition") {
-          throw conditionWrite(name, field);
-        }
-
-        if (
-          !relation ||
-          !entry ||
-          typeof entry !== "object" ||
-          Array.isArray(entry)
-        ) {
-          return [field, scalar(name, field, entry)];
-        }
-
-        const operations = Object.fromEntries(
-          definedEntries(entry).map(([operation, payload]) => {
-            const target = (row: unknown) =>
-              operation === "connect"
-                ? connect(relation.target, row, scalarKey(name, relation))
-                : capture(relation.target, row);
-
-            return [
-              operation,
-              relation.kind === "one" || !Array.isArray(payload)
-                ? target(payload)
-                : payload.map(target),
-            ];
-          }),
-        );
-
-        return [field, operations];
-      }),
-    );
-    ancestors.delete(value);
-
-    return freeze(result);
-  };
+  const {
+    tableByName,
+    referencedName,
+    scalarKey,
+    capture,
+    lookupFields,
+    lookupKey,
+    connected,
+  } = nestedInput(snapshot, tableName, codecs);
 
   // A value the codecs reject fails the insert when it runs.
   const [values, failure] = collectDataErrors(
@@ -306,24 +94,59 @@ export const createNestedInsert = (
           return table[kind]!(data);
         };
 
+        // Rows that several connects name, read once per table and column.
+        // A row that is not here (created by this insert, or spelled
+        // differently from how PostgreSQL returns it) is still looked up
+        // by itself.
+        const found = new Map<string, Map<string, Map<string, unknown>>>();
+
+        for (const [name, columns] of connected(values)) {
+          for (const [column, keys] of columns) {
+            if (
+              keys.size < 2 ||
+              !uniqueKeys(tableByName.get(name)!).some(
+                (key) => key.length === 1 && key[0] === column,
+              )
+            ) {
+              continue;
+            }
+
+            const rows = await (database[name] as RuntimeQuery)(
+              (scope) => ({ ...scope }),
+              {
+                where: (scope) =>
+                  scope[column]!.in([...keys.values()] as never),
+              },
+            ).execute();
+            const byKey = new Map<string, unknown>();
+
+            for (const row of rows) {
+              const key = lookupKey(
+                encodeValue(row[column], codecs[name]?.[column]),
+              );
+
+              if (key !== undefined) {
+                byKey.set(key, row);
+              }
+            }
+
+            let cached = found.get(name);
+
+            if (!cached) {
+              found.set(name, (cached = new Map()));
+            }
+
+            cached.set(column, byKey);
+          }
+        }
+
         const find = async (
           name: string,
           selection: unknown,
           scalarColumn?: string,
         ): Promise<Record<string, unknown>> => {
           const table = tableByName.get(name)!;
-          const primary = primaryKeyColumns(table);
-          const fields =
-            selection !== null &&
-            typeof selection === "object" &&
-            !(COLUMN_EXPRESSION in selection) &&
-            !Array.isArray(selection)
-              ? (selection as Record<string, unknown>)
-              : scalarColumn !== undefined
-                ? { [scalarColumn]: selection }
-                : primary.length === 1
-                  ? { [primary[0]!.name]: selection }
-                  : {};
+          const fields = lookupFields(name, selection, scalarColumn);
           const names = Object.keys(fields);
 
           if (
@@ -342,6 +165,18 @@ export const createNestedInsert = (
             );
           }
 
+          if (names.length === 1) {
+            const key = lookupKey(fields[names[0]!]);
+            const cached =
+              key === undefined
+                ? undefined
+                : found.get(name)?.get(names[0]!)?.get(key);
+
+            if (cached) {
+              return cached as Record<string, unknown>;
+            }
+          }
+
           const rows = await (database[name] as RuntimeQuery)(
             (columns) => ({
               ...columns,
@@ -358,11 +193,9 @@ export const createNestedInsert = (
           ).execute();
 
           if (rows.length !== 1) {
-            throw Object.assign(
-              new Error(
-                `symmetria: connect on "${name}" expected one existing row`,
-              ),
-              { code: "SYMMETRIA_RECORD_NOT_FOUND" },
+            throw new NotFoundError(
+              `symmetria: connect on "${name}" expected one existing row`,
+              name,
             );
           }
 
@@ -394,24 +227,46 @@ export const createNestedInsert = (
             .execute();
         };
 
-        const insertRow = async (
+        /** The fields `returning()` asked for, as an object of expressions. */
+        const resultOf = (
+          returning: Selector,
+          row: RuntimeScope[string],
+          table: TableSnapshot,
+        ): Projection => {
+          const selection = returningProjection(returning, row, table);
+
+          return Array.isArray(selection)
+            ? Object.fromEntries(
+                selection.map((column) => [
+                  readColumn(column).outputName,
+                  column,
+                ]),
+              )
+            : selection;
+        };
+
+        type WritableRelation = Exclude<
+          TableSnapshot["relations"][number],
+          { kind: "condition" }
+        >;
+        type RowParts = {
+          /** Column values, to which resolved foreign keys are added. */
+          readonly scalars: Record<string, unknown>;
+          readonly relations: [WritableRelation, Record<string, unknown>][];
+        };
+
+        /** A row's own values apart from its nested operations, validated. */
+        const split = (
           name: string,
           data: Record<string, unknown>,
-          returning?: Selector,
-        ): Promise<{
-          row: Record<string, unknown>;
-          result?: Record<string, unknown>;
-        }> => {
+        ): RowParts => {
           if (!data || typeof data !== "object" || Array.isArray(data)) {
             throw new Error("symmetria: nested create requires a row object");
           }
 
           const table = tableByName.get(name)!;
           const scalars: Record<string, unknown> = Object.create(null);
-          const relations: [
-            Exclude<TableSnapshot["relations"][number], { kind: "condition" }>,
-            Record<string, unknown>,
-          ][] = [];
+          const relations: RowParts["relations"] = [];
 
           for (const [field, value] of Object.entries(data)) {
             const relation = table.relations.find(
@@ -454,6 +309,76 @@ export const createNestedInsert = (
 
             relations.push([relation, operations]);
           }
+
+          return { scalars, relations };
+        };
+
+        /**
+         * True when the row's only nested operations connect rows it
+         * references: it writes nothing but itself, so it can share a
+         * multi-row INSERT with its neighbours.
+         */
+        const connectsOnly = ({ relations }: RowParts): boolean =>
+          relations.every(
+            ([relation, operations]) =>
+              relation.kind === "one" &&
+              !relation.reverse &&
+              Object.hasOwn(operations, "connect"),
+          );
+
+        type ResolveRow = (
+          target: string,
+          operation: string,
+          value: unknown,
+          extra?: Record<string, unknown>,
+          scalarColumn?: string,
+        ) => Promise<Record<string, unknown>>;
+
+        /** Resolves the rows a row references and stores their keys in its foreign-key columns. */
+        const forwards = async (
+          name: string,
+          data: Record<string, unknown>,
+          { scalars, relations }: RowParts,
+          resolveRow: ResolveRow,
+        ): Promise<void> => {
+          for (const [relation, operations] of relations) {
+            if (relation.kind !== "one" || relation.reverse) {
+              continue;
+            }
+
+            if (Object.hasOwn(data, relation.foreignKey)) {
+              throw new Error(
+                `symmetria: supply either "${relation.name}" or "${relation.foreignKey}"`,
+              );
+            }
+
+            const [operation, value] = Object.entries(operations)[0]!;
+            const referenced = referencedName(
+              name,
+              relation.foreignKey,
+              relation.target,
+            );
+            const row = await resolveRow(
+              relation.target,
+              operation,
+              value,
+              {},
+              referenced,
+            );
+            scalars[relation.foreignKey] = row[referenced];
+          }
+        };
+
+        const insertRow = async (
+          name: string,
+          data: Record<string, unknown>,
+          returning?: Selector,
+        ): Promise<{
+          row: Record<string, unknown>;
+          result?: Record<string, unknown>;
+        }> => {
+          const table = tableByName.get(name)!;
+          const { scalars, relations } = split(name, data);
 
           /** The row a create or connectOrCreate writes: its values and the parent's key. */
           const payloadOf = (
@@ -516,46 +441,13 @@ export const createNestedInsert = (
               .execute();
           };
 
-          for (const [relation, operations] of relations) {
-            if (relation.kind !== "one" || relation.reverse) {
-              continue;
-            }
-
-            if (Object.hasOwn(data, relation.foreignKey)) {
-              throw new Error(
-                `symmetria: supply either "${relation.name}" or "${relation.foreignKey}"`,
-              );
-            }
-
-            const [operation, value] = Object.entries(operations)[0]!;
-            const referenced = referencedName(
-              name,
-              relation.foreignKey,
-              relation.target,
-            );
-            const row = await resolveRow(
-              relation.target,
-              operation,
-              value,
-              {},
-              referenced,
-            );
-            scalars[relation.foreignKey] = row[referenced];
-          }
+          await forwards(name, data, { scalars, relations }, resolveRow);
 
           // Returning both shapes in the INSERT avoids a second lookup and works for keyless roots.
           const mutation = mutate(name, "insert", scalars).returning((row) => {
-            const selection = returning
-              ? returningProjection(returning, row, table)
+            const result = returning
+              ? resultOf(returning, row, table)
               : undefined;
-            const result = Array.isArray(selection)
-              ? Object.fromEntries(
-                  selection.map((column) => [
-                    readColumn(column).outputName,
-                    column,
-                  ]),
-                )
-              : selection;
 
             return {
               row,
@@ -625,6 +517,16 @@ export const createNestedInsert = (
                     siblings.push(payload);
                     continue;
                   }
+
+                  // A child that only connects rows it references (an order
+                  // item and its product) joins the same INSERT.
+                  const parts = split(relation.target, payload);
+
+                  if (connectsOnly(parts)) {
+                    await forwards(relation.target, payload, parts, resolveRow);
+                    siblings.push(parts.scalars);
+                    continue;
+                  }
                 }
 
                 await insertSiblings();
@@ -682,14 +584,59 @@ export const createNestedInsert = (
         };
 
         const results: Record<string, unknown>[] = [];
+        const rootTable = tableByName.get(tableName)!;
+        // Consecutive roots that write nothing but themselves share one
+        // multi-row INSERT; rows are still inserted in the order given.
+        let roots: Record<string, unknown>[] = [];
+
+        const insertRoots = async () => {
+          if (!roots.length) {
+            return;
+          }
+
+          const rows = roots;
+          roots = [];
+          const mutation = mutate(tableName, "insert", rows);
+
+          if (selector) {
+            results.push(
+              ...((await mutation
+                .returning((row) => resultOf(selector, row, rootTable))
+                .execute()) as unknown as Record<string, unknown>[]),
+            );
+          } else {
+            await mutation.execute();
+          }
+        };
+
+        /** A connect of a batched root: nothing else is written for it. */
+        const connectRow: ResolveRow = (
+          target,
+          _operation,
+          value,
+          _extra,
+          column,
+        ) => find(target, value, column);
 
         for (const value of values) {
+          const parts = values.length > 1 ? split(tableName, value) : undefined;
+
+          if (parts && connectsOnly(parts)) {
+            await forwards(tableName, value, parts, connectRow);
+            roots.push(parts.scalars);
+            continue;
+          }
+
+          await insertRoots();
+
           const inserted = await insertRow(tableName, value, selector);
 
           if (selector) {
             results.push(inserted.result!);
           }
         }
+
+        await insertRoots();
 
         if (!selector) {
           return { affectedRows: values.length };
@@ -701,12 +648,16 @@ export const createNestedInsert = (
     const run = () => (failure ? Promise.reject(failure.error) : execute());
 
     return freeze({
-      returning: (next: Selector) => build(next),
+      returning: (next?: unknown, ...names: unknown[]) =>
+        build(returningSelector(next, names) as Selector),
       execute: run,
       then: (
         onFulfilled?: ((value: unknown) => unknown) | null,
         onRejected?: ((reason: unknown) => unknown) | null,
       ) => run().then(onFulfilled, onRejected),
+      catch: (onRejected?: ((reason: unknown) => unknown) | null) =>
+        run().catch(onRejected),
+      finally: (onFinally?: (() => void) | null) => run().finally(onFinally),
     });
   };
 

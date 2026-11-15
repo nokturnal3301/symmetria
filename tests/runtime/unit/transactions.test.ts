@@ -297,6 +297,7 @@ test("a bound database builds table handles on first use and still lists every t
     "posts",
     "users",
     "$scope",
+    "$batch",
     "$snapshot",
     "$createIndexes",
     "$transaction",

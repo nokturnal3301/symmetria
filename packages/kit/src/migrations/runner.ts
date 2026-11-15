@@ -285,7 +285,7 @@ export const migrator = (options: MigratorOptions) => {
     if (expected) {
       if (snapshotHash(expected) !== hash) {
         throw new Error(
-          "symmetria: verification snapshot does not match the target migration hash",
+          "symmetria: verification snapshot does not match the target migration hash; it must be the snapshot written when that migration was generated",
         );
       }
 
@@ -305,7 +305,7 @@ export const migrator = (options: MigratorOptions) => {
     } else {
       if (!options.verificationDatabaseUrl) {
         throw new Error(
-          "symmetria: historical verification requires verificationDatabaseUrl or a matching snapshot",
+          "symmetria: this boundary is not the latest snapshot, so verifying it needs either the snapshot of that point (--snapshot <file>: meta/snapshot.json as it was at that migration, for example `git show <commit>:<dir>/meta/snapshot.json`) or a server for disposable databases (--verify-url, verificationDatabaseUrl)",
         );
       }
 
@@ -359,7 +359,7 @@ export const migrator = (options: MigratorOptions) => {
 
           throw new Error(
             link.pooled
-              ? `symmetria: migration "${id}" uses transaction: "none", which needs one server connection for its statements and the migration lock; this connection pools transactions (such as PgBouncer with pool_mode=transaction). Run it over a direct or session-pooled connection`
+              ? `symmetria: migration "${id}" uses transaction: "none", which needs one server connection for its statements and the migration lock; this connection pools transactions (such as PgBouncer with pool_mode=transaction), or its pool has a single connection, which leaves none to check that. Run it over a direct or session-pooled connection with at least two connections (max: 2)`
               : `symmetria: migration "${id}" uses transaction: "none", which needs a driver with sessions (driver.session); this driver only runs whole transactions`,
           );
         }
@@ -556,7 +556,17 @@ export const migrator = (options: MigratorOptions) => {
         ),
       );
     },
-    rollback: async (settings: { steps?: number } = {}): Promise<string[]> => {
+    rollback: async (
+      settings: {
+        steps?: number;
+        /**
+         * The migrations a plan showed, latest first. The rollback reverts
+         * exactly these or nothing: if another process changed the journal in
+         * between, it stops before running any SQL.
+         */
+        expected?: readonly string[];
+      } = {},
+    ): Promise<string[]> => {
       const steps = settings.steps ?? 1;
 
       if (!Number.isSafeInteger(steps) || steps < 1) {
@@ -582,6 +592,20 @@ export const migrator = (options: MigratorOptions) => {
             reverting = migrations
               .slice(Math.max(history.length - steps, 0), history.length)
               .reverse();
+
+            const { expected } = settings;
+
+            if (
+              expected &&
+              (expected.length !== reverting.length ||
+                reverting.some(
+                  (migration, position) => migration.id !== expected[position],
+                ))
+            ) {
+              throw new Error(
+                `symmetria: the applied migrations changed since this rollback was planned: it was to revert ${expected.join(", ") || "nothing"}, and would now revert ${reverting.map((migration) => migration.id).join(", ") || "nothing"}. Nothing was rolled back; check status and run rollback again`,
+              );
+            }
           }
 
           const remaining = reverting.filter(

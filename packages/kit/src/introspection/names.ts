@@ -15,6 +15,7 @@ const RESERVED_COLUMN_KEYS = new Set([
   "unique",
   "index",
   "onDelete",
+  "onUpdate",
   "inverse",
   "relations",
   "named",

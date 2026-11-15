@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   schema,
   table,
+  customType,
   int,
   text,
   bool,
@@ -20,6 +21,69 @@ import { testDatabase } from "../../support/postgres";
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("PostgreSQL drift definitions", () => {
+  test("char(n) and decimal columns have no drift, and a same-named type from another schema does", async () => {
+    const passthrough = {
+      encode: (value: string) => value,
+      decode: (value: unknown) => String(value),
+    };
+    const suffix = crypto.randomUUID().replaceAll("-", "");
+    const [allowed, loose] = [`drift_a_${suffix}`, `drift_b_${suffix}`];
+    const admin = await testDatabase({
+      url: databaseUrl!,
+      schema: schema({ marker: { id: int } }),
+    });
+    const run = (statement: string) =>
+      admin.driver.execute({ sql: statement, parameters: [] });
+
+    await run(`CREATE SCHEMA "${allowed}"`);
+    await run(`CREATE SCHEMA "${loose}"`);
+    await run(
+      `CREATE DOMAIN "${allowed}".code AS text CHECK (VALUE ~ '^[A-Z]+$')`,
+    );
+    await run(`CREATE DOMAIN "${loose}".code AS text`);
+
+    const model = schema({
+      records: {
+        id: int,
+        short: customType<string>("char(5)", passthrough),
+        price: customType<string>("decimal(8,2)", passthrough),
+        code: customType<string>(`${allowed}.code`, passthrough),
+        codes: customType<string>(`${allowed}.code[]`, passthrough).nullable,
+      },
+    });
+    const fixture = await testDatabase({ url: databaseUrl!, schema: model });
+    const drift = () =>
+      detectDrift({
+        execute: fixture.driver.execute,
+        snapshot: model.$snapshot(),
+        schemaName: fixture.namespace,
+      });
+
+    try {
+      // PostgreSQL prints character(5) and numeric(8,2) for these.
+      expect(await drift()).toEqual([]);
+
+      await fixture.driver.execute({
+        sql: `ALTER TABLE records ALTER COLUMN code TYPE "${loose}".code`,
+        parameters: [],
+      });
+      expect(await drift()).toEqual([
+        {
+          kind: "type-mismatch",
+          table: "records",
+          column: "code",
+          expected: `${allowed}.code`,
+          actual: `${loose}.code`,
+        },
+      ]);
+    } finally {
+      await fixture.close();
+      await run(`DROP SCHEMA "${allowed}" CASCADE`);
+      await run(`DROP SCHEMA "${loose}" CASCADE`);
+      await admin.close();
+    }
+  });
+
   test("fresh array aliases and expression, partial and covering indexes have no drift", async () => {
     const model = schema({
       records: table({

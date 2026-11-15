@@ -44,6 +44,8 @@ type QueryState = {
   readonly sharedRoot: boolean;
   /** The plan with its own source bindings, for use inside another query (subquery, derived table, CTE). */
   embedded?: SelectPlan;
+  /** The plan with the root's own columns selected, for a query given options only. */
+  whole?: SelectPlan;
 };
 export type QueryHandle = ((callback: never) => object) & {
   readonly [QUERY_STATE]: QueryState;

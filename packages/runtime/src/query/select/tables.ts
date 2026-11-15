@@ -15,11 +15,8 @@ import {
   type PredicateDescription,
   type ValueNode,
 } from "../expressions";
-import {
-  createMutation,
-  type AtomicRunner,
-  type MutationOptions,
-} from "../write/mutations";
+import { createMutation } from "../write/mutations";
+import type { AtomicRunner, MutationOptions } from "../write/types";
 import { SHAPE_SOURCE } from "./projections";
 import type {
   QueryExecutor,
@@ -31,6 +28,7 @@ import { executorProfiling } from "../../observability/profiling";
 import { boundMethodDescriptors, extendBuilder } from "../expressions/callable";
 import { createContext } from "./context";
 import type { ShapeCallback } from "./joins";
+import { equalityPredicates, plainRecord } from "./shape";
 import { createQueryFactory } from "./query";
 import {
   createTableRegistry,
@@ -51,6 +49,70 @@ export {
   type SchemaTables,
   type TableScopes,
 } from "./registry";
+
+type WriteBuilder = {
+  readonly where: (callback: (row: RuntimeScope[string]) => unknown) => object;
+  readonly onConflict: (...columns: string[]) => {
+    readonly doUpdate: (...columns: string[]) => object;
+  };
+};
+
+/**
+ * `update(values, { where })` and `delete({ where })`: the options form of
+ * `.where()`. An object of equalities must name at least one column, because
+ * a filter that ends up empty would otherwise write every row.
+ */
+const restricted = (
+  kind: "update" | "delete",
+  mutation: object,
+  options: unknown,
+): object => {
+  if (options === undefined) {
+    return mutation;
+  }
+
+  if (!plainRecord(options)) {
+    throw new Error(`symmetria: ${kind}() options must be an object`);
+  }
+
+  for (const name of Object.keys(options)) {
+    if (name !== "where") {
+      throw new Error(`symmetria: unknown ${kind}() option "${name}"`);
+    }
+  }
+
+  const { where } = options;
+
+  if (where === undefined) {
+    return mutation;
+  }
+
+  return (mutation as WriteBuilder).where((row) => {
+    const value = typeof where === "function" ? where(row) : where;
+
+    if (!plainRecord(value)) {
+      return value;
+    }
+
+    const predicates = equalityPredicates(row, value) as readonly unknown[];
+
+    if (!predicates.length) {
+      throw new Error(
+        `symmetria: ${kind}() where: {} names no column; call .all() to ${kind} every row`,
+      );
+    }
+
+    // One condition is that condition, as `.where()` would write it.
+    return predicates.length === 1 ? predicates[0] : predicates;
+  });
+};
+
+/** A lookup as `get()` and `find()` use it. */
+type LookupQuery = {
+  (shape: ShapeCallback): LookupQuery;
+  readonly one: () => Promise<Record<string, unknown>>;
+  readonly maybeOne: () => Promise<Record<string, unknown> | null>;
+};
 
 /** The table handles of one bound database, each created when first asked for. */
 export type QueryTables = {
@@ -114,23 +176,32 @@ export const createQueryTables = (
             values:
               | Record<string, unknown>
               | ((row: RuntimeScope[string]) => Record<string, unknown>),
+            options?: unknown,
           ) {
             const plan = this[QUERY_STATE].plan;
 
-            return createMutation("update", plan.root, values, executor, {
-              ...mutationOptions,
-              scope: () => plan.predicates,
-              ...(plan.failure ? { failure: plan.failure } : {}),
-            });
+            return restricted(
+              "update",
+              createMutation("update", plan.root, values, executor, {
+                ...mutationOptions,
+                scope: () => plan.predicates,
+                ...(plan.failure ? { failure: plan.failure } : {}),
+              }),
+              options,
+            );
           },
-          delete(this: QueryHandle) {
+          delete(this: QueryHandle, options?: unknown) {
             const plan = this[QUERY_STATE].plan;
 
-            return createMutation("delete", plan.root, {}, executor, {
-              ...mutationOptions,
-              scope: () => plan.predicates,
-              ...(plan.failure ? { failure: plan.failure } : {}),
-            });
+            return restricted(
+              "delete",
+              createMutation("delete", plan.root, {}, executor, {
+                ...mutationOptions,
+                scope: () => plan.predicates,
+                ...(plan.failure ? { failure: plan.failure } : {}),
+              }),
+              options,
+            );
           },
         }),
       ),
@@ -261,6 +332,137 @@ export const createQueryTables = (
 
     const uniqueKeys = schemaTables.uniqueKeys.get(table.name)!;
 
+    const byId = (value: unknown) => {
+      const keys = primaryKeyColumns(table);
+
+      if (!keys.length) {
+        throw new Error(
+          `symmetria: byId() requires a primary key on "${table.name}"`,
+        );
+      }
+
+      if (
+        keys.length > 1 &&
+        (!value ||
+          typeof value !== "object" ||
+          Object.keys(value).length !== keys.length ||
+          keys.some((column) => !Object.hasOwn(value, column.name)))
+      ) {
+        throw new Error(
+          `symmetria: byId() requires exactly these key fields: ${keys.map((column) => column.name).join(", ")}`,
+        );
+      }
+
+      return keyLookup(
+        "primary key",
+        keys,
+        keys.map((column) =>
+          keys.length === 1
+            ? value
+            : (value as Record<string, unknown>)[column.name],
+        ),
+      );
+    };
+
+    /**
+     * INSERT … ON CONFLICT (by) DO UPDATE: the row is inserted, or the row
+     * with the same key takes the listed columns, by default every column the
+     * rows carry except the key.
+     */
+    const upsert = (
+      values: Record<string, unknown> | readonly Record<string, unknown>[],
+      options: unknown,
+    ) => {
+      if (!plainRecord(options) || options.by === undefined) {
+        throw new Error(
+          `symmetria: upsert() on "${table.name}" needs the conflict key: upsert(values, { by: "column" })`,
+        );
+      }
+
+      for (const name of Object.keys(options)) {
+        if (name !== "by" && name !== "update") {
+          throw new Error(`symmetria: unknown upsert() option "${name}"`);
+        }
+      }
+
+      const by: readonly unknown[] = Array.isArray(options.by)
+        ? options.by
+        : [options.by];
+      const keys = [
+        primaryKeyColumns(table).map((column) => column.name),
+        ...uniqueKeys.values(),
+      ].filter((key) => key.length);
+
+      if (
+        !keys.some(
+          (key) =>
+            key.length === by.length && key.every((name) => by.includes(name)),
+        )
+      ) {
+        throw new Error(
+          `symmetria: upsert() by: ${by.map((name) => JSON.stringify(name)).join(", ")} is not the primary key or a unique key of "${table.name}"; its keys: ${keys.map((key) => (key.length > 1 ? `[${key.join(", ")}]` : key[0])).join(", ") || "none"}`,
+        );
+      }
+
+      const rows = Array.isArray(values) ? values : [values];
+      let update = options.update as readonly string[] | undefined;
+
+      if (update === undefined) {
+        const present = (row: Record<string, unknown>) =>
+          Object.keys(row).filter(
+            (name) => row[name] !== undefined && !by.includes(name),
+          );
+        const first = present(rows[0] ?? {});
+        const shared = new Set(first);
+        let uneven: string | undefined;
+
+        for (const row of rows) {
+          const names = present(row);
+
+          uneven ??=
+            names.find((name) => !shared.has(name)) ??
+            (names.length < first.length
+              ? first.find((name) => !names.includes(name))
+              : undefined);
+        }
+
+        // A column some rows leave out would be overwritten with its default.
+        if (uneven !== undefined) {
+          throw new Error(
+            `symmetria: upsert() rows carry different columns ("${uneven}" is not in every row); list the columns to overwrite: upsert(rows, { by, update: [...] })`,
+          );
+        }
+
+        update = first;
+      } else if (!Array.isArray(update)) {
+        throw new Error("symmetria: upsert() update must be a list of columns");
+      }
+
+      const key = by as readonly string[];
+
+      return (
+        (
+          createMutation(
+            "insert",
+            root,
+            values,
+            executor,
+            mutationOptions,
+          ) as WriteBuilder
+        )
+          .onConflict(...key)
+          // Nothing to overwrite: the key assigns itself, so the row still comes back.
+          .doUpdate(...(update.length ? update : key))
+      );
+    };
+
+    /** The row with this primary key, whole or through a shape. */
+    const keyed = (value: unknown, shape?: ShapeCallback) => {
+      const lookup = byId(value) as LookupQuery;
+
+      return shape === undefined ? lookup : lookup(shape);
+    };
+
     return extendBuilder(createQuery(rootPlan, true, true), {
       shape: (callback: ShapeCallback) => {
         if (typeof callback !== "function") {
@@ -283,47 +485,33 @@ export const createQueryTables = (
           ]),
         ),
       ),
-      byId: (value: unknown) => {
-        const keys = primaryKeyColumns(table);
-
-        if (!keys.length) {
-          throw new Error(
-            `symmetria: byId() requires a primary key on "${table.name}"`,
-          );
-        }
-
-        if (
-          keys.length > 1 &&
-          (!value ||
-            typeof value !== "object" ||
-            Object.keys(value).length !== keys.length ||
-            keys.some((column) => !Object.hasOwn(value, column.name)))
-        ) {
-          throw new Error(
-            `symmetria: byId() requires exactly these key fields: ${keys.map((column) => column.name).join(", ")}`,
-          );
-        }
-
-        return keyLookup(
-          "primary key",
-          keys,
-          keys.map((column) =>
-            keys.length === 1
-              ? value
-              : (value as Record<string, unknown>)[column.name],
-          ),
-        );
-      },
+      byId,
+      // async: a malformed key rejects like any other failure of the read.
+      get: async (value: unknown, shape?: ShapeCallback) =>
+        keyed(value, shape).one(),
+      find: async (value: unknown, shape?: ShapeCallback) =>
+        keyed(value, shape).maybeOne(),
       insert: (
         values: Record<string, unknown> | readonly Record<string, unknown>[],
       ) => createMutation("insert", root, values, executor, mutationOptions),
+      upsert,
       update: (
         values:
           | Record<string, unknown>
           | ((row: RuntimeScope[string]) => Record<string, unknown>),
-      ) => createMutation("update", root, values, executor, mutationOptions),
-      delete: () =>
-        createMutation("delete", root, {}, executor, mutationOptions),
+        options?: unknown,
+      ) =>
+        restricted(
+          "update",
+          createMutation("update", root, values, executor, mutationOptions),
+          options,
+        ),
+      delete: (options?: unknown) =>
+        restricted(
+          "delete",
+          createMutation("delete", root, {}, executor, mutationOptions),
+          options,
+        ),
     });
   };
 

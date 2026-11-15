@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createDatabase, type SchemaSnapshot } from "symmetria";
 import {
   postgres,
-  SCHEMA_BIND,
+  type SCHEMA_BIND,
   type BindableSchema,
   type PostgresDriver,
 } from "symmetria/driver";

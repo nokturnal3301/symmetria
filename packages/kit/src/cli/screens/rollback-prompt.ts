@@ -1,19 +1,25 @@
 /**
  * Confirmation before a rollback: shows what down.sql removes and asks before
- * anything runs. Dropping tables needs the database name typed out.
+ * anything runs. Dropping or emptying whole tables needs the database name
+ * typed out.
  */
+import { parseMigrationSQL } from "../../migrations/sql";
 import { lintMigrationSQL } from "../../migrations/sql-lint";
 import type { Choose } from "../ui/terminal";
 
 export type RollbackSummary = {
   readonly migrations: readonly string[];
   readonly statements: number;
-  /** Statements that remove data or a database object, as one line each. */
   readonly destructive: readonly string[];
   readonly droppedTables: number;
+  readonly emptiedTables: number;
 };
 
-const DROP_TABLE = /^\s*DROP\s+TABLE\b/i;
+/** The statement's leading keywords, read past comments. */
+const opening = (sql: string): string =>
+  (parseMigrationSQL(`${sql};`)[0]?.words ?? []).slice(0, 2).join(" ");
+
+const EMPTIES_TABLES = /^(?:TRUNCATE\b|DROP (?:SCHEMA|OWNED)$)/;
 
 const oneLine = (sql: string): string => {
   const text = sql.replace(/\s+/g, " ").trim();
@@ -41,7 +47,9 @@ export const rollbackSummary = (
     migrations: steps.map((step) => step.id),
     statements: steps.reduce((sum, step) => sum + step.statements.length, 0),
     destructive: unique.map(oneLine),
-    droppedTables: unique.filter((sql) => DROP_TABLE.test(sql)).length,
+    droppedTables: unique.filter((sql) => opening(sql) === "DROP TABLE").length,
+    emptiedTables: unique.filter((sql) => EMPTIES_TABLES.test(opening(sql)))
+      .length,
   };
 };
 
@@ -89,9 +97,13 @@ export const confirmRollback = async (
 ): Promise<boolean> => {
   prompts.write(`${rollbackPreview(summary, database)}\n`);
 
-  if (summary.droppedTables) {
+  if (summary.droppedTables || summary.emptiedTables) {
     const answer = await prompts.ask(
-      `This drops ${summary.droppedTables} table${summary.droppedTables === 1 ? "" : "s"}. Type the database name "${database}" to continue:`,
+      `${
+        summary.emptiedTables
+          ? "This drops or empties whole tables"
+          : `This drops ${summary.droppedTables} table${summary.droppedTables === 1 ? "" : "s"}`
+      }. Type the database name "${database}" to continue:`,
     );
 
     return answer === database;

@@ -1,7 +1,7 @@
 /**
  * Drift detection: compares the live catalog with the expected snapshot and reports findings by kind.
  */
-import { quoteIdentifier } from "symmetria/internal";
+import { normalizeResult, quoteIdentifier } from "symmetria/internal";
 import type { QueryExecutor, SchemaSnapshot } from "symmetria";
 import { indexSQL } from "./ddl";
 import { readCatalog, readExtensions } from "./catalog";
@@ -99,6 +99,9 @@ const typeAliases: Record<string, string> = {
   timestamptz: "timestamp with time zone",
   timestamp: "timestamp without time zone",
   varchar: "character varying",
+  char: "character",
+  decimal: "numeric",
+  dec: "numeric",
   float8: "double precision",
   float4: "real",
   time: "time without time zone",
@@ -128,6 +131,52 @@ export const normalizeSqlType = (sqlType: string): string => {
 
   // format_type() prints modifiers without spaces: `numeric(12, 2)` is `numeric(12,2)`.
   return `${typeAliases[qualified] ?? qualified}${match[2]?.replace(/\s+/g, "") ?? ""}`;
+};
+
+/** A type name to_regtype() can always parse: one word, optionally in a schema, optionally an array. */
+const RESOLVABLE_TYPE = /^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?(?:\[\])*$/i;
+
+/**
+ * The type each declared SQL type resolves to on this connection, by OID,
+ * keyed by the declared spelling. Length and precision are left out of the
+ * lookup (they are compared by name), and so are spellings of several words,
+ * which are built-in types: a statement that fails would abort the
+ * transaction an adoption or repair compares in.
+ */
+const typeIdentities = async (
+  execute: DriftOptions["execute"],
+  sqlTypes: readonly string[],
+): Promise<ReadonlyMap<string, string>> => {
+  const names = new Map(
+    [...new Set(sqlTypes)].flatMap((sqlType) => {
+      const name = sqlType.trim().replace(/\s*\([^)]*\)/, "");
+
+      return RESOLVABLE_TYPE.test(name) ? [[sqlType, name] as const] : [];
+    }),
+  );
+  const distinct = [...new Set(names.values())];
+
+  if (!distinct.length) {
+    return new Map();
+  }
+
+  const rows = normalizeResult(
+    await execute({
+      sql: `SELECT declared.name, to_regtype(declared.name)::oid AS oid FROM (VALUES ${distinct.map((_, position) => `($${position + 1}::text)`).join(", ")}) AS declared(name)`,
+      parameters: distinct,
+    }),
+  ).rows as { name: string; oid: number | string | null }[];
+  const resolved = new Map(
+    rows.flatMap((row) =>
+      row.oid === null ? [] : [[row.name, String(row.oid)] as const],
+    ),
+  );
+
+  return new Map(
+    [...names].flatMap(([sqlType, name]) =>
+      resolved.has(name) ? [[sqlType, resolved.get(name)!] as const] : [],
+    ),
+  );
 };
 
 /** The `ignoreTables` entries to leave out: a table the schema declares is always compared. */
@@ -172,6 +221,39 @@ export const detectDrift = async (
     actualTables.set(row.table_name, table);
   }
 
+  const declaredTypes = await typeIdentities(
+    options.execute,
+    expected.tables.flatMap((table) =>
+      table.columns.flatMap((column) =>
+        column.enumeration ? [] : [column.sqlType],
+      ),
+    ),
+  );
+  // Read only when a declared type resolved: the OIDs of a column's types.
+  const liveTypes = declaredTypes.size
+    ? new Map(
+        (
+          normalizeResult(
+            await options.execute({
+              sql: `SELECT relation.relname AS table_name, attribute.attname AS column_name, attribute.atttypid::oid AS type_oid
+                FROM pg_attribute attribute JOIN pg_class relation ON relation.oid = attribute.attrelid
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname = COALESCE($1, current_schema()) AND relation.relkind IN ('r', 'p')
+                  AND attribute.attnum > 0 AND NOT attribute.attisdropped`,
+              parameters: [options.schemaName ?? null],
+            }),
+          ).rows as {
+            table_name: string;
+            column_name: string;
+            type_oid: number | string;
+          }[]
+        ).map((row) => [
+          `${row.table_name}.${row.column_name}`,
+          String(row.type_oid),
+        ]),
+      )
+    : new Map<string, string>();
+
   for (const table of expected.tables) {
     const actual = actualTables.get(table.name);
 
@@ -200,19 +282,32 @@ export const detectDrift = async (
         column.enumeration ?? column.sqlType,
       );
       const actualType = normalizeSqlType(live.type);
+      // The names compare without their schema, so a type of the same name
+      // from another schema is told apart by what PostgreSQL resolves it to.
+      const declaredType = declaredTypes.get(column.sqlType);
+      const liveType = liveTypes.get(`${table.name}.${column.name}`);
+      const otherType =
+        declaredType !== undefined &&
+        liveType !== undefined &&
+        declaredType !== liveType;
 
       if (
         column.enumeration
           ? details.enum_name !== column.enumeration ||
             details.enum_schema !== null
-          : expectedType !== actualType
+          : expectedType !== actualType || otherType
       ) {
         findings.push({
           kind: "type-mismatch",
           table: table.name,
           column: column.name,
-          expected: expectedType,
-          actual: actualType,
+          expected:
+            otherType && expectedType === actualType
+              ? column.sqlType
+              : expectedType,
+          // Both names are the same without their schema: show them in full.
+          actual:
+            otherType && expectedType === actualType ? live.type : actualType,
         });
       }
 

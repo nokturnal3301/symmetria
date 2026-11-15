@@ -15,32 +15,38 @@ a connection, so migrations can import it independently of your application.
 
 ```ts
 // schema.ts
-import { schema, table, int, text, bigint } from "symmetria";
+import { schema, table, one, maybe, many, int, text, bigint } from "symmetria";
 
 const users = table({
   id: int.auto,
   name: text,
+  posts: many,
+  edited: many,
 });
 
 const posts = table({
   id: int.auto,
   title: text,
-  author: users,
-  editor: users.nullable.inverse("edited"),
+  author: one(users.posts),
+  editor: maybe(users.edited),
   views: bigint.default(0n),
 });
 
 export const model = schema({ users, posts });
 ```
 
-`author: users` declares a required foreign key. It gives a post an `authorId`
-column and an `author` relationship. `editor` is optional, so `editorId` can be
-`null`. The inverse name distinguishes a user's edited posts from authored
-posts. Existing databases rarely follow one convention: `users.by("email")`
-references a unique column instead of the primary key,
-`users.column("created_by")` keeps a legacy column name, `.named("User")` sets
-any table or column name, and `schema(…, { casing: "preserve" })` keeps
-camelCase keys as SQL names, as databases created by Prisma use them.
+`author: one(users.posts)` declares a required foreign key. It gives a post an
+`authorId` column and an `author` relationship, and a user the `posts` it names
+on the other side. `editor` is optional, so `editorId` can be `null`, and its
+slot distinguishes a user's edited posts from authored posts. The older
+spelling, `author: users` and `editor: users.nullable.inverse("edited")`,
+declares the same tables and is still accepted
+([relations](reference.md#relations-one-maybe-many)). Existing databases rarely
+follow one convention: `users.by("email")` references a unique column instead of
+the primary key, `users.column("created_by")` keeps a legacy column name,
+`.named("User")` sets any table or column name, and
+`schema(…, { casing: "preserve" })` keeps camelCase keys as SQL names, as
+databases created by Prisma use them.
 
 ```ts
 // database.ts

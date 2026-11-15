@@ -4,12 +4,10 @@
  */
 import { freeze } from "../plan/freeze";
 import { scopeViolation } from "../../driver/errors";
-import {
-  collectDataErrors,
-  dataError,
-  type DeferredError,
-} from "../codecs/deferred";
+import { collectDataErrors, dataError } from "../codecs/deferred";
 import type { PredicateList } from "../select/types";
+import { rejectDuplicateKeys } from "./conflict-keys";
+import type { MutationOptions } from "./types";
 import {
   compilePlan,
   compileQuery,
@@ -17,19 +15,10 @@ import {
   executeCompiled,
 } from "../compile";
 import { executorProfiling } from "../../observability/profiling";
-import {
-  returningProjection,
-  type ReturningTools,
-  type ReusableShape,
-} from "../select/projections";
+import { returningProjection, returningSelector } from "../select/projections";
 import { validatePredicate } from "../select/scope";
 import { columnsOnly } from "../select/suggest";
-import {
-  PREPARE_QUERY,
-  preparePlan,
-  type PreparedQuery,
-  type Preparable,
-} from "../select/prepared";
+import { PREPARE_QUERY, preparePlan } from "../select/prepared";
 import {
   and,
   readPredicate,
@@ -37,7 +26,6 @@ import {
   jsonNullNode,
   type Predicate,
   type PredicateDescription,
-  type SelectedColumn,
   type ValueNode,
 } from "../expressions";
 import { primaryKeyColumns, type ColumnSnapshot } from "../../schema/assembly";
@@ -45,10 +33,6 @@ import {
   createScope,
   initialPlan,
   readSelection,
-  type Columns,
-  type Projection,
-  type ProjectionRow,
-  type ProjectionObject,
   type RuntimeScope,
 } from "../select";
 import {
@@ -60,320 +44,8 @@ import {
   type TableBinding,
 } from "../plan/types";
 
-/** Optional write fields accept `undefined` as "omitted", even under exactOptionalPropertyTypes. */
-type InputValues<Insert extends Record<string, unknown>> = {
-  [ColumnName in keyof Insert]:
-    | Insert[ColumnName]
-    | SelectedColumn<Exclude<Insert[ColumnName], undefined>>
-    | ({} extends Pick<Insert, ColumnName>
-        ? typeof DEFAULT_VALUE | undefined
-        : never);
-};
-/** The `update()` / `doUpdate()` input: every field optional, SQL expressions and `defaultValue` allowed. */
-export type UpdateValues<Insert extends Record<string, unknown>> = {
-  [ColumnName in keyof Insert]?:
-    | Exclude<Insert[ColumnName], undefined>
-    | SelectedColumn<Exclude<Insert[ColumnName], undefined>>
-    | ({} extends Pick<Insert, ColumnName> ? typeof DEFAULT_VALUE : never)
-    | undefined;
-};
-type WritableColumnNames<Insert> = {
-  [Name in keyof Insert & string]: [Exclude<Insert[Name], undefined>] extends [
-    never,
-  ]
-    ? never
-    : Name;
-}[keyof Insert & string];
-
-/** Runs several statements atomically: a transaction, or a savepoint inside one. */
-export type AtomicRunner = <Result>(
-  run: (executor: QueryExecutor) => Promise<Result>,
-) => Promise<Result>;
-
 /** PostgreSQL's wire-protocol bind-parameter limit; larger multi-row INSERTs are split into atomic chunks. */
 const PARAMETER_LIMIT = 65535;
-
-/** Hooks a table's query machinery hands to its mutations: $scope() filters and relation-path contexts. */
-export type MutationOptions = {
-  readonly atomic?: AtomicRunner;
-  /**
-   * The rows an UPDATE or DELETE may reach, evaluated each time a write is
-   * built: the `$scope()` predicates, plus a lookup's key. Its `$scope()`
-   * predicates are also checked against every row an INSERT or UPDATE writes.
-   */
-  readonly scope?: () => readonly PredicateDescription[];
-  readonly context?: (plan: SelectPlan) => {
-    readonly plan: SelectPlan;
-    readonly scope: () => RuntimeScope;
-  };
-  /** A data error of the lookup the write starts from. */
-  readonly failure?: DeferredError;
-};
-
-type FlatInsert<
-  Insert extends Record<string, unknown>,
-  RelationNames extends string,
-> = InputValues<Insert> & { [Name in RelationNames]?: undefined };
-
-/** `insert(object)` resolves to one row, `insert(array)` to an array; DO NOTHING may skip the row. */
-type MutationResult<
-  Selection extends Projection | undefined,
-  Single extends boolean,
-  Optional extends boolean = false,
-> = Selection extends Projection
-  ? Single extends true
-    ? ProjectionRow<Selection> | (Optional extends true ? null : never)
-    : ProjectionRow<Selection>[]
-  : { affectedRows: number };
-
-export type NestedInsertQuery<
-  Row extends Record<string, unknown>,
-  TableName extends string,
-  Single extends boolean,
-  Selection extends Projection | undefined = undefined,
-> = {
-  readonly returning: <const NextSelection extends Projection>(
-    selector:
-      | ((row: Columns<Row>, tools: ReturningTools) => NextSelection)
-      | ReusableShape<TableName, NextSelection>,
-  ) => NestedInsertQuery<Row, TableName, Single, NextSelection>;
-  readonly execute: () => Promise<MutationResult<Selection, Single>>;
-  readonly then: PromiseLike<MutationResult<Selection, Single>>["then"];
-};
-type Mutation<
-  Row extends Record<string, unknown>,
-  Insert extends Record<string, unknown>,
-  TableName extends string,
-  Kind extends "insert" | "update" | "delete",
-  Selection extends Projection | undefined = undefined,
-  Single extends boolean = false,
-  Optional extends boolean = false,
-  WhereScope = Columns<Row>,
-> = Preparable<MutationResult<Selection, Single, Optional>, "mutation"> & {
-  readonly prepare: () => PreparedQuery<
-    MutationResult<Selection, Single, Optional>,
-    Record<never, never>,
-    "mutation"
-  >;
-  readonly returning: <const NextSelection extends Projection>(
-    selector:
-      | ((row: Columns<Row>, tools: ReturningTools) => NextSelection)
-      | ReusableShape<TableName, NextSelection>,
-  ) => Mutation<
-    Row,
-    Insert,
-    TableName,
-    Kind,
-    NextSelection,
-    Single,
-    Optional,
-    WhereScope
-  >;
-  readonly toSQL: () => CompiledQuery;
-  readonly execute: () => Promise<MutationResult<Selection, Single, Optional>>;
-  readonly then: PromiseLike<
-    MutationResult<Selection, Single, Optional>
-  >["then"];
-} & (Kind extends "insert"
-    ? {
-        readonly onConflict: (...columns: (keyof Row & string)[]) => {
-          readonly doNothing: () => Mutation<
-            Row,
-            Insert,
-            TableName,
-            Kind,
-            Selection,
-            Single,
-            true
-          >;
-          readonly doUpdate: {
-            /** Update only when `where` holds for the conflicting row; otherwise nothing is written and a single `returning()` is `null`. */
-            (
-              values:
-                | UpdateValues<Insert>
-                | ((
-                    row: Columns<Row>,
-                    excluded: Columns<Row>,
-                  ) => UpdateValues<Insert>),
-              options: {
-                readonly where: (
-                  row: Columns<Row>,
-                  excluded: Columns<Row>,
-                ) => Predicate | PredicateList;
-              },
-            ): Mutation<Row, Insert, TableName, Kind, Selection, Single, true>;
-            (
-              first: WritableColumnNames<Insert>,
-              ...columns: WritableColumnNames<Insert>[]
-            ): Mutation<
-              Row,
-              Insert,
-              TableName,
-              Kind,
-              Selection,
-              Single,
-              Optional
-            >;
-            (
-              values:
-                | UpdateValues<Insert>
-                | ((
-                    row: Columns<Row>,
-                    excluded: Columns<Row>,
-                  ) => UpdateValues<Insert>),
-            ): Mutation<
-              Row,
-              Insert,
-              TableName,
-              Kind,
-              Selection,
-              Single,
-              Optional
-            >;
-          };
-        };
-      }
-    : {
-        /** Relation paths and quantifiers compile to a primary-key subquery. */
-        readonly where: (
-          predicate: (scope: WhereScope) => Predicate | PredicateList,
-        ) => Mutation<
-          Row,
-          Insert,
-          TableName,
-          Kind,
-          Selection,
-          Single,
-          Optional,
-          WhereScope
-        >;
-        /** Confirms a whole-table UPDATE or DELETE; without where() or all() the statement is refused. */
-        readonly all: () => Mutation<
-          Row,
-          Insert,
-          TableName,
-          Kind,
-          Selection,
-          Single,
-          Optional,
-          WhereScope
-        >;
-      });
-
-export type TableMutations<
-  Row extends Record<string, unknown>,
-  Insert extends Record<string, unknown>,
-  TableName extends string,
-  RelationNames extends string = never,
-  WhereScope = Columns<Row>,
-> = {
-  readonly insert: {
-    (
-      values: readonly FlatInsert<Insert, RelationNames>[],
-    ): Mutation<Row, Insert, TableName, "insert", undefined, false>;
-    (
-      values: FlatInsert<Insert, RelationNames>,
-    ): Mutation<Row, Insert, TableName, "insert", undefined, true>;
-  };
-  readonly update: (
-    values:
-      | UpdateValues<Insert>
-      | ((row: Columns<Row>) => UpdateValues<Insert>),
-  ) => Mutation<
-    Row,
-    Insert,
-    TableName,
-    "update",
-    undefined,
-    false,
-    false,
-    WhereScope
-  >;
-  readonly delete: () => Mutation<
-    Row,
-    Insert,
-    TableName,
-    "delete",
-    undefined,
-    false,
-    false,
-    WhereScope
-  >;
-};
-
-/** The bound value of a conflict column as a comparable key; undefined when only PostgreSQL knows it. */
-const conflictKey = (
-  value: ValueNode | typeof DEFAULT_VALUE | undefined,
-): string | undefined => {
-  if (
-    value === undefined ||
-    value === DEFAULT_VALUE ||
-    value.kind !== "parameter" ||
-    value.value === null
-  ) {
-    return undefined;
-  }
-
-  const bound = value.value;
-
-  if (bound instanceof Date) {
-    return `date:${bound.getTime()}`;
-  }
-
-  return bound !== null && typeof bound === "object"
-    ? `json:${JSON.stringify(bound, (_key, entry: unknown) =>
-        typeof entry === "bigint" ? String(entry) : entry,
-      )}`
-    : `value:${String(bound)}`;
-};
-
-/**
- * PostgreSQL refuses to DO UPDATE one row twice in a statement, but a large
- * insert split into chunks would let the later duplicate win silently, so
- * duplicates are refused for every size, as a data error. NULL and
- * SQL-expression keys never conflict here and are left to PostgreSQL.
- */
-const rejectDuplicateKeys = (
-  root: TableBinding,
-  columns: readonly ColumnSnapshot[],
-  rows: MutationPlan["values"],
-): void => {
-  if (rows.length < 2) {
-    return;
-  }
-
-  const seen = new Map<string, number>();
-
-  rows.forEach((values, position) => {
-    const parts: string[] = [];
-
-    for (const column of columns) {
-      const key = conflictKey(values[column.name]);
-
-      if (key === undefined) {
-        return;
-      }
-
-      parts.push(key);
-    }
-
-    const key = JSON.stringify(parts);
-    const first = seen.get(key);
-
-    if (first !== undefined) {
-      dataError(
-        Object.assign(
-          new Error(
-            `symmetria: rows ${first + 1} and ${position + 1} of the upsert on "${root.table.name}" share a conflict key (${columns.map((column) => column.name).join(", ")}); ON CONFLICT DO UPDATE cannot change a row twice in one statement, so merge or remove the duplicates`,
-          ),
-          { code: "SYMMETRIA_DUPLICATE_CONFLICT_KEY" },
-        ),
-      );
-    }
-
-    seen.set(key, position);
-  });
-};
 
 /** A JS null stored as JSON null; a jsonb(schema) that rejects null makes it a data error. */
 const jsonNullValue = (
@@ -717,18 +389,14 @@ export const createMutation = (
     const execute = () => executeUsing();
 
     const builder = freeze({
-      returning: (
-        selector: (
-          row: RuntimeScope[string],
-        ) => readonly SelectedColumn[] | ProjectionObject,
-      ) =>
+      returning: (selector?: unknown, ...names: unknown[]) =>
         build(
           derive(() =>
             freeze({
               ...state,
               selection: readSelection(
                 returningProjection(
-                  selector as never,
+                  returningSelector(selector, names) as never,
                   columnsOnly(root.table, scope[root.alias]!, "RETURNING"),
                   root.table,
                 ),
@@ -920,6 +588,10 @@ export const createMutation = (
         onFulfilled?: ((value: unknown) => unknown) | null,
         onRejected?: ((reason: unknown) => unknown) | null,
       ) => execute().then(onFulfilled, onRejected),
+      catch: (onRejected?: ((reason: unknown) => unknown) | null) =>
+        execute().catch(onRejected),
+      finally: (onFinally?: (() => void) | null) =>
+        execute().finally(onFinally),
     });
 
     return profile ? profile.trackBuilder(builder) : builder;

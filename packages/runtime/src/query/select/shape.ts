@@ -16,6 +16,7 @@ import {
   type SelectPlan,
   type TableBinding,
 } from "../plan/types";
+import { expressionSqlType } from "../plan/metadata";
 import { SHAPE_SOURCE, shapeExpressions } from "./projections";
 import {
   countValue,
@@ -117,6 +118,85 @@ const selectedFields = (
   });
 };
 
+/** `{ state: "draft" }`, not a predicate, an ordering or any other handle. */
+export const plainRecord = (value: unknown): value is Record<string, unknown> =>
+  !!value &&
+  typeof value === "object" &&
+  Object.getPrototypeOf(value) === Object.prototype &&
+  !Object.getOwnPropertySymbols(value).length;
+
+/** A column of the source by key, for the object forms of `where` and `orderBy`. */
+const sourceColumn = (
+  columns: RuntimeScope[string],
+  option: string,
+  key: string,
+): RuntimeScope[string][string] => {
+  // An unknown key throws here, with the closest known name.
+  const column = columns[key];
+
+  if (!column || typeof column !== "object" || !(COLUMN_EXPRESSION in column)) {
+    throw new Error(
+      `symmetria: ${option}: "${key}" is a relation; the object form takes columns, use a callback for relation paths`,
+    );
+  }
+
+  return column;
+};
+
+/**
+ * `where: { state: "draft", editorId: null }`: every key equals its value,
+ * `null` is IS NULL and `undefined` leaves the key out, as in query options.
+ */
+export const equalityPredicates = (
+  columns: RuntimeScope[string],
+  filter: Record<string, unknown>,
+): ShapePredicate =>
+  Object.entries(filter).flatMap(([key, value]) => {
+    if (value === undefined) {
+      return [];
+    }
+
+    const column = sourceColumn(columns, "where", key);
+
+    if (
+      Array.isArray(value) &&
+      !/(?:\[\]|^jsonb?)$/.test(expressionSqlType(readColumn(column)))
+    ) {
+      throw new Error(
+        `symmetria: where: "${key}" takes one value; write a list as a callback, ${key}.in([...])`,
+      );
+    }
+
+    return [column.is(value as never)];
+  }) as unknown as ShapePredicate;
+
+/** `orderBy: { spent: "desc" }`: selected fields first, as ORDER BY reads output names, then source columns. */
+const fieldOrdering = (
+  columns: RuntimeScope[string],
+  selected: () => object,
+  fields: Record<string, unknown>,
+): Ordering[] =>
+  Object.entries(fields).flatMap(([key, direction]) => {
+    if (direction === undefined) {
+      return [];
+    }
+
+    if (direction !== "asc" && direction !== "desc") {
+      throw new Error(
+        `symmetria: orderBy: "${key}" must be "asc" or "desc", received ${JSON.stringify(direction) ?? String(direction)}`,
+      );
+    }
+
+    const fieldsNow = selected() as Record<string, unknown>;
+    const expression = (
+      Object.hasOwn(fieldsNow, key)
+        ? fieldsNow[key]
+        : sourceColumn(columns, "orderBy", key)
+    ) as RuntimeScope[string][string];
+
+    return [direction === "asc" ? expression.ascending : expression.descending];
+  });
+
 export const applyShape = (
   context: QueryContext,
   binding: TableBinding,
@@ -200,35 +280,65 @@ export const applyShape = (
     result = evaluateContext(context, () => {
       const columns = context.columns(binding);
       // Tools live only for these callbacks; freezing them is pure overhead.
-      const tools = Object.assign(Object.create(shapeExpressions), {
+      const tools = {
+        __proto__: shapeExpressions,
         join: join("AUTO"),
         innerJoin: join("INNER"),
         leftJoin: join("LEFT"),
         crossJoin: join("CROSS"),
         whereNotNull,
-      });
-      const projection = callback(columns, tools);
+        // The source's own columns, for `{ ...row, extra }`; relations are not among them.
+        get row() {
+          return { ...columns };
+        },
+      };
+      const projection = callback(columns, tools as never);
 
       if (options !== undefined) {
-        let selected: object | undefined;
+        let fields: object | undefined;
+        const selected = () =>
+          (fields ??= selectedFields(projection, context.plan));
+        let selectedTools: object | undefined;
 
         controls = Object.entries(options).map(([name, value]) => {
           if (!queryOptionNames.has(name as keyof QueryOptions<never, never>)) {
             throw new Error(`symmetria: unknown query option "${name}"`);
           }
 
-          return [
-            name,
+          const resolved =
             typeof value !== "function"
               ? value
               : selectedOptionNames.has(name)
                 ? value(
                     columns,
-                    tools,
-                    (selected ??= selectedFields(projection, context.plan)),
+                    // The same fields under a name, next to the third argument.
+                    (selectedTools ??= Object.create(tools, {
+                      selected: { get: selected },
+                    })),
+                    selected(),
                   )
-                : value(columns, tools),
-          ];
+                : value(columns, tools);
+
+          if (name === "where" && plainRecord(resolved)) {
+            return [name, equalityPredicates(columns, resolved)];
+          }
+
+          if (name === "orderBy") {
+            const entries = Array.isArray(resolved) ? resolved : [resolved];
+
+            if (entries.some(plainRecord)) {
+              return [
+                name,
+                entries.flatMap((entry) =>
+                  plainRecord(entry)
+                    ? fieldOrdering(columns, selected, entry)
+                    : [entry],
+                ),
+              ];
+            }
+          }
+
+          return [name, resolved];
         });
       }
 

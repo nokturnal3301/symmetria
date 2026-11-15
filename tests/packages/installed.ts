@@ -182,7 +182,7 @@ try {
   await Bun.write(
     join(directory, "smoke.ts"),
     `import assert from "node:assert/strict";
-import { createDatabase, schema, table, int, text, bigint, bool, jsonb, oneOf, index, rowNumber, prepare, createProfiler, type Transaction } from "symmetria";
+import { createDatabase, schema, table, link, one, maybe, many, int, text, bigint, bool, jsonb, oneOf, index, rowNumber, prepare, createProfiler, NotFoundError, QueryError, UniqueViolation, type Transaction } from "symmetria";
 import { postgres, type Driver } from "symmetria/driver";
 import { vector, type Vector } from "symmetria/vector";
 import { createSchemaSQL, migrator, generateMigration, loadMigrationState, type MigrationState } from "symmetria-kit";
@@ -197,6 +197,25 @@ void embeddingRow;
 const posts = table({ id: int.auto, author: users, title: text, views: bigint.default(0n), state: oneOf("draft", "published").default("draft") })
   .indexes((posts) => ({ authorTitle: index(posts.authorId, posts.title).unique }));
 const model = schema({ users, posts });
+const authors = table({ id: int.auto, name: text, books: many, drafts: many });
+const genres = table({ id: int.auto, label: text.unique, books: many });
+const books = table({ id: int.auto, title: text, author: one(authors.books), editor: maybe(authors.drafts).setNull, genres: many(genres.books) });
+const library = schema({ authors, genres, books });
+assert.equal(typeof link, "function");
+const shelved = library.authors((author) => ({ name: author.name, books: author.books(({ title, genres }) => ({ title, genres: genres(({ label }) => ({ label })) })) }), { where: { name: "Ada" }, orderBy: { id: "desc" } });
+assert.match(shelved.toSQL().sql, /"books_genres"/);
+const shelvedType: Promise<{ name: string; books: { title: string; genres: { label: string }[] }[] }[]> = null as unknown as ReturnType<typeof shelved.execute>;
+void shelvedType;
+const whole = library.authors({ limit: 1 });
+const wholeRow: Promise<{ id: number; name: string }[]> = null as unknown as ReturnType<typeof whole.execute>;
+void wholeRow;
+assert.match(library.books.upsert({ title: "x", authorId: 1 }, { by: "id" }).returning("id").toSQL().sql, /ON CONFLICT/);
+assert.match(library.books.delete({ where: { id: 1 } }).toSQL().sql, /WHERE/);
+// @ts-expect-error not a slot of authors
+void (() => one(authors.pamphlets));
+assert.equal(typeof library.authors.get, "function");
+assert(new UniqueViolation("x", { kind: "unique", sqlState: "23505" }, undefined) instanceof QueryError);
+assert.equal(typeof NotFoundError, "function");
 const modern = model.users(({ email, posts }) => ({ email, posts: posts(({ title, views }) => ({ title, views }), { orderBy: ({ id }) => id.descending, limit: 3 }) }), { where: ({ email }) => email.is("ada"), limit: 20 });
 assert.match(modern.toSQL().sql, /LIMIT 3/);
 assert.deepEqual(modern.toSQL().parameters, ["ada"]);

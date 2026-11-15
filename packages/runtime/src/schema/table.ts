@@ -12,6 +12,9 @@
  *   - table.nullable, .unique, .onDelete.<action>, .onUpdate.<action> → FK with flags
  *   - a thunk `() => users` → lazy FK (cross-file cycles)
  *   - `self` (with the same chain as tables, e.g. `self.nullable.inverse("children")`) → self-reference
+ *   - `many` / `one` → a slot: the reverse side of a relation, declared on the parent
+ *   - `one(users.posts)` / `maybe(users.edited)` → FK that claims a slot
+ *   - `many(tags.posts)` → many-to-many through a junction table schema() creates
  */
 
 import {
@@ -20,7 +23,19 @@ import {
   type Column,
   type TraitsMetadata,
 } from "./column";
-import type { LinkMetadata, LinkOptions } from "./model";
+import type { LinkMetadata, LinkOptions } from "./links";
+import {
+  SLOT,
+  isSlot,
+  isThrough,
+  type Marker,
+  type SelfSlots,
+  type Slot,
+  type SlotReference,
+  type SlotReferenceInput,
+  type SlotState,
+  type ThroughInput,
+} from "./slots";
 import type { RowOf, TableTraits } from "./infer";
 import {
   createScope,
@@ -62,10 +77,18 @@ export type ReferenceFlags = {
   by?: string;
   /** SQL name of the foreign-key column (`users.column("created_by")`); the TS name stays `<key>Id`. */
   column?: string;
+  /** On a junction's reference: the name of the many-to-many relation its target gets. */
+  through?: string;
+  /** A claim written against `self`: the slot is on the declaring table itself. */
+  selfSlot?: boolean;
 };
 
 export type TableState = {
   readonly columns: Record<string, unknown>;
+  /** Reverse sides declared in the body (`posts: many`); not columns. */
+  readonly slots: Readonly<Record<string, SlotState>>;
+  /** Many-to-many relations declared in the body (`tags: many(tags.posts)`); not columns. */
+  readonly throughs: Readonly<Record<string, ThroughInput>>;
   readonly indexCallbacks: readonly TableIndexCallback[];
   readonly checkCallbacks: readonly TableCheckCallback[];
   readonly computedCallbacks: readonly ComputedCallback[];
@@ -75,6 +98,8 @@ export type TableState = {
   readonly named?: string;
   /** Declared with junction(): both foreign keys form the primary key and expose M:N relations. */
   readonly junction: boolean;
+  /** Declared with link(): the delete action of references that name none. */
+  readonly defaultDelete?: OnDeleteAction;
   /** Assigned by the schema assembler; public schema() lowers declarations to fresh states. */
   key?: string;
   sqlName?: string;
@@ -343,10 +368,15 @@ type ColumnReferences<Columns> = {
     | "computed"
     | "relations"
     | "named"
+    | "nullable"
+    | "unique"
+    | "onDelete"
     | "onUpdate"
     | "by"
     | "column"
-  >]: ColumnReference;
+  >]: Columns[ColumnName] extends Slot<infer Kind>
+    ? SlotReference<Columns, ColumnName & string, Kind>
+    : ColumnReference;
 };
 
 export type TableHandle<Columns> = Table<Columns> &
@@ -445,12 +475,14 @@ export type TableHandle<Columns> = Table<Columns> &
 /** Reference declarations of a junction: every non-column entry. */
 type JunctionReferenceNames<ColumnDefinitions> = {
   [ColumnName in keyof ColumnDefinitions &
-    string]: ColumnDefinitions[ColumnName] extends Column<ColumnMetadata>
+    string]: ColumnDefinitions[ColumnName] extends
+    | Column<ColumnMetadata>
+    | Marker
     ? never
     : ColumnName;
 }[keyof ColumnDefinitions & string];
 
-type JunctionColumns<ColumnDefinitions> = ColumnDefinitions & {
+export type JunctionColumns<ColumnDefinitions> = ColumnDefinitions & {
   readonly [TABLE_JUNCTION]: true;
   readonly [TABLE_PRIMARY_KEY]: readonly `${JunctionReferenceNames<ColumnDefinitions>}Id`[];
 };
@@ -467,9 +499,10 @@ export type ColumnInput =
   | ReferenceBuilder<Record<string, unknown>, ReferenceFlags>
   | SelfReference<ReferenceFlags>
   | (() => Table<Record<string, unknown>>)
+  | Marker
   | undefined;
 
-const referenceChain = (
+export const referenceChain = (
   target: ReferenceInput["target"],
   flags: ReferenceFlags,
 ): ReferenceInput => {
@@ -508,6 +541,11 @@ const referenceChain = (
     value: (sqlName: string) =>
       referenceChain(target, { ...flags, column: sqlName }),
   });
+  // The short forms one() and maybe() chains are typed with.
+  getter("cascade", { onDelete: "cascade" });
+  getter("restrict", { onDelete: "restrict" });
+  getter("setNull", { onDelete: "set null", nullable: true });
+  getter("noIndex", { index: false });
 
   return Object.freeze(reference) as ReferenceInput;
 };
@@ -603,17 +641,66 @@ const REFERENCE_MODIFIERS = new Set([
   "column",
 ]);
 
+/**
+ * Everything a table handle answers to by itself. A slot becomes a property
+ * of its table (`users.posts`), so it cannot take one of these names.
+ */
+export const HANDLE_KEYS: ReadonlySet<string> = new Set([
+  "indexes",
+  "checks",
+  "computed",
+  "relations",
+  "named",
+  "primaryKey",
+  ...REFERENCE_MODIFIERS,
+]);
+
+/**
+ * Splits a table body into what is stored (columns and references, in
+ * `columns` as before) and what only describes relations: slots and
+ * many-to-many declarations.
+ */
+export const tableBody = (
+  body: Record<string, unknown>,
+): Pick<TableState, "columns" | "slots" | "throughs"> => {
+  // No prototype: a column may be named `__proto__` or `constructor`.
+  const columns: Record<string, unknown> = Object.create(null);
+  const slots: Record<string, SlotState> = Object.create(null);
+  const throughs: Record<string, ThroughInput> = Object.create(null);
+
+  for (const [key, value] of Object.entries(body)) {
+    if (isSlot(value)) {
+      if (HANDLE_KEYS.has(key)) {
+        throw new Error(
+          `symmetria: a slot cannot be named "${key}": every table has .${key} of its own; choose another name`,
+        );
+      }
+
+      slots[key] = value[SLOT];
+    } else if (isThrough(value)) {
+      throughs[key] = value;
+    } else {
+      columns[key] = value;
+    }
+  }
+
+  return { columns, slots, throughs };
+};
+
 /** The declaration part of a table's state; the assembler adds key and sqlName. */
 type TableInit = Omit<TableState, "key" | "sqlName">;
 
-const createTable = (init: TableInit): object => {
+export const createTable = (init: TableInit): object => {
   const state: TableState = {
     columns: Object.freeze({ ...init.columns }),
+    slots: Object.freeze({ ...init.slots }),
+    throughs: Object.freeze({ ...init.throughs }),
     indexCallbacks: Object.freeze([...init.indexCallbacks]),
     checkCallbacks: Object.freeze([...init.checkCallbacks]),
     computedCallbacks: Object.freeze([...init.computedCallbacks]),
     relationCallbacks: Object.freeze([...init.relationCallbacks]),
     junction: init.junction,
+    ...(init.defaultDelete ? { defaultDelete: init.defaultDelete } : {}),
     ...(init.primaryKey
       ? { primaryKey: Object.freeze([...init.primaryKey]) }
       : {}),
@@ -760,6 +847,15 @@ const createTable = (init: TableInit): object => {
         } satisfies ColumnReference;
       }
 
+      if (Object.hasOwn(state.slots, key)) {
+        return Object.freeze({
+          kind: "slotReference",
+          table: state,
+          key,
+          slot: state.slots[key]!,
+        } satisfies SlotReferenceInput);
+      }
+
       return undefined;
     },
     has: (proxyTarget, key) => {
@@ -771,7 +867,8 @@ const createTable = (init: TableInit): object => {
         key === "computed" ||
         key === "relations" ||
         key === "named" ||
-        (typeof key === "string" && key in state.columns) ||
+        (typeof key === "string" &&
+          (key in state.columns || Object.hasOwn(state.slots, key))) ||
         Reflect.has(proxyTarget, key)
       );
     },
@@ -785,7 +882,7 @@ export const table = <
   columns: ColumnDefinitions,
 ): TableHandle<ColumnDefinitions> =>
   createTable({
-    columns,
+    ...tableBody(columns),
     indexCallbacks: [],
     checkCallbacks: [],
     computedCallbacks: [],
@@ -804,6 +901,12 @@ export const junction = <
 ): JunctionHandle<ColumnDefinitions> => {
   const entries = Object.entries(columns);
   const references = entries.filter(([, value]) => !isColumn(value));
+
+  if (entries.some(([, value]) => isSlot(value) || isThrough(value))) {
+    throw new Error(
+      "symmetria: a junction table holds two references and columns; many and one belong to the tables it links",
+    );
+  }
 
   if (references.length !== 2) {
     throw new Error(
@@ -824,6 +927,8 @@ export const junction = <
 
   return createTable({
     columns,
+    slots: {},
+    throughs: {},
     indexCallbacks: [],
     checkCallbacks: [],
     computedCallbacks: [],
@@ -833,7 +938,20 @@ export const junction = <
 };
 
 /** Self-reference marker: `parent: self.nullable.onDelete.cascade.inverse("children")`. */
-export const self: SelfChain<{}> = referenceChain("self", {}) as never;
+export const self: SelfChain<{}> & SelfSlots = new Proxy(
+  referenceChain("self", {}),
+  {
+    // Any other name is a slot of the table being declared: `self.children`.
+    get: (target, key) =>
+      typeof key !== "string" || key in target
+        ? Reflect.get(target, key)
+        : Object.freeze({
+            kind: "slotReference",
+            table: "self",
+            key,
+          } satisfies SlotReferenceInput),
+  },
+) as never;
 
 export const isTable = (
   value: unknown,

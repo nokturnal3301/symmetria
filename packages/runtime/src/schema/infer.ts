@@ -13,7 +13,8 @@ import type {
   MetadataTraits,
   Vector,
 } from "./column";
-import type { UpdateValues } from "../query/write/mutations";
+import type { UpdateValues } from "../query/write/types";
+import type { Marker } from "./slots";
 import type {
   PrimaryKeyNames,
   ReferenceBuilder,
@@ -46,9 +47,19 @@ type ScalarColumnNames<Columns> = {
     : never;
 }[keyof Columns & string];
 
+/** Slots and many-to-many declarations describe relations; the row has no column for them. */
+type MarkerNames<Columns> = {
+  [ColumnName in keyof Columns & string]: ReadColumn<
+    Columns,
+    ColumnName
+  > extends Marker
+    ? ColumnName
+    : never;
+}[keyof Columns & string];
+
 type ReferenceColumnNames<Columns> = Exclude<
   keyof Columns & string,
-  ScalarColumnNames<Columns>
+  ScalarColumnNames<Columns> | MarkerNames<Columns>
 >;
 
 type ColumnValue<Definition> =
@@ -190,11 +201,13 @@ type OptionalNamesOf<Columns> = {
           >["notNull"] extends false
         ? ColumnName
         : never
-    : ReferenceFlagsOf<ReadColumn<Columns, ColumnName>> extends {
-          nullable: true;
-        }
-      ? `${ColumnName}Id`
-      : never;
+    : ReadColumn<Columns, ColumnName> extends Marker
+      ? never
+      : ReferenceFlagsOf<ReadColumn<Columns, ColumnName>> extends {
+            nullable: true;
+          }
+        ? `${ColumnName}Id`
+        : never;
 }[keyof Columns & string];
 
 type GeneratedNamesOf<Columns> = {

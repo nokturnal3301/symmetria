@@ -8,7 +8,7 @@ import {
   renameExpressionIdentifiers,
 } from "./expression-tokens";
 import { expressionKey, indexKeyKey } from "./expressions";
-import { typeConversion } from "./conversions";
+import { typeConversion, utcConversion } from "./conversions";
 import type { CompiledQuery, SchemaSnapshot } from "symmetria";
 import {
   columnSQL,
@@ -38,16 +38,13 @@ import {
 } from "./snapshot";
 
 export type RenameHints = {
-  /** Physical SQL names: old table -> new table. */
   readonly tables?: Readonly<Record<string, string>>;
-  /** Keyed by the NEW table name: old column -> new column. */
   readonly columns?: Readonly<Record<string, Readonly<Record<string, string>>>>;
 };
+
 export type MigrationDiffOptions = {
-  /** Generate concurrent indexes, phased constraint validation and enum additions. Requires nontransactional execution. */
   readonly online?: boolean;
   readonly renames?: RenameHints;
-  /** SQL USING expressions, keyed by new table and column names. */
   readonly using?: Readonly<
     Record<
       string,
@@ -55,31 +52,31 @@ export type MigrationDiffOptions = {
     >
   >;
 };
+
 export type MigrationPlan = {
   before: MigrationSnapshot;
   after: MigrationSnapshot;
   up: string[];
   down: string[];
 };
+
 type ColumnPair = {
   before: MigrationColumn;
   after: MigrationColumn;
   typeChanged: boolean;
 };
+
 type TablePair = {
   before: MigrationTable;
   after: MigrationTable;
   columns: ColumnPair[];
   primaryChanged: boolean;
-  /** The table rename changes the primary key's name, not its definition. */
   primaryRenamed: boolean;
-  /** Quoted names of retyped or dropped columns; definitions mentioning them are rebuilt. */
   affected: string[];
-  /** Applies column renames to a previous definition; PostgreSQL renames them in place. */
   renamed: <Definition>(definition: Definition) => Definition;
-  /** SQL types of the new table's columns, for comparing expressions. */
   types: ReadonlyMap<string, string>;
 };
+
 type Casts = Readonly<Record<string, Readonly<Record<string, string>>>>;
 
 const equal = (left: unknown, right: unknown): boolean =>
@@ -912,14 +909,31 @@ const direction = (
       if (column.typeChanged) {
         // An explicit ::varchar(n) cuts long values; without USING, PostgreSQL's
         // assignment cast rejects them instead.
+        const supplied = casts[pair.after.name]?.[next.name];
+        // A cast would use the migrating session's time zone.
+        const atUtc =
+          supplied === undefined ? utcConversion(previous, next) : undefined;
         const conversion =
-          casts[pair.after.name]?.[next.name] ??
+          supplied ??
           (typeConversion(previous, next)?.assignmentCast
             ? undefined
-            : `${quoteIdentifier(current)}${previous.enumeration || next.enumeration ? "::text" : ""}::${columnTypeSQL(next)}`);
+            : atUtc === "value"
+              ? `${quoteIdentifier(current)} AT TIME ZONE 'UTC'`
+              : `${quoteIdentifier(current)}${previous.enumeration || next.enumeration ? "::text" : ""}::${columnTypeSQL(next)}`);
+
+        // An array has no AT TIME ZONE and USING takes no subquery, so the
+        // cast itself runs with the zone set to UTC.
+        if (atUtc === "array") {
+          statements.push("SET TIME ZONE 'UTC'");
+        }
+
         statements.push(
           `${prefix} TYPE ${columnTypeSQL(next)}${conversion === undefined ? "" : ` USING ${conversion}`}`,
         );
+
+        if (atUtc === "array") {
+          statements.push("RESET TIME ZONE");
+        }
 
         if (renameLater) {
           statements.push(

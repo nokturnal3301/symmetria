@@ -120,7 +120,7 @@ type ForeignKeysMatch = Expect<
     // @ts-expect-error JOIN handles live inside their own callback
     { where: (users, { leftJoin }) => users.name.is(profile.id) },
   );
-  // @ts-expect-error an unselected query cannot execute
+  // Options without fields read the table's own columns.
   model.posts({ where: (posts) => posts.id.isNot(null) }).execute();
   model.posts((posts) => ({ heading: posts.title }), {
     // @ts-expect-error result field names do not declare JavaScript variables

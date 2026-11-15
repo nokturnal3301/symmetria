@@ -586,8 +586,9 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
       { postId: 6, tagId: 2 },
     ]);
 
-    // Connected and upserted targets are still resolved one by one; their
-    // junction rows are one INSERT per operation, duplicates included.
+    // Rows connected by the same column are read together; upserted targets
+    // are still resolved one by one. Junction rows are one INSERT per
+    // operation, duplicates included.
     const linked = await statements(() =>
       profiled.posts.insert({
         slug: "i",
@@ -599,9 +600,10 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
         },
       }),
     );
-    // The author and three tags are looked up, two tags upserted: 1 + 1 + 3 + 1 + 2 + 1.
-    expect(linked).toHaveLength(9);
-    expect(linked.filter((sql) => sql.startsWith("SELECT"))).toHaveLength(4);
+    // The connected tags in one read, the author in another, two tags
+    // upserted: 1 + 1 + 1 + 1 + 2 + 1.
+    expect(linked).toHaveLength(7);
+    expect(linked.filter((sql) => sql.startsWith("SELECT"))).toHaveLength(2);
     expect(
       linked.filter((sql) => sql.startsWith('INSERT INTO "post_tags"')),
     ).toHaveLength(2);
@@ -778,5 +780,127 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
         .execute(),
     ).rejects.toThrow(/existing row/);
     expect(await database.posts.by.slug("missing").maybeOne()).toBeNull();
+  });
+
+  test("rows that only connect are read and written together", async () => {
+    const insert = (table: string) => `INSERT INTO "${table}" AS "${table}"`;
+
+    await database.users.insert(
+      Array.from({ length: 20 }, (_, position) => ({
+        email: `u${position}`,
+        name: `U${position}`,
+      })),
+    );
+
+    // Twenty posts for twenty authors: one read of the authors, one INSERT.
+    let created: { id: number; slug: string }[] = [];
+    const sent = await statements(async () => {
+      created = await profiled.posts
+        .insert(
+          Array.from({ length: 20 }, (_, position) => ({
+            slug: `s${position}`,
+            title: "T",
+            // By key, by unique column, and one author twice.
+            author:
+              position % 2
+                ? { connect: 1 + (position % 10) }
+                : { connect: { email: `u${position}` } },
+          })),
+        )
+        .returning("id", "slug");
+    });
+
+    expect(sent).toHaveLength(3);
+    expect(sent.filter((sql) => sql.startsWith("SELECT"))).toHaveLength(2);
+    expect(sent.at(-1)).toStartWith(insert("posts"));
+    // In input order, as before.
+    expect(created).toEqual(
+      Array.from({ length: 20 }, (_, position) => ({
+        id: position + 1,
+        slug: `s${position}`,
+      })),
+    );
+    expect(
+      await database.posts((post) => ({ author: post.author.email }), {
+        orderBy: { id: "asc" },
+        limit: 4,
+      }),
+    ).toEqual([
+      { author: "u0" },
+      { author: "u1" },
+      { author: "u2" },
+      { author: "u3" },
+    ]);
+
+    // Children that only connect what they reference share their parent's INSERT.
+    const withPosts = await statements(() =>
+      profiled.users.insert({
+        email: "writer",
+        name: "Writer",
+        posts: {
+          create: Array.from({ length: 5 }, (_, position) => ({
+            slug: `w${position}`,
+            title: "W",
+            tags: undefined,
+          })),
+        },
+      }),
+    );
+
+    expect(withPosts).toHaveLength(2);
+
+    // A row created by the same insert is found when a later row connects it,
+    // and rows that need more than a connect keep their place in the order.
+    const mixed = await profiled.posts
+      .insert([
+        { slug: "m0", title: "M", author: { connect: 1 } },
+        {
+          slug: "m1",
+          title: "M",
+          author: { create: { email: "fresh", name: "Fresh" } },
+        },
+        { slug: "m2", title: "M", author: { connect: { email: "fresh" } } },
+        { slug: "m3", title: "M", author: { connect: 2 } },
+      ])
+      .returning("slug", "authorId");
+
+    expect(mixed).toEqual([
+      { slug: "m0", authorId: 1 },
+      { slug: "m1", authorId: 22 },
+      { slug: "m2", authorId: 22 },
+      { slug: "m3", authorId: 2 },
+    ]);
+
+    // One missing row among many fails the whole insert.
+    await expect(
+      database.posts
+        .insert([
+          { slug: "x0", title: "X", author: { connect: 1 } },
+          { slug: "x1", title: "X", author: { connect: 999 } },
+          { slug: "x2", title: "X", author: { connect: 2 } },
+        ])
+        .execute(),
+    ).rejects.toThrow('connect on "users" expected one existing row');
+    expect(await database.posts.by.slug("x0").maybeOne()).toBeNull();
+
+    // A scope still decides which rows a connect can find.
+    const scoped = database.$scope({ users: (user) => user.id.atMost(2) });
+
+    await expect(
+      scoped.posts
+        .insert([
+          { slug: "y0", title: "Y", author: { connect: 1 } },
+          { slug: "y1", title: "Y", author: { connect: 3 } },
+        ])
+        .execute(),
+    ).rejects.toThrow('connect on "users" expected one existing row');
+    expect(
+      await scoped.posts
+        .insert([
+          { slug: "z0", title: "Z", author: { connect: 1 } },
+          { slug: "z1", title: "Z", author: { connect: 2 } },
+        ])
+        .returning("authorId"),
+    ).toEqual([{ authorId: 1 }, { authorId: 2 }]);
   });
 });

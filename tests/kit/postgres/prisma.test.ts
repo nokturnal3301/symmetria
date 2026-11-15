@@ -138,14 +138,17 @@ describe.skipIf(!url)("moving from Prisma", () => {
         'categoryName: text.named("category_name").unique,',
       );
       expect(pulled.source).toContain(
-        "user: user.unique.onDelete.cascade.onUpdate.cascade,",
+        "user: one(user).unique.cascade.onUpdate.cascade,",
       );
-      expect(pulled.source).toContain("author: user.onUpdate.cascade,");
+      expect(pulled.source).toContain(
+        "author: one(user).noIndex.onUpdate.cascade,",
+      );
+      expect(pulled.source).toContain("profile: one,");
       expect(pulled.source).toContain(
         "categoryToPost: ({ category, posts }) =>",
       );
       expect(pulled.source).toContain(
-        'a: category.column("A").onDelete.cascade.onUpdate.cascade,',
+        'a: category.column("A").onUpdate.cascade,',
       );
       expect(pulled.source).toContain(
         "_CategoryToPost_B_index: index(categoryToPost.bId),",

@@ -1,6 +1,8 @@
 /**
  * Renders a pulled schema as TypeScript source in the keyed-callback schema() form,
  * importing only the builders it uses and marking approximations with `// pull:`.
+ * A foreign key is `one(users)` or `maybe(users)` on the table that holds it
+ * and a slot (`posts: many`) on the table it points to.
  */
 import { sqlKey, type Casing } from "symmetria";
 import { escapeTemplate, quoteString } from "./names";
@@ -47,8 +49,12 @@ const IMPORT_ORDER = [
   "interval",
   "jsonb",
   "junction",
+  "link",
+  "many",
+  "maybe",
   "not",
   "numeric",
+  "one",
   "oneOf",
   "operatorClass",
   "or",
@@ -170,9 +176,128 @@ const columnSource = (
   return source;
 };
 
+/** Names a table handle answers to by itself; a slot cannot take one. */
+const HANDLE_KEYS = new Set([
+  "indexes",
+  "checks",
+  "computed",
+  "relations",
+  "named",
+  "primaryKey",
+  "nullable",
+  "unique",
+  "index",
+  "onDelete",
+  "onUpdate",
+  "inverse",
+  "by",
+  "column",
+]);
+
+/**
+ * `one(users)` / `maybe(users)`: a foreign key with its index. What decides
+ * the column and the names goes inside (`users.by("email").inverse("x")`),
+ * what the key does goes after (`.unique`, `.noIndex`, `.cascade`).
+ */
+const claimSource = (
+  reference: PulledReference,
+  bindings: ReadonlyMap<string, string>,
+  imports: Set<string>,
+): string => {
+  let target = bindings.get(reference.target) ?? reference.target;
+
+  if (reference.by) {
+    target += `.by(${quoteString(reference.by)})`;
+  }
+
+  if (reference.column) {
+    target += `.column(${quoteString(reference.column)})`;
+  }
+
+  if (reference.inverse) {
+    target += `.inverse(${quoteString(reference.inverse)})`;
+  }
+
+  const claim = reference.nullable ? "maybe" : "one";
+  imports.add(claim);
+  let source = `${claim}(${target})`;
+
+  if (reference.unique) {
+    source += ".unique";
+  } else if (!reference.index) {
+    source += ".noIndex";
+  }
+
+  if (reference.onDelete === "cascade" || reference.onDelete === "setNull") {
+    source += `.${reference.onDelete}`;
+  } else if (reference.onDelete) {
+    source += `.onDelete.${reference.onDelete}`;
+  }
+
+  if (reference.onUpdate) {
+    source += `.onUpdate.${reference.onUpdate}`;
+  }
+
+  return source;
+};
+
+/** The reverse sides a table gets from the tables that reference it, as slots. */
+type Slots = ReadonlyMap<
+  string,
+  readonly { key: string; kind: "many" | "one" }[]
+>;
+
+const tableSlots = (model: PulledSchema): Slots => {
+  const slots = new Map<string, { key: string; kind: "many" | "one" }[]>();
+  const members = new Map(
+    model.tables.map((table) => [
+      table.key,
+      new Set(
+        table.members.flatMap((member) =>
+          member.kind === "reference"
+            ? [member.key, `${member.key}Id`]
+            : [member.key],
+        ),
+      ),
+    ]),
+  );
+
+  for (const table of model.tables) {
+    // A junction's references name many-to-many relations, not slots.
+    if (table.junction) {
+      continue;
+    }
+
+    for (const member of table.members) {
+      if (member.kind !== "reference") {
+        continue;
+      }
+
+      const key = member.inverse ?? table.key;
+      const taken = slots.get(member.target) ?? [];
+
+      // A slot is optional: without one the relation is still declared.
+      if (
+        HANDLE_KEYS.has(key) ||
+        members.get(member.target)?.has(key) ||
+        taken.some((slot) => slot.key === key)
+      ) {
+        continue;
+      }
+
+      taken.push({ key, kind: member.unique ? "one" : "many" });
+      slots.set(member.target, taken);
+    }
+  }
+
+  return slots;
+};
+
+/** A junction's reference: the table, then what differs from the junction's defaults. */
 const referenceSource = (
   reference: PulledReference,
   bindings: ReadonlyMap<string, string>,
+  defaultDelete?: PulledReference["onDelete"],
 ): string => {
   let source = bindings.get(reference.target) ?? reference.target;
 
@@ -196,7 +321,7 @@ const referenceSource = (
     source += ".index";
   }
 
-  if (reference.onDelete) {
+  if (reference.onDelete && reference.onDelete !== defaultDelete) {
     source += `.onDelete.${reference.onDelete}`;
   }
 
@@ -219,8 +344,19 @@ const memberLine = (
   imports: Set<string>,
   casing: Casing,
   bindings: ReadonlyMap<string, string>,
+  junction: "junction" | "link" | undefined,
 ): string =>
-  `${member.key}: ${member.kind === "column" ? columnSource(member, imports, casing) : referenceSource(member, bindings)},${comment(member.comments)}`;
+  `${member.key}: ${
+    member.kind === "column"
+      ? columnSource(member, imports, casing)
+      : junction
+        ? referenceSource(
+            member,
+            bindings,
+            junction === "link" ? "cascade" : undefined,
+          )
+        : claimSource(member, bindings, imports)
+  },${comment(member.comments)}`;
 
 /** `{ users, date: dateTable }`: tables destructured by key under their bindings. */
 const destructure = (
@@ -336,6 +472,7 @@ const tableSource = (
   imports: Set<string>,
   casing: Casing,
   bindings: ReadonlyMap<string, string>,
+  slots: Slots,
 ): string[] => {
   const targets = [
     ...new Set(
@@ -348,13 +485,30 @@ const tableSource = (
   ].sort();
   const callback = targets.length > 0;
   const indent = callback ? "      " : "    ";
-  const constructor = table.junction ? "junction" : "table";
+  // link() is a junction whose rows go with either side: both keys cascade.
+  const junction = !table.junction
+    ? undefined
+    : table.members.every(
+          (member) =>
+            member.kind !== "reference" || member.onDelete === "cascade",
+        )
+      ? "link"
+      : "junction";
+  const constructor = junction ?? "table";
   imports.add(constructor);
+  const declared = slots.get(table.key) ?? [];
+
+  for (const slot of declared) {
+    imports.add(slot.kind);
+  }
+
   const body = [
     ...table.comments.map((note) => `${indent}// pull: ${note}`),
     ...table.members.map(
-      (member) => `${indent}${memberLine(member, imports, casing, bindings)}`,
+      (member) =>
+        `${indent}${memberLine(member, imports, casing, bindings, junction)}`,
     ),
+    ...declared.map((slot) => `${indent}${slot.key}: ${slot.kind},`),
     ...table.skipped.map(
       (column) =>
         `${indent}// ${column.sqlName} ${column.dataType}: pull: ${column.reason}`,
@@ -437,8 +591,9 @@ export const renderSchema = (
   const bindings = new Map(
     model.tables.map((table) => [table.key, table.binding]),
   );
+  const slots = tableSlots(model);
   const tables = model.tables.flatMap((table) =>
-    tableSource(table, imports, model.casing, bindings),
+    tableSource(table, imports, model.casing, bindings, slots),
   );
   // Schema-level indexes contribute imports too, so render them before the import line.
   for (const { binding, index } of model.schemaIndexes) {

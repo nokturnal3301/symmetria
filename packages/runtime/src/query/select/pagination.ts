@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { compileShape, executePlan } from "../compile";
-import { type PredicateDescription, type ValueNode } from "../expressions";
+import type { PredicateDescription, ValueNode } from "../expressions";
 import type {
   OrderingDescription,
   QueryExecutor,

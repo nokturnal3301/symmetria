@@ -37,6 +37,7 @@ export const help = `symmetria <command>
   --plan               Show SQL and transaction groups without executing migrations
   --action <action>    repair: retry or complete, after manual data reconciliation
   --verify-url <url>   Administrative PostgreSQL URL for disposable verification databases
+  --snapshot <file>    repair: meta/snapshot.json of the boundary to verify, instead of --verify-url
   --advisory-lock-timeout <ms>  Migration lock wait (default: 10000)
   --lock-timeout <ms>   DDL lock wait (default: 5000; 0 disables)
   --statement-timeout <ms>  Statement duration (default: 600000, no default in transaction none migrations; 0 disables)
@@ -99,6 +100,7 @@ export const FLAGS = {
   plan: { type: "boolean" },
   action: { type: "string" },
   "verify-url": { type: "string" },
+  snapshot: { type: "string" },
   "advisory-lock-timeout": { type: "string" },
   "lock-timeout": { type: "string" },
   "statement-timeout": { type: "string" },
@@ -178,6 +180,11 @@ const SCOPED_FLAGS: readonly {
     flags: ["action"],
     commands: ["repair"],
     message: "symmetria: --action is a repair option",
+  },
+  {
+    flags: ["snapshot"],
+    commands: ["repair"],
+    message: "symmetria: --snapshot is a repair option",
   },
   {
     flags: ["strict"],

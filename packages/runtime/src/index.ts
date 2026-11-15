@@ -43,6 +43,22 @@ export {
   type DatabaseError,
   type DatabaseErrorKind,
 } from "./driver/errors";
+export {
+  SymmetriaError,
+  NotFoundError,
+  TooManyRowsError,
+  OutOfScopeError,
+  DuplicateConflictKeyError,
+  QueryError,
+  UniqueViolation,
+  ForeignKeyViolation,
+  NotNullViolation,
+  CheckViolation,
+  ExclusionViolation,
+  SerializationFailure,
+  DeadlockDetected,
+  ConnectionError,
+} from "./errors";
 
 export {
   table,
@@ -63,6 +79,17 @@ export {
 } from "./schema/table";
 
 export {
+  link,
+  one,
+  maybe,
+  many,
+  type Slot,
+  type SlotReference,
+  type ManyThrough,
+  type RelationChain,
+} from "./schema/slots";
+
+export {
   snakeCase,
   sqlKey,
   type Casing,
@@ -72,17 +99,16 @@ export {
   type RelationSnapshot,
 } from "./schema/assembly";
 
-export {
-  schema,
-  type Database,
-  type TransactionDatabase,
-  type Transaction,
-  type SchemaOptions,
-  type ScopeDefinitions,
-  type Link,
-  type Row,
-  type Insert,
-} from "./schema/model";
+export { schema } from "./schema/model";
+export type {
+  Database,
+  TransactionDatabase,
+  Transaction,
+  SchemaOptions,
+  ScopeDefinitions,
+} from "./schema/database";
+export type { Link } from "./schema/links";
+export type { Row, Insert } from "./schema/graph";
 
 export {
   and,

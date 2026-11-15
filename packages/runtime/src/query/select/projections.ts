@@ -74,6 +74,38 @@ export const returningTools = Object.freeze({
 export type ReturningTools = typeof returningTools;
 
 /** Reusable write projections share scalar SQL tools, table identity and codecs. */
+/**
+ * The forms `returning()` takes besides a callback or a reusable shape: no
+ * argument is the whole row, column names are those columns.
+ */
+export const returningSelector = (
+  selector: unknown,
+  names: readonly unknown[],
+): unknown => {
+  if (selector === undefined && !names.length) {
+    return (row: RuntimeScope[string]) => ({ ...row });
+  }
+
+  if (typeof selector === "string") {
+    const columns = [selector, ...names];
+
+    if (columns.some((name) => typeof name !== "string")) {
+      throw new Error("symmetria: returning() takes column names as strings");
+    }
+
+    return (row: RuntimeScope[string]) =>
+      Object.fromEntries(columns.map((name) => [name, row[name as string]]));
+  }
+
+  if (names.length) {
+    throw new Error(
+      "symmetria: returning() takes column names, or one callback or shape",
+    );
+  }
+
+  return selector;
+};
+
 export const returningProjection = (
   selector: (row: RuntimeScope[string], tools?: object) => Projection,
   row: RuntimeScope[string],

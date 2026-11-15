@@ -230,6 +230,35 @@ export const typeConversion = (
   return undefined;
 };
 
+/**
+ * A change between `timestamptz` and `timestamp`, for a value or for an
+ * array of them. A plain cast converts through the time zone of the session
+ * that runs the migration, so the stored values would depend on who
+ * migrates; Symmetria reads and writes `timestamp` as UTC, and the generated
+ * SQL converts at UTC: `AT TIME ZONE 'UTC'` for a value, and for an array,
+ * which has no such operator, the cast with the session's zone set to UTC.
+ */
+export const utcConversion = (
+  before: MigrationColumn,
+  after: MigrationColumn,
+): "value" | "array" | undefined => {
+  if (before.enumeration || after.enumeration) {
+    return undefined;
+  }
+
+  const source = parse(before.sqlType);
+  const target = parse(after.sqlType);
+
+  return source.array === target.array &&
+    TIMESTAMPS.has(source.base) &&
+    TIMESTAMPS.has(target.base) &&
+    source.base !== target.base
+    ? source.array
+      ? "array"
+      : "value"
+    : undefined;
+};
+
 /** The lint sentence for a lossy conversion, naming both types. */
 export const conversionMessage = (
   before: MigrationColumn,

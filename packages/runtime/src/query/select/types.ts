@@ -1,20 +1,20 @@
 /** Type-level API of queries: scopes, projections, relations, options and the query handle. */
-import {
+import type {
   COLUMN_EXPRESSION,
-  type ExpressionValue,
-  type Ordering,
-  type Decimal,
-  type SkippedPredicate,
-  type Predicate,
-  type QueryColumn,
-  type RowColumnTraits,
-  type ScalarQuery,
-  type SelectedColumn,
-  type Summable,
-  type SummableValue,
-  type TraitedRow,
-  type TraitsOf,
-  type Parameter,
+  ExpressionValue,
+  Ordering,
+  Decimal,
+  SkippedPredicate,
+  Predicate,
+  QueryColumn,
+  RowColumnTraits,
+  ScalarQuery,
+  SelectedColumn,
+  Summable,
+  SummableValue,
+  TraitedRow,
+  TraitsOf,
+  Parameter,
 } from "../expressions";
 import type {
   CompiledQuery,
@@ -23,7 +23,7 @@ import type {
   TableBinding,
   TableSource,
 } from "../plan/types";
-import type { TableMutations } from "../write/mutations";
+import type { TableMutations } from "../write/types";
 import type { PreparedQuery, Preparable } from "./prepared";
 import type { Page, PageCursor, PageOptions } from "./pagination";
 import type {
@@ -183,7 +183,11 @@ type RelationQuery<
   >(
     shape: (
       columns: RelatedColumns<Rows, Relations, Target>,
-      tools: ShapeTools<Rows, Relations>,
+      tools: ProjectionTools<
+        Rows,
+        Relations,
+        RelatedColumns<Rows, Relations, Target>
+      >,
     ) => Shape & ValidShape<Shape>,
     options?: QueryOptions<
       RelatedColumns<Rows, Relations, Target>,
@@ -471,14 +475,66 @@ export type ShapeControls = {
 export type QueryOptions<Columns, Tools, Selected = {}> = {
   readonly [Name in keyof ShapeControls]?:
     | undefined
-    | ShapeControls[Name]
+    | OptionValue<Name, Columns>
     | (Name extends "orderBy" | "groupBy" | "having"
         ? (
             columns: Columns,
-            tools: Tools,
+            tools: Tools & { readonly selected: Selected },
             selected: Selected,
-          ) => ShapeControls[Name]
-        : (columns: Columns, tools: Tools) => ShapeControls[Name]);
+          ) => OptionValue<Name, Columns>
+        : (columns: Columns, tools: Tools) => OptionValue<Name, Columns>);
+};
+/** What an option accepts: `where` and `orderBy` also take an object keyed by field. */
+type OptionValue<Name extends keyof ShapeControls, Columns> =
+  | ShapeControls[Name]
+  | (Name extends "where" ? EqualityFilter<Columns> : never)
+  | (Name extends "orderBy"
+      ?
+          | FieldOrder<Columns>
+          | readonly [
+              Ordering | FieldOrder<Columns>,
+              ...(Ordering | FieldOrder<Columns>)[],
+            ]
+      : never);
+/** The source's own columns, without its relations. */
+export type RowColumns<Source> = {
+  readonly [Name in keyof Source as Source[Name] extends SelectedColumn
+    ? Name
+    : never]: Source[Name];
+};
+/**
+ * `where: { state: "draft", editorId: null }`: every listed column equals its
+ * value, `null` is IS NULL, and an `undefined` value leaves the column out.
+ */
+export type EqualityFilter<Columns> = {
+  readonly [Name in keyof RowColumns<Columns>]?:
+    | (Columns[Name] extends {
+        readonly is: (value: infer Value) => unknown;
+      }
+        ? Value
+        : never)
+    | undefined;
+};
+/**
+ * `orderBy: { spent: "desc" }` over the source's columns and the selected
+ * fields. Column names are offered and checked; a selected field is any other
+ * name, checked when the query is built: typing those keys from the
+ * projection would make TypeScript settle the projection's type too early.
+ */
+export type FieldOrder<Columns> = {
+  readonly [Name in keyof RowColumns<Columns> & string]?:
+    | "asc"
+    | "desc"
+    | undefined;
+} & { readonly [field: string]: "asc" | "desc" | undefined };
+/** A projection callback's tools: the shared ones and the source's own columns as `row`. */
+type ProjectionTools<
+  Rows extends SchemaRows,
+  Relations extends SchemaRelations,
+  Source,
+> = ShapeTools<Rows, Relations> & {
+  /** Every column of the source, for `{ ...row, extra }`. */
+  readonly row: RowColumns<Source>;
 };
 declare const NESTED_RESULT: unique symbol;
 /** Marks a relation selected with a shape: rows or an object, not a value to sort or group by. */
@@ -612,6 +668,44 @@ type RootColumns<
         >
     : never;
 }[keyof Scope];
+/** What runs a query that has fields: `await`, `execute()`, the row-count terminals, pages and streams. */
+type Terminals<Selection extends Projection> = Preparable<
+  ProjectionRow<Selection>[]
+> & {
+  readonly prepare: () => PreparedQuery<ProjectionRow<Selection>[]>;
+  readonly toSQL: () => CompiledQuery;
+  readonly execute: () => Promise<ProjectionRow<Selection>[]>;
+  /** Queries are thenable: `await query` executes it like `execute()`. */
+  readonly then: PromiseLike<ProjectionRow<Selection>[]>["then"];
+  readonly catch: Promise<ProjectionRow<Selection>[]>["catch"];
+  readonly finally: Promise<ProjectionRow<Selection>[]>["finally"];
+  readonly inspect: (
+    options?: InspectQueryOptions,
+  ) => Promise<QueryInspection<ProjectionRow<Selection>>>;
+  readonly first: () => Promise<ProjectionRow<Selection> | null>;
+  readonly one: () => Promise<ProjectionRow<Selection>>;
+  readonly maybeOne: () => Promise<ProjectionRow<Selection> | null>;
+  /** `SELECT COUNT(*)` with the same filters; LIMIT, OFFSET, GROUP BY and DISTINCT count result rows. */
+  readonly count: () => Promise<number>;
+  /** `SELECT 1 … LIMIT 1`: whether at least one row matches. */
+  readonly exists: () => Promise<boolean>;
+  /** One keyset page; `after` moves forward, `before` backward (never both). */
+  readonly page: (
+    options: PageOptions<ProjectionRow<Selection>>,
+  ) => Promise<Page<ProjectionRow<Selection>>>;
+  /** Iterate keyset pages: `for await (const page of query.pages({ size: 100 }))`. */
+  readonly pages: (options: {
+    size: number;
+    after?: PageCursor<ProjectionRow<Selection>> | null | undefined;
+  }) => AsyncIterable<Page<ProjectionRow<Selection>>>;
+  /**
+   * Rows through a server-side cursor: `for await (const row of query.stream({ size: 1000 }))`.
+   * Works for any SELECT; a connection stays reserved until iteration ends.
+   */
+  readonly stream: (options?: {
+    size?: number;
+  }) => AsyncIterable<ProjectionRow<Selection>>;
+};
 export type Query<
   Rows extends SchemaRows,
   Relations extends SchemaRelations,
@@ -619,13 +713,31 @@ export type Query<
   Scope extends QueryScope = RootScope<Rows, RootTable>,
   Selection extends Projection | undefined = undefined,
 > = {
+  /**
+   * Aggregates over the source as one object instead of an array of one row:
+   * `orders.aggregate((order, { sum }) => ({ total: sum(order.amount) }))`.
+   */
+  readonly aggregate: <const Shape extends Record<string, unknown>>(
+    shape: (
+      columns: RootColumns<Scope, Rows, Relations>,
+      tools: ProjectionTools<
+        Rows,
+        Relations,
+        RootColumns<Scope, Rows, Relations>
+      >,
+    ) => Shape & ValidShape<Shape>,
+  ) => Promise<ProjectionRow<ShapeSelection<Shape>>>;
   (
     options: QueryOptions<
       RootColumns<Scope, Rows, Relations>,
       ShapeTools<Rows, Relations>,
       SelectedFields<Selection>
     >,
-  ): Query<Rows, Relations, RootTable, Scope, Selection>;
+  ): Query<Rows, Relations, RootTable, Scope, Selection> &
+    // Options without fields read the root's own columns.
+    ([Selection] extends [undefined]
+      ? Terminals<RowColumns<RootColumns<Scope, Rows, Relations>>>
+      : unknown);
   <Shape extends Record<string, unknown>>(
     shape: ReusableShape<RootTable, Shape>,
     options?: QueryOptions<
@@ -637,7 +749,11 @@ export type Query<
   <const Shape extends Record<string, unknown>>(
     shape: (
       columns: RootColumns<Scope, Rows, Relations>,
-      tools: ShapeTools<Rows, Relations>,
+      tools: ProjectionTools<
+        Rows,
+        Relations,
+        RootColumns<Scope, Rows, Relations>
+      >,
     ) => Shape & ValidShape<Shape>,
     options?: QueryOptions<
       RootColumns<Scope, Rows, Relations>,
@@ -659,40 +775,9 @@ export type Query<
   >;
 } & (Selection extends Projection
   ? QueryReference &
-      Preparable<ProjectionRow<Selection>[]> & {
+      Terminals<Selection> & {
         readonly [QUERY_RESULT]: ProjectionRow<Selection>;
         readonly [QUERY_TRAITS]: ProjectionTraits<Selection>;
-        readonly prepare: () => PreparedQuery<ProjectionRow<Selection>[]>;
-        readonly toSQL: () => CompiledQuery;
-        readonly execute: () => Promise<ProjectionRow<Selection>[]>;
-        /** Queries are thenable: `await query` executes it like `execute()`. */
-        readonly then: PromiseLike<ProjectionRow<Selection>[]>["then"];
-        readonly inspect: (
-          options?: InspectQueryOptions,
-        ) => Promise<QueryInspection<ProjectionRow<Selection>>>;
-        readonly first: () => Promise<ProjectionRow<Selection> | null>;
-        readonly one: () => Promise<ProjectionRow<Selection>>;
-        readonly maybeOne: () => Promise<ProjectionRow<Selection> | null>;
-        /** `SELECT COUNT(*)` with the same filters; LIMIT, OFFSET, GROUP BY and DISTINCT count result rows. */
-        readonly count: () => Promise<number>;
-        /** `SELECT 1 … LIMIT 1`: whether at least one row matches. */
-        readonly exists: () => Promise<boolean>;
-        /** One keyset page; `after` moves forward, `before` backward (never both). */
-        readonly page: (
-          options: PageOptions<ProjectionRow<Selection>>,
-        ) => Promise<Page<ProjectionRow<Selection>>>;
-        /** Iterate keyset pages: `for await (const page of query.pages({ size: 100 }))`. */
-        readonly pages: (options: {
-          size: number;
-          after?: PageCursor<ProjectionRow<Selection>> | null | undefined;
-        }) => AsyncIterable<Page<ProjectionRow<Selection>>>;
-        /**
-         * Rows through a server-side cursor: `for await (const row of query.stream({ size: 1000 }))`.
-         * Works for any SELECT; a connection stays reserved until iteration ends.
-         */
-        readonly stream: (options?: {
-          size?: number;
-        }) => AsyncIterable<ProjectionRow<Selection>>;
         readonly as: <const AliasName extends string>(
           name: AliasName,
         ) => DerivedQuery<Rows, Relations, DerivedRow<Selection>, AliasName>;
@@ -781,7 +866,11 @@ export type QueryTable<
     readonly shape: <const Shape extends ProjectionObject>(
       callback: (
         columns: RelatedColumns<Rows, Relations, RootTable>,
-        tools: ShapeTools<Rows, Relations>,
+        tools: ProjectionTools<
+          Rows,
+          Relations,
+          RelatedColumns<Rows, Relations, RootTable>
+        >,
       ) => Shape &
         (keyof Shape extends never ? never : unknown) & {
           [Name in keyof Shape]: Name extends `$${string}`
@@ -803,7 +892,34 @@ export type QueryTable<
         readonly byId: (
           value: LookupKey<Rows[RootTable], KeyNames>,
         ) => KeyLookup<Rows, Relations, RootTable, Insert>;
+        /** The row with this primary key; rejects with `NotFoundError` when there is none. */
+        readonly get: KeyRead<Rows, Relations, RootTable, KeyNames, never>;
+        /** The row with this primary key, or `null`. */
+        readonly find: KeyRead<Rows, Relations, RootTable, KeyNames, null>;
       });
+/** `get()` / `find()`: the whole row, or the fields a shape selects. */
+type KeyRead<
+  Rows extends SchemaRows,
+  Relations extends SchemaRelations,
+  RootTable extends string,
+  KeyNames extends StringKeys<Rows[RootTable]>,
+  Missing,
+> = {
+  (
+    value: LookupKey<Rows[RootTable], KeyNames>,
+  ): Promise<ProjectionRow<Columns<Rows[RootTable]>> | Missing>;
+  <const Shape extends Record<string, unknown>>(
+    value: LookupKey<Rows[RootTable], KeyNames>,
+    shape: (
+      columns: RelatedColumns<Rows, Relations, RootTable>,
+      tools: ProjectionTools<
+        Rows,
+        Relations,
+        RelatedColumns<Rows, Relations, RootTable>
+      >,
+    ) => Shape & ValidShape<Shape>,
+  ): Promise<ProjectionRow<ShapeSelection<Shape>> | Missing>;
+};
 type KeyLookup<
   Rows extends SchemaRows,
   Relations extends SchemaRelations,

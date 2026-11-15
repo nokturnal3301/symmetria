@@ -20,7 +20,7 @@ import {
   type TableBinding,
   type TableSource,
 } from "../plan/types";
-import { shapeExpressions } from "./projections";
+import type { shapeExpressions } from "./projections";
 import { primaryKeyColumns, type ColumnSnapshot } from "../../schema/assembly";
 import { createScope, initialPlan, validatePredicate } from "./scope";
 import { columnsOnly } from "./suggest";

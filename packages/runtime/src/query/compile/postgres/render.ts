@@ -29,19 +29,32 @@ const jsonObject = (
   return `(${chunks.join(" || ")})${jsonOutput ? "::json" : ""}`;
 };
 
+/**
+ * An explicit cast to `varchar(5)` or `numeric(10,2)` silently cuts or rounds
+ * the value, so a bound value compared with such a column would match rows it
+ * does not equal. Casts state the base type only; assignment to a column still
+ * applies the column's own length and scale. `char(5)` becomes `bpchar`, the
+ * same type without a length: plain `char` would mean `char(1)` and cut the
+ * value to one character.
+ */
+const unconstrained = (type: string): string =>
+  type
+    .replace(/^(?:char|character|bpchar)\s*\([^)]*\)/i, "bpchar")
+    .replace(/^(varchar|character varying|numeric|decimal)\s*\([^)]*\)/i, "$1");
+
 /** PostgreSQL SQL rendering, shared by every execution adapter. */
 export const postgresRenderer: PostgresRenderer = {
   placeholder: (position) => `$${position}`,
   cast: (value, target) => {
     switch (target.kind) {
       case "parameter":
-        return `${value}::text::${target.type}`;
+        return `${value}::text::${unconstrained(target.type)}`;
       case "numeric":
         return `${value}::numeric`;
       case "text":
         return target.array ? `(${value})::text[]` : `(${value})::text`;
       case "typed":
-        return `(${value})::${target.type}`;
+        return `(${value})::${unconstrained(target.type)}`;
     }
   },
   limitOffset: (limit, offset) => [

@@ -995,13 +995,17 @@ describe("pull: tables and relations", () => {
     ]);
     // ON UPDATE CASCADE, Prisma's default, is declared.
     expect(renderSchema(model)).toContain(
-      'editor: users.onDelete.noAction.onUpdate.cascade.inverse("loginsByEditor"),',
+      'editor: one(users.inverse("loginsByEditor")).noIndex.onDelete.noAction.onUpdate.cascade,',
     );
     expect(renderSchema(model)).toContain(
-      'owner: users.column("owner").onDelete.noAction,',
+      'owner: one(users.column("owner")).noIndex.onDelete.noAction,',
     );
     expect(renderSchema(model)).toContain(
-      'email: users.by("email").column("email").onDelete.noAction.inverse("loginsByEmail"),',
+      'email: one(users.by("email").column("email").inverse("loginsByEmail")).noIndex.onDelete.noAction,',
+    );
+    // The referenced table names the other side of each key.
+    expect(renderSchema(model)).toContain(
+      "    logins: many,\n    loginsByEmail: many,\n    loginsByEditor: many,\n",
     );
   });
 
@@ -1431,7 +1435,8 @@ describe("pull: tables and relations", () => {
     expect(source).toContain(
       'email: text.unique, // pull: unique index "User_email_key" becomes a constraint',
     );
-    expect(source).toContain("author: user.index.onUpdate.cascade,");
+    expect(source).toContain("author: one(user).onUpdate.cascade,");
+    expect(source).toContain("post: many,");
     expect(source).toContain("viewCount: int.default(0),");
     expect(model.skippedTables).toEqual([
       {

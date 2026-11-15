@@ -41,13 +41,13 @@ Runtime modules are grouped by responsibility:
 
 ```text
 packages/runtime/src/
-├── schema/         # Columns, tables, inference, graph assembly, constraints
+├── schema/         # Columns, tables, slots, links, relation graph, lowering, assembly, constraints
 ├── query/
 │   ├── plan/       # Driver-neutral plan types, occurrences, equivalence, metadata
-│   ├── expressions/ # Column expressions, aggregates, JSON paths, callables
+│   ├── expressions/ # Nodes, column handles, arithmetic, search, windows, functions, sql tag, aggregates, JSON paths
 │   ├── codecs/     # Value and JSON codecs
 │   ├── select/     # SELECT construction: types, scope, joins, shape, pagination, prepared
-│   ├── write/      # INSERT/UPDATE/DELETE builders and nested inserts
+│   ├── write/      # INSERT/UPDATE/DELETE builders, their types, conflict keys, nested inserts
 │   └── compile/    # SQL compiler (state, values, predicates, select, mutations)
 │       └── postgres/ # PostgreSQL renderer, rendering types and value encoding
 ├── driver/         # Bun.SQL/pg adapters and shared pool/transaction/session lifecycle
@@ -56,10 +56,20 @@ packages/runtime/src/
 └── index.ts        # Public symmetria API
 ```
 
-`schema/model.ts` composes the declarations and query APIs.
-`query/plan/types.ts` holds the driver-neutral plan/executor contracts; both
-PostgreSQL adapters consume those contracts. Kit uses the public package entries
-rather than source paths.
+`schema/model.ts` holds `schema()` and binds a database to it. Its parts live
+beside it: `table.ts` and `slots.ts` (declarations and `one`/`maybe`/`many`/
+`link`), `links.ts` (keyed links inside a `schema()` callback), `lowering.ts`
+(declarations turned into foreign keys and junction tables), `graph.ts` (the
+type-level relation graph, `Row` and `Insert`) and `database.ts` (the types of a
+bound database and its transactions). `query/expressions/index.ts` only
+re-exports its neighbours. `query/plan/types.ts` holds the driver-neutral
+plan/executor contracts; both PostgreSQL adapters consume those contracts. Kit
+uses the public package entries rather than source paths.
+
+An import that names only types is written `import type { … }`, not
+`import { type … }`: the bundler keeps the second form as a real import, which
+can order modules wrongly in the built package. `test:drivers` runs the built
+package and catches it; the source tests do not.
 
 ## Local validation
 

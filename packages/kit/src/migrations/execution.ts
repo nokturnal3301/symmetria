@@ -271,9 +271,10 @@ const backendPid = async (
  * client connection's statements move between server processes and two client
  * connections share one, so a session lock or setting protects nothing. A
  * direct or session-pooled connection never does either. The second client
- * connection comes from the driver's pool; a pool with no free connection
- * cannot answer within the timeout, and then only the session's own
- * statements are compared.
+ * connection comes from the driver's pool. A pool with no free connection
+ * (`max: 1`) cannot answer, and a session alone cannot tell: a pooler hands a
+ * lone client the same server every time. Such a session counts as unpinned,
+ * so the lock is taken per transaction, which is safe either way.
  */
 const pinnedBackend = async (
   driver: Driver,
@@ -300,11 +301,11 @@ const pinnedBackend = async (
       return undefined;
     }
 
-    latest = next;
-
     if (other === undefined) {
-      break;
+      return undefined;
     }
+
+    latest = next;
   }
 
   return first;

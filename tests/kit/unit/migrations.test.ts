@@ -8,6 +8,7 @@ import {
   bigint,
   jsonb,
   timestamptz,
+  timestamp,
   oneOf,
   index,
   customType,
@@ -524,6 +525,10 @@ test("normalizeSqlType resolves PostgreSQL aliases for drift comparison", () => 
   expect(normalizeSqlType("timestamptz")).toBe("timestamp with time zone");
   expect(normalizeSqlType("timestamptz[]")).toBe("timestamp with time zone[]");
   expect(normalizeSqlType("varchar(40)[]")).toBe("character varying(40)[]");
+  // The spellings PostgreSQL prints back differently.
+  expect(normalizeSqlType("char(5)")).toBe("character(5)");
+  expect(normalizeSqlType("decimal(8, 2)")).toBe("numeric(8,2)");
+  expect(normalizeSqlType("dec(8,2)[]")).toBe("numeric(8,2)[]");
   // Custom types may spell modifiers with spaces; format_type() never does.
   expect(normalizeSqlType("numeric(12, 2)")).toBe("numeric(12,2)");
   expect(normalizeSqlType("Numeric( 12 , 2 )[]")).toBe("numeric(12,2)[]");
@@ -888,6 +893,41 @@ test("checks and partial indexes accept boolean expressions without = true", () 
   ).toEqual({ live: '"deleted_at" IS NULL', enabled: '"active"' });
 });
 
+test("timestamptz and timestamp convert at UTC, not in the migrating session's time zone", () => {
+  const build = (zoned: boolean) =>
+    schema({
+      events: { id: int.auto, at: zoned ? timestamptz : timestamp(3) },
+    }).$snapshot();
+
+  expect(diffSchemas(build(true), build(false))).toMatchObject({
+    up: [
+      `ALTER TABLE "events" ALTER COLUMN "at" TYPE timestamp(3) USING "at" AT TIME ZONE 'UTC'`,
+    ],
+    down: [
+      `ALTER TABLE "events" ALTER COLUMN "at" TYPE timestamptz USING "at" AT TIME ZONE 'UTC'`,
+    ],
+  });
+
+  // An array has no AT TIME ZONE: the cast runs with the zone set to UTC.
+  const arrays = (zoned: boolean) =>
+    schema({
+      events: { id: int.auto, at: zoned ? timestamptz.array : timestamp.array },
+    }).$snapshot();
+
+  expect(diffSchemas(arrays(true), arrays(false))).toMatchObject({
+    up: [
+      "SET TIME ZONE 'UTC'",
+      'ALTER TABLE "events" ALTER COLUMN "at" TYPE timestamp[] USING "at"::timestamp[]',
+      "RESET TIME ZONE",
+    ],
+    down: [
+      "SET TIME ZONE 'UTC'",
+      'ALTER TABLE "events" ALTER COLUMN "at" TYPE timestamptz[] USING "at"::timestamptz[]',
+      "RESET TIME ZONE",
+    ],
+  });
+});
+
 test("expression keys ignore rendering and keep meaning", () => {
   const types = new Map([
     ["score", "integer"],
@@ -926,6 +966,17 @@ test("expression keys ignore rendering and keep meaning", () => {
   different(`"code" LIKE E'a%'`, `"code" ILIKE E'a%'`);
   different('"score" / 2 > 1', '"score"::numeric / 2 > 1');
   different(`"label" IN (E'a', E'b')`, `"label" IN (E'a', E'c')`);
+  // A number and a string select different operators, and a date or JSON
+  // type decides what the text means.
+  different(`"doc" -> 0 IS NOT NULL`, `"doc" -> '0' IS NOT NULL`);
+  different(
+    `"at" > '2026-01-01 00:00:00+00'::timestamptz`,
+    `"at" > '2026-01-01 00:00:00+00'::timestamp`,
+  );
+  different(
+    `"doc" = '{"a":1}'::jsonb`,
+    `"doc"::json::text = '{"a":1}'::json::text`,
+  );
   // A cast to text of a column that is not text keeps its meaning, and so
   // does a real literal, which compares in single precision.
   different(`"score"::text = E'1'`, `"score" = E'1'`);

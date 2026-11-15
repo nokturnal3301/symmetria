@@ -20,6 +20,7 @@ import {
 import {
   detectDrift,
   generateMigration,
+  migrationSnapshot,
   migrator,
   verifyMigrations,
   type MigrationEvent,
@@ -64,6 +65,96 @@ const sandbox = async (
 };
 
 describe.skipIf(!url)("production migrations", () => {
+  test("a planned rollback reverts what was planned or nothing", () =>
+    sandbox(async ({ driver, directory, namespace }) => {
+      await generateMigration({
+        directory,
+        name: "initial",
+        snapshot: schema({ records: { id: int.auto } }).$snapshot(),
+      });
+      await generateMigration({
+        directory,
+        name: "note",
+        snapshot: schema({
+          records: { id: int.auto, note: text.nullable },
+        }).$snapshot(),
+      });
+      const runner = migrator({ driver, directory, metadataSchema: namespace });
+      const [first, second] = await runner.migrate();
+      // What the confirmation showed: dropping the column of the second one.
+      const planned = [
+        ...new Set(
+          (await runner.plan({ steps: 1, direction: "down" })).map(
+            (step) => step.id,
+          ),
+        ),
+      ];
+
+      expect(planned).toEqual([second!]);
+      // Another process rolls it back before the answer arrives.
+      await migrator({
+        driver,
+        directory,
+        metadataSchema: namespace,
+      }).rollback();
+
+      await expect(runner.rollback({ expected: planned })).rejects.toThrow(
+        `symmetria: the applied migrations changed since this rollback was planned: it was to revert ${second}, and would now revert ${first}. Nothing was rolled back`,
+      );
+      // The table of the first migration is still there.
+      expect((await runner.status()).map((entry) => entry.status)).toEqual([
+        "applied",
+        "pending",
+      ]);
+      await driver.execute({ sql: "SELECT id FROM records", parameters: [] });
+      // The same plan, unchanged, runs.
+      expect(await runner.rollback({ expected: [first!] })).toEqual([first!]);
+    }));
+
+  test("a pool of one connection cannot prove its sessions are pinned: locks are per transaction and nontransactional migrations are refused", () =>
+    sandbox(async ({ directory, namespace, address }) => {
+      const single = postgres({ url: address, max: 1 });
+
+      try {
+        await generateMigration({
+          directory,
+          name: "initial",
+          snapshot: schema({
+            records: { id: int.auto, name: text },
+          }).$snapshot(),
+        });
+        const runner = migrator({
+          driver: single,
+          directory,
+          metadataSchema: namespace,
+        });
+
+        // Transactional migrations work, each under a transaction-level lock.
+        expect(await runner.migrate()).toHaveLength(1);
+
+        const online = (await generateMigration({
+          directory,
+          name: "index",
+          snapshot: schema({
+            records: table({ id: int.auto, name: text }).indexes((record) => ({
+              name: index(record.name),
+            })),
+          }).$snapshot(),
+          online: true,
+        }))!;
+
+        await expect(runner.migrate()).rejects.toThrow(
+          /uses transaction: "none".*its pool has a single connection.*max: 2/s,
+        );
+        expect((await runner.status()).at(-1)).toMatchObject({
+          id: online.id,
+          status: "pending",
+        });
+      } finally {
+        await single.close();
+      }
+    }));
+
   // A session lock and nontransactional statements need a pinned server.
   test.skipIf(transactionPooling)(
     "cancellation with an uncertain lock result never leaves a session advisory lock behind",
@@ -213,6 +304,69 @@ describe.skipIf(!url)("production migrations", () => {
         }),
       ).rejects.toThrow(/await all session operations/);
     }));
+  test.skipIf(transactionPooling)(
+    "a retry is verified against the earlier snapshot when there is no verification server",
+    () =>
+      sandbox(async ({ driver, directory, namespace }) => {
+        const first = schema({ records: { id: int.auto, name: text } });
+        const second = schema({
+          records: table({ id: int.auto, name: text }).indexes((record) => ({
+            name: index(record.name).unique,
+          })),
+        });
+        await generateMigration({
+          directory,
+          name: "initial",
+          snapshot: first.$snapshot(),
+        });
+        const runner = migrator({
+          driver,
+          directory,
+          metadataSchema: namespace,
+        });
+        await runner.migrate();
+        await driver.execute({
+          sql: "INSERT INTO records(name) VALUES ('same'), ('same')",
+          parameters: [],
+        });
+        const migration = (await generateMigration({
+          directory,
+          name: "unique",
+          snapshot: second.$snapshot(),
+          online: true,
+        }))!;
+        await expect(runner.migrate()).rejects.toMatchObject({
+          sqlState: "23505",
+        });
+        await driver.execute({
+          sql: "DROP INDEX records_name_idx",
+          parameters: [],
+        });
+        await driver.execute({
+          sql: "DELETE FROM records WHERE id = 2",
+          parameters: [],
+        });
+        // Without the snapshot or a server, the error names both ways out.
+        await expect(
+          runner.repair({ id: migration.id, action: "retry" }),
+        ).rejects.toThrow(/--snapshot <file>.*--verify-url/);
+        // Only the snapshot of that boundary is accepted.
+        await expect(
+          runner.repair({
+            id: migration.id,
+            action: "retry",
+            snapshot: migrationSnapshot(second.$snapshot()),
+          }),
+        ).rejects.toThrow(/does not match the target migration hash/);
+        await runner.repair({
+          id: migration.id,
+          action: "retry",
+          snapshot: migrationSnapshot(first.$snapshot()),
+        });
+        expect(await runner.migrate()).toEqual([migration.id]);
+      }),
+  );
+
   // A session lock and nontransactional statements need a pinned server.
   test.skipIf(transactionPooling)(
     "online unique-index failure persists incomplete state and requires verified repair",

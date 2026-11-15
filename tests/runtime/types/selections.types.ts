@@ -99,7 +99,7 @@ const database = schema({ users, posts });
   type SelfJoin = Assert<
     Equal<Awaited<ReturnType<typeof selfJoin.execute>>, { title: string }[]>
   >;
-  // @ts-expect-error a controls-only query cannot execute without selected fields
+  // A controls-only query reads the table's own columns.
   database.users({ where: (users) => users.id.above(0) }).execute();
   // @ts-expect-error no unknown column names
   database.users((users) => ({ missing: users.missing }));

@@ -157,17 +157,18 @@ npx --package symmetria-kit symmetria pull schema.ts   # existing database (Pris
 
 ```ts
 // schema.ts
-import { schema, table, int, text, bool, bigint } from "symmetria";
+import { schema, table, one, many, int, text, bool, bigint } from "symmetria";
 
 const users = table({
   id: int.auto,
   name: text,
   email: text.unique,
+  posts: many, // user.posts
 });
 
 const posts = table({
   id: int.auto,
-  author: users.index, // foreign key, index, post.author and user.posts
+  author: one(users.posts), // foreign key, index, post.author
   title: text,
   views: bigint.default(0n),
   published: bool.default(false),

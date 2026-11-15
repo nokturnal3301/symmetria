@@ -315,6 +315,7 @@ test("rollback asks before down.sql runs and wants the database name before drop
     statements: 2,
     destructive: ['ALTER TABLE "orders" DROP COLUMN "reference"'],
     droppedTables: 0,
+    emptiedTables: 0,
   });
   expect(rollbackPreview(column, "shop")).toContain(
     'Rollback on "shop": 000002_reference',
@@ -346,6 +347,37 @@ test("rollback asks before down.sql runs and wants the database name before drop
   ]);
 
   expect(baseline.droppedTables).toBe(2);
+  // A comment in front of the statement does not hide it.
+  expect(
+    rollbackSummary([
+      {
+        id: "000001_baseline",
+        statements: ['-- remove orders\nDROP TABLE "orders"'],
+      },
+    ]).droppedTables,
+  ).toBe(1);
+  // TRUNCATE and DROP SCHEMA remove whole tables too.
+  const emptied = rollbackSummary([
+    {
+      id: "000003_reset",
+      statements: ['TRUNCATE "orders"', 'DROP SCHEMA "archive" CASCADE'],
+    },
+  ]);
+
+  expect(emptied).toMatchObject({ droppedTables: 0, emptiedTables: 2 });
+  expect(
+    await confirmRollback(emptied, "shop", {
+      write: () => {},
+      select: async () => {
+        throw new Error("the menu must not be used");
+      },
+      ask: async (question) => {
+        expect(question).toContain("This drops or empties whole tables");
+
+        return "shop";
+      },
+    }),
+  ).toBe(true);
   // Dropping tables never goes through the two-item menu.
   const typed = (answer: string) =>
     confirmRollback(baseline, "shop", {

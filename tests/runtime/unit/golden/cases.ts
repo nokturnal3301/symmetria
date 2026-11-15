@@ -17,9 +17,12 @@ import {
   junction,
   lag,
   lead,
+  many,
   maximum,
+  maybe,
   not,
   numeric,
+  one,
   oneOf,
   or,
   over,
@@ -28,6 +31,7 @@ import {
   rowNumber,
   schema,
   searchDocument,
+  self,
   sql,
   sum,
   table,
@@ -2086,6 +2090,149 @@ export const collectGolden = async (): Promise<Record<string, GoldenEntry>> => {
   );
   await invalidSchema("keys-unknown-table", () =>
     schema.keys({ missing: int })({ users: { id: int } } as never),
+  );
+
+  // -- slots, claims and the shortcuts --------------------------------------
+  const authors = table({
+    id: int.auto,
+    name: text,
+    books: many,
+    drafts: many.setNull,
+    profile: one.cascade,
+  });
+  const genres = table({ id: int.auto, label: text.unique, books: many });
+  const books = table({
+    id: int.auto,
+    title: text,
+    price: numeric(10, 2),
+    author: one(authors.books),
+    editor: maybe(authors.drafts),
+    genres: many(genres.books).with({ addedAt: timestamptz.now }),
+  });
+  const profiles = table({ id: int.auto, author: one(authors.profile) });
+  const chapters = table({
+    id: int.auto,
+    book: one(books).cascade,
+    parent: maybe(self.sections),
+    sections: many,
+  });
+  const library = schema(
+    { authors, genres, books, profiles, chapters },
+    { driver },
+  );
+
+  compiled("slots/nested-both-sides", () =>
+    library.authors(
+      (author) => ({
+        name: author.name,
+        books: author.books((book) => ({
+          title: book.title,
+          editor: book.editor.name,
+          genres: book.genres((genre) => ({ label: genre.label })),
+        })),
+        drafts: author.drafts.count(),
+        profile: author.profile((profile) => ({ id: profile.id })),
+      }),
+      { where: { name: "Ada" }, orderBy: [{ drafts: "desc" }, { id: "asc" }] },
+    ),
+  );
+  compiled("slots/many-to-many-reverse", () =>
+    library.genres((genre) => ({
+      label: genre.label,
+      books: genre.books((book) => ({ title: book.title })),
+    })),
+  );
+  compiled("slots/self-tree", () =>
+    library.chapters((chapter) => ({
+      parent: chapter.parent.id,
+      sections: chapter.sections.count(),
+      book: chapter.book.title,
+    })),
+  );
+  await sent("slots/nested-insert", () =>
+    library.authors.insert({
+      name: "Ada",
+      books: {
+        create: [
+          {
+            title: "Notes",
+            price: "10.00",
+            genres: { connectOrCreate: [{ label: "math" }] },
+          },
+        ],
+      },
+    }),
+  );
+  compiled("shortcuts/whole-row", () =>
+    library.books({ where: { title: "Notes", editorId: null }, limit: 5 }),
+  );
+  compiled("shortcuts/row-spread", () =>
+    library.books((book, { row }) => ({ ...row, author: book.author.name })),
+  );
+  compiled("shortcuts/predicate-chain", () =>
+    library.books((book) => ({ id: book.id }), {
+      where: (book) =>
+        book.price
+          .above("5")
+          .and(book.title.is("Notes").or(book.editorId.is(null))),
+    }),
+  );
+  compiled("shortcuts/selected-in-tools", () =>
+    library.authors(
+      (author) => ({ name: author.name, written: author.books.count() }),
+      {
+        having: (_author, { selected }) => selected.written.above(1),
+        groupBy: (author) => [author.id, author.name],
+      },
+    ),
+  );
+  await sent("shortcuts/get-find-aggregate", async () => {
+    await library.books.get(1);
+    await library.books.find(1, (book) => ({ title: book.title }));
+    await library.books.aggregate((book, { maximum }) => ({
+      last: maximum(book.title),
+    }));
+  });
+  await sent("shortcuts/batch", () =>
+    library
+      .$batch((db) => [
+        db.books({ where: { authorId: 1 }, limit: 2 }),
+        db.genres((genre) => ({ label: genre.label })),
+        db.books.byId(1),
+      ])
+      // The recorded answer has no rows for the batch to hand out.
+      .catch(() => undefined),
+  );
+  compiled("shortcuts/update-option", () =>
+    library.books.update({ title: "x" }, { where: { id: 1 } }),
+  );
+  compiled("shortcuts/delete-option", () =>
+    library.books.delete({ where: (book) => book.author.name.is("Ada") }),
+  );
+  compiled("shortcuts/upsert", () =>
+    library.genres.upsert([{ label: "math" }, { label: "sql" }], {
+      by: "label",
+    }),
+  );
+  compiled("shortcuts/upsert-update-returning", () =>
+    library.genres
+      .upsert({ label: "math" }, { by: "label", update: ["label"] })
+      .returning("id", "label"),
+  );
+  compiled("shortcuts/returning-whole-row", () =>
+    library.books.byId(1).update({ title: "x" }).returning(),
+  );
+  await failure("shortcuts/delete-empty-object", () =>
+    library.books.delete({ where: {} }),
+  );
+  await failure("shortcuts/bare-table", () =>
+    (library.books as unknown as { toSQL: () => unknown }).toSQL(),
+  );
+  await invalidSchema("slot-unclaimed", () =>
+    schema({ authors: table({ id: int.auto, books: many }) } as never),
+  );
+  await invalidSchema("slot-reserved-name", () =>
+    table({ id: int.auto, index: many }),
   );
 
   return golden;

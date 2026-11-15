@@ -1,5 +1,133 @@
 # Changelog
 
+## Unreleased
+
+### Runtime (`symmetria`)
+
+- `in()` / `notIn()` with more than 1,000 values on a `varchar(n)` or
+  `numeric(p,s)` column no longer cut or round the listed values to the column's
+  length or scale before comparing. Before, `code.in([...])` on `varchar(5)`
+  matched `'abcde'` for a listed `'abcdefgh'`, and a `delete().where(...)` with
+  such a list could remove rows that were not listed. Bound values are now cast
+  to the base type (`varchar[]`, `numeric[]`).
+- `match()` returns literal branches whole when another branch is a `varchar(n)`
+  or `numeric(p,s)` column (`"Draft (unpublished)"` came back as `"Draft"`), and
+  so does a prepared parameter selected as a field.
+- An array element longer than a `varchar(n).array` column allows is refused by
+  PostgreSQL on write instead of being cut silently.
+- A value cast to a `char(n)` column's type keeps its characters: the cast is to
+  `bpchar`, since plain `char` means `char(1)`.
+- An upsert recognises two spellings of one key: `"1"` and `"1.0"` on a
+  `numeric` key (also values that round to the same number at the column's
+  scale), a UUID in either letter case, a `char(n)` value with or without
+  padding. Before, such rows failed inside PostgreSQL in one statement, and in a
+  large insert split into several statements the later row silently replaced the
+  earlier one.
+- `in()` and `notIn()` reject a `null` in the list where the query is built:
+  `NOT IN (…, NULL)` matches no row. Combine the list with `is(null)` or
+  `isNot(null)`.
+- The `symmetria/pg` adapter sets `DateStyle` to ISO on every new connection.
+  With another style set for the database or role (`SQL, DMY`), timestamps read
+  as `null` or with day and month swapped, and page cursors were refused.
+- Relations are declared on both sides: a slot on the referenced table
+  (`posts: many`, `profile: one`, `comments: many.cascade`) and a key that
+  claims it (`author: one(users.posts)`, `editor: maybe(users.edited)`,
+  `parent: maybe(self.children)`). The slot is a typed property of its table, so
+  a wrong name is an error on that line. `one()` and `maybe()` index the key
+  (`.noIndex` opts out) and take `.cascade`, `.restrict`, `.setNull`, `.unique`,
+  `.by()` and `.column()`. The earlier spellings (`author: users`,
+  `users.index`, `.inverse()`, `self`, `junction()`) are unchanged, declare the
+  same tables and can be mixed with slots.
+- `tags: many(tags.posts)` declares a many-to-many relation and creates its
+  junction table (`posts_tags`, `db.postsTags`), with `.with({ … })` for its own
+  columns, `.named()` and `.restrict`. `link(posts.tags, tags.posts, { … })`
+  declares that junction by itself, and `link({ a: users, b: teams })` is
+  `junction()` whose rows go with either side.
+- `db.users.get(id)` and `db.users.find(id)` read one row by primary key, whole
+  or through a shape; `find()` returns `null` when there is none.
+- A query given options and no fields reads the whole row:
+  `await db.users({ where: { active: true } })`. A bare table still does not
+  execute. In a shape, `(post, { row }) => ({ ...row, author: … })` spreads the
+  source's columns.
+- `where` takes an object of equalities
+  (`{ state: "published", editorId: null }`) and `orderBy` an object of
+  directions (`{ spent: "desc" }`) over selected fields and columns. The
+  selected fields are also among the tools of `orderBy`, `groupBy` and `having`
+  callbacks: `(user, { selected }) => …`.
+- Predicates chain:
+  `views.above(10).and(state.is.published.or(pinned.is(true)))`.
+- `db.orders.aggregate((order, { sum }) => ({ total: sum(order.amount) }))`
+  returns one object.
+- Nested inserts read the rows they `connect` together and write rows that only
+  connect in one multi-row INSERT: twenty posts connecting twenty authors are 2
+  statements instead of 40 (about three times faster), and an order whose items
+  each connect a product costs about what the same statements written by hand
+  do.
+- `db.$batch((db) => [db.users.get(id), db.posts({ … }), db.posts.count()])`
+  sends several reads as one statement: one round trip and one snapshot of the
+  data, on both drivers, inside transactions and under `$scope()`. `$batch` is
+  now a reserved table name.
+- `update(values, { where })` and `delete({ where })` take the filter as an
+  option; an object that names no column is refused instead of writing every
+  row.
+- `upsert(row, { by: "sku" })` inserts or overwrites the row with that key, with
+  `update: [...]` to choose the columns.
+- `returning("id", "name")` and `returning()` (the whole row).
+- Queries and writes have `catch()` and `finally()` next to `then()`.
+- Errors are classes: `NotFoundError`, `TooManyRowsError`, `OutOfScopeError` and
+  `DuplicateConflictKeyError` extend `SymmetriaError` (same `code` and message
+  as before), and database failures from the built-in adapters are
+  `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`,
+  `CheckViolation`, `ExclusionViolation`, `SerializationFailure`,
+  `DeadlockDetected`, `ConnectionError` or `QueryError`, with `kind`,
+  `sqlState`, `table`, `column`, `constraint` and `detail`.
+- A keyed link keeps its `by()` column type after `.nullable`, `.unique` and
+  `.index`.
+
+### Changes to note when upgrading
+
+- A database error from `symmetria/pg` or `symmetria/bun` is now a `QueryError`
+  that wraps the driver's error (`error.cause`) and copies its fields. Code that
+  compared it with the driver's error object by identity, or read `error.name`
+  or `error.constructor`, sees the new class; `sqlState()`, `databaseError()`,
+  `error.code` and the message are unchanged.
+- `symmetria pull` writes foreign keys as `one(users)` / `maybe(users)` with
+  slots on the referenced tables, and a junction whose keys both cascade as
+  `link({ … })`. Schemas pulled earlier keep working as they are.
+
+### Kit (`symmetria-kit`)
+
+- `pull` writes the relation syntax above: `author: one(users).cascade`,
+  `editor: maybe(users.inverse("postsByEditor")).noIndex.setNull`, and
+  `posts: many` on the referenced table.
+- `generate` and `diff` see a changed CHECK or index expression when only a
+  literal's kind or type changed: a number against the same digits as a string
+  (`doc -> 0` and `doc -> '0'`), or the same text as `timestamptz` and
+  `timestamp`, or as `jsonb` and `json`.
+- A column changed between `timestamptz` and `timestamp` converts with
+  `USING "column" AT TIME ZONE 'UTC'` in both directions. The plain cast used
+  the time zone of the session that ran the migration. An array column
+  (`timestamptz[]` ↔ `timestamp[]`) is converted with the session's zone set to
+  UTC around the statement (`SET TIME ZONE 'UTC'` … `RESET TIME ZONE`).
+- `rollback` in a terminal reverts exactly the migrations its confirmation
+  showed: if another process changed the journal in between, it stops before
+  running any SQL. `runner.rollback({ expected: [...] })` does the same from
+  code.
+- A driver whose pool has one connection can no longer be mistaken for a pinned
+  session behind a transaction-mode pooler: without a second connection to
+  check, the runner locks per transaction and refuses `transaction: "none"`
+  migrations, naming `max: 2` as the fix.
+- `drift` no longer reports `char(n)` and `decimal(p,s)` columns as changed
+  (PostgreSQL prints `character(n)` and `numeric(p,s)`), and it reports a column
+  whose type was replaced by a type of the same name from another schema.
+- `repair --snapshot <file>` verifies a boundary against the snapshot of that
+  point (`meta/snapshot.json` from version control), so a failed `--online`
+  migration can be retried without a `--verify-url` server; the error for a
+  missing one names both options.
+- `rollback` asks for the database name before `TRUNCATE`, `DROP SCHEMA` and
+  `DROP OWNED` as well, and no longer misses a `DROP TABLE` that follows a
+  comment.
+
 ## 2.0.0 — 2026-11-15
 
 ### Changes to note when upgrading

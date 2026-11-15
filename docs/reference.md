@@ -108,6 +108,97 @@ deletes the referencing rows with it, `.onDelete.setNull` (the column becomes
 nullable) clears the reference, and `.onDelete.noAction` is PostgreSQL's own
 default, which checks at the end of the statement instead of immediately.
 
+### Relations: one, maybe, many
+
+Both sides of a relation can be written where they live. The table that is
+referenced declares a _slot_, a name for the rows that point at it, and the
+table that holds the foreign key claims it:
+
+```ts
+import { table, one, maybe, many, self, int, text } from "symmetria";
+
+const users = table({
+  id: int.auto,
+  name: text,
+  posts: many, // user.posts
+  edited: many, // user.edited
+  profile: one, // user.profile, at most one row
+  comments: many.cascade, // deleting a user deletes their comments
+});
+const tags = table({ id: int.auto, label: text.unique, posts: many });
+const posts = table({
+  id: int.auto,
+  title: text,
+  author: one(users.posts), // author_id NOT NULL, indexed; post.author
+  editor: maybe(users.edited), // editor_id, nullable
+  tags: many(tags.posts), // many-to-many: post.tags and tag.posts
+});
+const profiles = table({ id: int.auto, user: one(users.profile) }); // unique
+const comments = table({
+  id: int.auto,
+  post: one(posts), // no slot named: posts.comments
+  author: one(users.comments),
+  parent: maybe(self.children), // a tree
+  children: many,
+});
+
+export const appSchema = schema({ users, tags, posts, profiles, comments });
+```
+
+`one(users.posts)` is a required foreign key to `users`, `maybe(…)` an optional
+one; both create an index on the key, which `.noIndex` leaves out. `users.posts`
+is a property of the table, so the editor completes it, a mistyped slot is a
+type error on that line, and "go to definition" jumps to the other side. A slot
+is a name, not a column: the row of `users` has no `posts` field.
+
+- A slot claimed by a key is the reverse relation under that name. `one` as a
+  slot (`profile: one`) makes the key unique: a one-to-one.
+- A slot may say what deleting the parent does to the rows that claim it:
+  `many.cascade` deletes them, `many.setNull` clears the reference (the other
+  side must be `maybe()`), `many.restrict` refuses the delete, which is also the
+  default. The key can say it instead (`one(users.posts).cascade`), but not both
+  with different answers.
+- `one(users)` without a slot names the reverse side after the table that holds
+  the key, as `author: users` does; if `users` has a slot of that name
+  (`comments: many`), the two are the same relation.
+- After `one()` / `maybe()`: `.cascade`, `.restrict`, `.setNull` (optional keys
+  only), `.unique`, `.noIndex`, `.by("email")`, `.column("author_email")` and
+  `.onUpdate.cascade`.
+- `maybe(self.children)` claims a slot of the table being declared. TypeScript
+  cannot read a property name off `self`, so the types pair the key with the
+  table's one slot nothing else claims; a table with two relations to itself
+  names them with `self.nullable.inverse("…")` as before.
+- A slot nothing claims, a slot claimed twice and a slot named like a table
+  method (`index`, `named`, …) are errors, in the types and when `schema()`
+  runs.
+
+`tags: many(tags.posts)` declares a many-to-many relation and creates its
+junction table: `posts_tags` with `posts_id` and `tags_id` (the two relation
+names), both keys as the primary key, an index on the second, and rows that go
+when either side is deleted. It is a table of the schema, `db.postsTags`.
+`.with({ addedAt: timestamptz.now })` adds columns to it, `.named("post_tags")`
+sets its SQL name and `.restrict` makes a linked row undeletable instead. When
+the junction should be declared by itself, both tables carry a bare slot and
+`link()` joins them:
+
+```ts
+const tags = table({ id: int.auto, label: text.unique, posts: many });
+const posts = table({ id: int.auto, title: text, tags: many });
+const postTags = link(posts.tags, tags.posts, { addedAt: timestamptz.now });
+
+// Named references instead of slots, as junction() takes them:
+const members = link({ person: people, team: teams });
+```
+
+`link()` is `junction()` whose references cascade unless they say otherwise;
+`junction()` keeps PostgreSQL's stricter default. Inside a `schema()` callback a
+table is a keyed link and has no slots to name, so a key is written `one(users)`
+or `maybe(users.inverse("edited"))` there; `symmetria pull` writes this form.
+
+Everything in the rest of this section is still accepted and can be mixed with
+slots in one schema: `one(users.posts)` is `users.index.inverse("posts")`, and
+both produce the same tables, constraints and migrations.
+
 ### SQL names
 
 Keys decide SQL names: by default `createdAt` becomes `created_at` and a
@@ -278,6 +369,11 @@ await database.users
 more than one. The error names the source and carries `code`:
 `SYMMETRIA_RECORD_NOT_FOUND` for no row, `SYMMETRIA_TOO_MANY_ROWS` for several.
 
+`database.users.get(42)` is `byId(42).one()` and `database.users.find(42)` is
+`byId(42).maybeOne()`: the row, or `null` from `find()`. Both take a shape as a
+second argument, `get(42, (user) => ({ name: user.name }))`, and reject (rather
+than throw) for a malformed key.
+
 `byId()` starts a query on a table's primary key and selects all its columns,
 including computed fields. It accepts the key's value type, including branded
 values and prepared parameters. A key named `code` works the same way as `id`;
@@ -344,8 +440,10 @@ database.posts((post, { innerJoin, join }) => {
 Also supported: `crossJoin`, `distinct`, `groupBy`, `having`, `offset`,
 `ascending.nullsLast`, `is` / `isNot` (equality; `is(null)` compiles to
 `IS NULL`), ordering comparisons, `in` / `notIn` (lists longer than 1,000 values
-bind one array parameter on PostgreSQL: `= ANY($1::type[])`), `between`, `like`
-/ `ilike`, `isDistinctFrom`, and `and` / `or` / `not`.
+bind one array parameter on PostgreSQL: `= ANY($1::type[])`; a `null` in the
+list is rejected where the query is built, because SQL's `NOT IN (…, NULL)`
+matches no row: combine the list with `is(null)` or `isNot(null)`), `between`,
+`like` / `ilike`, `isDistinctFrom`, and `and` / `or` / `not`.
 
 ### Shape-first queries
 
@@ -401,6 +499,34 @@ nullability.
 | `distinct`              | Boolean; replaces the DISTINCT flag when supplied                                    |
 | `forUpdate`, `forShare` | `true` or `{ of?, noWait?, skipLocked? }`; `false`/`undefined` omit the request      |
 
+`where` also takes an object of equalities, and `orderBy` an object of
+directions:
+
+```ts
+await database.posts({ where: { state: "published", editorId: null } });
+database.users((user) => ({ name: user.name, written: user.posts.count() }), {
+  orderBy: [{ written: "desc" }, { id: "asc" }],
+});
+```
+
+Every key of a `where` object is a column of the source and must equal its
+value; `null` is `IS NULL` and an `undefined` value leaves the key out, so
+optional request fields can be passed through. It is the same SQL as
+`[state.is("published"), editorId.is(null)]`; lists, ranges and relation paths
+stay in the callback form. An `orderBy` key is a selected field or, failing
+that, a column of the source. Column names are completed and checked by the
+types; a selected field's name is checked when the query is built.
+
+A query that is given options and no fields reads the source's own columns,
+computed fields included: `await database.users({ where: { active: true } })`. A
+bare table is not such a query (`await database.users` reads nothing and is a
+type error), and neither is a grouped source. Inside a shape, the tools carry
+the same columns as `row`, for "everything plus":
+
+```ts
+database.posts((post, { row }) => ({ ...row, author: post.author.name }));
+```
+
 Every option accepts the listed value or a synchronous
 `(source, tools) => value` callback. Callbacks receive the projection's full
 source and SQL tools, including columns that are not selected. `undefined`
@@ -410,7 +536,8 @@ can describe shared options.
 
 `orderBy`, `groupBy` and `having` callbacks receive a third argument: the fields
 the projection returned, under their names, so a computed field is written once
-and then ordered, grouped or filtered by name.
+and then ordered, grouped or filtered by name. The same fields are among the
+tools of those callbacks, `(user, { selected }) => selected.spent.descending`.
 
 ```ts
 database.users(
@@ -856,6 +983,10 @@ database.posts((post, { whereNotNull }) => ({
 }));
 ```
 
+A predicate also chains: `views.above(10).and(state.is.published)` and `.or(…)`
+are `and(a, b)` and `or(a, b)`, a chain of the same kind stays one flat group,
+and falsy arguments are skipped the same way.
+
 Import `and` and `when` from `symmetria`. `when` skips only null/undefined;
 zero, false and empty strings are values. Empty AND is TRUE; empty OR is FALSE.
 Predicate lists in `where`, `having`, JOIN conditions, `and()`, `or()` and
@@ -868,6 +999,40 @@ is a real value; a mutation list that filters down to nothing still means
 `WHERE TRUE`, and a single `false` returned from a mutation callback is an error
 rather than "no filter". `whereNotNull()` adds a predicate and returns a
 narrowed expression.
+
+### Several reads in one statement
+
+```ts
+const [user, posts, unread] = await database.$batch((db) => [
+  db.users.get(id),
+  db.posts({ where: { authorId: id }, orderBy: { id: "desc" }, limit: 10 }),
+  db.notifications({ where: { userId: id, read: false } }).count(),
+]);
+
+const page = await database.$batch((db) => ({
+  items: db.posts(postCard, { limit: 20 }),
+  total: db.posts.count(),
+}));
+```
+
+`$batch()` sends the reads its callback starts as one SQL statement: each read
+is a JSON subquery of a single `SELECT`, the way a nested query in a projection
+is rendered. That is one round trip on either driver and one snapshot of the
+data, so a list and its total cannot disagree. It also works inside
+`$transaction`, where separate reads would otherwise run one after another, and
+under `$scope()`. Every read keeps its own type and result: queries, `get()`,
+`find()`, `one()`, `first()`, `count()`, `exists()`, `aggregate()` and `page()`.
+
+The callback is synchronous and returns the reads at once, as an array or an
+object; other values pass through. A read that cannot run by itself (a malformed
+key, no row for `get()`) fails alone. A statement PostgreSQL rejects fails every
+read in it. Writes, row locks, streams and transactions are not reads and are
+refused on the batch's handle. Beyond 1,000 reads or 65,535 bound values the
+batch becomes several statements, sent in order.
+
+Outside a transaction the gain over `Promise.all` is the single connection and
+the single snapshot rather than time: both drivers already run independent
+queries in parallel.
 
 ### Cursor pages
 
@@ -1145,6 +1310,36 @@ await database.users
   .where((users) => users.posts.none());
 ```
 
+The filter of an UPDATE or DELETE can be an option instead of `.where()`, as a
+callback, a list of predicates or an object of equalities:
+
+```ts
+await database.posts.update({ published: true }, { where: { id: 7 } });
+await database.posts.delete({ where: (post) => post.author.name.is("Ada") });
+```
+
+An object that names no column (`{}`, or every value `undefined`) throws rather
+than write every row; `.all()` remains the only way to say that.
+
+`upsert()` inserts a row or overwrites the one with the same key:
+
+```ts
+await database.products.upsert(product, { by: "sku" });
+await database.products
+  .upsert(rows, { by: "sku", update: ["title", "price"] })
+  .returning("id", "sku");
+```
+
+`by` is the primary key or a unique key (an array for a composite one). An
+existing row takes the columns in `update`, by default every column the rows
+carry except the key; rows of a bulk upsert must then carry the same columns,
+because a column some rows leave out would be overwritten with its default. It
+is `insert(…).onConflict(…).doUpdate(…)`, with the same scope checks and the
+same refusal of two rows with one key.
+
+`returning("id", "name")` returns those columns and `returning()` the whole row,
+next to the callback and reusable-shape forms.
+
 Bulk INSERT accepts arrays, including rows with different omitted defaults. An
 array whose parameters exceed the driver's wire-protocol limit (65,535 on
 PostgreSQL) runs as several INSERT statements in one transaction, or in a
@@ -1178,11 +1373,14 @@ PostgreSQL refuses to `DO UPDATE` the same row twice in one statement, and a
 large insert split into several statements would otherwise let the later
 duplicate win silently, so two rows with the same conflict key reject with code
 `SYMMETRIA_DUPLICATE_CONFLICT_KEY` before anything is sent, whatever the size;
-merge or remove the duplicates first. Keys that are NULL or SQL expressions are
-left to PostgreSQL. `doNothing()` accepts duplicates: the first row is inserted
-and the rest are skipped, in one statement or several. `returning()` callbacks
-receive the scalar tools as a second argument (`and`, `or`, `not`, `when`,
-`coalesce`, `sql`).
+merge or remove the duplicates first. Keys are compared as their column's type
+compares them: `"1"`, `"1.0"` and `"1e0"` are one `numeric` key, as are two
+values that round to the same number at the column's scale, a UUID in either
+letter case and a `char(n)` value with or without its padding. Keys that are
+NULL or SQL expressions are left to PostgreSQL. `doNothing()` accepts
+duplicates: the first row is inserted and the rest are skipped, in one statement
+or several. `returning()` callbacks receive the scalar tools as a second
+argument (`and`, `or`, `not`, `when`, `coalesce`, `sql`).
 
 `returning()` also accepts a reusable projection of the same table, in flat and
 nested inserts, updates and deletes. The projection must stay row-local: plain
@@ -1302,9 +1500,15 @@ multi-row INSERT for its items, split into several only above PostgreSQL's limit
 of 65,535 parameters. Rows are inserted in the order given, so generated
 identities follow the input. A child that has nested relations of its own is
 written by itself, between the groups of plain children before and after it.
-`connect` and `connectOrCreate` still resolve each target with its own
-statement, and so does every target created through a junction; the junction
-rows of one operation are then one multi-row INSERT.
+
+Rows connected by the same column are read together, once, before the first
+write: twenty posts that each `connect` an author are one SELECT of the authors
+and one INSERT of the posts. A row or child whose only nested operations connect
+what it references (an order item and its product) therefore joins the multi-row
+INSERT of its neighbours. A row this insert creates itself is still found by a
+later `connect`, with a statement of its own. `connectOrCreate` and targets
+created through a junction resolve one by one; the junction rows of one
+operation are then one multi-row INSERT.
 
 ## CTEs and window functions
 
@@ -1412,6 +1616,20 @@ const activeAuthors = database.users((user) => ({ name: user.name }), {
     ),
 });
 ```
+
+`aggregate()` returns one object instead of an array of one row, on a table or a
+filtered source:
+
+```ts
+const { orders, total } = await database
+  .orders({ where: { status: "paid" } })
+  .aggregate((order, { count, sum }) => ({
+    orders: count(),
+    total: sum(order.amount),
+  }));
+```
+
+A shape that yields several rows (a `groupBy`) rejects with `TooManyRowsError`.
 
 `count()` returns `number`. `sum()` and `average()` take numbers, bigints and
 decimals (not text) and return lossless decimal strings or `null`. `minimum()`
@@ -1749,6 +1967,41 @@ directly, as does `prepare()` for values fixed in the query; parameters of a
 prepared query and `$scope()` values are checked at every execution. Messages
 and codes are the same in every case.
 
+Queries and writes are thenable with `catch()` and `finally()` as well, so they
+read like promises; they run each time one of the three is called.
+
+### Error classes
+
+```ts
+import { NotFoundError, UniqueViolation, QueryError } from "symmetria";
+
+try {
+  await database.users.insert({ email });
+} catch (error) {
+  if (error instanceof UniqueViolation) {
+    return conflict(error.constraint); // "users_email_key"
+  }
+
+  throw error;
+}
+```
+
+Symmetria's own failures extend `SymmetriaError` and carry the `code` they
+always had: `NotFoundError` (`SYMMETRIA_RECORD_NOT_FOUND`, from `one()`, `get()`
+and a nested `connect`), `TooManyRowsError`, `OutOfScopeError` and
+`DuplicateConflictKeyError`, each with the `table`.
+
+A statement PostgreSQL rejects is a `QueryError` when it comes from the built-in
+adapters: `UniqueViolation`, `ForeignKeyViolation`, `NotNullViolation`,
+`CheckViolation`, `ExclusionViolation`, `SerializationFailure`,
+`DeadlockDetected` and `ConnectionError`, or `QueryError` itself for any other
+SQLSTATE. It has `kind`, `sqlState`, and `table`, `column`, `constraint` and
+`detail` where PostgreSQL reports them, the same on both drivers. The driver's
+own error is its `cause`, and that error's fields (`code`, `errno`, `hint`, …)
+are copied onto it, so `sqlState(error)` and `databaseError(error)` read it as
+before. A custom driver or executor throws whatever it throws; `databaseError()`
+describes those too.
+
 ### PostgreSQL adapters
 
 ```ts
@@ -1765,7 +2018,9 @@ PostgreSQL SQL and normalize execution results to `{ rows, affectedRows }`. The
 declarations describe those options themselves, so TypeScript projects need no
 `@types/pg`. The Bun adapter accepts Bun SQL PostgreSQL options plus `profiler`.
 Both preserve bigint and numeric values. The `pg` adapter installs parsers per
-pool, leaving global node-postgres configuration untouched.
+pool, leaving global node-postgres configuration untouched, and sets `DateStyle`
+to ISO on every new connection, so a database or role that prints dates another
+way (`SQL, DMY`) still reads correctly.
 
 Transactions and nested savepoints reserve a single connection, and its
 operations run one at a time in call order on both drivers. Use
@@ -2532,6 +2787,7 @@ matching config and API options.
 | `--plan`                       | `migrate`, `rollback`                        | Show SQL and transaction groups without running them                                                            |
 | `--action <action>`            | `repair`                                     | `retry` or `complete` (`action`)                                                                                |
 | `--verify-url <url>`           | `verify`, `adopt`, `repair`                  | Server for disposable databases (`verificationDatabaseUrl`)                                                     |
+| `--snapshot <file>`            | `repair`                                     | Snapshot file of the boundary to verify, instead of `--verify-url`                                              |
 | `--ignore-table <name>`        | `pull`, `drift`, `adopt`, `repair`, `verify` | Leave an undeclared table out, repeatable (`ignoreTables`)                                                      |
 | `--advisory-lock-timeout <ms>` | commands that run migrations                 | Migration lock wait (`advisoryLockTimeoutMs`, default 10000)                                                    |
 | `--lock-timeout <ms>`          | commands that run migrations                 | DDL lock wait (`lockTimeoutMs`, default 5000; 0 disables)                                                       |
@@ -2689,8 +2945,9 @@ appends a journal entry without changing the snapshot.
   applied changes nothing, and the output says where the database stands.
 - `rollback` runs `down.sql`, which usually removes columns or tables, so it
   asks first: it lists the statements that remove data or database objects and
-  waits for a yes, and a rollback that drops tables (the first migration, or a
-  squashed baseline) needs the database name typed out. Without a terminal it
+  waits for a yes, and a rollback that drops or empties whole tables
+  (`DROP TABLE` in the first migration or a squashed baseline, `TRUNCATE`,
+  `DROP SCHEMA`) needs the database name typed out. Without a terminal it
   refuses unless `--yes` is passed; `rollback --plan` prints the SQL without
   running it. In menus a digit only moves the selection; Enter runs the action.
 - `lint` inspects saved `up.sql` files and any ungenerated schema diff. It exits
@@ -3014,13 +3271,17 @@ processes, the connection pools transactions. `migrate`, `rollback`, `adopt`,
 its own transaction under `pg_advisory_xact_lock`, with `SET LOCAL` timeouts,
 re-reading the journal. A `none` migration is refused before anything runs
 ("…this connection pools transactions (such as PgBouncer with
-pool_mode=transaction). Run it over a direct or session-pooled connection"). If
-the check could not tell (a busy pooler handed the server to another client, or
-a one-connection pool could not answer within a second) and a migration
-transaction later lands on another server process, the run stops with "the
-migration session moved from PostgreSQL process …" before that transaction
-changes anything. With hosted poolers, point `databaseUrl` (or `DATABASE_URL`
-for the CLI) at the direct or session-mode address for migrations.
+pool_mode=transaction), or its pool has a single connection, which leaves none
+to check that…"). A pool of one connection (`max: 1`) cannot answer the second
+question, and a session alone cannot tell, because a pooler hands a lone client
+the same server every time; such a driver is treated like a pooled one, which is
+safe on a direct connection too, so give the driver two connections for `none`
+migrations. If the check was misled (a busy pooler handed the server to another
+client) and a migration transaction later lands on another server process, the
+run stops with "the migration session moved from PostgreSQL process …" before
+that transaction changes anything. With hosted poolers, point `databaseUrl` (or
+`DATABASE_URL` for the CLI) at the direct or session-mode address for
+migrations.
 
 ```sh
 symmetria migrate --plan --json
@@ -3085,15 +3346,24 @@ symmetria status --json
 symmetria repair 000003_email_index --action retry --verify-url "$VERIFY_DATABASE_URL"
 # Or finish the migration manually and confirm its final schema:
 symmetria repair 000003_email_index --action complete --verify-url "$VERIFY_DATABASE_URL"
+# Without a verification server: the snapshot from before the migration was generated.
+git show HEAD~1:migrations/meta/snapshot.json > before.json
+symmetria repair 000003_email_index --action retry --snapshot before.json
 ```
 
 `retry` verifies the schema at the starting boundary and resets the journal so
 the unchanged SQL can run again. `complete` verifies the destination boundary
-and records completion. The API is `runner.repair({ id, action, snapshot? })`. A
-crash may occur after PostgreSQL commits but before the statement count is
-saved; that count is not an exactly-once guarantee. Reconcile data changes as
-well as schema before repair. Schema verification cannot establish whether a
-backfill, external function or other data-only operation has already run.
+and records completion. Only the latest snapshot is stored, so the boundary
+before the last migration is verified either by replaying the chain on the
+`--verify-url` server or against the snapshot of that point passed with
+`--snapshot <file>`: `meta/snapshot.json` as version control has it from before
+the migration was generated. Its hash must match the journal's, so another
+snapshot is refused. `complete` on the latest migration needs neither. The API
+is `runner.repair({ id, action, snapshot? })`. A crash may occur after
+PostgreSQL commits but before the statement count is saved; that count is not an
+exactly-once guarantee. Reconcile data changes as well as schema before repair.
+Schema verification cannot establish whether a backfill, external function or
+other data-only operation has already run.
 
 Generation and squash use a durable filesystem publication journal. After a
 process crash, `symmetria recover` restores the previous files or finishes

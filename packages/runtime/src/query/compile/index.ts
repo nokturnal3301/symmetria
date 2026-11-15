@@ -5,6 +5,7 @@ import { createRowDecoder, cloneParameter } from "../codecs";
 import { throwDataErrors } from "../codecs/deferred";
 import { executorProfiling } from "../../observability/profiling";
 import { postgresRenderer } from "./postgres/render";
+import { batchCollectors } from "../plan/batching";
 import type {
   PlaceholderNode,
   PredicateDescription,
@@ -234,6 +235,16 @@ export const executePlan = (
   plan: SelectPlan | MutationPlan,
   executor?: QueryExecutor,
 ): Promise<ExecutionResult> => {
+  // Inside an open $batch(), a read waits for the batch's single statement.
+  const batched =
+    executor && plan.kind === "select"
+      ? batchCollectors.get(executor)?.add(plan)
+      : undefined;
+
+  if (batched) {
+    return batched;
+  }
+
   const profile = executorProfiling(executor);
   const started = profile ? performance.now() : 0;
   let compiled: CompiledQuery;

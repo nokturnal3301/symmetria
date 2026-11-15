@@ -77,6 +77,7 @@ export default defineMigrationConfig({
 | `--plan`                       | `migrate`, `rollback`                        | Show SQL and transaction groups without running them                                                            |
 | `--action <action>`            | `repair`                                     | `retry` or `complete` (`action`)                                                                                |
 | `--verify-url <url>`           | `verify`, `adopt`, `repair`                  | Server for disposable databases (`verificationDatabaseUrl`)                                                     |
+| `--snapshot <file>`            | `repair`                                     | Snapshot file of the boundary to verify, instead of `--verify-url`                                              |
 | `--ignore-table <name>`        | `pull`, `drift`, `adopt`, `repair`, `verify` | Leave an undeclared table out, repeatable (`ignoreTables`)                                                      |
 | `--advisory-lock-timeout <ms>` | commands that run migrations                 | Migration lock wait (`advisoryLockTimeoutMs`, default 10000)                                                    |
 | `--lock-timeout <ms>`          | commands that run migrations                 | DDL lock wait (`lockTimeoutMs`, default 5000; 0 disables)                                                       |
