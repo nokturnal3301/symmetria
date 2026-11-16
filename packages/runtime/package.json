@@ -1,6 +1,6 @@
 {
   "name": "symmetria",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Type-safe, SQL-first PostgreSQL query builder for Node.js and Bun.",
   "homepage": "https://github.com/nokturnal3301/symmetria#readme",
   "repository": {
@@ -35,6 +35,42 @@
       "types": "./dist/vector.d.ts",
       "default": "./dist/vector.js"
     },
+    "./search": {
+      "types": "./dist/search.d.ts",
+      "default": "./dist/search.js"
+    },
+    "./voyage": {
+      "types": "./dist/voyage.d.ts",
+      "default": "./dist/voyage.js"
+    },
+    "./ollama": {
+      "types": "./dist/ollama.d.ts",
+      "default": "./dist/ollama.js"
+    },
+    "./openai": {
+      "types": "./dist/openai.d.ts",
+      "default": "./dist/openai.js"
+    },
+    "./cohere": {
+      "types": "./dist/cohere.d.ts",
+      "default": "./dist/cohere.js"
+    },
+    "./google": {
+      "types": "./dist/google.d.ts",
+      "default": "./dist/google.js"
+    },
+    "./mistral": {
+      "types": "./dist/mistral.d.ts",
+      "default": "./dist/mistral.js"
+    },
+    "./jina": {
+      "types": "./dist/jina.d.ts",
+      "default": "./dist/jina.js"
+    },
+    "./better-auth": {
+      "types": "./dist/better-auth.d.ts",
+      "default": "./dist/better-auth.js"
+    },
     "./internal": {
       "types": "./dist/internal.d.ts",
       "default": "./dist/internal.js"
@@ -58,10 +94,14 @@
   },
   "peerDependencies": {
     "@types/bun": ">=1.4.3",
+    "better-auth": "^1.7.0",
     "pg": "^8.0.0"
   },
   "peerDependenciesMeta": {
     "@types/bun": {
+      "optional": true
+    },
+    "better-auth": {
       "optional": true
     },
     "pg": {

@@ -288,15 +288,17 @@ export const createQueryTables = (
             : {}),
         });
       });
-      const selection = table.columns.map((column): ExpressionDescription => {
-        const codec = binding.codecs[column.name];
+      const selection = table.columns
+        .filter((column) => !column.hidden)
+        .map((column): ExpressionDescription => {
+          const codec = binding.codecs[column.name];
 
-        return freeze({
-          node: columnNode(column),
-          outputName: column.name,
-          ...(codec ? { codec } : {}),
+          return freeze({
+            node: columnNode(column),
+            outputName: column.name,
+            ...(codec ? { codec } : {}),
+          });
         });
-      });
 
       return freeze({
         ...initialPlan(binding),

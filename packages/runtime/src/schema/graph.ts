@@ -11,6 +11,7 @@ import {
   type Table,
   type PrimaryKeyNames,
   type TABLE_RELATIONS,
+  type TABLE_SEARCH,
   type ConditionRelation,
   type ReferenceBuilder,
   type SelfReference,
@@ -366,7 +367,21 @@ export type Insert<
           keyof Row<Definition, TableName, true>
       >
     > & { [ColumnName in GeneratedColumns<Definition[TableName]>]?: undefined }
->;
+> &
+  SearchEmbeddings<Definition[TableName]>;
+
+/** The embedding of each search that matches meaning; computed by its model unless given. */
+type SearchEmbeddings<Columns> = Columns extends {
+  readonly [TABLE_SEARCH]: infer Searches;
+}
+  ? {
+      [Name in keyof Searches as Searches[Name] extends {
+        readonly meaning: true;
+      }
+        ? Name
+        : never]?: readonly number[] | null;
+    }
+  : {};
 
 export type IsUnion<Member, EntireUnion = Member> = Member extends EntireUnion
   ? [EntireUnion] extends [Member]

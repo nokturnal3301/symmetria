@@ -1,7 +1,7 @@
 {
   "name": "symmetria-workspace",
   "private": true,
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Type-safe, SQL-first PostgreSQL query builder for Node.js and Bun.",
   "homepage": "https://github.com/nokturnal3301/symmetria#readme",
   "repository": {
@@ -56,10 +56,11 @@
     "node": ">=24.11.0"
   },
   "devDependencies": {
-    "pg": "^8.23.1",
-    "@types/pg": "^8.15.6",
     "@biomejs/biome": "2.5.15",
     "@types/bun": "^1.4.3",
+    "@types/pg": "^8.15.6",
+    "better-auth": "^1.7.2",
+    "pg": "^8.23.1",
     "prettier": "3.9.10",
     "publint": "^0.3.25",
     "symmetria": "workspace:*",

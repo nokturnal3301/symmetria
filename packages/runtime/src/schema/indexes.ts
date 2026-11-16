@@ -38,7 +38,8 @@ export type IndexMethod =
   | "spgist"
   | "brin"
   | "hnsw"
-  | "ivfflat";
+  | "ivfflat"
+  | "bm25";
 export const INDEX_METHODS: readonly IndexMethod[] = Object.freeze([
   "btree",
   "hash",
@@ -48,6 +49,7 @@ export const INDEX_METHODS: readonly IndexMethod[] = Object.freeze([
   "brin",
   "hnsw",
   "ivfflat",
+  "bm25",
 ]);
 /** Methods that index exactly one column without ordering or INCLUDE (pgvector). */
 const VECTOR_METHODS: readonly IndexMethod[] = Object.freeze([

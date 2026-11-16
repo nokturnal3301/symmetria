@@ -305,7 +305,7 @@ export const joinRelation = (
 const joinSource = (
   registry: TableRegistry,
   state: SelectPlan,
-  kind: "LEFT" | "INNER" | "CROSS",
+  kind: "LEFT" | "INNER" | "CROSS" | "FULL",
   input: TableSource<Record<string, unknown>, string>,
   condition?: (scope: RuntimeScope) => Predicate,
   context?: QueryContext,
@@ -483,9 +483,21 @@ const joinAlias = (
   return alias;
 };
 
+/** The tool `search()` joins its ranked lists with; not part of the public shape tools. */
+export const FULL_JOIN = Symbol("symmetria.query.fullJoin");
+
+/** A relation is joined LEFT or INNER; a full join takes an explicit source. */
+const relationKind = (kind: "LEFT" | "INNER" | "FULL"): "LEFT" | "INNER" => {
+  if (kind === "FULL") {
+    throw new Error("symmetria: a full join requires a table source");
+  }
+
+  return kind;
+};
+
 export const localJoin = (
   context: QueryContext,
-  kind: "LEFT" | "INNER" | "AUTO" | "CROSS",
+  kind: "LEFT" | "INNER" | "AUTO" | "CROSS" | "FULL",
   input: LocalJoinInput,
   condition?: (columns: RuntimeScope[string]) => ShapePredicate,
 ): RuntimeScope[string] => {
@@ -604,7 +616,11 @@ export const localJoin = (
   context.plan = joinRelation(
     context.registry,
     context.plan,
-    kind === "AUTO" ? (relation.nullable ? "LEFT" : "INNER") : kind,
+    kind === "AUTO"
+      ? relation.nullable
+        ? "LEFT"
+        : "INNER"
+      : relationKind(kind),
     relation.from,
     relation.relation,
     alias,

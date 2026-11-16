@@ -82,6 +82,17 @@ enum mappings, aggregate result types and direct-row mutation callbacks.
 Installed-package checks exercise these APIs through the public npm exports as
 well.
 
+The BM25 half of `runtime/postgres/table-search.test.ts` needs the `pg_search`
+extension and skips without it. To run it, point the suites at a ParadeDB
+server, which has both `pg_search` and `vector`:
+
+```sh
+docker run -d --name symmetria-paradedb -e POSTGRES_PASSWORD=secret \
+  -p 127.0.0.1:55442:5432 paradedb/paradedb:latest
+SYMMETRIA_TEST_DATABASE_URL=postgres://postgres:secret@127.0.0.1:55442/postgres \
+  bun test tests/runtime/postgres/table-search.test.ts
+```
+
 ## PostgreSQL versions and PgBouncer
 
 The documented floor is PostgreSQL 14; CI runs 14 and 17. Before changing

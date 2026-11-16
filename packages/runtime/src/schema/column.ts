@@ -62,6 +62,8 @@ export type ColumnDefinition = {
   collation?: string;
   /** SQL name set with `.named()`; otherwise the schema key decides it. */
   sqlName?: string;
+  /** Kept out of whole-row reads: the embedding a `.search()` declaration stores. */
+  hidden?: boolean;
 };
 
 /** The value a column stores and accepts on write: its input type when it declares one. */
@@ -824,6 +826,14 @@ export type Vector = Branded<number[], "vector">;
  * `symmetria/vector`. Not part of the public API.
  * @internal
  */
+/** The same column, kept out of whole-row reads; see `ColumnDefinition.hidden`. */
+export const hiddenColumn = (column: Column): Column =>
+  makeColumn(
+    { ...column.definition, hidden: true },
+    {},
+    (column as { [COLUMN_CODEC]?: RuntimeCodec })[COLUMN_CODEC],
+  );
+
 export const typedColumn = <Value>(
   sqlType: string,
   codec: RuntimeCodec,

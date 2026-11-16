@@ -31,6 +31,7 @@ import type {
   QueryInspection,
 } from "../../observability/inspection";
 import type { ReusableShape } from "./projections";
+import type { PartialSearch } from "../search";
 import type { shapeExpressions } from "./projections";
 
 type SchemaRows = Record<string, Record<string, unknown>>;
@@ -846,6 +847,90 @@ type DerivedQuery<
   }
 > &
   TableSource<Row, AliasName>;
+/** What one declared search accepts: a question, and an embedding where it matches meaning. */
+type SearchInput<Declared> = Declared extends { readonly meaning: true }
+  ?
+      | string
+      | readonly number[]
+      | { readonly text?: string; readonly vector?: readonly number[] }
+  : string | { readonly text: string };
+
+/** Rows of a search, best first. `partial` is set when a search asked for could not be used. */
+export type SearchRows<Row> = Row[] & { readonly partial?: PartialSearch };
+
+export type SearchQuery<Row> = PromiseLike<SearchRows<Row>> & {
+  readonly execute: () => Promise<SearchRows<Row>>;
+  /** The statement, once the question's embedding is known. */
+  readonly toSQL: () => Promise<{ sql: string; parameters: unknown[] }>;
+  readonly catch: Promise<SearchRows<Row>>["catch"];
+  readonly finally: Promise<SearchRows<Row>>["finally"];
+};
+
+type SearchOptions<Columns, Tools, Searches> = {
+  readonly where?: QueryOptions<Columns, Tools>["where"];
+  /** How many rows to return; 10 unless given. */
+  readonly limit?: number;
+  /** How many rows each way of searching contributes before they are merged. */
+  readonly candidates?: number;
+} & { readonly [Name in keyof Searches]?: SearchInput<Searches[Name]> };
+
+/**
+ * `table.search()`: rows ranked by the searches the table declares, by words
+ * and meaning at once where both are declared, in one statement.
+ */
+export type TableSearch<
+  Rows extends SchemaRows,
+  Relations extends SchemaRelations,
+  RootTable extends string,
+  Searches,
+> = {
+  (
+    options: SearchOptions<
+      RootColumns<RootScope<Rows, RootTable>, Rows, Relations>,
+      ShapeTools<Rows, Relations>,
+      Searches
+    >,
+  ): SearchQuery<
+    ProjectionRow<
+      RowColumns<RootColumns<RootScope<Rows, RootTable>, Rows, Relations>>
+    >
+  >;
+  <Shape extends Record<string, unknown>>(
+    shape: ReusableShape<RootTable, Shape>,
+    options: SearchOptions<
+      RootColumns<RootScope<Rows, RootTable>, Rows, Relations>,
+      ShapeTools<Rows, Relations>,
+      Searches
+    >,
+  ): SearchQuery<ProjectionRow<ShapeSelection<Shape>>>;
+  <const Shape extends Record<string, unknown>>(
+    shape: (
+      columns: RootColumns<RootScope<Rows, RootTable>, Rows, Relations>,
+      tools: ProjectionTools<
+        Rows,
+        Relations,
+        RootColumns<RootScope<Rows, RootTable>, Rows, Relations>
+      >,
+    ) => Shape & ValidShape<Shape>,
+    options: SearchOptions<
+      RootColumns<RootScope<Rows, RootTable>, Rows, Relations>,
+      ShapeTools<Rows, Relations>,
+      Searches
+    >,
+  ): SearchQuery<ProjectionRow<ShapeSelection<Shape>>>;
+  /**
+   * Computes the embeddings that are missing: rows written before the search
+   * was declared, or whose text an UPDATE changed. Resolves to their number.
+   */
+  readonly reindex: (options?: {
+    readonly where?: QueryOptions<
+      RootColumns<RootScope<Rows, RootTable>, Rows, Relations>,
+      ShapeTools<Rows, Relations>
+    >["where"];
+    readonly batch?: number;
+  }) => Promise<number>;
+};
+
 export type QueryTable<
   Rows extends SchemaRows,
   Relations extends SchemaRelations,

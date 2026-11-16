@@ -3,6 +3,7 @@
  * must be confirmed with all(). A scoped database's writes check every written row against the scope.
  */
 import { freeze } from "../plan/freeze";
+import { embeddingColumns } from "../../schema/search-columns";
 import { scopeViolation } from "../../driver/errors";
 import { collectDataErrors, dataError } from "../codecs/deferred";
 import type { PredicateList } from "../select/types";
@@ -238,6 +239,19 @@ export const createMutation = (
 
     if (!insert && !assigned) {
       dataError(new Error("symmetria: update() requires at least one value"));
+    }
+
+    if (!insert) {
+      // New text under an old embedding would be found by what it used to say.
+      for (const { column, sources } of embeddingColumns.get(root.table) ??
+        []) {
+        if (
+          result[column] === undefined &&
+          sources.some((source) => result[source] !== undefined)
+        ) {
+          result[column] = valueNode(null, root.codecs[column]);
+        }
+      }
     }
 
     return freeze(result);

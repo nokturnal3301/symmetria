@@ -98,7 +98,8 @@ export const bindingScope = (
         return [
           column.name,
           {
-            enumerable: true,
+            // A hidden column is reachable by name and left out of `{ ...row }`.
+            enumerable: !column.hidden,
             // Handles are cached and shared by every query of the binding, so
             // they are frozen for real, once.
             get: () =>

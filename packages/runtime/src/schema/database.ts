@@ -1,7 +1,8 @@
 import type { TraitedRow } from "../query/expressions";
 import type { Column } from "./column";
 import type { Casing, SchemaSnapshot } from "./assembly";
-import type { PrimaryKeyNames, TABLE_UNIQUE_KEYS } from "./table";
+import type { PrimaryKeyNames, TABLE_SEARCH, TABLE_UNIQUE_KEYS } from "./table";
+import type { TableSearch } from "../query/select/types";
 import type {
   QueryTable,
   QueryExecutor,
@@ -290,10 +291,20 @@ export type Database<
       ): NestedInsertQuery<QueryRows<Definition>[TableName], TableName, true>;
     };
     readonly $name: string;
-    /** Type-only row and insert shapes. */
-    readonly $row: Row<Definition, TableName>;
-    readonly $insert: Insert<Definition, TableName>;
-  };
+  } & (Definition[TableName] extends { readonly [TABLE_SEARCH]: infer Searches }
+      ? {
+          readonly search: TableSearch<
+            QueryRows<Definition>,
+            Relations,
+            TableName,
+            Searches
+          >;
+        }
+      : unknown) & {
+      /** Type-only row and insert shapes. */
+      readonly $row: Row<Definition, TableName>;
+      readonly $insert: Insert<Definition, TableName>;
+    };
 } & {
   readonly [SCHEMA_BIND]: (driver: Driver) => Database<Definition, Relations>;
   /** Tenant or visibility filters that follow the tables into joins, paths, collections and writes. */

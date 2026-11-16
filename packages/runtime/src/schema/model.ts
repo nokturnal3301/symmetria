@@ -51,6 +51,23 @@ import type {
 } from "../query/plan/types";
 import { SCHEMA_BIND } from "./binding";
 import { computedFields, type ComputedCallback } from "./computed";
+import {
+  createReindex,
+  createSearch,
+  deferredWrite,
+  embedRows,
+  embeddedSearches,
+  needsEmbedding,
+} from "../query/search";
+import { embeddingColumns } from "./search-columns";
+import { createScope } from "../query/select/scope";
+import {
+  declaredSearches,
+  searchColumns,
+  tableSearches,
+  type Search,
+  type SearchCallback,
+} from "./search";
 import { createNestedInsert } from "../query/write/nested-inserts";
 import { readsOnly, runBatch } from "../query/batch";
 import { executorProfiling } from "../observability/profiling";
@@ -218,6 +235,31 @@ const schemaRuntime = (
   ),
 });
 
+const declaredByTable = new WeakMap<object, readonly Search[]>();
+
+/** A table's searches, read once against its own columns: names, kinds and models. */
+const searchesOf = (
+  table: SchemaSnapshot["tables"][number],
+): readonly Search[] => {
+  let declared = declaredByTable.get(table);
+
+  if (!declared) {
+    const binding = Object.freeze({
+      table,
+      alias: table.name,
+      codecs: Object.freeze({}),
+    });
+
+    declared = declaredSearches(
+      tableSearches.get(table) ?? [],
+      createScope({ [binding.alias]: binding })[binding.alias]!,
+    );
+    declaredByTable.set(table, declared);
+  }
+
+  return declared;
+};
+
 /** A table of a bound database: its query table, with an insert() that also takes related rows. */
 const createTableHandle = (
   { snapshot, codecs, schemaTables, relationNames }: SchemaRuntime,
@@ -228,49 +270,105 @@ const createTableHandle = (
   const tableSnapshot = schemaTables.tablesByName.get(tableName)!;
   const relations = relationNames.get(tableName)!;
 
-  return extendBuilder(queryTable, {
-    $name: tableSnapshot.sqlName,
-    insert: (
-      values: Record<string, unknown> | readonly Record<string, unknown>[],
-    ) => {
-      const rows = Array.isArray(values) ? values : [values];
+  const searches = tableSearches.get(tableSnapshot) ?? [];
+  const embedded = searches.length
+    ? embeddedSearches(searchesOf(tableSnapshot), searchColumns)
+    : [];
+  // Rows whose searches keep an embedding wait for it before they are written.
+  const embedding =
+    <Values>(write: (values: Values) => object) =>
+    (values: Values, ...rest: unknown[]): object => {
+      const rows = (Array.isArray(values) ? values : [values]) as Record<
+        string,
+        unknown
+      >[];
 
-      if (
-        rows.some(
-          (row) =>
-            row &&
-            relations.some(
-              (name) => (row as Record<string, unknown>)[name] !== undefined,
-            ),
-        )
-      ) {
-        return createNestedInsert(
-          snapshot,
-          tableSnapshot.name,
+      if (!embedded.length || !needsEmbedding(embedded, rows)) {
+        return (write as (...argumentsList: unknown[]) => object)(
           values,
-          runTransaction,
-          codecs,
+          ...rest,
         );
       }
 
-      // An omitted (undefined) relation keeps the flat, single-statement INSERT.
-      const flat = (row: Record<string, unknown>) =>
-        row && relations.some((name) => name in row)
-          ? Object.fromEntries(
-              Object.entries(row).filter(([name]) => !relations.includes(name)),
-            )
-          : row;
+      return deferredWrite(async () => {
+        const filled = await embedRows(embedded, rows);
 
-      return (
-        queryTable as {
-          insert: (values: unknown) => object;
+        return {
+          builder: (write as (...argumentsList: unknown[]) => object)(
+            Array.isArray(values) ? filled : filled[0],
+            ...rest,
+          ),
+        };
+      });
+    };
+
+  return extendBuilder(queryTable, {
+    $name: tableSnapshot.sqlName,
+    ...(searches.length
+      ? {
+          search: Object.assign(
+            createSearch(
+              queryTable,
+              tableSnapshot,
+              searches,
+              searchesOf(tableSnapshot),
+            ),
+            { reindex: createReindex(queryTable, tableSnapshot, embedded) },
+          ),
         }
-      ).insert(
-        Array.isArray(values)
-          ? rows.map(flat)
-          : flat(values as Record<string, unknown>),
-      );
-    },
+      : {}),
+    ...(embedded.length
+      ? {
+          upsert: embedding(
+            (queryTable as { upsert: (values: unknown) => object }).upsert,
+          ),
+        }
+      : {}),
+    insert: embedding(
+      (
+        values: Record<string, unknown> | readonly Record<string, unknown>[],
+      ) => {
+        const rows = Array.isArray(values) ? values : [values];
+
+        if (
+          rows.some(
+            (row) =>
+              row &&
+              relations.some(
+                (name) => (row as Record<string, unknown>)[name] !== undefined,
+              ),
+          )
+        ) {
+          return createNestedInsert(
+            snapshot,
+            tableSnapshot.name,
+            values,
+            runTransaction,
+            codecs,
+          );
+        }
+
+        // An omitted (undefined) relation keeps the flat, single-statement INSERT.
+        const flat = (row: Record<string, unknown>) =>
+          row && relations.some((name) => name in row)
+            ? Object.fromEntries(
+                Object.entries(row).filter(
+                  ([name]) => !relations.includes(name),
+                ),
+              )
+            : row;
+
+        return (
+          queryTable as {
+            insert: (values: unknown) => object;
+          }
+        ).insert(
+          Array.isArray(values)
+            ? rows.map(flat)
+            : flat(values as Record<string, unknown>),
+        );
+      },
+    ),
   });
 };
 
@@ -476,6 +574,9 @@ const createSchema = <
   const tableIndexes = new Map<string, readonly TableIndexCallback[]>();
   const tableChecks = new Map<string, readonly TableCheckCallback[]>();
   const tableComputed = new Map<string, readonly ComputedCallback[]>();
+  const tableSearch = new Map<string, readonly SearchCallback[]>();
+  // What `.search()` declarations need: `vector`, `pg_search`.
+  const neededExtensions = new Set<string>();
   const tableSqlNames = new Map<string, string>();
   const tableRelations = new Map<string, readonly TableRelationCallback[]>();
   const primaryKeys = new Map<string, readonly string[]>();
@@ -527,6 +628,11 @@ const createSchema = <
       tableIndexes.set(tableName, state.indexCallbacks);
       tableChecks.set(tableName, state.checkCallbacks);
       tableComputed.set(tableName, state.computedCallbacks);
+      tableSearch.set(tableName, state.searchCallbacks);
+
+      for (const extension of state.extensions) {
+        neededExtensions.add(extension);
+      }
 
       if (state.named !== undefined) {
         tableSqlNames.set(tableName, state.named);
@@ -742,12 +848,27 @@ const createSchema = <
     }
   }
 
-  if (options.extensions?.length) {
-    snapshot.extensions = declaredExtensions(options.extensions);
+  if (options.extensions?.length || neededExtensions.size) {
+    snapshot.extensions = declaredExtensions([
+      ...(options.extensions ?? []),
+      ...neededExtensions,
+    ]);
   }
 
   for (const table of snapshot.tables) {
     computedFields.set(table, tableComputed.get(table.name) ?? []);
+    tableSearches.set(table, tableSearch.get(table.name) ?? []);
+
+    if (tableSearch.get(table.name)?.length) {
+      embeddingColumns.set(
+        table,
+        searchesOf(table).flatMap((search) =>
+          search.meaning
+            ? [{ column: search.name, sources: searchColumns(search.meaning) }]
+            : [],
+        ),
+      );
+    }
     conditionRelations.set(table, tableRelations.get(table.name) ?? []);
   }
 

@@ -20,6 +20,17 @@
       "symmetria/bun": ["./packages/runtime/src/entries/bun.ts"],
       "symmetria/pg": ["./packages/runtime/src/entries/pg.ts"],
       "symmetria/vector": ["./packages/runtime/src/entries/vector.ts"],
+      "symmetria/search": ["./packages/runtime/src/entries/search.ts"],
+      "symmetria/voyage": ["./packages/runtime/src/entries/voyage.ts"],
+      "symmetria/ollama": ["./packages/runtime/src/entries/ollama.ts"],
+      "symmetria/openai": ["./packages/runtime/src/entries/openai.ts"],
+      "symmetria/cohere": ["./packages/runtime/src/entries/cohere.ts"],
+      "symmetria/google": ["./packages/runtime/src/entries/google.ts"],
+      "symmetria/mistral": ["./packages/runtime/src/entries/mistral.ts"],
+      "symmetria/jina": ["./packages/runtime/src/entries/jina.ts"],
+      "symmetria/better-auth": [
+        "./packages/runtime/src/entries/better-auth.ts"
+      ],
       "symmetria/internal": ["./packages/runtime/src/entries/internal.ts"],
       "symmetria-kit": ["./packages/kit/src/index.ts"],
       "symmetria-kit/inspect": [

@@ -23,6 +23,9 @@ nullability and bigint, read [Core concepts](guide.md).
 - [Nested relations](#nested-relations) and [value codecs](#values-and-drivers)
 - [Relation aggregates](#relation-aggregates) and [cursor pages](#cursor-pages)
 - [Arrays](#arrays) and [full-text search](#full-text-search)
+- [Vectors](#vectors-pgvector) and
+  [search by words and meaning](#search-by-words-and-meaning)
+- [better-auth](#better-auth)
 - [Scoped databases](#scoped-databases) and
   [PostgreSQL adapters](#postgresql-adapters)
 - [Computed fields, enums and JSON](#computed-fields-enums-and-json)
@@ -2258,6 +2261,184 @@ snapshot: generated migrations start with `CREATE EXTENSION IF NOT EXISTS`,
 `drift` reports `missing-extension`, and removing it from the schema leaves a
 comment in the migration instead of dropping the extension, since other schemas
 may depend on it.
+
+## Search by words and meaning
+
+A table says once what it is searched by, and `search()` ranks its rows by that:
+by words, by meaning (embeddings), or by both in one statement.
+
+```ts
+import { schema, table, one, many, uuid, text } from "symmetria";
+import { bm25 } from "symmetria/search";
+import { voyage4 } from "symmetria/voyage";
+
+const chunks = table({
+  id: uuid.v4,
+  note: one(notes.chunks),
+  owner: text,
+  title: text,
+  content: text,
+}).search((chunk) => ({
+  about: {
+    words: bm25({ A: chunk.title, B: chunk.content }),
+    meaning: voyage4(chunk.title, chunk.content),
+  },
+}));
+
+export const appSchema = schema({ notes, chunks });
+
+// The embedding is computed with the row.
+await database.chunks.insert({ noteId, owner, title, content });
+
+const found = await database.chunks.search(
+  (chunk) => ({ content: chunk.content, note: chunk.note.title }),
+  { where: { owner }, about: "where are the garage keys?", limit: 6 },
+);
+```
+
+`about` is a name of your choosing; a table may declare several searches, in one
+`.search()` call or in several. Each has `words`, `meaning` or both:
+
+- `words: fullText(parts, { language })` uses PostgreSQL's own full-text search,
+  which every server has, and creates a GIN index. `words: bm25(parts)` ranks
+  with BM25, which weighs rare words more than common ones and long texts more
+  fairly; it needs the `pg_search` extension (ParadeDB, for example the
+  `paradedb/paradedb` image) and creates its `bm25` index. The server must load
+  the library (`shared_preload_libraries = 'pg_search'`); the image sets that
+  when it creates a data directory, so a database first created by another image
+  needs the setting and a restart. `parts` is a column, an array of columns, or
+  a weight map `{ A, B, C, D }` in which `A` counts most. `language` is a text
+  search configuration; the default `"simple"` does no stemming and works for
+  any language.
+- `meaning: model(...columns)` keeps an embedding of those columns' text and
+  creates an HNSW cosine index. It needs pgvector. The embedding lives in a
+  column named after the search (`about`, `vector(1024)` for `voyage4`,
+  nullable) that is hidden: it is not a field of the row, whole-row reads and
+  `returning()` leave it out, and it can still be named in a query
+  (`chunk.about`, untyped).
+
+The extensions are recorded by the declaration itself: migrations start with
+`CREATE EXTENSION IF NOT EXISTS` for `vector` and `pg_search` as needed, without
+`extensions: [...]` in the schema options. Everything else is an ordinary column
+and ordinary indexes in the snapshot, so `generate`, `drift` and `rollback`
+treat a search like any other change; `pull` reads it back as the column and the
+indexes.
+
+**Models.** Each service has a module of its own; all of them call the service's
+HTTP API directly and add no dependency.
+
+| Module              | Ready models                                         | Any other model           | Key                                |
+| ------------------- | ---------------------------------------------------- | ------------------------- | ---------------------------------- |
+| `symmetria/voyage`  | `voyage4`, `voyage4Lite`, `voyage4Large` (1,024)     | `voyage(model, options)`  | `VOYAGE_API_KEY`                   |
+| `symmetria/openai`  | `textEmbedding3Small`, `textEmbedding3Large` (1,536) | `openai(model, options)`  | `OPENAI_API_KEY`                   |
+| `symmetria/cohere`  | `embedV4` (1,536), `embedMultilingualV3` (1,024)     | `cohere(model, options)`  | `COHERE_API_KEY`                   |
+| `symmetria/google`  | `geminiEmbedding` (1,536)                            | `google(model, options)`  | `GEMINI_API_KEY`, `GOOGLE_API_KEY` |
+| `symmetria/mistral` | `mistralEmbed` (1,024)                               | `mistral(model, options)` | `MISTRAL_API_KEY`                  |
+| `symmetria/jina`    | `jinaV3` (1,024)                                     | `jina(model, options)`    | `JINA_API_KEY`                     |
+| `symmetria/ollama`  | `ollama("bge-m3")` and other local models            | `ollama(model, { size })` | none: runs on your machine         |
+
+`options` are `{ apiKey, size, baseUrl }`. `size` is the embedding's length,
+which becomes the column's type; models that can shorten their output are asked
+for that length, and those whose own output is longer than the 2,000 numbers
+pgvector indexes (`text-embedding-3-large`, `gemini-embedding-001`) default to
+1,536. `openai(model, { baseUrl })` also reaches any server that speaks OpenAI's
+embeddings API. A source without a module is one function,
+`embedder(size, async (texts, kind) => vectors)` from `symmetria/search`, where
+`kind` is `"document"` for rows and `"query"` for questions. A model is asked
+only when a row is written or a question is searched, so building the schema,
+generating migrations and tests with another model need no network. The request
+each module sends is tested against a stand-in; only Voyage's and Ollama's
+shapes were also exercised through a running application.
+
+**Writing.** `insert()` and `upsert()` ask the model once for all the rows that
+need an embedding, before the statement is sent, including rows created by a
+nested insert. A row that brings its own (`{ ...row, about: vector }`), or whose
+text is empty or a SQL expression, is written as it is. If the model fails, the
+write is rejected and nothing is sent. The write is still chained as usual
+(`returning()`, `onConflict()`); only `toSQL()` and `prepare()` on such a write
+throw, because the statement does not exist until the embedding does. Inside
+`$transaction` the connection is held while the model answers; embed beforehand
+and pass the vectors when that matters.
+
+An `UPDATE` that changes one of the embedded columns sets the embedding to
+`NULL` in the same statement, because it would describe the old text; an
+`UPDATE` that sets the embedding itself keeps what it sets. The row is found by
+its words meanwhile. `await database.chunks.search.reindex()` computes every
+missing embedding (`{ where, batch }` narrow and size the work) and resolves to
+the number of rows it embedded; it is also how rows written before the search
+was declared get theirs.
+
+**Searching.** `search(shape?, options)` takes the shape of any query, or none
+for whole rows, and resolves to rows ordered best first:
+
+| Option                    | Value                                                                     |
+| ------------------------- | ------------------------------------------------------------------------- |
+| a search's name (`about`) | A question as a string, an embedding, or `{ text, vector }`               |
+| `where`                   | As in any query; applied inside each way of searching                     |
+| `limit`                   | Rows to return, 10 unless given                                           |
+| `candidates`              | Rows each way of searching contributes, `max(40, 4 × limit)` unless given |
+
+A string is matched by words where the search declares them and embedded by the
+model where it declares a meaning. An array is an embedding you computed
+yourself, and `{ text, vector }` gives both without a call to the model. Any
+word of the question may match: a question shares few words with its answer.
+
+Each way of searching is a ranked list of primary keys in a CTE, limited to
+`candidates`; several lists are merged by reciprocal rank fusion, where a row
+scores `1 / (60 + its place)` in every list that has it, and the table is joined
+to the result. It is one statement, it runs under `$scope()` and inside
+`$transaction` like any query, and `await search.toSQL()` shows it. The table
+needs a single-column primary key.
+
+If the model fails at search time and the search also declares words, the rows
+are found by words alone and the result says so: `rows.partial` is
+`{ search: "about", error }`. A search that has only a meaning rejects instead.
+
+Not included: a search inside a nested relation (`note.chunks.search(...)`),
+inside `$batch()`, and a migration warning when a model is replaced by another
+of the same size (embeddings of different models cannot be compared; clear the
+column and run `reindex()`).
+
+## better-auth
+
+```ts
+import { betterAuth } from "better-auth";
+import { symmetriaAdapter } from "symmetria/better-auth";
+
+export const auth = betterAuth({
+  database: symmetriaAdapter(db),
+  emailAndPassword: { enabled: true },
+});
+```
+
+`symmetria/better-auth` is a [better-auth](https://better-auth.com) database
+adapter; `better-auth` is an optional peer dependency. The auth tables are
+tables of your schema, keyed and named as better-auth names its models and
+fields (`user`, `session.userId`, `account`, `verification`, and whatever its
+plugins add), so they are migrated by `symmetria generate`, related to your own
+tables (`author: one(user)`) and queried like any other.
+
+`npx auth generate` writes them through the adapter: a module of `table()`
+declarations and `authTables`, to spread into the schema.
+
+```ts
+import { authTables, user } from "./auth-schema";
+
+const posts = table({ id: int.auto, title: text, author: one(user).cascade });
+export const appSchema = schema({ ...authTables, posts });
+```
+
+Dates are `timestamptz`, ids are `text` (better-auth generates them), a
+reference is `one(target)` or `maybe(target)` with better-auth's delete action
+(cascade unless it names another), and plugin tables come with the rest. Run it
+again after adding a plugin and generate a migration from the difference.
+
+`symmetriaAdapter(db, { usePlural, debugLogs })`: `usePlural` when the tables
+are keyed `users`, `sessions`. `db` may be a `$scope()` of the database.
+better-auth's transactions run inside `db.$transaction`, a single-use row (a
+verification token) is taken by a `DELETE … RETURNING` that only one of two
+concurrent callers wins, and a table the schema lacks is named in the error.
+Joins are left to better-auth, which reads related rows with separate queries.
 
 ## Scoped databases
 

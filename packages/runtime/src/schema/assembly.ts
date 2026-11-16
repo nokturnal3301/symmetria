@@ -56,6 +56,8 @@ export type ColumnSnapshot = {
     /** Present only when it differs from PostgreSQL's default `no action`. */
     onUpdate?: Exclude<OnUpdateAction, "no action">;
   };
+  /** Not part of the row: read and written only when named (a search's embedding). */
+  hidden?: true;
 };
 
 export type RelationSnapshot =
@@ -745,6 +747,7 @@ export const assembleSchema = <
         ...(column.definition.collation !== undefined
           ? { collation: column.definition.collation }
           : {}),
+        ...(column.definition.hidden ? { hidden: true as const } : {}),
       }));
 
       for (const reference of analyzedTable.references) {

@@ -282,6 +282,19 @@ db.documents(
   },
 );
 
+// Hybrid search: a table declares what it is found by; one statement ranks by both.
+const chunks = table({
+  id: int.auto,
+  title: text,
+  content: text,
+}).search((chunk) => ({
+  about: {
+    words: bm25({ A: chunk.title, B: chunk.content }), // or fullText(...)
+    meaning: voyage4(chunk.title, chunk.content), // embedded on insert
+  },
+}));
+await db.chunks.search({ about: "where are the garage keys?", limit: 6 });
+
 // Legacy keys: reference a unique column, keep the old column name.
 const comments = table({
   id: int.auto,
@@ -298,7 +311,8 @@ db.posts(({ title, author }) => ({ title, author: author.name })); // LEFT JOIN 
 ```
 
 [Full-text search](docs/reference.md#full-text-search),
-[vectors](docs/reference.md#vectors-pgvector) and
+[vectors](docs/reference.md#vectors-pgvector),
+[search by words and meaning](docs/reference.md#search-by-words-and-meaning) and
 [relations without a foreign key](docs/reference.md#relations-without-a-foreign-key)
 use the same shapes, paths and nested collections as everything else.
 

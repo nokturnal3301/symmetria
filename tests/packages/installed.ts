@@ -185,6 +185,14 @@ try {
 import { createDatabase, schema, table, link, one, maybe, many, int, text, bigint, bool, jsonb, oneOf, index, rowNumber, prepare, createProfiler, NotFoundError, QueryError, UniqueViolation, type Transaction } from "symmetria";
 import { postgres, type Driver } from "symmetria/driver";
 import { vector, type Vector } from "symmetria/vector";
+import { bm25, fullText, embedder } from "symmetria/search";
+import { voyage4 } from "symmetria/voyage";
+import { ollama } from "symmetria/ollama";
+import { textEmbedding3Small } from "symmetria/openai";
+import { embedV4 } from "symmetria/cohere";
+import { geminiEmbedding } from "symmetria/google";
+import { mistralEmbed } from "symmetria/mistral";
+import { jinaV3 } from "symmetria/jina";
 import { createSchemaSQL, migrator, generateMigration, loadMigrationState, type MigrationState } from "symmetria-kit";
 import { testDatabase } from "symmetria-kit/testing";
 
@@ -194,6 +202,17 @@ const embeddings = table({ id: int.auto, embedding: vector(3) });
 const embeddingRow: Vector | undefined = undefined;
 void embeddings;
 void embeddingRow;
+const searched = table({ id: int.auto, title: text, body: text }).search((row) => ({
+  about: { words: fullText({ A: row.title, B: row.body }), meaning: embedder(2, async (texts) => texts.map(() => [1, 0]))(row.body) },
+  exact: { words: bm25(row.title) },
+}));
+const searchedSchema = schema({ searched }, { executor: async () => [] });
+assert.deepEqual(searchedSchema.$snapshot().extensions, ["pg_search", "vector"]);
+assert.equal(typeof searchedSchema.searched.search, "function");
+assert.match((await searchedSchema.searched.search({ about: "words", limit: 2 }).toSQL()).sql, /FULL JOIN "search_about_words"/);
+assert.equal(voyage4.model.size, 1024);
+assert.equal(ollama("bge-m3").model.size, 1024);
+assert.deepEqual([textEmbedding3Small, embedV4, geminiEmbedding, mistralEmbed, jinaV3].map((model) => model.model.size), [1536, 1536, 1536, 1024, 1024]);
 const posts = table({ id: int.auto, author: users, title: text, views: bigint.default(0n), state: oneOf("draft", "published").default("draft") })
   .indexes((posts) => ({ authorTitle: index(posts.authorId, posts.title).unique }));
 const model = schema({ users, posts });

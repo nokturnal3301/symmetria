@@ -11,3 +11,4 @@ packages/kit/LICENSE
 !.env.example
 .symmetria-generate.lock/
 .symmetria-*/
+tests/runtime/postgres/.better-auth-schema.generated.ts

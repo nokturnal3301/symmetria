@@ -54,6 +54,12 @@ import type { ComputedCallback } from "./computed";
 import type { CONDITION, TableRelationCallback } from "./conditions";
 import type { TableBinding } from "../query/plan/types";
 import type { IndexDefinition, SchemaCondition } from "./indexes";
+import type {
+  MeaningSearch,
+  SearchCallback,
+  SearchDeclaration,
+  WordsSearch,
+} from "./search";
 
 export const TABLE: unique symbol = Symbol("symmetria.table");
 const TABLE_PRIMARY_KEY: unique symbol = Symbol("symmetria.table.primaryKey");
@@ -61,6 +67,8 @@ export declare const TABLE_UNIQUE_KEYS: unique symbol;
 export declare const TABLE_JUNCTION: unique symbol;
 /** Phantom key carrying the condition relations declared with `.relations()`. */
 export declare const TABLE_RELATIONS: unique symbol;
+/** Phantom key carrying the searches declared with `.search()`. */
+export declare const TABLE_SEARCH: unique symbol;
 
 export type OnDeleteAction = "cascade" | "restrict" | "set null" | "no action";
 /** `ON UPDATE` of a foreign key; PostgreSQL's default is `no action`. */
@@ -93,6 +101,10 @@ export type TableState = {
   readonly checkCallbacks: readonly TableCheckCallback[];
   readonly computedCallbacks: readonly ComputedCallback[];
   readonly relationCallbacks: readonly TableRelationCallback[];
+  /** Searches declared with `.search()`; their columns and indexes are already in the state. */
+  readonly searchCallbacks: readonly SearchCallback[];
+  /** PostgreSQL extensions the table's declarations need (`vector`, `pg_search`). */
+  readonly extensions: readonly string[];
   readonly primaryKey?: readonly string[];
   /** SQL name set with `.named()`; otherwise the schema key decides it. */
   readonly named?: string;
@@ -436,6 +448,31 @@ export type TableHandle<Columns> = Table<Columns> &
         };
       }
     >;
+    /**
+     * What the table is searched by: words, meaning, or both under one name.
+     * `search((chunk) => ({ about: { words: bm25(chunk.content), meaning: voyage4(chunk.content) } }))`
+     * creates the indexes and, for a meaning, a hidden column for its embedding.
+     */
+    readonly search: <const Declared extends Record<string, SearchDeclaration>>(
+      callback: (columns: TableIndexColumns<Columns>) => Declared,
+    ) => TableHandle<
+      Columns & {
+        readonly [TABLE_SEARCH]: (Columns extends {
+          readonly [TABLE_SEARCH]: infer Earlier;
+        }
+          ? Earlier
+          : {}) & {
+          readonly [Name in keyof Declared]: {
+            readonly words: Declared[Name] extends { words: WordsSearch }
+              ? true
+              : false;
+            readonly meaning: Declared[Name] extends { meaning: MeaningSearch }
+              ? true
+              : false;
+          };
+        };
+      }
+    >;
     /** CHECK constraints: predicates, or boolean expressions such as ``sql<boolean>`${t.price} > 0` ``. */
     readonly checks: (
       callback: (
@@ -650,6 +687,7 @@ export const HANDLE_KEYS: ReadonlySet<string> = new Set([
   "checks",
   "computed",
   "relations",
+  "search",
   "named",
   "primaryKey",
   ...REFERENCE_MODIFIERS,
@@ -687,8 +725,24 @@ export const tableBody = (
   return { columns, slots, throughs };
 };
 
+/**
+ * `.search()` is lowered by schema/search.ts, which builds on the query
+ * expressions this module is loaded before; it registers itself here.
+ */
+export const searchLowering: {
+  lower?: (
+    callback: SearchCallback,
+    draft: TableBinding,
+    state: TableState,
+  ) => Partial<TableState>;
+} = {};
+
 /** The declaration part of a table's state; the assembler adds key and sqlName. */
-type TableInit = Omit<TableState, "key" | "sqlName">;
+type TableInit = Omit<
+  TableState,
+  "key" | "sqlName" | "searchCallbacks" | "extensions"
+> &
+  Partial<Pick<TableState, "searchCallbacks" | "extensions">>;
 
 export const createTable = (init: TableInit): object => {
   const state: TableState = {
@@ -699,6 +753,8 @@ export const createTable = (init: TableInit): object => {
     checkCallbacks: Object.freeze([...init.checkCallbacks]),
     computedCallbacks: Object.freeze([...init.computedCallbacks]),
     relationCallbacks: Object.freeze([...init.relationCallbacks]),
+    searchCallbacks: Object.freeze([...(init.searchCallbacks ?? [])]),
+    extensions: Object.freeze([...(init.extensions ?? [])]),
     junction: init.junction,
     ...(init.defaultDelete ? { defaultDelete: init.defaultDelete } : {}),
     ...(init.primaryKey
@@ -753,6 +809,12 @@ export const createTable = (init: TableInit): object => {
           (callback: TableRelationCallback) => ({
             relationCallbacks: [...state.relationCallbacks, callback],
           }),
+        );
+      }
+
+      if (key === "search") {
+        return callbackMethod("search", (callback: SearchCallback) =>
+          searchLowering.lower!(callback, draftBinding(state), state),
         );
       }
 

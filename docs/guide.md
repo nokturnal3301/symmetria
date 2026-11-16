@@ -288,6 +288,13 @@ embeddings written as plain number arrays, with `cosineDistance()`,
 `l2Distance()`, `innerProduct()` and `l1Distance()` for ordering and HNSW or
 IVFFlat indexes.
 
+When rows should be found by a question, a table declares the search instead:
+`.search((chunk) => ({ about: { words: bm25(chunk.content), meaning: voyage4(chunk.content) } }))`
+creates the indexes and a hidden embedding column, `insert()` fills it, and
+`db.chunks.search({ about: "a question", limit: 6 })` ranks by words and meaning
+in one statement. See
+[search by words and meaning](reference.md#search-by-words-and-meaning).
+
 Tables that relate through plain columns, without a foreign key, declare the
 join predicate once:
 

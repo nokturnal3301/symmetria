@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.2.0 — 2026-11-16
+
+### Runtime (`symmetria`)
+
+- `table(...).search((row) => ({ about: { words, meaning } }))` declares what a
+  table is searched by, and
+  `db.table.search(shape?, { about: "question", where, limit })` ranks its rows
+  by words, by meaning, or by both merged by reciprocal rank fusion, in one
+  statement. `words` is `fullText()` (PostgreSQL's own) or `bm25()` (the
+  `pg_search` extension); `meaning` is an embedding model: `voyage4` and others
+  from `symmetria/voyage`, `ollama("bge-m3")` from `symmetria/ollama`, or
+  `embedder(size, fn)` from `symmetria/search`.
+- A search by meaning keeps its embedding in a hidden column: `insert()`,
+  `upsert()` and nested inserts compute it before the statement is sent, an
+  `UPDATE` of the embedded text clears it, and `db.table.search.reindex()`
+  computes the missing ones.
+- Ready embedding models, each calling its service's HTTP API without a
+  dependency: `symmetria/voyage`, `symmetria/openai`, `symmetria/cohere`,
+  `symmetria/google`, `symmetria/mistral`, `symmetria/jina` and, for local
+  models, `symmetria/ollama`.
+- `symmetria/better-auth`: a better-auth database adapter,
+  `betterAuth({ database: symmetriaAdapter(db) })`. `npx auth generate` writes
+  the auth tables as Symmetria `table()` declarations, plugin tables included.
+- The extensions a search needs (`vector`, `pg_search`) are recorded without
+  `extensions: [...]` in the schema options.
+- `index(...).using("bm25")` for `pg_search` indexes.
+
+### Kit (`symmetria-kit`)
+
+- Migrations, `drift` and `pull` handle `bm25` indexes and the column and
+  indexes a `.search()` declaration creates.
+
 ## 2.1.0 — 2026-11-16
 
 ### Runtime (`symmetria`)

@@ -320,6 +320,12 @@ UPDATE or DELETE without `where()` is refused unless `.all()` confirms it.
   carry a code. Invalid values (out-of-range numbers, invalid `jsonb(schema)`
   input, `null` for NOT NULL columns) reject the query's promise when it runs;
   mistakes in the query's shape throw where it is built.
+- `table.search()`: hybrid search declared on the table, by words (full text or
+  BM25) and by meaning (embeddings computed on insert), merged in one statement
+  (`symmetria/search`; models from `symmetria/voyage`, `openai`, `cohere`,
+  `google`, `mistral`, `jina`, `ollama`)
+- `symmetria/better-auth`: a better-auth adapter; `auth generate` writes the
+  auth tables as part of your schema
 - Arrays, full-text search with stored `tsvector` columns, weighted documents,
   ranking and headlines, pgvector embeddings with distance operators and HNSW
   indexes (`symmetria/vector`), typed JSON paths and Standard Schema JSON

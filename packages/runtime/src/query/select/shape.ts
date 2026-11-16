@@ -33,6 +33,7 @@ import {
   type LocalJoinInput,
   type ShapeCallback,
   type ShapePredicate,
+  FULL_JOIN,
 } from "./joins";
 import type { QueryContext } from "./registry";
 import type { ProjectionObject, QueryOptions, RuntimeScope } from "./types";
@@ -248,7 +249,7 @@ export const applyShape = (
   };
 
   const join =
-    (kind: "LEFT" | "INNER" | "AUTO" | "CROSS") =>
+    (kind: "LEFT" | "INNER" | "AUTO" | "CROSS" | "FULL") =>
     (
       input: LocalJoinInput,
       condition?: (columns: RuntimeScope[string]) => ShapePredicate,
@@ -286,6 +287,8 @@ export const applyShape = (
         innerJoin: join("INNER"),
         leftJoin: join("LEFT"),
         crossJoin: join("CROSS"),
+        // Not public: a full join makes the root nullable, which the types do not model.
+        [FULL_JOIN]: join("FULL"),
         whereNotNull,
         // The source's own columns, for `{ ...row, extra }`; relations are not among them.
         get row() {
