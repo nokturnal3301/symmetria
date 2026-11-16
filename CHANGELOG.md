@@ -1,5 +1,43 @@
 # Changelog
 
+## 2.4.0 — 2026-11-16
+
+### Runtime (`symmetria`)
+
+- An ordering by a selected field repeats the field with the same SQL text and
+  the same parameters, as grouped queries already did. PostgreSQL then
+  recognises one expression and computes it once per row: a list sorted by a
+  relation aggregate without `limit` ran about a fifth faster on a 3-million-row
+  table (37 ms to 30 ms). A filter that repeats a selected expression shares its
+  parameters too, so a pgvector query that selects, filters and orders by one
+  distance sends the vector once instead of three times.
+- Aggregates over one relation with one filter are computed by one subquery:
+  `user.orders.count()`, `user.orders.sum.total`, `user.orders.average.total`
+  and `user.orders.maximum.createdAt` in one shape read a user's orders once
+  instead of four times. A table of 8,925 customers with these four totals over
+  3 million orders went from 276 ms to 150 ms, and a page of 50 from 19 ms to 12
+  ms, the time of the hand-written `LATERAL` join. The subquery is joined only
+  where it cannot cost more: when every row is returned, or after a page has
+  been cut; a query limited and sorted by a total keeps per-row subqueries.
+- `get()` and `find()` without a shape compile their statement once per table
+  and key and only bind the key afterwards, in transactions too: the client cost
+  of such a read went from 3.4 µs to 0.3 µs, that of a prepared query. Scoped
+  tables, tables with computed fields, `$batch` and profiled drivers take the
+  ordinary path.
+- A bulk `insert()` or `upsert()` of 100 rows or more whose rows carry the same
+  columns as plain values is sent as one array per column
+  (`INSERT … SELECT * FROM unnest(…)`). 20,000 rows with a `jsonb` column went
+  from about 260 ms to about 210 ms, the time of the same statement written by
+  hand, and are one statement instead of two, since the parameter count no
+  longer grows with the rows. Inserts with defaults per row, SQL expressions,
+  enums or array columns keep `VALUES`.
+- `some()`, `none()` and `every()` take a list of predicates joined by `AND`,
+  like `where`: `user.orders.some((order) => [order.status.is.paid, …])`. Falsy
+  entries are skipped.
+- `count()`, `sum()` and the other aggregates no longer allocate a wrapper for
+  `.over()` on every call (2.3.0 added about 1 µs to every query that counts a
+  relation).
+
 ## 2.3.0 — 2026-11-16
 
 ### Runtime (`symmetria`)

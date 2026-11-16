@@ -258,17 +258,17 @@ type RelationQuery<
       readonly some: (
         predicate?: (
           columns: RelatedColumns<Rows, Relations, Target>,
-        ) => Predicate,
+        ) => Predicate | PredicateList,
       ) => Predicate;
       readonly none: (
         predicate?: (
           columns: RelatedColumns<Rows, Relations, Target>,
-        ) => Predicate,
+        ) => Predicate | PredicateList,
       ) => Predicate;
       readonly every: (
         predicate: (
           columns: RelatedColumns<Rows, Relations, Target>,
-        ) => Predicate,
+        ) => Predicate | PredicateList,
       ) => Predicate;
     });
 type RelationMethods =

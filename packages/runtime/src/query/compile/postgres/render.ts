@@ -37,7 +37,7 @@ const jsonObject = (
  * same type without a length: plain `char` would mean `char(1)` and cut the
  * value to one character.
  */
-const unconstrained = (type: string): string =>
+export const unconstrained = (type: string): string =>
   type
     .replace(/^(?:char|character|bpchar)\s*\([^)]*\)/i, "bpchar")
     .replace(/^(varchar|character varying|numeric|decimal)\s*\([^)]*\)/i, "$1");

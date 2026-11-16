@@ -7,6 +7,7 @@ import type { PredicateDescription, ValueNode } from "../expressions";
 import { DEFAULT_VALUE, type MutationPlan } from "../plan/types";
 import {
   aliasSql,
+  parameter,
   quoteIdentifier,
   type Bindings,
   type Compilation,
@@ -14,6 +15,7 @@ import {
 import { projectionSql, valueSql } from "./values";
 import { predicateSql } from "./predicates";
 import { tableSql } from "./select";
+import { unconstrained } from "./postgres/render";
 
 /**
  * TRUE (or the `passing` condition) when the row satisfies the scope;
@@ -39,6 +41,84 @@ const scopeCheckSql = (
   const text = scopeViolationText(failure, query.root.table.name);
 
   return `CASE WHEN ${scope} THEN ${passing ? passing() : "TRUE"} ELSE ('${text.replaceAll("'", "''")}' || ${aliasSql(compilation, query.root)}.tableoid)::boolean END`;
+};
+
+/** From this many rows on, a plain multi-row INSERT sends one array per column. */
+const ARRAY_INSERT_THRESHOLD = 100;
+
+/** Column types whose values bind as they are; the array is cast to the type without its length or scale, which assignment then applies. */
+const ARRAY_TYPES =
+  /^(smallint|integer|bigint|text|uuid|boolean|date|double precision|timestamptz|timestamp|numeric|varchar|character varying)(?:\(\d+(?:,\s*\d+)?\))?$/;
+
+/**
+ * The rows of a bulk INSERT as one array per column, when every row carries
+ * the same columns as plain values of types PostgreSQL reads from an array
+ * literal exactly as from a parameter. Anything else (a DEFAULT, an SQL
+ * expression, a prepared parameter, an enum, an array column) keeps VALUES.
+ */
+const columnArrays = (
+  query: MutationPlan,
+  columns: readonly MutationPlan["root"]["table"]["columns"][number][],
+): { values: unknown[]; type: string }[] | undefined => {
+  if (query.values.length < ARRAY_INSERT_THRESHOLD) {
+    return undefined;
+  }
+
+  const arrays: { values: unknown[]; type: string }[] = [];
+
+  for (const column of columns) {
+    const values: unknown[] = [];
+    let cast: string | undefined;
+    let typed = false;
+
+    for (const row of query.values) {
+      const value = row[column.name];
+
+      if (
+        value === undefined ||
+        value === DEFAULT_VALUE ||
+        value.kind !== "parameter" ||
+        Array.isArray(value.value)
+      ) {
+        return undefined;
+      }
+
+      // NULL is NULL under any cast; the other values must agree on theirs.
+      if (value.value !== null) {
+        if (typed && value.cast !== cast) {
+          return undefined;
+        }
+
+        cast = value.cast;
+        typed = true;
+      }
+
+      values.push(value.value);
+    }
+
+    if (cast) {
+      // A value bound as `$1::text::jsonb` is an element of `text[]::jsonb[]`.
+      if (cast.endsWith("]")) {
+        return undefined;
+      }
+
+      arrays.push({ values, type: `text[]::${unconstrained(cast)}[]` });
+      continue;
+    }
+
+    const base = ARRAY_TYPES.exec(column.sqlType)?.[1];
+
+    if (!base) {
+      return undefined;
+    }
+
+    arrays.push({
+      values,
+      type: `${base === "varchar" || base === "character varying" ? "text" : base}[]`,
+    });
+  }
+
+  return arrays;
 };
 
 export const mutationSql = (
@@ -92,21 +172,32 @@ export const mutationSql = (
         );
       }
 
-      fragments.push(
-        `(${columns.map((column) => quoteIdentifier(column.sqlName)).join(", ")}) VALUES ${query.values
-          .map(
-            (values) =>
-              `(${columns
-                .map((column) => {
-                  const value = values[column.name];
+      const arrays = columnArrays(query, columns);
 
-                  return value === undefined || value === DEFAULT_VALUE
-                    ? "DEFAULT"
-                    : valueSql(compilation, value, query.bindings);
-                })
-                .join(", ")})`,
-          )
-          .join(", ")}`,
+      fragments.push(
+        arrays
+          ? // One array per column: the statement's text and its parameter
+            // count no longer grow with the number of rows.
+            `(${columns.map((column) => quoteIdentifier(column.sqlName)).join(", ")}) SELECT * FROM unnest(${arrays
+              .map(
+                ({ values, type }) =>
+                  `${parameter(compilation, values)}::${type}`,
+              )
+              .join(", ")})`
+          : `(${columns.map((column) => quoteIdentifier(column.sqlName)).join(", ")}) VALUES ${query.values
+              .map(
+                (values) =>
+                  `(${columns
+                    .map((column) => {
+                      const value = values[column.name];
+
+                      return value === undefined || value === DEFAULT_VALUE
+                        ? "DEFAULT"
+                        : valueSql(compilation, value, query.bindings);
+                    })
+                    .join(", ")})`,
+              )
+              .join(", ")}`,
       );
     }
 

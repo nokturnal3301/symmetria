@@ -708,7 +708,7 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
     expect(await database.posts.by.slug("c").maybeOne()).toBeNull();
   });
 
-  test("siblings above the wire-protocol parameter limit are written in chunks, atomically", async () => {
+  test("siblings above the wire-protocol parameter limit are written together, atomically", async () => {
     const children = Array.from({ length: 22_000 }, (_, position) => ({
       slug: `slug-${position}`,
       title: `Title ${position}`,
@@ -721,8 +721,8 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
       }),
     );
 
-    // Three parameters a row: two statements for the children instead of 22,000.
-    expect(sent).toHaveLength(3);
+    // The children are one statement of three arrays instead of 22,000 rows.
+    expect(sent).toHaveLength(2);
     expect(
       await database.posts((posts) => ({ id: posts.id, slug: posts.slug }), {
         where: (posts) => posts.id.in([1, 11_000, 11_001, 22_000]),

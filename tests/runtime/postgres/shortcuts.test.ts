@@ -165,6 +165,26 @@ describe.skipIf(!databaseUrl)("query and write shortcuts on PostgreSQL", () => {
       { slug: "a", price: "10.50", author: { name: "Ada" } },
       { slug: "b", price: "1.25", author: { name: "Ada" } },
     ]);
+    // Several totals of one relation come from one shared subquery.
+    const totals = database.users(
+      (user) => ({
+        name: user.name,
+        posts: user.posts.count(),
+        total: user.posts.sum.price,
+        top: user.posts.maximum.price,
+      }),
+      { orderBy: { id: "asc" } },
+    );
+    const expected: Awaited<typeof totals> = [
+      { name: "Ada", posts: 2, total: "11.75", top: "10.50" },
+      { name: "Bob", posts: 1, total: "0.00", top: "0.00" },
+      { name: "Cy", posts: 0, total: null, top: null },
+    ];
+
+    expect(totals.toSQL().sql).toContain("LEFT JOIN LATERAL");
+    expect(await totals).toEqual(expected);
+    expect(await totals({ limit: 2 })).toEqual(expected.slice(0, 2));
+    expect(await totals({ limit: 2, offset: 1 })).toEqual(expected.slice(1));
     // Pages and streams of a whole-row query.
     const page = await database
       .users({ orderBy: { id: "asc" } })

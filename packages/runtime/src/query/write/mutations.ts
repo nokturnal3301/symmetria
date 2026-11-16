@@ -339,10 +339,18 @@ export const createMutation = (
       // Atomic values bind at most one parameter each, so most inserts are
       // provably under the limit without compiling; compilePlan caches otherwise.
       (state.atomicValues &&
-        state.values.length * root.table.columns.length + 1000 <= limit) ||
-      (!chunks && compiled(state).parameters.length <= limit)
+        state.values.length * root.table.columns.length + 1000 <= limit)
     ) {
       return run(state, executor);
+    }
+
+    if (!chunks && compiled(state).parameters.length <= limit) {
+      // Rows sent as one array per column fit one statement however many
+      // they are. An insert this large used to be several statements in a
+      // savepoint, so a caught failure left the transaction usable: it still does.
+      return state.values.length * Object.keys(state.values[0]!).length > limit
+        ? options.atomic((atomicExecutor) => run(state, atomicExecutor))
+        : run(state, executor);
     }
 
     // Halve until every chunk fits; rows may bind different numbers of parameters.

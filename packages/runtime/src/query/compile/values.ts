@@ -4,6 +4,7 @@
 import { bigintCodec, numericCodec, cloneParameter } from "../codecs";
 import { expressionSqlType } from "../plan/metadata";
 import { sameExpression } from "../plan/equivalence";
+import { containsNode } from "../plan/traverse";
 import type {
   ExpressionDescription,
   ValueNode,
@@ -63,6 +64,9 @@ export const jsonPrecisionSql = (
   return compilation.renderer.cast(value, { kind: "text", array: !!array });
 };
 
+const buildsJson = (node: ValueNode): boolean =>
+  node.kind === "jsonObject" || node.kind === "jsonRows";
+
 export const valueSql = (
   compilation: Compilation,
   node: ValueNode,
@@ -84,9 +88,11 @@ export const valueSql = (
     node.kind !== "placeholder"
       ? compilation.expressionCaches?.get(bindings)
       : undefined;
+  // Only JSON builders render differently as the statement's own output.
   const existing = cache?.find(
     (entry) =>
-      entry.jsonOutput === jsonOutput && sameExpression(entry.node, node),
+      sameExpression(entry.node, node) &&
+      (entry.jsonOutput === jsonOutput || !containsNode(node, buildsJson)),
   );
 
   if (existing) {

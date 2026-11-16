@@ -7,6 +7,7 @@ import { booleanCodec } from "../codecs";
 import { quoteIdentifier } from "../compile";
 import { derivedBinding } from "../plan/derived";
 import {
+  and,
   average,
   count,
   createExpression,
@@ -28,7 +29,12 @@ import {
   type TableBinding,
 } from "../plan/types";
 import { callable } from "../expressions/callable";
-import { joinRelation, type ShapeCallback } from "./joins";
+import {
+  joinRelation,
+  readShapePredicates,
+  type ShapeCallback,
+  type ShapePredicate,
+} from "./joins";
 import type { QueryContext, TableRegistry } from "./registry";
 import {
   bindingScope,
@@ -273,7 +279,7 @@ export const createContext = (
 
           const quantified = (
             mode: "some" | "none" | "every",
-            callback?: (columns: RuntimeScope[string]) => Predicate,
+            callback?: (columns: RuntimeScope[string]) => ShapePredicate,
           ): Predicate => {
             let query = current();
 
@@ -289,15 +295,23 @@ export const createContext = (
 
             if (callback) {
               const { nested, result } = evaluate(callback);
-              const description = readPredicate(result);
+              // A list is its predicates joined by AND, as in `where`.
+              const conditions =
+                mode === "every"
+                  ? [
+                      {
+                        kind: "notTrue" as const,
+                        predicate: readPredicate(
+                          Array.isArray(result)
+                            ? and(...result)
+                            : (result as Predicate),
+                        ),
+                      },
+                    ]
+                  : readShapePredicates(result);
               query = freeze({
                 ...nested.plan,
-                predicates: freeze([
-                  ...nested.plan.predicates,
-                  mode === "every"
-                    ? { kind: "notTrue" as const, predicate: description }
-                    : description,
-                ]),
+                predicates: freeze([...nested.plan.predicates, ...conditions]),
               });
             }
 

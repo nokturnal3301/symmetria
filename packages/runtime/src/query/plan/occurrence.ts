@@ -11,14 +11,8 @@ const remap = <Value>(
   visit: (value: Value) => Value,
 ): readonly Value[] => (values.length ? freeze(values.map(visit)) : values);
 
-/** Give a reusable query new local sources, retaining its correlated ancestors. */
-export const queryOccurrence = (source: SelectPlan): SelectPlan => {
-  const replacements = new Map<TableBinding, TableBinding>(
-    [source.root, ...source.joins.map((join) => join.binding)].map(
-      (binding) => [binding, freeze({ ...binding })],
-    ),
-  );
-
+/** Rewrites plans and expressions onto other bindings; anything not listed stays as it is. */
+const rebinder = (replacements: ReadonlyMap<TableBinding, TableBinding>) => {
   const derivedBindings = new Map<TableBinding, TableBinding>();
 
   const binding = (original: TableBinding): TableBinding => {
@@ -262,5 +256,21 @@ export const queryOccurrence = (source: SelectPlan): SelectPlan => {
       ordering: remap(original.ordering, ordering),
     });
 
-  return query(source);
+  return { query, expression };
 };
+
+/** Give a reusable query new local sources, retaining its correlated ancestors. */
+export const queryOccurrence = (source: SelectPlan): SelectPlan =>
+  rebinder(
+    new Map<TableBinding, TableBinding>(
+      [source.root, ...source.joins.map((join) => join.binding)].map(
+        (binding) => [binding, freeze({ ...binding })],
+      ),
+    ),
+  ).query(source);
+
+/** An expression read from other bindings, such as one query's root in place of another's. */
+export const reboundExpression = (
+  expression: ExpressionDescription,
+  replacements: ReadonlyMap<TableBinding, TableBinding>,
+): ExpressionDescription => rebinder(replacements).expression(expression);

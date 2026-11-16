@@ -694,3 +694,166 @@ test("an aggregate has over() like the ranking functions", () => {
     'SELECT SUM("posts"."version")::numeric AS "total"\nFROM "posts" AS "posts"',
   );
 });
+
+test("relation quantifiers take a list of predicates like where", () => {
+  const { database } = recording();
+  const where = (query: { toSQL: () => CompiledQuery }) =>
+    query.toSQL().sql.split("WHERE ").slice(1).join("WHERE ");
+  const list = database.users((user) => ({ id: user.id }), {
+    where: (user) =>
+      user.posts.some((post) => [
+        post.version.above(1),
+        undefined,
+        post.title.is("A"),
+      ]),
+  });
+
+  expect(where(list)).toBe(
+    'EXISTS (SELECT 1 AS "present"\nFROM "posts" AS "__symmetria_aggregate_0"\nWHERE "users"."id" = "__symmetria_aggregate_0"."author_id" AND "__symmetria_aggregate_0"."version" > $1 AND "__symmetria_aggregate_0"."title" = $2)',
+  );
+  // every(): no post fails the conjunction.
+  expect(
+    where(
+      database.users((user) => ({ id: user.id }), {
+        where: (user) =>
+          user.posts.every((post) => [
+            post.version.above(1),
+            post.title.is("A"),
+          ]),
+      }),
+    ),
+  ).toBe(
+    where(
+      database.users((user) => ({ id: user.id }), {
+        where: (user) =>
+          user.posts.every((post) =>
+            post.version.above(1).and(post.title.is("A")),
+          ),
+      }),
+    ),
+  );
+});
+
+test("an ordering by a selected field reuses its text and parameters", () => {
+  const { database } = recording();
+  const { sql, parameters } = database
+    .users(
+      (user) => ({
+        id: user.id,
+        drafts: user.posts({ where: { title: "Draft" } }).count(),
+      }),
+      {
+        orderBy: (user, { selected }) => [selected.drafts.desc, user.id.asc],
+      },
+    )
+    .toSQL();
+
+  // One parameter: PostgreSQL sees one expression and computes it once per row.
+  expect(parameters).toEqual(["Draft"]);
+  expect(sql.match(/\$1/g)).toHaveLength(2);
+  expect(sql).not.toContain("$2");
+});
+
+test("aggregates over one relation share one subquery", () => {
+  const { database } = recording();
+  const card = (options: Record<string, unknown>) =>
+    database
+      .users(
+        (user) => ({
+          id: user.id,
+          posts: user.posts.count(),
+          versions: user.posts.sum.version,
+          newest: user.posts.maximum.version,
+          oldestId: user.posts.minimum.id,
+        }),
+        options as never,
+      )
+      .toSQL().sql;
+  const shared =
+    'LEFT JOIN LATERAL (SELECT COUNT(*) AS "count", SUM("__symmetria_aggregate_0"."version")::numeric AS "sum", MAX("__symmetria_aggregate_0"."version") AS "maximum", MIN("__symmetria_aggregate_0"."id") AS "minimum"\nFROM "posts" AS "__symmetria_aggregate_0"\nWHERE "users"."id" = "__symmetria_aggregate_0"."author_id") AS "__symmetria_shared_0" ON TRUE';
+
+  // Every row is returned: one subquery per user instead of four.
+  expect(card({})).toBe(
+    `SELECT "users"."id" AS "id", "__symmetria_shared_0"."count" AS "posts", "__symmetria_shared_0"."sum" AS "versions", "__symmetria_shared_0"."maximum" AS "newest", "__symmetria_shared_0"."minimum" AS "oldestId"\nFROM "users" AS "users"\n${shared}`,
+  );
+  // A page is cut first; only its rows reach the subquery.
+  expect(card({ orderBy: { id: "asc" }, limit: 10 })).toEndWith(
+    `ORDER BY "users"."id" ASC\nLIMIT 10) AS "users"\n${shared}\nORDER BY "users"."id" ASC`,
+  );
+  // Sorting by a total needs it for every row, and a join would compute the
+  // other totals for every row too: they stay per-row subqueries.
+  expect(
+    card({
+      orderBy: (
+        _user: never,
+        { selected }: { selected: { posts: { desc: unknown } } },
+      ) => selected.posts.desc,
+      limit: 10,
+    }),
+  ).not.toContain("LATERAL");
+  // Different filters are different rows: nothing to share.
+  expect(
+    database
+      .users((user) => ({
+        all: user.posts.count(),
+        named: user.posts({ where: { title: "A" } }).count(),
+      }))
+      .toSQL().sql,
+  ).not.toContain("LATERAL");
+  // Two sums get two column names.
+  expect(
+    database
+      .users((user) => ({
+        versions: user.posts.sum.version,
+        ids: user.posts.sum.id,
+      }))
+      .toSQL().sql,
+  ).toContain(
+    '"__symmetria_shared_0"."sum" AS "versions", "__symmetria_shared_0"."sum_1" AS "ids"',
+  );
+});
+
+test("get() and find() without a shape bind the key into one compiled statement", async () => {
+  const { database, calls } = recording([{ id: 7, name: "Ada", active: true }]);
+
+  await database.users.get(7);
+  await database.users.find(8);
+  expect(calls.map((call) => call.parameters)).toEqual([[7], [8]]);
+  expect(calls[1]!.sql).toBe(calls[0]!.sql);
+  // The same statement and errors as the query it shortens.
+  await database.users.byId(7).one();
+  expect(calls[2]).toEqual(calls[0]!);
+  await expect(database.users.get(1.5)).rejects.toThrow(
+    await database.users
+      .byId(1.5)
+      .one()
+      .catch((error: Error) => error.message),
+  );
+  expect(calls).toHaveLength(3);
+
+  // A scoped table keeps its filter, with the value current at the call.
+  let tenant = true;
+  const scoped = database.$scope({ users: (user) => user.active.is(tenant) });
+
+  await scoped.users.find(7);
+  tenant = false;
+  await scoped.users.find(7);
+  expect(calls.at(-2)!.sql).toContain('"users"."active" = $1');
+  expect(calls.at(-2)!.parameters).toEqual([true, 7]);
+  expect(calls.at(-1)!.parameters).toEqual([false, 7]);
+
+  // Two rows for one key are an error, none is null or NotFoundError.
+  const { database: doubled } = recording([{ id: 1 }, { id: 1 }]);
+
+  await expect(doubled.users.find(1)).rejects.toMatchObject({
+    code: "SYMMETRIA_TOO_MANY_ROWS",
+  });
+
+  const { database: empty } = recording([]);
+
+  expect(await empty.users.find(1)).toBeNull();
+  await expect(empty.users.get(1)).rejects.toMatchObject({
+    code: "SYMMETRIA_RECORD_NOT_FOUND",
+    table: "users",
+  });
+});

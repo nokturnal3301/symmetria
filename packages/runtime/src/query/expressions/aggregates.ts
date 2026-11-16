@@ -1,17 +1,41 @@
 /**
  * Plan analysis for aggregates: shared aggregate detection, correlated-subquery checks and root-first pagination.
  */
-import type { PredicateDescription, ValueNode } from ".";
+import type { ExpressionDescription, PredicateDescription, ValueNode } from ".";
+import { freeze } from "../plan/freeze";
+import { reboundExpression } from "../plan/occurrence";
 import type { SelectPlan } from "../plan/types";
 import { sameExpression } from "../plan/equivalence";
 import { containsNode } from "../plan/traverse";
 
 type AggregateQuery = Extract<ValueNode, { kind: "subquery" }>;
-type SharedAggregate = {
-  node: AggregateQuery;
-  references: ValueNode[];
+
+/**
+ * Aggregates over one relation with one filter: `orders.count()` and
+ * `orders.sum.total` read the same rows, so one subquery computes both.
+ */
+export type SharedAggregate = {
+  /** The subquery with every distinct aggregate of the group selected. */
+  readonly query: SelectPlan;
+  /** Each replaced node and the column of `query` it reads. */
+  readonly references: ReadonlyMap<ValueNode, string>;
+};
+
+export type SharedAggregates = {
+  /** Joined before WHERE: a filter reads them, or no LIMIT trims the rows. */
+  readonly inner: readonly SharedAggregate[];
+  /** Joined to the page a root-first pagination has already cut. */
+  readonly outer: readonly SharedAggregate[];
+};
+
+type AggregateGroup = {
+  first: AggregateQuery;
+  columns: { expression: ExpressionDescription; name: string }[];
+  references: Map<ValueNode, string>;
   filtered: boolean;
 };
+
+const NONE: SharedAggregates = Object.freeze({ inner: [], outer: [] });
 
 const atomicValue = (node: ValueNode): boolean =>
   node.kind === "column" ||
@@ -87,26 +111,47 @@ const shareable = (node: AggregateQuery): boolean => {
   );
 };
 
-export const sharedAggregates = (query: SelectPlan): SharedAggregate[] => {
+const subquery = (node: ValueNode): boolean => node.kind === "subquery";
+
+export const sharedAggregates = (query: SelectPlan): SharedAggregates => {
   if (
-    !query.predicates.length ||
+    query.rootless ||
     query.joins.length ||
     query.grouping.length ||
     query.having.length ||
     query.distinct ||
-    query.locking ||
-    query.predicates.every(
-      (predicate) =>
-        predicate.kind === "scope" ||
-        (predicate.kind === "comparison" &&
-          atomicValue(predicate.left) &&
-          atomicValue(predicate.right)),
-    )
+    query.locking
   ) {
-    return [];
+    return NONE;
   }
 
-  const groups: SharedAggregate[] = [];
+  // Most queries stop here: sharing needs two aggregates, or one that a filter repeats.
+  const filters = !query.predicates.every(
+    (predicate) =>
+      predicate.kind === "scope" ||
+      (predicate.kind === "comparison" &&
+        atomicValue(predicate.left) &&
+        atomicValue(predicate.right)),
+  );
+
+  if (
+    !filters &&
+    query.selection.reduce(
+      (count, expression) =>
+        count + (containsNode(expression.node, subquery) ? 1 : 0),
+      0,
+    ) +
+      (query.ordering.some((ordering) =>
+        containsNode(ordering.expression.node, subquery),
+      )
+        ? 1
+        : 0) <
+      2
+  ) {
+    return NONE;
+  }
+
+  const groups: AggregateGroup[] = [];
 
   const visit = (value: unknown, filtered: boolean): void => {
     if (!value || typeof value !== "object") {
@@ -142,28 +187,53 @@ export const sharedAggregates = (query: SelectPlan): SharedAggregate[] => {
           return;
         }
 
-        const matching = groups.find((group) => {
-          const first = group.node.query;
-          const second = node.query;
-          const bindings = new Map([[first.root, second.root]]);
+        let group = groups.find(({ first }) => {
+          const one = first.query;
+          const other = node.query;
 
           return (
-            first.root.table === second.root.table &&
+            one.root.table === other.root.table &&
             sameExpression(
-              first.selection[0]!.node,
-              second.selection[0]!.node,
-              bindings,
-            ) &&
-            sameExpression(first.predicates, second.predicates, bindings)
+              one.predicates,
+              other.predicates,
+              new Map([[one.root, other.root]]),
+            )
           );
         });
 
-        if (matching) {
-          matching.references.push(node);
-          matching.filtered ||= filtered;
-        } else {
-          groups.push({ node, references: [node], filtered });
+        if (!group) {
+          group = { first: node, columns: [], references: new Map(), filtered };
+          groups.push(group);
         }
+
+        // Read from the group's own source, so equal aggregates compare equal.
+        const expression =
+          group.first === node
+            ? node.query.selection[0]!
+            : reboundExpression(
+                node.query.selection[0]!,
+                new Map([[node.query.root, group.first.query.root]]),
+              );
+        let column = group.columns.find((existing) =>
+          sameExpression(existing.expression.node, expression.node),
+        );
+
+        if (!column) {
+          const taken = group.columns.some(
+            (existing) => existing.name === expression.outputName,
+          );
+
+          column = {
+            expression,
+            name: taken
+              ? `${expression.outputName}_${group.columns.length}`
+              : expression.outputName,
+          };
+          group.columns.push(column);
+        }
+
+        group.references.set(node, column.name);
+        group.filtered ||= filtered;
 
         return;
       }
@@ -204,17 +274,43 @@ export const sharedAggregates = (query: SelectPlan): SharedAggregate[] => {
   };
 
   visit(query.predicates, true);
-
-  if (!groups.length) {
-    return [];
-  }
-
   visit(query.selection, false);
   visit(query.ordering, false);
 
-  return groups.filter(
-    (group) => group.filtered && group.references.length > 1,
-  );
+  const repeated = groups.filter((group) => group.references.size > 1);
+
+  if (!repeated.length) {
+    return NONE;
+  }
+
+  const shared = (group: AggregateGroup): SharedAggregate => ({
+    query: freeze({
+      ...group.first.query,
+      selection: freeze(
+        group.columns.map(({ expression, name }) =>
+          freeze({ ...expression, outputName: name }),
+        ),
+      ),
+    }),
+    references: group.references,
+  });
+
+  // Without LIMIT every row is returned, so each of its aggregates runs anyway.
+  if (query.limit === undefined && query.offset === undefined) {
+    return { inner: repeated.map(shared), outer: [] };
+  }
+
+  const filtered = repeated.filter((group) => group.filtered);
+
+  // A filter needs its aggregate before LIMIT, for every candidate row.
+  if (filtered.length) {
+    return { inner: filtered.map(shared), outer: [] };
+  }
+
+  // Otherwise only the rows of the page may pay for a subquery.
+  return paginatesRootFirst(query)
+    ? { inner: [], outer: repeated.map(shared) }
+    : NONE;
 };
 
 /** Subqueries evaluated once per outer row: nested collections, aggregates, EXISTS. */

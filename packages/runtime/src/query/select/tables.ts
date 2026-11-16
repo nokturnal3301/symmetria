@@ -6,11 +6,20 @@ import {
   type TableSnapshot,
 } from "../../schema/assembly";
 import { computedFields } from "../../schema/computed";
-import { collectDataErrors, dataError } from "../codecs/deferred";
+import { cloneParameter, encodeValue } from "../codecs";
 import {
+  collectDataErrors,
+  dataError,
+  throwDataErrors,
+} from "../codecs/deferred";
+import { compileTemplate, executeCompiled } from "../compile";
+import { batchCollectors } from "../plan/batching";
+import {
+  createExpression,
   readColumn,
   readPredicate,
   valueNode,
+  type PlaceholderNode,
   type ExpressionDescription,
   type PredicateDescription,
   type ValueNode,
@@ -39,9 +48,11 @@ import {
   QUERY_STATE,
   createScope,
   initialPlan,
+  limitedPlan,
   type QueryHandle,
   shapeFrame,
 } from "./scope";
+import { rowCountError } from "./terminal";
 import type { RuntimeScope } from "./types";
 
 export {
@@ -114,6 +125,40 @@ type LookupQuery = {
   readonly maybeOne: () => Promise<Record<string, unknown> | null>;
 };
 
+/** A whole-row key lookup compiled once: its plan, SQL and where the key's values go. */
+type LookupTemplate = {
+  readonly plan: SelectPlan;
+  readonly sql: string;
+  readonly slots: readonly (
+    | { readonly position: number; readonly codec: PlaceholderNode["codec"] }
+    | { readonly value: unknown }
+  )[];
+};
+
+/** Shared by every database bound to the schema: a transaction reuses the pool's. */
+const schemaLookups = new WeakMap<
+  SchemaTables,
+  Map<string, Map<string, LookupTemplate>>
+>();
+
+const lookupsOf = (schemaTables: SchemaTables, tableName: string) => {
+  let tables = schemaLookups.get(schemaTables);
+
+  if (!tables) {
+    tables = new Map();
+    schemaLookups.set(schemaTables, tables);
+  }
+
+  let lookups = tables.get(tableName);
+
+  if (!lookups) {
+    lookups = new Map();
+    tables.set(tableName, lookups);
+  }
+
+  return lookups;
+};
+
 /** The table handles of one bound database, each created when first asked for. */
 export type QueryTables = {
   readonly table: (tableName: string) => object;
@@ -162,6 +207,7 @@ export const createQueryTables = (
 
   const createTable = (table: TableSnapshot): object => {
     const { root, plan: rootPlan } = rootOf(table.name);
+    const lookupTemplates = lookupsOf(schemaTables, table.name);
     const mutationOptions: MutationOptions = freeze({
       ...(atomic ? { atomic } : {}),
       scope: () => registry.scopePredicates(root),
@@ -462,23 +508,35 @@ export const createQueryTables = (
      * `get({ email })`: an object names the columns of the primary key or of
      * one unique key; any other value is the primary key itself.
      */
-    const keyLookupOf = (value: unknown): object => {
+    const resolveKey = (
+      value: unknown,
+    ):
+      | {
+          label: "primary key" | "unique key";
+          keys: readonly ColumnSnapshot[];
+          values: readonly unknown[];
+        }
+      | undefined => {
+      const primary = primaryKeyColumns(table);
+
       if (!plainRecord(value)) {
-        return byId(value);
+        // A missing or composite primary key is reported by byId().
+        return primary.length === 1
+          ? { label: "primary key", keys: primary, values: [value] }
+          : undefined;
       }
 
       const names = Object.keys(value);
-      const primary = primaryKeyColumns(table);
       const sameColumns = (columns: readonly string[]) =>
         columns.length === names.length &&
         columns.every((name) => Object.hasOwn(value, name));
 
       if (sameColumns(primary.map((column) => column.name))) {
-        return keyLookup(
-          "primary key",
-          primary,
-          primary.map((column) => value[column.name]),
-        );
+        return {
+          label: "primary key",
+          keys: primary,
+          values: primary.map((column) => value[column.name]),
+        };
       }
 
       const unique = [...uniqueKeys.values()].find(sameColumns);
@@ -494,12 +552,120 @@ export const createQueryTables = (
         );
       }
 
-      return keyLookup(
-        "unique key",
-        unique.map(
+      return {
+        label: "unique key",
+        keys: unique.map(
           (name) => table.columns.find((column) => column.name === name)!,
         ),
-        unique.map((name) => value[name]),
+        values: unique.map((name) => value[name]),
+      };
+    };
+
+    const keyLookupOf = (value: unknown): object => {
+      const key = resolveKey(value);
+
+      return key ? keyLookup(key.label, key.keys, key.values) : byId(value);
+    };
+
+    /**
+     * `get(7)` and `find({ email })` without a shape ask for the same statement
+     * every time, so it is compiled once per table and key and only the key is
+     * bound afterwards. A scope, a computed field, a batch, a profiler or a key
+     * that is not a plain value takes the ordinary path.
+     */
+    const wholeRow = (
+      value: unknown,
+      required: boolean,
+    ): Promise<Record<string, unknown> | null> | undefined => {
+      if (
+        !executor ||
+        shapeFrame.bindings ||
+        registry.scopes[table.name] ||
+        computedFields.get(table)?.length ||
+        batchCollectors.has(executor) ||
+        profile
+      ) {
+        return undefined;
+      }
+
+      const key = resolveKey(value);
+
+      if (
+        !key ||
+        !key.values.every(
+          (item) =>
+            typeof item === "string" ||
+            typeof item === "number" ||
+            typeof item === "bigint" ||
+            typeof item === "boolean",
+        )
+      ) {
+        return undefined;
+      }
+
+      const name = key.keys.map((column) => column.name).join("\0");
+      let template = lookupTemplates.get(name);
+
+      if (!template) {
+        const scope = {};
+        const plan = limitedPlan(
+          keyPlan(
+            key.label,
+            key.keys,
+            key.keys.map((column, position) => {
+              const codec = root.codecs[column.name];
+
+              return createExpression({
+                outputName: column.name,
+                node: freeze({
+                  kind: "placeholder",
+                  name: String(position),
+                  scope,
+                  nullable: false,
+                  sqlType: column.sqlType,
+                  ...(codec ? { codec } : {}),
+                }),
+                ...(codec ? { codec } : {}),
+              });
+            }),
+          ),
+          2,
+        );
+        const statement = compileTemplate(plan, (node) => node);
+
+        template = {
+          plan,
+          sql: statement.sql,
+          slots: statement.parameters.map((parameter) => {
+            const node = parameter as PlaceholderNode | null;
+
+            return node && typeof node === "object" && node.scope === scope
+              ? { position: Number(node.name), codec: node.codec }
+              : { value: parameter };
+          }),
+        };
+        lookupTemplates.set(name, template);
+      }
+
+      const { plan, sql, slots } = template;
+      const parameters = throwDataErrors(() =>
+        slots.map((slot) =>
+          cloneParameter(
+            "position" in slot
+              ? encodeValue(key.values[slot.position], slot.codec)
+              : slot.value,
+          ),
+        ),
+      );
+
+      return executeCompiled(plan, { sql, parameters }, executor).then(
+        ({ rows }) => {
+          if (rows.length > 1 || (required && !rows.length)) {
+            throw rowCountError(plan, rows.length, required);
+          }
+
+          return rows[0] ?? null;
+        },
       );
     };
 
@@ -535,8 +701,10 @@ export const createQueryTables = (
       byId,
       // async: a malformed key rejects like any other failure of the read.
       get: async (value: unknown, shape?: ShapeCallback) =>
+        (shape === undefined ? wholeRow(value, true) : undefined) ??
         keyed(value, shape).one(),
       find: async (value: unknown, shape?: ShapeCallback) =>
+        (shape === undefined ? wholeRow(value, false) : undefined) ??
         keyed(value, shape).maybeOne(),
       insert: (
         values: Record<string, unknown> | readonly Record<string, unknown>[],

@@ -7,12 +7,13 @@ import {
   COLUMN_EXPRESSION,
   ORDERING_EXPRESSION,
   type TraitsOf,
+  type ExpressionDescription,
   type SelectedColumn,
   type ExpressionValue,
   type Ordering,
 } from "./nodes";
 import type { Literal, StoredOf, QueryColumn } from "./column-types";
-import { readColumn, valueNode, createExpression } from "./core";
+import { ColumnHandle, readColumn, valueNode, createExpression } from "./core";
 
 export type WindowBoundary =
   | "unbounded preceding"
@@ -122,14 +123,39 @@ export const over = <Expression extends SelectedColumn>(
   });
 };
 
+/**
+ * A column handle whose `over()` lives on its prototype, so an aggregate costs
+ * one object. Created on first use: this module and `core` import each other.
+ */
+let WindowHandle:
+  | (new (
+      description: ExpressionDescription,
+    ) => ColumnHandle)
+  | undefined;
+
+const windowHandle = () =>
+  (WindowHandle ??= class extends ColumnHandle {
+    over(options?: WindowOptions) {
+      return over(this as unknown as SelectedColumn, options);
+    }
+  });
+
+/** An expression that can become a window: the ranking functions and the aggregates. */
+export const windowExpression = <Value, Name extends string, Traits = {}>(
+  description: ExpressionDescription<Name>,
+): WindowExpression<Value, Name, Traits> =>
+  freeze(new (windowHandle())(description)) as unknown as WindowExpression<
+    Value,
+    Name,
+    Traits
+  >;
+
 export const windowFunction = <Value, Name extends string, Traits = {}>(
   expression: QueryColumn<Value, Name, Traits>,
 ): WindowExpression<Value, Name, Traits> =>
-  freeze(
-    Object.assign(Object.create(expression), {
-      over: (options?: WindowOptions) => over(expression, options),
-    }),
-  ) as WindowExpression<Value, Name, Traits>;
+  windowExpression(
+    readColumn(expression) as unknown as ExpressionDescription<Name>,
+  );
 
 export const rowNumber = (): WindowExpression<number, "rowNumber"> =>
   windowFunction(

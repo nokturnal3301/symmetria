@@ -179,6 +179,13 @@ const model = schema({ users, posts, logs });
     where: { views: 1n, title: undefined },
     orderBy: { id: "desc", title: "asc" },
   });
+  model.users((user) => ({ id: user.id }), {
+    where: (user) => [
+      user.posts.some((post) => [post.views.above(1n), undefined]),
+      user.posts.none((post) => [post.title.is("x")]),
+      user.posts.every((post) => [post.views.above(1n)]),
+    ],
+  });
   model.posts((post) => ({ id: post.id }), {
     // @ts-expect-error no such column
     where: { titel: "x" },

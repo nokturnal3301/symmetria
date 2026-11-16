@@ -64,13 +64,15 @@ test("distance operators compile with a cast vector parameter and no array metho
     `("documents"."embedding" <-> "documents"."optional") AS "between"`,
   );
   expect(query.sql).toContain(
-    `WHERE ("documents"."embedding" <=> $5::text::vector) < $6`,
+    `WHERE ("documents"."embedding" <=> $2::text::vector) < $5`,
   );
   expect(query.sql).toContain(
-    `ORDER BY ("documents"."embedding" <=> $7::text::vector) ASC`,
+    `ORDER BY ("documents"."embedding" <=> $2::text::vector) ASC`,
   );
   expect(query.parameters[0]).toBe("[0.1,0.2,0.3]");
-  expect(query.parameters[5]).toBe(0.5);
+  // The filter and the ordering reuse the selected distance: one vector is sent.
+  expect(query.parameters).toHaveLength(5);
+  expect(query.parameters[4]).toBe(0.5);
 });
 
 test("prepared vector parameters and writes encode embeddings as pgvector text", () => {

@@ -591,9 +591,10 @@ db.posts(
 ```
 
 A selected field is the same expression as in the projection, not a reference to
-its alias: the SQL repeats the expression, and in a grouped or `distinct` query
-it is the same text with the same parameters, as PostgreSQL requires. Only
-fields that are one value are offered: a nested object, a nested collection or a
+its alias: the SQL repeats the expression as the same text with the same
+parameters, which PostgreSQL requires in a grouped or `distinct` query and which
+lets it compute an expression that is selected and ordered by once. Only fields
+that are one value are offered: a nested object, a nested collection or a
 relation selected with a shape is a type error, and an error when the query is
 built for untyped code. `where` receives no selected fields, because a WHERE
 runs before aggregates and window functions exist; filter on source columns
@@ -991,11 +992,12 @@ db.users(
 ```
 
 `some` uses EXISTS; `none` and `every` use NOT EXISTS. `some()` / `none()` also
-accept no predicate. For an empty relation, `some` is false and `none` / `every`
-are true. `every` treats SQL NULL as a failed predicate (`IS NOT TRUE`). Filters
-can nest and follow to-one paths. Quantifiers apply before LIMIT/OFFSET;
-paginated collections still support shape callbacks, aggregates and `.exists()`,
-with pagination included in their result.
+accept no predicate, and all three take a list of predicates joined by `AND`, as
+`where` does. For an empty relation, `some` is false and `none` / `every` are
+true. `every` treats SQL NULL as a failed predicate (`IS NOT TRUE`). Filters can
+nest and follow to-one paths. Quantifiers apply before LIMIT/OFFSET; paginated
+collections still support shape callbacks, aggregates and `.exists()`, with
+pagination included in their result.
 
 ### Conditional filters and narrowing
 
@@ -1360,21 +1362,27 @@ same refusal of two rows with one key.
 `returning("id", "name")` returns those columns and `returning()` the whole row,
 next to the callback and reusable-shape forms.
 
-Bulk INSERT accepts arrays, including rows with different omitted defaults. An
-array whose parameters exceed the driver's wire-protocol limit (65,535 on
-PostgreSQL) runs as several INSERT statements in one transaction, or in a
-savepoint inside one, with `RETURNING` rows concatenated in order. An
-`undefined` field is omitted, as with query options, so optional request fields
-can be passed through; required columns still fail when `undefined`, and unknown
-keys fail even when `undefined`. Nullable references accept `undefined` in the
-nested form too (`editor: body.editor` with `{ connect }` or nothing).
-`insert([])` executes no statement and resolves to `{ affectedRows: 0 }` or `[]`
-with `returning()`; its `toSQL()` throws. `defaultValue` explicitly emits SQL
-`DEFAULT`. Mutations resolve to `{ affectedRows }` without `returning()`. With
-`returning()`, `insert(object)` resolves to one row (`null` when
-`onConflict().doNothing()` skipped it) and `insert(array)`, UPDATE and DELETE
-resolve to arrays. `bigint` columns accept safe integers on write and in
-comparisons. Relation paths in `where()` compile to a primary-key subquery
+Bulk INSERT accepts arrays, including rows with different omitted defaults. From
+100 rows on, rows that all carry the same columns as plain values are sent as
+one array per column (`INSERT … SELECT * FROM unnest($1::integer[], …)`): the
+statement has as many parameters as columns, whatever the number of rows. A row
+with a `defaultValue`, an SQL expression, a prepared parameter, an enum or an
+array column keeps the whole insert in the `VALUES` form, and so does a row that
+leaves out a column the others carry. A `VALUES` insert whose parameters exceed
+the driver's wire-protocol limit (65,535 on PostgreSQL) runs as several INSERT
+statements in one transaction, or in a savepoint inside one, with `RETURNING`
+rows concatenated in order. An `undefined` field is omitted, as with query
+options, so optional request fields can be passed through; required columns
+still fail when `undefined`, and unknown keys fail even when `undefined`.
+Nullable references accept `undefined` in the nested form too
+(`editor: body.editor` with `{ connect }` or nothing). `insert([])` executes no
+statement and resolves to `{ affectedRows: 0 }` or `[]` with `returning()`; its
+`toSQL()` throws. `defaultValue` explicitly emits SQL `DEFAULT`. Mutations
+resolve to `{ affectedRows }` without `returning()`. With `returning()`,
+`insert(object)` resolves to one row (`null` when `onConflict().doNothing()`
+skipped it) and `insert(array)`, UPDATE and DELETE resolve to arrays. `bigint`
+columns accept safe integers on write and in comparisons. Relation paths in
+`where()` compile to a primary-key subquery
 (`WHERE "posts"."id" IN (SELECT ... JOIN ...)`), so they need a primary key.
 UPDATE/DELETE without `where()` are refused when compiled; `.all()` spells out a
 deliberate whole-table write. Scoped databases and lookups count as
@@ -1692,6 +1700,12 @@ db.users((user) => ({
 | `exists()`                                                 | `boolean`                                        | `false`     |
 | `sum.column`, `average.column`, `sum(row => expression)`   | Decimal `string \| null`                         | `null`      |
 | `minimum.column`, `maximum.column`, `maximum(row => expr)` | Column or expression type and codec, plus `null` | `null`      |
+
+Aggregates over the same relation with the same filter share one subquery:
+`posts.count()`, `posts.sum.views` and `posts.maximum.createdAt` in one shape
+read a user's posts once. The shared subquery is a `LEFT JOIN LATERAL`, joined
+where it cannot cost more than separate subqueries: when every row is returned,
+or after the page of a limited query has been cut.
 
 A plain column aggregates through a property (`posts.sum.views`); expressions
 use the callback form. `sum` and `average` accept numeric, bigint and decimal

@@ -6,6 +6,7 @@ import {
   sharedAggregates,
 } from "../expressions/aggregates";
 import type { ValueNode } from "../expressions";
+import { sameExpression } from "../plan/equivalence";
 import {
   containsBinding,
   mergeBindings,
@@ -143,38 +144,63 @@ const renderSelect = (
         })
       : query.bindings;
 
-  if (query.grouping.length || query.distinct) {
+  // A grouped or distinct query must repeat an expression as the same text.
+  // An ordering by a selected field repeats it too: with the same text and
+  // parameters PostgreSQL computes the expression once, not once per clause.
+  if (
+    query.grouping.length ||
+    query.distinct ||
+    query.ordering.some(
+      ({ expression }) =>
+        expression.node.kind !== "column" &&
+        query.selection.some((selected) =>
+          sameExpression(selected.node, expression.node),
+        ),
+    )
+  ) {
     (compilation.expressionCaches ??= new Map()).set(bindings, []);
   }
 
   const aggregates = sharedAggregates(query);
-  const lateral: { alias: string; query: SelectPlan }[] = [];
+  const shared = {
+    inner: [] as { alias: string; query: SelectPlan }[],
+    outer: [] as { alias: string; query: SelectPlan }[],
+  };
+  const lateral = (placement: "inner" | "outer") =>
+    shared[placement].map(
+      ({ alias, query: aggregate }) =>
+        `LEFT JOIN LATERAL (${selectSql(compilation, aggregate, bindings)}) AS ${quoteIdentifier(alias)} ON TRUE`,
+    );
 
-  if (aggregates.length) {
+  if (aggregates.inner.length || aggregates.outer.length) {
     const sharedReferences = new Map<ValueNode, string>();
     const occupied = new Set(
       Object.values(bindings).map(
         (binding) => compilation.aliasNames.get(binding) ?? binding.alias,
       ),
     );
-    aggregates.forEach((group, position) => {
-      let alias = `__symmetria_shared_${position}`;
+    let position = 0;
 
-      while (occupied.has(alias)) {
-        alias += "_";
+    for (const placement of ["inner", "outer"] as const) {
+      for (const group of aggregates[placement]) {
+        let alias = `__symmetria_shared_${position++}`;
+
+        while (occupied.has(alias)) {
+          alias += "_";
+        }
+
+        occupied.add(alias);
+
+        for (const [node, column] of group.references) {
+          sharedReferences.set(
+            node,
+            `${quoteIdentifier(alias)}.${quoteIdentifier(column)}`,
+          );
+        }
+
+        shared[placement].push({ alias, query: group.query });
       }
-
-      occupied.add(alias);
-
-      for (const node of group.references) {
-        sharedReferences.set(
-          node,
-          `${quoteIdentifier(alias)}.${quoteIdentifier(group.node.query.selection[0]!.outputName)}`,
-        );
-      }
-
-      lateral.push({ alias, query: group.node.query });
-    });
+    }
 
     (compilation.aggregateReferences ??= new Map()).set(
       bindings,
@@ -216,13 +242,9 @@ const renderSelect = (
     }
   }
 
-  if (query.predicates.length) {
-    for (const aggregate of lateral) {
-      fragments.push(
-        `LEFT JOIN LATERAL (${selectSql(compilation, aggregate.query, bindings)}) AS ${quoteIdentifier(aggregate.alias)} ON TRUE`,
-      );
-    }
+  fragments.push(...lateral("inner"));
 
+  if (query.predicates.length) {
     fragments.push(
       `WHERE ${query.predicates.map((description) => predicateSql(compilation, description, bindings)).join(" AND ")}`,
     );
@@ -276,7 +298,7 @@ const renderSelect = (
     fragments.push(lock);
   }
 
-  if (aggregates.length || !paginatesRootFirst(query)) {
+  if (aggregates.inner.length || !paginatesRootFirst(query)) {
     return [projection, source, ...body, ...fragments].join("\n");
   }
 
@@ -291,6 +313,7 @@ const renderSelect = (
   return [
     projection,
     `FROM (${inner}) AS ${aliasSql(compilation, query.root)}`,
+    ...lateral("outer"),
     ...(orderBy ? [orderBy] : []),
   ].join("\n");
 };
