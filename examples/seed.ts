@@ -1,37 +1,34 @@
 import { connect } from "./database";
 
-const database = connect();
+const db = connect();
 
 try {
-  await database.$transaction(async (transaction) => {
+  await db.$transaction(async (transaction) => {
     await transaction.users
       .insert({ email: "ada@example.test", name: "Ada" })
       .onConflict("email")
-      .doNothing()
-      .execute();
+      .doNothing();
 
-    const author = await transaction.users.by.email("ada@example.test").one();
+    const author = await transaction.users.get({ email: "ada@example.test" });
 
     for (const slug of ["typed-sql", "relations", "transactions", "draft"]) {
-      const existing = await transaction.posts.by.slug(slug).maybeOne();
+      const existing = await transaction.posts.find({ slug });
 
       if (existing) {
         continue;
       }
 
-      await transaction.posts
-        .insert({
-          slug,
-          title: slug,
-          state: slug === "draft" ? "draft" : "published",
-          views: 9007199254740993n,
-          author: { connect: author.id },
-          tags: { connectOrCreate: [{ label: "postgres" }, { label: "bun" }] },
-        })
-        .execute();
+      await transaction.posts.insert({
+        slug,
+        title: slug,
+        state: slug === "draft" ? "draft" : "published",
+        views: 9007199254740993n,
+        author: { connect: author.id },
+        tags: { connectOrCreate: [{ label: "postgres" }, { label: "bun" }] },
+      });
     }
   });
   console.log("Seed ready: Ada, four posts and two tags.");
 } finally {
-  await database.$close();
+  await db.$close();
 }

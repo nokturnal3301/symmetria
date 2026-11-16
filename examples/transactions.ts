@@ -1,21 +1,20 @@
 import type { Transaction } from "symmetria";
 import { connect } from "./database";
 
-const database = connect();
+const db = connect();
 
-const lockPost = (transaction: Transaction<typeof database>, slug: string) =>
+const lockPost = (transaction: Transaction<typeof db>, slug: string) =>
   transaction.posts.by.slug(slug)({ forUpdate: true }).one();
 
 try {
-  const result = await database.$transaction(async (transaction) => {
+  const result = await db.$transaction(async (transaction) => {
     const post = await lockPost(transaction, "typed-sql");
 
     try {
       await transaction.$transaction(async (savepoint) => {
         await savepoint.posts
-          .update({ title: "Discard this change" })
-          .where((posts) => posts.id.is(post.id))
-          .execute();
+          .byId(post.id)
+          .update({ title: "Discard this change" });
         throw new Error("Cancel the nested operation");
       });
     } catch (error) {
@@ -29,11 +28,12 @@ try {
       // The savepoint has rolled back; the outer transaction remains usable.
     }
 
-    return transaction.posts
-      .byId(post.id)((posts) => ({ title: posts.title, views: posts.views }))
-      .one();
+    return transaction.posts.get(post.id, ({ title, views }) => ({
+      title,
+      views,
+    }));
   });
   console.log(result);
 } finally {
-  await database.$close();
+  await db.$close();
 }

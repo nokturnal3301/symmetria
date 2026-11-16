@@ -127,21 +127,21 @@ import { createDatabase } from "symmetria";
 import { postgres } from "symmetria/bun";
 import { appSchema } from "./schema.ts";
 
-const database = createDatabase({
+const db = createDatabase({
   schema: appSchema,
   driver: postgres({ url: process.env.DATABASE_URL! }),
 });
 
 try {
-  await database.users
+  await db.users
     .insert({ name: "Ada", email: "ada@example.com" })
     .onConflict("email")
     .doNothing();
 
-  const author = await database.users.by.email("ada@example.com").one();
-  await database.posts.insert({ title: "Typed SQL", authorId: author.id });
+  const author = await db.users.get({ email: "ada@example.com" });
+  await db.posts.insert({ title: "Typed SQL", authorId: author.id });
 
-  const authors = await database.users(({ name, posts }) => ({
+  const authors = await db.users(({ name, posts }) => ({
     name,
     posts: posts(({ title, views }) => ({ title, views }), {
       orderBy: ({ id }) => id.descending,
@@ -152,7 +152,7 @@ try {
 
   console.log(authors);
 } finally {
-  await database.$close();
+  await db.$close();
 }
 ```
 
@@ -170,7 +170,7 @@ Each option can be a value or a synchronous callback receiving the same typed
 source and SQL tools.
 
 ```ts
-const feed = database.posts(
+const feed = db.posts(
   ({ title, authorId }, { join }) => ({ title, author: join(authorId).name }),
   { orderBy: ({ id }) => id.descending },
 );
@@ -197,8 +197,8 @@ Reusable projections bind to each source occurrence, including aliases and
 relations:
 
 ```ts
-const userCard = database.users.shape((user) => ({ name: user.name }));
-const feed = database.posts((post) => ({
+const userCard = db.users.shape((user) => ({ name: user.name }));
+const feed = db.posts((post) => ({
   title: post.title,
   author: post.author(userCard),
 }));
@@ -207,14 +207,14 @@ const feed = database.posts((post) => ({
 `.shape()` stores a synchronous callback and evaluates it on each application. A
 projection belongs to its defining table, contains at least one selected field
 and has no `$...` controls. Apply options at use sites, for example
-`database.users(userCard, { limit: 20 })`. It can be defined on an offline
-schema and used on its connected or transaction-bound tables. To-one selections
-are typed as an object or `null`.
+`db.users(userCard, { limit: 20 })`. It can be defined on an offline schema and
+used on its connected or transaction-bound tables. To-one selections are typed
+as an object or `null`.
 
 Relations offer `count`, `exists`, `sum`, `average`, `minimum` and `maximum`:
 
 ```ts
-const totals = database.users(({ name, posts }) => ({
+const totals = db.users(({ name, posts }) => ({
   name,
   totalViews: posts.sum.views,
   latestPost: posts.maximum.createdAt,
@@ -238,7 +238,7 @@ returns `false` for empty inputs.
 ## Enum mappings
 
 ```ts
-const labels = database.posts((post) => ({
+const labels = db.posts((post) => ({
   title: post.title,
   status: post.state.match({ draft: "Draft", published: "Published" }),
   visibleViews: post.state.match({ draft: 0n, published: post.views }),
@@ -253,31 +253,32 @@ CTEs.
 ## Write callbacks
 
 ```ts
-const updated = await database.posts
+const updated = await db.posts
   .byId(42)
   .update((post) => ({ views: post.views.plus(1n) }))
-  .returning((post) => ({ id: post.id, views: post.views }));
+  .returning("id", "views");
 
-const userCard = database.users.shape(({ id, name }) => ({ id, name }));
-await database.users.by
+const userCard = db.users.shape(({ id, name }) => ({ id, name }));
+await db.users.by
   .email("ada@example.com")
   .update({ name: "Ada Lovelace" })
   .returning(userCard);
 
-await database.users
+await db.users
   .insert({ name: "Ada Lovelace", email: "ada@example.com" })
   .onConflict("email")
   .doUpdate((user, excluded) => ({ email: user.email, name: excluded.name }));
 
-await database.posts.update({ state: "draft" }).all(); // whole table, spelled out
+await db.posts.update({ state: "draft" }).all(); // whole table, spelled out
 ```
 
 `byId()` and `.by.<key>()` lookups update and delete directly, in one statement.
-`returning()` accepts a callback or a row-local reusable projection of the same
-table. UPDATE, WHERE and RETURNING callbacks receive the row directly, including
-nested-insert RETURNING. Upserts receive the existing row first and the proposed
-`excluded` row second. `.doUpdate("name")` copies a field from `excluded`. An
-UPDATE or DELETE without `where()` is refused unless `.all()` confirms it.
+`returning()` accepts column names, a callback or a row-local reusable
+projection of the same table. UPDATE, WHERE and RETURNING callbacks receive the
+row directly, including nested-insert RETURNING. Upserts receive the existing
+row first and the proposed `excluded` row second. `.doUpdate("name")` copies a
+field from `excluded`. An UPDATE or DELETE without `where()` is refused unless
+`.all()` confirms it.
 
 ## Capabilities
 
@@ -297,7 +298,7 @@ UPDATE or DELETE without `where()` is refused unless `.all()` confirms it.
   `exists` / `inspect`, keyset pagination in both directions and `pages()` async
   iteration; `count()` and `exists()` on any table or filtered source.
 - Transactions, nested savepoints, isolation options and row locks.
-- `Transaction<typeof database>` for schema-specific transaction helpers.
+- `Transaction<typeof db>` for schema-specific transaction helpers.
 - `$scope()` filters for reads, updates and deletes, including related tables,
   and checks every row a scoped insert, upsert or update writes, like row-level
   security's `WITH CHECK` (`SYMMETRIA_OUT_OF_SCOPE`); reused and prepared
@@ -368,7 +369,7 @@ Official drivers ship with `symmetria` and are maintained and released together:
 import { createDatabase } from "symmetria";
 import { postgres } from "symmetria/pg";
 
-const database = createDatabase({
+const db = createDatabase({
   schema: appSchema,
   driver: postgres({ url: process.env.DATABASE_URL!, max: 10 }),
 });

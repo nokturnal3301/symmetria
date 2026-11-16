@@ -75,6 +75,38 @@ describe.skipIf(!databaseUrl)("query and write shortcuts on PostgreSQL", () => {
       tenant: 1,
     });
     expect(await database.users.find(99)).toBeNull();
+    // A unique key as an object of its columns.
+    expect(await database.users.get({ email: "bob@x.test" })).toMatchObject({
+      id: 2,
+      name: "Bob",
+    });
+    expect(
+      await database.posts.find({ slug: "b" }, (post) => ({
+        author: post.author.name,
+      })),
+    ).toEqual({ author: "Ada" });
+    expect(await database.users.find({ email: "nobody@x.test" })).toBeNull();
+    await expect(
+      database.users.get({ email: "nobody@x.test" }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+    // An aggregate over a window, by its method, ordered with the short words.
+    expect(
+      await database.posts(
+        (post, { sum, count }) => ({
+          slug: post.slug,
+          running: sum(post.price).over({
+            partitionBy: [post.authorId],
+            orderBy: post.id.asc,
+          }),
+          byAuthor: count().over({ partitionBy: [post.authorId] }),
+        }),
+        { orderBy: { slug: "descending" } },
+      ),
+    ).toEqual([
+      { slug: "c", running: "0.00", byAuthor: 1 },
+      { slug: "b", running: "11.75", byAuthor: 2 },
+      { slug: "a", running: "10.50", byAuthor: 2 },
+    ]);
     expect(
       await database.posts.get(1, (post) => ({ author: post.author.name })),
     ).toEqual({ author: "Ada" });
@@ -115,6 +147,24 @@ describe.skipIf(!databaseUrl)("query and write shortcuts on PostgreSQL", () => {
         total: sum(post.price),
       })),
     ).toEqual({ posts: 3, total: "11.75" });
+    // A CTE given options and no fields reads its fields, codecs included.
+    const priced = database
+      .posts((post) => ({
+        slug: post.slug,
+        price: post.price,
+        author: { name: post.author.name },
+      }))
+      .cte("priced");
+
+    expect(
+      await priced({
+        where: (post) => post.price.above("1"),
+        orderBy: { slug: "asc" },
+      }),
+    ).toEqual([
+      { slug: "a", price: "10.50", author: { name: "Ada" } },
+      { slug: "b", price: "1.25", author: { name: "Ada" } },
+    ]);
     // Pages and streams of a whole-row query.
     const page = await database
       .users({ orderBy: { id: "asc" } })

@@ -73,8 +73,9 @@ it also executes its four queries against the seeded example schema.
 `join(post.authorId)` infers the target and condition; repeated JOINs get
 automatic aliases. An options-only call such as `feed({ limit: 5 })` preserves
 the projection. Its feed reuses a user card for author/editor, maps enum labels
-with `.match()` and aggregates filtered relations with `.sum()` / `.maximum()`.
-`write.ts` uses direct-row callbacks for UPDATE, WHERE and RETURNING.
+with `.match()` and aggregates filtered relations with `.sum` / `.maximum`.
+`write.ts` updates and deletes through a primary-key lookup and names the
+returned columns.
 
 Reusable shapes contain selected fields; filtering and pagination belong in
 query or relation calls. The sum returns a decimal string or `null`; the maximum

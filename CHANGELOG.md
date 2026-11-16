@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.3.0 — 2026-11-16
+
+### Runtime (`symmetria`)
+
+- `get()` and `find()` read a row by a unique key given as an object of its
+  columns, `db.users.get({ email })` or
+  `db.handles.find({ tenant: "team", handle: "ada" })` for a unique index over
+  two columns, next to the primary key's value. A table without a primary key
+  but with a unique key has both methods now. An object that is not a key of the
+  table rejects with a message that lists the table's keys; for a composite
+  primary key given incompletely this message replaces the former
+  `byId() requires exactly these key fields`.
+- A CTE or a derived table given options and no fields reads all its fields, as
+  a table does: `await ranked({ where: (post) => post.position.atMost(3) })`.
+  The types already allowed this call, and it threw
+  `select fields in a shape before compiling or executing a query` when it ran.
+- Aggregates have `.over()`, like the ranking functions:
+  `sum(post.views).over({ partitionBy, orderBy })`, also on `count`, `average`,
+  `minimum` and `maximum`. `over(sum(post.views), options)` is unchanged.
+- `column.asc` and `column.desc` are short for `ascending` and `descending`, and
+  an `orderBy` object accepts `"ascending"` and `"descending"` next to `"asc"`
+  and `"desc"`.
+
+### Documentation
+
+- The reference, guide, READMEs and examples use one spelling throughout: `db`
+  for the database, a singular row name in callbacks, `await` without
+  `.execute()`, slots (`one`, `maybe`, `many`) for relations, `get()` / `find()`
+  for reads by key, the `where` option for UPDATE and DELETE, column names in
+  `returning()`, and `{ selected }` for selected fields. The earlier relation
+  spelling has its own section in the reference.
+
 ## 2.2.0 — 2026-11-16
 
 ### Runtime (`symmetria`)

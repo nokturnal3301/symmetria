@@ -1,22 +1,22 @@
 import { connect } from "./database";
 import { appSchema } from "./schema";
 
-const database = process.env.DATABASE_URL ? connect() : appSchema;
+const db = process.env.DATABASE_URL ? connect() : appSchema;
 
 try {
-  const userCard = database.users.shape((user) => ({ name: user.name }));
+  const userCard = db.users.shape((user) => ({ name: user.name }));
 
-  const feed = database.users(
+  const feed = db.users(
     (user) => {
       const published = user.posts({
-        where: (posts) => posts.state.is.published,
+        where: (post) => post.state.is.published,
       });
 
       return {
         name: user.name,
         publications: published.count(),
-        totalViews: published.sum((post) => post.views),
-        latestPost: published.maximum((post) => post.createdAt),
+        totalViews: published.sum.views,
+        latestPost: published.maximum.createdAt,
         posts: published(
           (post) => ({
             title: post.title,
@@ -37,17 +37,16 @@ try {
       };
     },
     {
-      where: (user) =>
-        user.posts({ where: (posts) => posts.state.is.published }).some(),
-      orderBy: (user) => user.id.ascending,
+      where: (user) => user.posts.some((post) => post.state.is.published),
+      orderBy: { id: "asc" },
       limit: 20,
     },
   );
 
-  const joined = database.posts(
+  const joined = db.posts(
     (post, { join, leftJoin }) => {
       const author = join(post.authorId);
-      const editor = leftJoin(database.users.as("reviewer"), (user) => [
+      const editor = leftJoin(db.users.as("reviewer"), (user) => [
         user.id.is(post.editorId),
         user.id.isNot(author.id),
       ]);
@@ -59,12 +58,12 @@ try {
       };
     },
     {
-      where: (post, { join, leftJoin }) => post.state.is.published,
-      orderBy: (post, { join, leftJoin }) => post.id.ascending,
+      where: { state: "published" },
+      orderBy: { id: "asc" },
     },
   );
 
-  const repeated = database.posts(
+  const repeated = db.posts(
     (post, { join }) => {
       const author = join(post.authorId);
       const editor = join(post.editorId);
@@ -77,10 +76,10 @@ try {
         sameAuthor: sameAuthor.name,
       };
     },
-    { orderBy: (post, { join }) => post.id.ascending, limit: 3 },
+    { orderBy: { id: "asc" }, limit: 3 },
   );
 
-  const ranked = database
+  const ranked = db
     .posts(
       (post, { rowNumber }) => ({
         authorId: post.authorId,
@@ -91,7 +90,7 @@ try {
           orderBy: [post.views.descending, post.id.ascending],
         }),
       }),
-      { where: (post, { rowNumber }) => post.state.is.published },
+      { where: { state: "published" } },
     )
     .cte("ranked_posts");
 
@@ -105,21 +104,21 @@ try {
     { where: (post) => post.position.atMost(2) },
   ).cte("top_posts");
 
-  const totals = database
+  const totals = db
     .posts(
       (post, { count }) => ({
         authorId: post.authorId,
         publications: count(),
       }),
       {
-        where: (post, { count }) => post.state.is.published,
-        groupBy: (post, { count }) => [post.authorId],
-        having: (post, { count }) => count().above(0),
+        where: { state: "published" },
+        groupBy: (post) => [post.authorId],
+        having: (post, { selected }) => selected.publications.above(0),
       },
     )
     .cte("post_totals");
 
-  const analytics = database.users(
+  const analytics = db.users(
     (user, { leftJoin, coalesce }) => {
       const total = leftJoin(totals, (total) => total.authorId.is(user.id));
 
@@ -139,7 +138,7 @@ try {
         ),
       };
     },
-    { orderBy: (user, { leftJoin, coalesce }) => user.id.ascending },
+    { orderBy: { id: "asc" } },
   );
 
   for (const [name, query] of Object.entries({
@@ -155,5 +154,5 @@ try {
     }
   }
 } finally {
-  await database.$close();
+  await db.$close();
 }

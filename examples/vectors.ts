@@ -46,7 +46,7 @@ const documents = table({
     .with({ m: 16, ef_construction: 64 }),
 }));
 
-const { database, close } = await testDatabase({
+const { database: db, close } = await testDatabase({
   url,
   schema: schema({ documents }, { extensions: ["vector"] }),
   prefix: "symmetria_vectors",
@@ -55,14 +55,14 @@ const { database, close } = await testDatabase({
 
 try {
   // Embeddings are plain number arrays on both sides.
-  await database.documents.insert([
+  await db.documents.insert([
     { content: "east", embedding: [1, 0, 0] },
     { content: "north", embedding: [0, 1, 0] },
     { content: "north-east", embedding: [0.7, 0.7, 0] },
   ]);
 
   const query = [1, 0.1, 0];
-  const nearest = database.documents(
+  const nearest = db.documents(
     (document) => ({
       content: document.content,
       distance: document.embedding.cosineDistance(query),

@@ -107,7 +107,7 @@ through the supplied `Transaction<typeof appSchema>` context on the same
 transaction.
 
 ```ts
-const result = await database.$transaction((transaction) =>
+const result = await db.$transaction((transaction) =>
   importPosts(transaction, feed),
 );
 ```

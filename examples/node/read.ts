@@ -18,13 +18,13 @@ if (!url) {
   );
 }
 
-const database = createDatabase({
+const db = createDatabase({
   schema: schema({ users }),
   driver: postgres({ url, max: 2 }),
 });
 
 try {
-  const authors = database.users(
+  const authors = db.users(
     ({ id, name }) => ({
       id,
       name,
@@ -37,5 +37,5 @@ try {
   console.log(authors.toSQL().sql);
   console.log(`node ${process.version}:`, await authors);
 } finally {
-  await database.$close();
+  await db.$close();
 }

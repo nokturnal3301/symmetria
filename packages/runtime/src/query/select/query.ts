@@ -212,12 +212,7 @@ export const createQueryFactory = (
   const runnable = (state: QueryHandle[typeof QUERY_STATE]): SelectPlan => {
     const { plan } = state;
 
-    if (
-      plan.selection.length ||
-      state.freshSource ||
-      plan.grouping.length ||
-      plan.root.projection
-    ) {
+    if (plan.selection.length || state.freshSource || plan.grouping.length) {
       return plan;
     }
 

@@ -39,7 +39,9 @@ nullability and bigint, read [Core concepts](guide.md).
 import {
   schema,
   table,
-  junction,
+  one,
+  maybe,
+  many,
   createDatabase,
   int,
   text,
@@ -55,61 +57,36 @@ const users = table({
   id: int.auto,
   name: text.unique,
   active: bool.default(true),
+  posts: many,
+  edited: many,
 });
+const tags = table({ id: int.auto, label: text.unique, posts: many });
 
 const posts = table({
   id: int.auto,
   title: text,
-  author: users.index,
-  editor: users.nullable.inverse("edited"),
+  author: one(users.posts),
+  editor: maybe(users.edited),
+  tags: many(tags.posts),
   views: bigint.default(0n),
   state: oneOf("draft", "published").default("draft"),
   createdAt: timestamptz.now,
 });
-const tags = table({ id: int.auto, label: text.unique });
-const postTags = junction({ post: posts, tag: tags });
 
-export const appSchema = schema({ users, posts, tags, postTags });
-export const database = createDatabase({
+export const appSchema = schema({ users, posts, tags });
+export const db = createDatabase({
   schema: appSchema,
   driver: postgres({ url: process.env.DATABASE_URL! }),
 });
 ```
 
 Names come from object keys; camelCase maps to snake_case. Columns are non-null
-by default. `author: users` creates `authorId` and the `author` relationship;
-`users.unique` represents 1:1. `junction({ post: posts, tag: tags })` declares a
-many-to-many link table: both foreign keys form its primary key and each side
-gains an M:N relation. The primary key already serves lookups by its first key
-(`post_id`), so `junction()` also creates an index on the second one
-(`post_tags_tag_id_idx`) for the other direction. `.inverse("edited")` resolves
-ambiguous reverse names.
-
-A reference targets the primary key and creates a `<key>_id` column by default.
-`users.by("email")` references a unique column instead (the foreign-key column
-takes that column's type, so `authorId` is a `string`), and
-`users.column("created_by")` names the SQL column while the TypeScript name
-stays `ownerId`; both combine with the other modifiers:
-`author: users.by("email").column("author_email").nullable.inverse("written")`.
-`by()` accepts the primary key or a column marked `.unique`; a unique index
-declared in `.indexes()` is not enough. Nested inserts `connect` such a
-reference by the referenced value (`author: { connect: "ada@example.com" }`) or
-by a key object.
-
-`self` refers to the table being declared, with the same modifiers as any other
-reference: `parent: self.nullable.onDelete.cascade.inverse("children")` adds a
-`parentId` column, a `parent` relation and, through `.inverse()`, a `children`
-collection. A self-reference has no automatic reverse relation; name it with
-`.inverse()` when you need one. `.onUpdate.cascade`, `.onUpdate.restrict` and
-`.onUpdate.noAction` set the foreign key's `ON UPDATE` action (the default is
-PostgreSQL's `NO ACTION`); databases created by Prisma use `.onUpdate.cascade`.
-
-Every foreign key, a junction's included, is created `ON DELETE RESTRICT` unless
-the reference says otherwise: deleting a row that other rows still point to
-fails, and nothing is deleted or set to NULL on its own. `.onDelete.cascade`
-deletes the referencing rows with it, `.onDelete.setNull` (the column becomes
-nullable) clears the reference, and `.onDelete.noAction` is PostgreSQL's own
-default, which checks at the end of the statement instead of immediately.
+by default. `author: one(users.posts)` creates the `authorId` column, the
+`author` relationship of a post and the `posts` of a user; `tags: many(…)` is a
+many-to-many relation with its own junction table. The next section describes
+these declarations, and
+[the one after it](#reference-modifiers-and-the-earlier-spelling) the modifiers
+of a reference and the spelling without slots.
 
 ### Relations: one, maybe, many
 
@@ -198,9 +175,55 @@ const members = link({ person: people, team: teams });
 table is a keyed link and has no slots to name, so a key is written `one(users)`
 or `maybe(users.inverse("edited"))` there; `symmetria pull` writes this form.
 
-Everything in the rest of this section is still accepted and can be mixed with
-slots in one schema: `one(users.posts)` is `users.index.inverse("posts")`, and
-both produce the same tables, constraints and migrations.
+### Reference modifiers and the earlier spelling
+
+A relation can also be written without slots, as a reference to the table
+itself. This spelling is still accepted and can be mixed with slots in one
+schema: `one(users.posts)` is `users.index.inverse("posts")`, and both produce
+the same tables, constraints and migrations.
+
+```ts
+const posts = table({
+  id: int.auto,
+  title: text,
+  author: users.index,
+  editor: users.nullable.inverse("edited"),
+});
+const postTags = junction({ post: posts, tag: tags });
+```
+
+`author: users` creates `authorId` and the `author` relationship; `users.unique`
+represents 1:1. `junction({ post: posts, tag: tags })` declares a many-to-many
+link table: both foreign keys form its primary key and each side gains an M:N
+relation. The primary key already serves lookups by its first key (`post_id`),
+so `junction()` also creates an index on the second one (`post_tags_tag_id_idx`)
+for the other direction. `.inverse("edited")` resolves ambiguous reverse names.
+
+A reference targets the primary key and creates a `<key>_id` column by default.
+`users.by("email")` references a unique column instead (the foreign-key column
+takes that column's type, so `authorId` is a `string`), and
+`users.column("created_by")` names the SQL column while the TypeScript name
+stays `ownerId`; both combine with the other modifiers:
+`author: users.by("email").column("author_email").nullable.inverse("written")`.
+`by()` accepts the primary key or a column marked `.unique`; a unique index
+declared in `.indexes()` is not enough. Nested inserts `connect` such a
+reference by the referenced value (`author: { connect: "ada@example.com" }`) or
+by a key object.
+
+`self` refers to the table being declared, with the same modifiers as any other
+reference: `parent: self.nullable.onDelete.cascade.inverse("children")` adds a
+`parentId` column, a `parent` relation and, through `.inverse()`, a `children`
+collection. A self-reference has no automatic reverse relation; name it with
+`.inverse()` when you need one. `.onUpdate.cascade`, `.onUpdate.restrict` and
+`.onUpdate.noAction` set the foreign key's `ON UPDATE` action (the default is
+PostgreSQL's `NO ACTION`); databases created by Prisma use `.onUpdate.cascade`.
+
+Every foreign key, a junction's included, is created `ON DELETE RESTRICT` unless
+the reference says otherwise: deleting a row that other rows still point to
+fails, and nothing is deleted or set to NULL on its own. `.onDelete.cascade`
+deletes the referencing rows with it, `.onDelete.setNull` (the column becomes
+nullable) clears the reference, and `.onDelete.noAction` is PostgreSQL's own
+default, which checks at the end of the statement instead of immediately.
 
 ### SQL names
 
@@ -222,7 +245,7 @@ const post = table({
 }).named("Post");
 
 export const appSchema = schema({ user, post }, { casing: "preserve" });
-await database.post((post) => ({
+await db.post((post) => ({
   title: post.title,
   author: post.author.email,
 }));
@@ -256,9 +279,9 @@ const products = table({
   id: int.auto,
   sku: text.collate("C").unique, // "sku" text COLLATE "C" NOT NULL
   name: varchar(200).collate("en-x-icu"),
-}).indexes((products) => ({
+}).indexes((product) => ({
   // An index key can use another collation than its column.
-  byName: index(sql<string>`${products.name} COLLATE "C"`),
+  byName: index(sql<string>`${product.name} COLLATE "C"`),
 }));
 ```
 
@@ -361,21 +384,24 @@ works on PostgreSQL 14; `uuid.v7` needs PostgreSQL 18+.
 Callable tables autocomplete columns and infer the exact result:
 
 ```ts
-await database.users((user) => ({ id: user.id, name: user.name }));
-await database.users.byId(42).one();
-await database.users
-  .byId(42)((user) => ({ name: user.name }))
-  .maybeOne();
+await db.users((user) => ({ id: user.id, name: user.name }));
+await db.users.get(42); // the row; rejects when there is none
+await db.users.find(42, (user) => ({ name: user.name })); // or null
+await db.users.find({ email: "ada@example.com" }); // by a unique key
 ```
 
+`get()` reads one row by its key and rejects with `NotFoundError` when there is
+none; `find()` resolves to `null` instead. The key is the primary key's value,
+or an object naming the columns of the primary key or of one unique key:
+`get({ email })`, `find({ tenant: "team", handle: "ada" })` for a unique index
+over two columns. Both take a shape as a second argument and reject (rather than
+throw) for a malformed key or an object that is not a key of the table.
+
+`get(42)` is `byId(42).one()` and `find(42)` is `byId(42).maybeOne()`; the
+longer form is a query like any other, for a lock, a write or another terminal.
 `one()` throws when there is no row or more than one, `maybeOne()` when there is
 more than one. The error names the source and carries `code`:
 `SYMMETRIA_RECORD_NOT_FOUND` for no row, `SYMMETRIA_TOO_MANY_ROWS` for several.
-
-`database.users.get(42)` is `byId(42).one()` and `database.users.find(42)` is
-`byId(42).maybeOne()`: the row, or `null` from `find()`. Both take a shape as a
-second argument, `get(42, (user) => ({ name: user.name }))`, and reject (rather
-than throw) for a malformed key.
 
 `byId()` starts a query on a table's primary key and selects all its columns,
 including computed fields. It accepts the key's value type, including branded
@@ -387,7 +413,7 @@ composite keys take an object with all key fields, for example
 Every SELECT uses a shape callback. Local JOINs return typed source handles:
 
 ```ts
-const query = database.posts(
+const query = db.posts(
   ({ title, authorId, editorId }, { join }) => {
     const author = join(authorId);
     const editor = join(editorId);
@@ -402,7 +428,7 @@ const query = database.posts(
 );
 
 query.toSQL(); // { sql, parameters }; filters use $1, $2, …; fixed LIMIT is literal
-const rows = await query.execute();
+const rows = await query;
 // { title: string; authorName: string; editorName: string | null }[]
 ```
 
@@ -425,8 +451,8 @@ at most two rows while respecting an existing LIMIT.
 Explicit and multi-hop JOINs use the same handles:
 
 ```ts
-database.posts((post, { innerJoin, join }) => {
-  const reviewer = innerJoin(database.users.as("reviewer"), (user) =>
+db.posts((post, { innerJoin, join }) => {
+  const reviewer = innerJoin(db.users.as("reviewer"), (user) =>
     post.editorId.is(user.id),
   );
   const writer = join(post.author);
@@ -455,11 +481,9 @@ projection followed by an optional options object. The projection's keys
 describe the result; options describe filtering, ordering and pagination:
 
 ```ts
-const feed = database.users(
+const feed = db.users(
   ({ name, posts }) => {
-    const published = posts(() => ({}), {
-      where: ({ state }) => state.is.published,
-    });
+    const published = posts({ where: { state: "published" } });
 
     return {
       name,
@@ -503,11 +527,12 @@ nullability.
 | `forUpdate`, `forShare` | `true` or `{ of?, noWait?, skipLocked? }`; `false`/`undefined` omit the request      |
 
 `where` also takes an object of equalities, and `orderBy` an object of
-directions:
+directions, `"asc"` or `"desc"` (`"ascending"` and `"descending"` mean the same,
+as `id.asc` and `id.desc` are short for `id.ascending` and `id.descending`):
 
 ```ts
-await database.posts({ where: { state: "published", editorId: null } });
-database.users((user) => ({ name: user.name, written: user.posts.count() }), {
+await db.posts({ where: { state: "published", editorId: null } });
+db.users((user) => ({ name: user.name, written: user.posts.count() }), {
   orderBy: [{ written: "desc" }, { id: "asc" }],
 });
 ```
@@ -521,13 +546,15 @@ that, a column of the source. Column names are completed and checked by the
 types; a selected field's name is checked when the query is built.
 
 A query that is given options and no fields reads the source's own columns,
-computed fields included: `await database.users({ where: { active: true } })`. A
-bare table is not such a query (`await database.users` reads nothing and is a
-type error), and neither is a grouped source. Inside a shape, the tools carry
-the same columns as `row`, for "everything plus":
+computed fields included: `await db.users({ where: { active: true } })`. A CTE
+or a derived table reads the fields it was built with the same way,
+`await ranked({ where: (post) => post.position.atMost(3) })`. A bare table is
+not such a query (`await db.users` reads nothing and is a type error), and
+neither is a grouped source. Inside a shape, the tools carry the same columns as
+`row`, for "everything plus":
 
 ```ts
-database.posts((post, { row }) => ({ ...row, author: post.author.name }));
+db.posts((post, { row }) => ({ ...row, author: post.author.name }));
 ```
 
 Every option accepts the listed value or a synchronous
@@ -537,28 +564,28 @@ values are ignored. Empty predicate arrays add no restriction; unknown option
 names are rejected. The exported `QueryOptions<Source, Tools, Selected>` type
 can describe shared options.
 
-`orderBy`, `groupBy` and `having` callbacks receive a third argument: the fields
-the projection returned, under their names, so a computed field is written once
-and then ordered, grouped or filtered by name. The same fields are among the
-tools of those callbacks, `(user, { selected }) => selected.spent.descending`.
+The tools of `orderBy`, `groupBy` and `having` callbacks carry `selected`: the
+fields the projection returned, under their names, so a computed field is
+written once and then ordered, grouped or filtered by name. The same fields are
+also the callbacks' third argument, `(user, tools, selected) => …`.
 
 ```ts
-database.users(
+db.users(
   (user) => ({
     name: user.name,
     spent: user.orders.sum((order) => order.quantity.multiply(order.price)),
   }),
-  { orderBy: (user, tools, selected) => selected.spent.descending.nullsLast },
+  { orderBy: (user, { selected }) => selected.spent.descending.nullsLast },
 );
 
-database.posts(
+db.posts(
   (post, { sql, count }) => ({
     month: sql<string>`to_char(${post.createdAt}, 'YYYY-MM')`,
     posts: count(),
   }),
   {
-    groupBy: (post, tools, selected) => [selected.month],
-    orderBy: (post, tools, selected) => selected.month.ascending,
+    groupBy: (post, { selected }) => [selected.month],
+    orderBy: { month: "asc" },
   },
 );
 ```
@@ -568,15 +595,15 @@ its alias: the SQL repeats the expression, and in a grouped or `distinct` query
 it is the same text with the same parameters, as PostgreSQL requires. Only
 fields that are one value are offered: a nested object, a nested collection or a
 relation selected with a shape is a type error, and an error when the query is
-built for untyped code. `where` receives no third argument, because a WHERE runs
-before aggregates and window functions exist; filter on source columns there and
-on aggregates in `having`. The fields also reach a relation's own options
-(`user.posts(shape, { orderBy })`), reusable shapes, prepared queries, and
-options added later to a selected query
-(`feed({ orderBy: (post, tools, selected) => … })`), where they are the
-selection the query already has. `page()` accepts a selected field in `orderBy`
-under its usual rule: an expression over the root table's columns, next to the
-primary key; an aggregate over a relation is not one.
+built for untyped code. `where` receives no selected fields, because a WHERE
+runs before aggregates and window functions exist; filter on source columns
+there and on aggregates in `having`. The fields also reach a relation's own
+options (`user.posts(shape, { orderBy })`), reusable shapes, prepared queries,
+and options added later to a selected query
+(`feed({ orderBy: (post, { selected }) => … })`), where they are the selection
+the query already has. `page()` accepts a selected field in `orderBy` under its
+usual rule: an expression over the root table's columns, next to the primary
+key; an aggregate over a relation is not one.
 
 A projection holds fields only; a `$`-prefixed key in it is rejected. Option
 callbacks run after the projection on the same source, so they can reach the
@@ -598,9 +625,9 @@ with no controls is rejected unless its callback added JOINs. Nested ordinary
 objects only change the result structure; they do not imply SQL grouping.
 
 An options-only call also starts a reusable filtered source:
-`database.posts({ where: ({ state }) => state.is.published })`. Select fields
-before executing it. Relations accept the same form; applying a limit or offset
-removes their `some` / `none` / `every` methods, as with inline pagination.
+`db.posts({ where: ({ state }) => state.is.published })`. Select fields before
+executing it. Relations accept the same form; applying a limit or offset removes
+their `some` / `none` / `every` methods, as with inline pagination.
 
 Fixed numeric LIMIT/OFFSET counts compile as validated integer literals.
 Explicit prepared count parameters remain placeholders and are validated when
@@ -625,10 +652,10 @@ a relationship or FK column to infer the target, but always produces a Cartesian
 product without ON:
 
 ```ts
-database.posts(
+db.posts(
   (post, { join, leftJoin }) => {
     const author = join(post.authorId);
-    const editor = leftJoin(database.users.as("reviewer"), (user) => [
+    const editor = leftJoin(db.users.as("reviewer"), (user) => [
       user.id.is(post.editorId),
       user.active.is(true),
     ]);
@@ -639,7 +666,7 @@ database.posts(
       editor: editor.name,
     };
   },
-  { where: (post, { join, leftJoin }) => post.state.is.published },
+  { where: { state: "published" } },
 );
 ```
 
@@ -649,7 +676,7 @@ INNER JOIN preserves column nullability. Handles can be captured by later JOIN
 callbacks. Repeated sources and self-JOINs get deterministic automatic aliases:
 
 ```ts
-database.users((user, { join }) => {
+db.users((user, { join }) => {
   const manager = join(user.managerId);
   const director = join(manager.managerId);
 
@@ -672,17 +699,17 @@ foreign bindings are rejected.
 #### Reusable projections
 
 ```ts
-const userCard = database.users.shape((user) => ({
+const userCard = db.users.shape((user) => ({
   name: user.name,
   posts: user.posts.count(),
 }));
 
-database.posts((post) => ({
+db.posts((post) => ({
   title: post.title,
   author: post.author(userCard),
   editor: post.editor(userCard),
 }));
-database.users.as("member")(userCard);
+db.users.as("member")(userCard);
 ```
 
 Definition stores the callback without evaluating it. Each use evaluates against
@@ -702,7 +729,7 @@ const postCard = appSchema.posts.shape((post) => ({
   status: post.state.match({ draft: "Draft", published: "Published" }),
 }));
 
-database.users(({ name, posts }) => ({
+db.users(({ name, posts }) => ({
   name,
   recent: posts(postCard, {
     where: ({ state }) => state.is.published,
@@ -710,7 +737,7 @@ database.users(({ name, posts }) => ({
     limit: 3,
   }),
 }));
-database.posts(postCard, { where: ({ views }) => views.above(0n) });
+db.posts(postCard, { where: ({ views }) => views.above(0n) });
 ```
 
 Keep reusable callbacks synchronous and derive expressions from their row and
@@ -722,7 +749,7 @@ scopes.
 For a column declared with `oneOf("draft", "published")`:
 
 ```ts
-database.posts((post) => ({
+db.posts((post) => ({
   status: post.state.match({ draft: "Draft", published: "Published" }),
   visibleViews: post.state.match({ draft: 0n, published: post.views }),
 }));
@@ -753,7 +780,7 @@ with their original types. They also remain available as named imports:
 | Local narrowing         | `whereNotNull`                                              |
 
 ```ts
-database.posts(
+db.posts(
   (post, { join, count, sum }) => ({
     author: join(post.author).name,
     publications: count(),
@@ -761,15 +788,15 @@ database.posts(
   }),
   {
     where: (post) => post.state.is.published,
-    groupBy: (post, tools, selected) => [selected.author],
-    having: (post, tools, selected) => selected.publications.above(2),
-    orderBy: (post, tools, selected) => selected.publications.descending,
+    groupBy: (post, { selected }) => [selected.author],
+    having: (post, { selected }) => selected.publications.above(2),
+    orderBy: { publications: "desc" },
   },
 );
 ```
 
 Variables of the projection callback are out of scope in the option callbacks;
-their third argument carries the returned fields instead (see
+`selected` carries the returned fields instead (see
 [query options](#shape-first-queries)).
 
 `whereNotNull(column)` adds `IS NOT NULL` to the current query and returns a
@@ -777,7 +804,7 @@ non-null typed expression; on a JSON value it also leaves out JSON `null`, which
 reads as `null` too. Select or reuse that returned expression:
 
 ```ts
-database.posts((post, { whereNotNull }) => ({
+db.posts((post, { whereNotNull }) => ({
   editorId: whereNotNull(post.editorId), // number, not number | null
 }));
 ```
@@ -792,7 +819,7 @@ An arbitrary selected query in a result field also produces an array, in the
 same SQL statement. JavaScript closures express correlation:
 
 ```ts
-const ranked = database
+const ranked = db
   .posts((post, { rowNumber }) => ({
     authorId: post.authorId,
     title: post.title,
@@ -803,7 +830,7 @@ const ranked = database
   }))
   .cte("ranked_posts");
 
-database.users((user) => ({
+db.users((user) => ({
   name: user.name,
   best: ranked(
     (post) => ({
@@ -834,7 +861,7 @@ fields; supplying ordinary fields replaces the projection. Filters, ordering and
 grouping append, while LIMIT/OFFSET replace their previous values when supplied:
 
 ```ts
-const published = database.posts({ where: (post) => post.state.is.published });
+const published = db.posts({ where: (post) => post.state.is.published });
 const titles = published((post) => ({ title: post.title }));
 const recent = titles({ orderBy: (post) => post.id.descending, limit: 10 });
 ```
@@ -849,7 +876,7 @@ The selected query retains `.as()`, `.cte()`, `.recursive()`, `.prepare()`,
 `db.users.byId(7).exists()`; a limited, grouped or distinct source counts its
 result rows. An object selection containing exactly one scalar expression
 supports `.scalar()` and column `.in(query)` / `.notIn(query)`. For example,
-`database.posts((post) => ({ id: post.id }), { limit: 1 }).scalar()` is a typed
+`db.posts((post) => ({ id: post.id }), { limit: 1 }).scalar()` is a typed
 nullable scalar subquery. `.in(query)` accepts a subquery over a nullable column
 of the same type; its NULLs never match, and, as in SQL, `.notIn(query)` matches
 no row when the subquery returns a NULL. Pagination and recursive CTEs keep
@@ -867,7 +894,7 @@ references rather than query rows.
 ### Shape the result directly
 
 ```ts
-database.posts((post, { join }) => {
+db.posts((post, { join }) => {
   const author = join(post.authorId);
 
   return {
@@ -888,15 +915,15 @@ prepared queries and derived tables.
 ### Follow relations directly
 
 ```ts
-database.posts((posts) => ({
-  title: posts.title,
-  author: posts.author.name,
-  editor: posts.editor.name, // string | null
+db.posts((post) => ({
+  title: post.title,
+  author: post.author.name,
+  editor: post.editor.name, // string | null
 }));
 
 // With users.country declared, paths can continue through multiple tables:
-database.posts((posts) => ({
-  country: posts.author.country.name,
+db.posts((post) => ({
+  country: post.author.country.name,
 }));
 ```
 
@@ -910,7 +937,7 @@ Explicit JOIN `ON` callbacks reference columns of their declared table aliases.
 To-many relations expose collection operations instead of scalar fields:
 
 ```ts
-database.users((user) => ({
+db.users((user) => ({
   name: user.name,
   posts: user.posts(
     (post) => ({
@@ -941,21 +968,21 @@ callback, where row fields retain their normal names.
 ### Filter related rows
 
 ```ts
-database.users(
+db.users(
   (user) => ({
     name: user.name,
   }),
   { where: (user) => user.posts.some((post) => post.views.above(0n)) },
 );
 
-database.users(
+db.users(
   (user) => ({
     name: user.name,
   }),
   { where: (user) => user.posts.none((post) => post.title.is("Untitled")) },
 );
 
-database.users(
+db.users(
   (user) => ({
     name: user.name,
   }),
@@ -974,14 +1001,14 @@ with pagination included in their result.
 
 ```ts
 query({
-  where: (posts) =>
+  where: (post) =>
     and(
-      when(search, (search) => posts.title.ilike(`%${search}%`)),
-      when(authorId, (authorId) => posts.authorId.is(authorId)),
+      when(search, (search) => post.title.ilike(`%${search}%`)),
+      when(authorId, (authorId) => post.authorId.is(authorId)),
     ),
 });
 
-database.posts((post, { whereNotNull }) => ({
+db.posts((post, { whereNotNull }) => ({
   editorId: whereNotNull(post.editorId), // number, not number | null
 }));
 ```
@@ -1006,13 +1033,13 @@ narrowed expression.
 ### Several reads in one statement
 
 ```ts
-const [user, posts, unread] = await database.$batch((db) => [
+const [user, posts, unread] = await db.$batch((db) => [
   db.users.get(id),
   db.posts({ where: { authorId: id }, orderBy: { id: "desc" }, limit: 10 }),
   db.notifications({ where: { userId: id, read: false } }).count(),
 ]);
 
-const page = await database.$batch((db) => ({
+const page = await db.$batch((db) => ({
   items: db.posts(postCard, { limit: 20 }),
   total: db.posts.count(),
 }));
@@ -1040,7 +1067,7 @@ queries in parallel.
 ### Cursor pages
 
 ```ts
-const pageQuery = database.posts(
+const pageQuery = db.posts(
   (post) => ({
     title: post.title,
   }),
@@ -1080,7 +1107,7 @@ keep the cursor you came from.
 ### Streaming rows
 
 ```ts
-for await (const row of database.events(exportShape).stream({ size: 1000 })) {
+for await (const row of db.events(exportShape).stream({ size: 1000 })) {
   writer.write(row);
 }
 ```
@@ -1155,7 +1182,7 @@ import { postgres } from "symmetria/driver";
 import { appSchema } from "./schema";
 
 const profiler = createProfiler({ capacity: 200 });
-const database = createDatabase({
+const db = createDatabase({
   schema: appSchema,
   driver: postgres({ url: process.env.DATABASE_URL!, profiler }),
 });
@@ -1163,9 +1190,7 @@ const profilingServer = await profiler.serve(); // 127.0.0.1:7331
 
 Bun.serve({
   fetch: profiler.fetch(async (request) => {
-    const users = await database
-      .users((user) => ({ id: user.id, name: user.name }))
-      .execute();
+    const users = await db.users((user) => ({ id: user.id, name: user.name }));
     return Response.json(users);
   }),
 });
@@ -1224,7 +1249,7 @@ import { prepare, int, text } from "symmetria";
 const searchPosts = prepare(
   { authorId: int, title: text, size: int },
   (parameters) =>
-    database.posts(
+    db.posts(
       (post) => ({
         id: post.id,
         title: post.title,
@@ -1251,7 +1276,7 @@ SELECTs keep the query terminals with the values as their first argument:
 `one(values)`, `maybeOne(values)`, `first(values)`, `count(values)`,
 `exists(values)` and `inspect(values, options?)`. Lookup writes are prepared the
 same way:
-`prepare({ id: int }, (p) => database.users.byId(p.id).update({ active: false }))`.
+`prepare({ id: int }, (p) => db.users.byId(p.id).update({ active: false }))`.
 
 The factory runs once and SQL is compiled once. Each execution binds a fresh set
 of typed values through the column codecs, typed like writes: a `jsonb(schema)`
@@ -1281,54 +1306,46 @@ value.
 ## INSERT, UPDATE, DELETE
 
 ```ts
-const author = await database.users
-  .insert({ name: "Ada" })
-  .returning((users) => [users.id, users.name]);
+const author = await db.users.insert({ name: "Ada" }).returning("id", "name");
 // { id: number; name: string }
 
 // Unique lookups write directly, in one statement.
-await database.users.byId(author.id).update({ name: "Ada Lovelace" });
-await database.posts.by.slug("sql-first").delete();
+await db.users.byId(author.id).update({ name: "Ada Lovelace" });
+await db.posts.by.slug("sql-first").delete();
 
-await database.posts.insert({ title: "SQL first", authorId: author.id });
+await db.posts.insert({ title: "SQL first", authorId: author.id });
 
-await database.posts
-  .update((posts) => ({ views: posts.views.plus(1) }))
-  .where((posts) => posts.title.is("SQL first"));
+await db.posts.update((post) => ({ views: post.views.plus(1) }), {
+  where: { title: "SQL first" },
+});
 
-await database.users
-  .insert({ name: "Ada" })
-  .onConflict("name")
-  .doUpdate("name");
+await db.users.upsert({ name: "Ada" }, { by: "name" });
 
-await database.posts.delete().where((posts) => posts.views.is(0));
+await db.posts.delete({ where: { views: 0 } });
 
-// Whole-table writes must be spelled out; a missing where() is refused.
-await database.posts.update({ published: false }).all();
+// Whole-table writes must be spelled out; a missing filter is refused.
+await db.posts.update({ published: false }).all();
 
 // Relation paths and quantifiers work in UPDATE/DELETE predicates.
-await database.posts.delete().where((posts) => posts.author.name.is("Ada"));
-await database.users
-  .update({ active: false })
-  .where((users) => users.posts.none());
+await db.posts.delete({ where: (post) => post.author.name.is("Ada") });
+await db.users.update(
+  { active: false },
+  { where: (user) => user.posts.none() },
+);
 ```
 
-The filter of an UPDATE or DELETE can be an option instead of `.where()`, as a
-callback, a list of predicates or an object of equalities:
-
-```ts
-await database.posts.update({ published: true }, { where: { id: 7 } });
-await database.posts.delete({ where: (post) => post.author.name.is("Ada") });
-```
-
-An object that names no column (`{}`, or every value `undefined`) throws rather
-than write every row; `.all()` remains the only way to say that.
+The filter of an UPDATE or DELETE is the `where` option: a callback, a list of
+predicates or an object of equalities. An object that names no column (`{}`, or
+every value `undefined`) throws rather than write every row; `.all()` remains
+the only way to say that. The chained form is the same statement:
+`db.posts.update(values).where((post) => …)` and
+`db.posts.delete().where((post) => …)`.
 
 `upsert()` inserts a row or overwrites the one with the same key:
 
 ```ts
-await database.products.upsert(product, { by: "sku" });
-await database.products
+await db.products.upsert(product, { by: "sku" });
+await db.products
   .upsert(rows, { by: "sku", update: ["title", "price"] })
   .returning("id", "sku");
 ```
@@ -1392,17 +1409,15 @@ aggregates, window functions, subqueries and `$` controls are rejected, and a
 projection of another table is rejected as well:
 
 ```ts
-const userCard = database.users.shape(({ id, name }, { sql }) => ({
+const userCard = db.users.shape(({ id, name }, { sql }) => ({
   id,
   name,
   upper: sql.of(text)`upper(${name})`,
 }));
 
-const created = await database.users
-  .insert({ name: "Ada" })
-  .returning(userCard);
+const created = await db.users.insert({ name: "Ada" }).returning(userCard);
 // { id: number; name: string; upper: string }
-const renamed = await database.users
+const renamed = await db.users
   .byId(created.id)
   .update({ name: "Ada Lovelace" })
   .returning(userCard);
@@ -1414,7 +1429,7 @@ including nested-insert RETURNING. The upsert callback receives the current row
 first and the proposed `excluded` row second:
 
 ```ts
-await database.users
+await db.users
   .insert({ name: "Ada", active: true })
   .onConflict("name")
   .doUpdate((user, excluded) => ({ name: user.name, active: excluded.active }))
@@ -1426,47 +1441,48 @@ await database.users
 ```ts
 const users = table({ id: int.auto, email: text.unique, name: text });
 const handles = table({ id: int.auto, tenant: text, handle: text }).indexes(
-  (handles) => ({ identity: index(handles.tenant, handles.handle).unique }),
+  (handle) => ({ identity: index(handle.tenant, handle.handle).unique }),
 );
-const database = createDatabase({
+const db = createDatabase({
   schema: schema({ users, handles }),
   driver: postgres({ url: process.env.DATABASE_URL! }),
 });
 
-await database.users.by.email("ada@example.com").one();
-await database.handles.by
-  .identity({ tenant: "team", handle: "ada" })
-  .maybeOne();
+await db.users.get({ email: "ada@example.com" });
+await db.handles.find({ tenant: "team", handle: "ada" });
+
+// A lookup is a query: it takes options, shapes and terminals.
+await db.users.by.email("ada@example.com")({ forUpdate: true }).one();
 
 // Lookups also write: one UPDATE or DELETE, no preliminary SELECT.
-await database.users.by.email("ada@example.com").update({ name: "Ada" });
-await database.handles.by.identity({ tenant: "team", handle: "ada" }).delete();
+await db.users.by.email("ada@example.com").update({ name: "Ada" });
+await db.handles.by.identity({ tenant: "team", handle: "ada" }).delete();
 ```
 
 `.by` is inferred from `.unique` columns and table-local named, unconditional
-unique indexes over plain columns. Composite keys require all fields. Lookups
-select all root columns, including computed fields, and compose with ordinary
-query methods and prepared parameters. A null or undefined key rejects when the
-lookup runs. Partial and expression indexes are excluded; use explicit
-predicates for them. Primary-key lookup remains `.byId(...)`, including non-`id`
-and composite keys.
+unique indexes over plain columns; `get()` and `find()` accept the same keys as
+an object of their columns and read the one row at once. Composite keys require
+all fields. Lookups select all root columns, including computed fields, and
+compose with ordinary query methods and prepared parameters. A null or undefined
+key rejects when the lookup runs. Partial and expression indexes are excluded;
+use explicit predicates for them. Primary-key lookup remains `.byId(...)`,
+including non-`id` and composite keys.
 
 `.update()` and `.delete()` on a lookup keep the source's write types, `$scope`
 filters and transaction binding, accept prepared parameters in the key, and
 return `{ affectedRows }` or, with `returning()`, an array of rows. The methods
-can be detached: `const { update } = database.users.by.email("ada")`.
+can be detached: `const { update } = db.users.by.email("ada")`.
 
 ## Atomic nested inserts
 
 ```ts
-await database.posts
+await db.posts
   .insert({
     title: "Relations in SQL",
     author: { connect: 1 },
     tags: { connectOrCreate: [{ label: "bun" }, { label: "postgres" }] },
   })
-  .returning((posts) => ({ id: posts.id, title: posts.title }))
-  .execute();
+  .returning("id", "title");
 ```
 
 - To-one relations accept exactly one of `connect`, `create`, `connectOrCreate`.
@@ -1516,16 +1532,16 @@ operation are then one multi-row INSERT.
 ## CTEs and window functions
 
 ```ts
-import { rowNumber, over, sum } from "symmetria";
+import { rowNumber, sum } from "symmetria";
 
-const ranked = database
+const ranked = db
   .posts((post) => ({
     id: post.id,
     position: rowNumber().over({
       partitionBy: [post.authorId],
       orderBy: [post.createdAt.descending, post.id.descending],
     }),
-    runningViews: over(sum(post.views), {
+    runningViews: sum(post.views).over({
       partitionBy: [post.authorId],
       orderBy: post.id.ascending,
       rows: ["unbounded preceding", "current row"],
@@ -1533,27 +1549,23 @@ const ranked = database
   }))
   .cte("ranked", { materialized: false });
 
-await ranked(
-  (post) => ({
-    id: post.id,
-    position: post.position,
-    runningViews: post.runningViews,
-  }),
-  { where: (post) => post.position.atMost(3) },
-).execute();
+await ranked({ where: (post) => post.position.atMost(3) });
 ```
 
 Call `.cte(name)` after selecting fields. The result is a typed table source:
-select from it, join it, or alias it. Dependencies are emitted once in a single
-`WITH` statement; conflicting names throw. A CTE cannot take the SQL name of a
-table (`.cte("posts")` throws): in PostgreSQL a `WITH` name hides the table of
-that name everywhere in the statement, so `FROM "posts"` would silently read the
-CTE. `materialized: true | false` emits the PostgreSQL hint; omission uses the
+select from it, join it, or alias it; given options and no fields, it reads all
+its fields. Dependencies are emitted once in a single `WITH` statement;
+conflicting names throw. A CTE cannot take the SQL name of a table
+(`.cte("posts")` throws): in PostgreSQL a `WITH` name hides the table of that
+name everywhere in the statement, so `FROM "posts"` would silently read the CTE.
+`materialized: true | false` emits the PostgreSQL hint; omission uses the
 database default. CTEs support SELECT bodies.
 
 `rowNumber()`, `rank()` and `denseRank()` return number after `.over(...)`.
 `lag(column, offset?, fallback?)` and `lead(...)` retain the column codec and a
-nullable result. `over(aggregate, options)` supports aggregate windows; sums and
+nullable result. An aggregate becomes a window the same way,
+`sum(post.views).over(options)`, for `count`, `sum`, `average`, `minimum` and
+`maximum`; `over(expression, options)` is the same as a function. Sums and
 averages retain numeric precision. `partitionBy` takes columns, `orderBy` takes
 one or multiple orderings. `rows: [start, end]` accepts `"unbounded preceding"`,
 `"current row"`, `"unbounded following"`, `{ preceding: number }` and
@@ -1564,7 +1576,7 @@ result because windows cannot appear directly in WHERE.
 Recursive example for a table with `id`, nullable `parentId`, and `name`:
 
 ```ts
-const tree = database
+const tree = db
   .nodes(
     (node) => ({
       id: node.id,
@@ -1573,14 +1585,14 @@ const tree = database
     { where: (node) => node.id.is(rootId) },
   )
   .recursive("tree", (tree) =>
-    database.nodes((node, { innerJoin }) => {
+    db.nodes((node, { innerJoin }) => {
       innerJoin(tree, (parent) => node.parentId.is(parent.id));
 
       return { id: node.id, name: node.name };
     }),
   );
 
-await tree((node) => ({ id: node.id, name: node.name })).execute();
+await tree((node) => ({ id: node.id, name: node.name }));
 ```
 
 The recursive term must return the anchor's fields in the same order and with
@@ -1594,7 +1606,7 @@ columns and codecs are preserved through the resulting table source.
 ```ts
 import { count, sum, exists } from "symmetria";
 
-const totals = database.posts(
+const totals = db.posts(
   (post, { innerJoin }) => {
     const author = innerJoin(post.authorId);
 
@@ -1606,14 +1618,14 @@ const totals = database.posts(
   },
   {
     groupBy: (post) => [post.author.name],
-    having: (_post, { count }) => count().above(1),
+    having: (post, { selected }) => selected.total.above(1),
   },
 );
 
-const activeAuthors = database.users((user) => ({ name: user.name }), {
+const activeAuthors = db.users((user) => ({ name: user.name }), {
   where: (user) =>
     exists(
-      database.posts((post) => ({ id: post.id }), {
+      db.posts((post) => ({ id: post.id }), {
         where: (post) => post.authorId.is(user.id),
       }),
     ),
@@ -1624,7 +1636,7 @@ const activeAuthors = database.users((user) => ({ name: user.name }), {
 filtered source:
 
 ```ts
-const { orders, total } = await database
+const { orders, total } = await db
   .orders({ where: { status: "paid" } })
   .aggregate((order, { count, sum }) => ({
     orders: count(),
@@ -1662,15 +1674,15 @@ support forward, reverse, self and junction relations without multiplying root
 rows:
 
 ```ts
-database.users((users) => ({
-  name: users.name,
-  posts: users.posts.count(),
-  viewed: users.posts({ where: (posts) => posts.views.above(0n) }).count(),
-  hasPosts: users.posts.exists(),
-  totalViews: users.posts.sum.views,
-  averageViews: users.posts.average.views,
-  latestPost: users.posts.maximum.createdAt,
-  weightedViews: users.posts.sum((post) => post.views.multiply(2n)),
+db.users((user) => ({
+  name: user.name,
+  posts: user.posts.count(),
+  viewed: user.posts({ where: (post) => post.views.above(0n) }).count(),
+  hasPosts: user.posts.exists(),
+  totalViews: user.posts.sum.views,
+  averageViews: user.posts.average.views,
+  latestPost: user.posts.maximum.createdAt,
+  weightedViews: user.posts.sum((post) => post.views.multiply(2n)),
 }));
 ```
 
@@ -1691,7 +1703,7 @@ the same SQL. Value aggregates ignore SQL NULL; an all-NULL input also produces
 per parent:
 
 ```ts
-database.users((user) => {
+db.users((user) => {
   const recent = user.posts({
     where: (post) => post.state.is.published,
     orderBy: (post) => [post.createdAt.descending, post.id.descending],
@@ -1714,7 +1726,7 @@ value aggregates, DISTINCT applies to the selected aggregate input expression.
 ### Arithmetic
 
 ```ts
-const totals = database.orderItems((item) => ({
+const totals = db.orderItems((item) => ({
   total: item.quantity.multiply(item.unitPrice), // Decimal
   withTax: item.unitPrice.multiply("1.2"), // Decimal
   perKg: item.unitPrice.divide(item.weight), // Decimal
@@ -1794,14 +1806,14 @@ the object. Symmetria casts its own JSON parameters this way.
 ```ts
 import { dateTrunc } from "symmetria";
 
-database.orders(
+db.orders(
   (order, { dateTrunc, count }) => ({
     month: dateTrunc("month", order.createdAt, { timeZone: "Europe/Berlin" }),
     orders: count(),
   }),
   {
-    groupBy: (order, tools, selected) => [selected.month],
-    orderBy: (order, tools, selected) => selected.month.ascending,
+    groupBy: (order, { selected }) => [selected.month],
+    orderBy: { month: "asc" },
   },
 );
 // date_trunc('month', "orders"."created_at", $1::text)
@@ -1831,7 +1843,7 @@ both being strings.
 ## Nested relations
 
 ```ts
-const authors = await database.users(
+const authors = await db.users(
   (user) => ({
     name: user.name,
     posts: user.posts(
@@ -1946,7 +1958,7 @@ scope. Raw expressions inside a nested query block only that query's rewrite.
   returning `{ rows, affectedRows }` (or an array of rows). JSON parameters use
   serialized text with explicit SQL casts. Selected aliases identify result
   keys.
-- `await database.$close()` closes the configured driver's pool.
+- `await db.$close()` closes the configured driver's pool.
 
 ### When errors surface
 
@@ -1979,7 +1991,7 @@ read like promises; they run each time one of the three is called.
 import { NotFoundError, UniqueViolation, QueryError } from "symmetria";
 
 try {
-  await database.users.insert({ email });
+  await db.users.insert({ email });
 } catch (error) {
   if (error instanceof UniqueViolation) {
     return conflict(error.constraint); // "users_email_key"
@@ -2012,7 +2024,7 @@ import { postgres } from "symmetria/pg"; // Node.js or Bun; install pg (no @type
 // import { postgres } from "symmetria/bun"; // Bun's built-in SQL pool
 
 const driver = postgres({ url: process.env.DATABASE_URL!, max: 10 });
-const database = createDatabase({ schema: appSchema, driver });
+const db = createDatabase({ schema: appSchema, driver });
 ```
 
 `symmetria/driver` re-exports `symmetria/pg`. Both adapters compile the same
@@ -2091,25 +2103,25 @@ const posts = table({
   tags: text.array,
   scores: bigint.array.nullable,
 });
-const database = createDatabase({
+const db = createDatabase({
   schema: schema({ posts }),
   driver: postgres({ url: process.env.DATABASE_URL! }),
 });
 
-database.posts(
+db.posts(
   (post) => ({
     id: post.id,
     tagCount: post.tags.length(), // cardinality("tags")
   }),
   { where: (post) => post.tags.has("sql") }, // $1 = ANY("tags")
 );
-database.posts(
+db.posts(
   (post) => ({
     id: post.id,
   }),
   { where: (post) => post.tags.contains(["bun", "sql"]) },
 ); // @>
-database.posts(
+db.posts(
   (post) => ({
     id: post.id,
   }),
@@ -2140,14 +2152,14 @@ const posts = table({
   title: text,
   body: text.nullable,
   document: tsvector.nullable, // optional stored vector
-}).indexes((posts) => ({
+}).indexes((post) => ({
   // The index expression is the query expression, so the planner uses it.
   search: index(
-    searchDocument({ A: posts.title, B: posts.body }, { language: "english" }),
+    searchDocument({ A: post.title, B: post.body }, { language: "english" }),
   ).using("gin"),
 }));
 
-database.posts(
+db.posts(
   (post) => {
     const document = searchDocument(
       { A: post.title, B: post.body },
@@ -2221,17 +2233,17 @@ const documents = table({
   id: int.auto,
   content: text,
   embedding: vector(1536),
-}).indexes((documents) => ({
-  embedding: index(operatorClass(documents.embedding, "vector_cosine_ops"))
+}).indexes((document) => ({
+  embedding: index(operatorClass(document.embedding, "vector_cosine_ops"))
     .using("hnsw")
     .with({ m: 16, ef_construction: 64 }),
 }));
 
 export const appSchema = schema({ documents }, { extensions: ["vector"] });
 
-await database.documents.insert({ content, embedding: await embed(content) });
+await db.documents.insert({ content, embedding: await embed(content) });
 
-const matches = await database.documents(
+const matches = await db.documents(
   (doc) => ({
     content: doc.content,
     distance: doc.embedding.cosineDistance(query),
@@ -2288,9 +2300,9 @@ const chunks = table({
 export const appSchema = schema({ notes, chunks });
 
 // The embedding is computed with the row.
-await database.chunks.insert({ noteId, owner, title, content });
+await db.chunks.insert({ noteId, owner, title, content });
 
-const found = await database.chunks.search(
+const found = await db.chunks.search(
   (chunk) => ({ content: chunk.content, note: chunk.note.title }),
   { where: { owner }, about: "where are the garage keys?", limit: 6 },
 );
@@ -2363,10 +2375,10 @@ and pass the vectors when that matters.
 An `UPDATE` that changes one of the embedded columns sets the embedding to
 `NULL` in the same statement, because it would describe the old text; an
 `UPDATE` that sets the embedding itself keeps what it sets. The row is found by
-its words meanwhile. `await database.chunks.search.reindex()` computes every
-missing embedding (`{ where, batch }` narrow and size the work) and resolves to
-the number of rows it embedded; it is also how rows written before the search
-was declared get theirs.
+its words meanwhile. `await db.chunks.search.reindex()` computes every missing
+embedding (`{ where, batch }` narrow and size the work) and resolves to the
+number of rows it embedded; it is also how rows written before the search was
+declared get theirs.
 
 **Searching.** `search(shape?, options)` takes the shape of any query, or none
 for whole rows, and resolves to rows ordered best first:
@@ -2445,14 +2457,14 @@ Joins are left to better-auth, which reads related rows with separate queries.
 For a schema whose `posts` and `comments` tables each declare `tenantId`:
 
 ```ts
-const tenant = database.$scope({
-  posts: (posts) => posts.tenantId.is(tenantId),
-  comments: (comments) => comments.tenantId.is(tenantId),
+const tenant = db.$scope({
+  posts: (post) => post.tenantId.is(tenantId),
+  comments: (comment) => comment.tenantId.is(tenantId),
 });
 
 await tenant.posts((post) => ({ id: post.id })); // WHERE "posts"."tenant_id" = $1
 await tenant.users((user) => ({ posts: user.posts.count() }));
-await tenant.posts.delete().where((posts) => posts.id.is(7));
+await tenant.posts.delete().where((post) => post.id.is(7));
 // Rejects with SYMMETRIA_OUT_OF_SCOPE: the row would leave the scope.
 await tenant.posts.byId(7).update({ tenantId: otherTenantId });
 ```
@@ -2517,8 +2529,8 @@ fails each execution that uses it rather than the build.
 
 ```ts
 const users = table({ id: int.auto, firstName: text, lastName: text }).computed(
-  (users) => ({
-    fullName: sql<string>`concat_ws(' ', ${users.firstName}, ${users.lastName})`,
+  (user) => ({
+    fullName: sql<string>`concat_ws(' ', ${user.firstName}, ${user.lastName})`,
   }),
 );
 ```
@@ -2584,7 +2596,7 @@ assigning the column would replace the whole document:
 
 ```ts
 // settings: jsonb<{ theme: "dark" | "light"; notifications: { email: boolean } }>()
-await database.users
+await db.users
   .update(({ settings }) => ({
     settings: settings
       .set("theme", "dark")
@@ -2668,10 +2680,10 @@ import {
 
 import { postgres } from "symmetria/driver";
 
-const database = createDatabase({
+const db = createDatabase({
   schema: schema({
-    users: table({ id: int.auto, name: text }).indexes((users) => ({
-      lowerName: index(sql<string>`lower(${users.name})`).unique,
+    users: table({ id: int.auto, name: text }).indexes((user) => ({
+      lowerName: index(sql<string>`lower(${user.name})`).unique,
     })),
     posts: ({ users }) =>
       table({
@@ -2680,21 +2692,19 @@ const database = createDatabase({
         author: users,
         views: bigint.default(0n),
         createdAt: timestamptz.now,
-      }).indexes((posts) => ({
-        byAuthorDate: index(posts.authorId, posts.createdAt.descending).include(
-          posts.title,
+      }).indexes((post) => ({
+        byAuthorDate: index(post.authorId, post.createdAt.descending).include(
+          post.title,
         ),
-        viewed: index(posts.views).where(posts.views.above(0n)),
-        untitled: index(posts.createdAt).where(
-          sql<boolean>`${posts.title} = ''`,
-        ),
+        viewed: index(post.views).where(post.views.above(0n)),
+        untitled: index(post.createdAt).where(sql<boolean>`${post.title} = ''`),
       })),
   }),
   driver: postgres({ url: process.env.DATABASE_URL! }),
 });
 
-database.$createIndexes().toSQL(); // CREATE INDEX statements
-await database.$createIndexes({ ifNotExists: true }).execute();
+db.$createIndexes().toSQL(); // CREATE INDEX statements
+await db.$createIndexes({ ifNotExists: true }).execute();
 ```
 
 Supported: compound, unique, partial, expression and covering indexes; `btree`
@@ -2721,7 +2731,7 @@ callbacks, including cycles, anchor their types before defining the tables:
 schema.keys({ users: int, teams: int })({
   users: ({ teams }) =>
     table({ id: int.auto, team: teams.nullable.inverse("members") }).indexes(
-      (users) => ({ byTeam: index(users.teamId) }),
+      (user) => ({ byTeam: index(user.teamId) }),
     ), // number | null
   teams: ({ users }) => ({ id: int.auto, owner: users.inverse("ownedTeams") }),
 });
@@ -2760,8 +2770,8 @@ output.
 import { schema, table, text, int, numeric } from "symmetria";
 
 const inventory = schema({
-  tenants: table({ code: text, name: text }).primaryKey((tenants) => [
-    tenants.code,
+  tenants: table({ code: text, name: text }).primaryKey((tenant) => [
+    tenant.code,
   ]),
   products: ({ tenants }) =>
     table({
@@ -2770,10 +2780,10 @@ const inventory = schema({
       price: numeric(12, 2),
       stock: int.default(0),
     })
-      .primaryKey((products) => [products.tenantId, products.sku])
-      .checks((products) => ({
-        positivePrice: products.price.above("0"),
-        availableStock: products.stock.atLeast(0),
+      .primaryKey((product) => [product.tenantId, product.sku])
+      .checks((product) => ({
+        positivePrice: product.price.above("0"),
+        availableStock: product.stock.atLeast(0),
       })),
 });
 ```
@@ -2804,17 +2814,15 @@ names derive from the table or column (`RENAME CONSTRAINT`,
 ```ts
 import { IsolationLevel } from "symmetria";
 
-const article = await database.$transaction(
+const article = await db.$transaction(
   async (transaction) => {
     const author = await transaction.users
       .insert({ name: "Grace" })
-      .returning((users) => [users.id])
-      .execute();
+      .returning("id");
 
     return transaction.posts
       .insert({ title: "Atomic writes", authorId: author.id })
-      .returning((posts) => [posts.id, posts.title])
-      .execute();
+      .returning("id", "title");
   },
   { isolationLevel: IsolationLevel.Serializable },
 );
@@ -2824,24 +2832,24 @@ The callback receives the same typed tables bound to one reserved connection.
 Its result is returned after COMMIT; a thrown error rolls back and is rethrown.
 Use this callback context for every operation in the transaction.
 
-Use `Transaction<typeof database>` for services that receive a transaction:
+Use `Transaction<typeof db>` for services that receive a transaction:
 
 ```ts
 import type { Transaction } from "symmetria";
 
-type AppTransaction = Transaction<typeof database>;
+type AppTransaction = Transaction<typeof db>;
 
 const findAuthor = (transaction: AppTransaction, authorId: number) =>
-  transaction.users.byId(authorId).one();
+  transaction.users.get(authorId);
 
-await database.$transaction((transaction) => findAuthor(transaction, 1));
+await db.$transaction((transaction) => findAuthor(transaction, 1));
 ```
 
 It infers the exact tables and relations from either the connected database or
 `typeof appSchema`. Nested savepoints have the same type. Pool shutdown and
 transaction-incompatible index options remain unavailable on this context. The
-type distinguishes a transaction from the pool-bound database, so passing
-`database` to a transaction-only helper is a compile-time error.
+type distinguishes a transaction from the pool-bound database, so passing `db`
+to a transaction-only helper is a compile-time error.
 
 - Isolation: `IsolationLevel.ReadCommitted`, `IsolationLevel.RepeatableRead`,
   `IsolationLevel.Serializable`. The corresponding strings (`"read committed"`,
@@ -2849,7 +2857,7 @@ type distinguishes a transaction from the pool-bound database, so passing
   a frozen constant object and an exported union type.
 - `readOnly: true`; `deferrable: true` with serializable read-only transactions.
 - The callback can be async or return a query directly, since a query is
-  awaitable: `database.$transaction((transaction) => transaction.posts(…))`.
+  awaitable: `db.$transaction((transaction) => transaction.posts(…))`.
 - `transaction.$transaction(async (savepoint) => …)` creates a nested savepoint.
   Catch its failure in the outer callback to recover and continue; successful
   nested writes still roll back if the outer transaction fails.

@@ -2,21 +2,21 @@ import { prepare, text } from "symmetria";
 import { connect } from "./database";
 import { authorFeed } from "./queries";
 
-const database = connect();
+const db = connect();
 
 try {
-  console.log(await authorFeed(database).execute());
+  console.log(await authorFeed(db));
 
-  const feed = database.posts(
-    (posts) => ({
-      id: posts.id,
-      title: posts.title,
-      views: posts.views,
-      createdAt: posts.createdAt,
+  const feed = db.posts(
+    (post) => ({
+      id: post.id,
+      title: post.title,
+      views: post.views,
+      createdAt: post.createdAt,
     }),
     {
-      where: (posts) => posts.state.is.published,
-      orderBy: (posts) => [posts.createdAt.descending, posts.id.descending],
+      where: (post) => post.state.is.published,
+      orderBy: (post) => [post.createdAt.descending, post.id.descending],
     },
   );
 
@@ -33,12 +33,12 @@ try {
   }
 
   const lookup = prepare({ slug: text }, ({ slug }) =>
-    database.posts.by.slug(slug)((posts) => ({
-      title: posts.title,
-      views: posts.views,
+    db.posts.by.slug(slug)((post) => ({
+      title: post.title,
+      views: post.views,
     })),
   );
-  console.log(await lookup.execute({ slug: "typed-sql" }));
+  console.log(await lookup({ slug: "typed-sql" }));
 } finally {
-  await database.$close();
+  await db.$close();
 }

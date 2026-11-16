@@ -21,7 +21,7 @@ connectionUrl.searchParams.set(
 );
 const administrator = postgres({ url: databaseUrl, max: 1 });
 const profiler = createProfiler({ capacity: 200 });
-const database = createDatabase({
+const db = createDatabase({
   schema: appSchema,
   driver: postgres({ url: connectionUrl.toString(), max: 4, profiler }),
 });
@@ -58,84 +58,71 @@ try {
         name: `Author ${position + 1}`,
       })),
     )
-    .returning((users) => [users.id])
-    .execute();
-  await setup.posts
-    .insert(
-      Array.from({ length: 200 }, (_, position) => ({
-        slug: `profile-post-${position + 1}`,
-        title: `Post ${position + 1}`,
-        authorId: users[position % users.length]!.id,
-        state: "published" as const,
-        views: 9007199254740993n + BigInt(position),
-      })),
-    )
-    .execute();
+    .returning("id");
+  await setup.posts.insert(
+    Array.from({ length: 200 }, (_, position) => ({
+      slug: `profile-post-${position + 1}`,
+      title: `Post ${position + 1}`,
+      authorId: users[position % users.length]!.id,
+      state: "published" as const,
+      views: 9007199254740993n + BigInt(position),
+    })),
+  );
 
   const handleRequest = profiler.fetch(async (request) => {
     const path = new URL(request.url).pathname;
 
     if (path === "/feed") {
-      await recentPosts(database)({ limit: 20 }).execute();
+      await recentPosts(db)({ limit: 20 });
     } else if (path === "/authors/nested") {
-      await database
-        .users(
-          (users) => ({
-            name: users.name,
-            posts: users.posts(
-              (posts) => ({
-                title: posts.title,
-                views: posts.views,
-              }),
-              { orderBy: (posts) => posts.id.descending, limit: 3 },
-            ),
-          }),
-          { orderBy: (users) => users.id.ascending, limit: 5 },
-        )
-        .execute();
+      await db.users(
+        (user) => ({
+          name: user.name,
+          posts: user.posts(
+            (post) => ({
+              title: post.title,
+              views: post.views,
+            }),
+            { orderBy: (post) => post.id.descending, limit: 3 },
+          ),
+        }),
+        { orderBy: (user) => user.id.ascending, limit: 5 },
+      );
     } else if (path === "/authors/n-plus-one") {
-      const authors = await database
-        .users(
-          (users) => ({
-            id: users.id,
-            name: users.name,
-          }),
-          { orderBy: (users) => users.id.ascending, limit: 5 },
-        )
-        .execute();
+      const authors = await db.users(
+        (user) => ({
+          id: user.id,
+          name: user.name,
+        }),
+        { orderBy: (user) => user.id.ascending, limit: 5 },
+      );
 
       // Deliberate N+1: the profiler marks repeated SQL with ↻.
       for (const author of authors) {
-        await database
-          .posts(
-            (posts) => ({
-              title: posts.title,
-              views: posts.views,
-            }),
-            {
-              where: (posts) => posts.authorId.is(author.id),
-              orderBy: (posts) => posts.id.descending,
-              limit: 3,
-            },
-          )
-          .execute();
+        await db.posts(
+          (post) => ({
+            title: post.title,
+            views: post.views,
+          }),
+          {
+            where: (post) => post.authorId.is(author.id),
+            orderBy: (post) => post.id.descending,
+            limit: 3,
+          },
+        );
       }
     } else if (path === "/slow") {
       // Artificial database delay, visible in Database rather than Build/Decode.
-      await database
-        .users(
-          (users) => ({
-            id: users.id,
-            delay: sql<string>`pg_sleep(${0.08})`,
-          }),
-          { limit: 1 },
-        )
-        .execute();
+      await db.users(
+        (user) => ({
+          id: user.id,
+          delay: sql<string>`pg_sleep(${0.08})`,
+        }),
+        { limit: 1 },
+      );
     } else if (path === "/error") {
       // Deliberate unique-constraint violation; the INSERT stores no row.
-      await database.users
-        .insert({ email: "user1@profile.test", name: "Duplicate" })
-        .execute();
+      await db.users.insert({ email: "user1@profile.test", name: "Duplicate" });
     } else {
       return new Response("Not found", { status: 404 });
     }
@@ -211,7 +198,7 @@ try {
   process.off("SIGTERM", stop);
   await applicationServer?.stop();
   await profilingServer?.stop();
-  await database.$close();
+  await db.$close();
 
   try {
     if (created) {

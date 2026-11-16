@@ -37,6 +37,7 @@ import {
 } from "./core";
 import { castNode, isJsonValue, jsonScalar } from "./arithmetic";
 import { searchLanguage } from "./search";
+import { windowFunction, type WindowExpression } from "./windows";
 
 /**
  * Entries a predicate list skips: every value `cond && predicate` can produce
@@ -91,49 +92,55 @@ export const notExists = (query: QueryReference): Predicate =>
 
 export const count = (
   expression?: SelectedColumn,
-): QueryColumn<number, "count"> =>
-  createExpression({
-    node: freeze({
-      kind: "aggregate",
-      name: "COUNT",
-      ...(expression ? { value: readColumn(expression).node } : {}),
+): WindowExpression<number, "count"> =>
+  windowFunction(
+    createExpression({
+      node: freeze({
+        kind: "aggregate",
+        name: "COUNT",
+        ...(expression ? { value: readColumn(expression).node } : {}),
+      }),
+      outputName: "count",
+      codec: countCodec,
     }),
-    outputName: "count",
-    codec: countCodec,
-  });
+  );
 
 /** A JSON number is summed exactly, as numeric. */
 export const sum = <
   Expression extends SelectedColumn<number | bigint | Decimal | null>,
 >(
   expression: Expression & Summable<Expression>,
-): QueryColumn<Decimal | null, "sum"> =>
-  createExpression({
-    node: freeze({
-      kind: "aggregate",
-      name: "SUM",
-      value: jsonScalar(readColumn(expression), "numeric").node,
-      numeric: true,
+): WindowExpression<Decimal | null, "sum"> =>
+  windowFunction(
+    createExpression({
+      node: freeze({
+        kind: "aggregate",
+        name: "SUM",
+        value: jsonScalar(readColumn(expression), "numeric").node,
+        numeric: true,
+      }),
+      outputName: "sum",
+      codec: numericCodec,
     }),
-    outputName: "sum",
-    codec: numericCodec,
-  });
+  );
 
 export const average = <
   Expression extends SelectedColumn<number | bigint | Decimal | null>,
 >(
   expression: Expression & Summable<Expression>,
-): QueryColumn<Decimal | null, "average"> =>
-  createExpression({
-    node: freeze({
-      kind: "aggregate",
-      name: "AVG",
-      value: jsonScalar(readColumn(expression), "numeric").node,
-      numeric: true,
+): WindowExpression<Decimal | null, "average"> =>
+  windowFunction(
+    createExpression({
+      node: freeze({
+        kind: "aggregate",
+        name: "AVG",
+        value: jsonScalar(readColumn(expression), "numeric").node,
+        numeric: true,
+      }),
+      outputName: "average",
+      codec: numericCodec,
     }),
-    outputName: "average",
-    codec: numericCodec,
-  });
+  );
 
 /** Types PostgreSQL orders without a MIN or MAX of their own, besides JSON and boolean. */
 export const ELEMENT_ORDERED = /^(uuid|bytea|tsvector|vector)(\(|$)/;
@@ -186,20 +193,20 @@ export const ordered = <Name extends "minimum" | "maximum">(
 /** The smallest value, ignoring NULL (and JSON null); `null` for no rows. */
 export const minimum = <Expression extends SelectedColumn>(
   expression: Expression,
-): QueryColumn<
+): WindowExpression<
   ExpressionValue<Expression> | null,
   "minimum",
   TraitsOf<Expression>
-> => ordered(expression, "minimum") as never;
+> => windowFunction(ordered(expression, "minimum")) as never;
 
 /** The largest value, ignoring NULL (and JSON null); `null` for no rows. */
 export const maximum = <Expression extends SelectedColumn>(
   expression: Expression,
-): QueryColumn<
+): WindowExpression<
   ExpressionValue<Expression> | null,
   "maximum",
   TraitsOf<Expression>
-> => ordered(expression, "maximum") as never;
+> => windowFunction(ordered(expression, "maximum")) as never;
 
 /** A JSON value with JSON null turned into SQL NULL, since both decode to null. */
 export const withoutJsonNull = (

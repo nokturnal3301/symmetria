@@ -48,14 +48,14 @@ const comments = table({
     .inverse("comments"),
 }));
 
-const { database, close } = await testDatabase({
+const { database: db, close } = await testDatabase({
   url,
   schema: schema({ accounts, posts, comments }),
   prefix: "symmetria_legacy",
 });
 
 try {
-  await database.accounts.insert([
+  await db.accounts.insert([
     {
       email: "ada@example.test",
       name: "Ada",
@@ -70,18 +70,18 @@ try {
     },
   ]);
   // The foreign key stores the referenced email; nested connect uses it too.
-  await database.posts.insert([
+  await db.posts.insert([
     { title: "Typed SQL", authorId: "ada@example.test" },
     { title: "Relations", author: { connect: "grace@example.test" } },
     { title: "Pull", authorId: "ada@example.test" },
   ]);
-  await database.comments.insert([
+  await db.comments.insert([
     { postTitle: "Typed SQL", body: "first" },
     { postTitle: "Typed SQL", body: "second" },
     { postTitle: "Lost", body: "nothing matches" },
   ]);
 
-  const feed = await database.posts(
+  const feed = await db.posts(
     (post) => ({
       title: post.title,
       author: post.author.name,
@@ -98,7 +98,7 @@ try {
   ]);
 
   // The condition relation is a LEFT JOIN: an unmatched comment keeps a null post.
-  const mentions = await database.comments(
+  const mentions = await db.comments(
     (comment) => ({ body: comment.body, post: comment.post.title }),
     { orderBy: (comment) => comment.id.ascending },
   );
@@ -107,13 +107,13 @@ try {
     ["Typed SQL", "Typed SQL", null],
   );
 
-  const account = await database.accounts.by.email("grace@example.test").one();
+  const account = await db.accounts.by.email("grace@example.test").one();
   assert.ok(account.avatar instanceof Uint8Array);
   assert.equal(account.joined, "1992-01-01");
 
   // Only a newer version may replace a post; a stale import writes nothing.
   const upsert = (version: number) =>
-    database.posts
+    db.posts
       .insert({ title: "Typed SQL", authorId: "grace@example.test", version })
       .onConflict("title")
       .doUpdate(
@@ -133,13 +133,13 @@ try {
   });
 
   // InferUpdate names the patch type for helpers and handlers.
-  const patch: InferUpdate<typeof database.posts> = {
+  const patch: InferUpdate<typeof db.posts> = {
     title: "Typed SQL, 2nd edition",
   };
-  await database.posts.byId(1).update(patch);
+  await db.posts.byId(1).update(patch);
 
   // Pages move both ways and always arrive in the declared order.
-  const pages = database.posts((post) => ({ id: post.id }), {
+  const pages = db.posts((post) => ({ id: post.id }), {
     orderBy: (post) => post.id.ascending,
   });
   const first = await pages.page({ size: 2 });

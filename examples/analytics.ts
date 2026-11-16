@@ -1,30 +1,21 @@
 import { rowNumber } from "symmetria";
 import { connect } from "./database";
 
-const database = connect();
+const db = connect();
 
 try {
-  const ranked = database
-    .posts((posts) => ({
-      title: posts.title,
-      authorId: posts.authorId,
+  const ranked = db
+    .posts((post) => ({
+      title: post.title,
+      authorId: post.authorId,
       position: rowNumber().over({
-        partitionBy: [posts.authorId],
-        orderBy: [posts.views.descending, posts.id.ascending],
+        partitionBy: [post.authorId],
+        orderBy: [post.views.descending, post.id.ascending],
       }),
     }))
     .cte("ranked_posts");
 
-  console.log(
-    await ranked(
-      (post) => ({
-        title: post.title,
-        authorId: post.authorId,
-        position: post.position,
-      }),
-      { where: (post) => post.position.atMost(2) },
-    ).execute(),
-  );
+  console.log(await ranked({ where: (post) => post.position.atMost(2) }));
 } finally {
-  await database.$close();
+  await db.$close();
 }

@@ -458,9 +458,54 @@ export const createQueryTables = (
       );
     };
 
-    /** The row with this primary key, whole or through a shape. */
+    /**
+     * `get({ email })`: an object names the columns of the primary key or of
+     * one unique key; any other value is the primary key itself.
+     */
+    const keyLookupOf = (value: unknown): object => {
+      if (!plainRecord(value)) {
+        return byId(value);
+      }
+
+      const names = Object.keys(value);
+      const primary = primaryKeyColumns(table);
+      const sameColumns = (columns: readonly string[]) =>
+        columns.length === names.length &&
+        columns.every((name) => Object.hasOwn(value, name));
+
+      if (sameColumns(primary.map((column) => column.name))) {
+        return keyLookup(
+          "primary key",
+          primary,
+          primary.map((column) => value[column.name]),
+        );
+      }
+
+      const unique = [...uniqueKeys.values()].find(sameColumns);
+
+      if (!unique) {
+        const keys = [
+          primary.map((column) => column.name),
+          ...uniqueKeys.values(),
+        ].filter((key) => key.length);
+
+        throw new Error(
+          `symmetria: ${names.map((name) => JSON.stringify(name)).join(", ") || "{}"} is not the primary key or a unique key of "${table.name}"; its keys: ${keys.map((key) => (key.length > 1 ? `[${key.join(", ")}]` : key[0])).join(", ") || "none"}`,
+        );
+      }
+
+      return keyLookup(
+        "unique key",
+        unique.map(
+          (name) => table.columns.find((column) => column.name === name)!,
+        ),
+        unique.map((name) => value[name]),
+      );
+    };
+
+    /** The row with this key, whole or through a shape. */
     const keyed = (value: unknown, shape?: ShapeCallback) => {
-      const lookup = byId(value) as LookupQuery;
+      const lookup = keyLookupOf(value) as LookupQuery;
 
       return shape === undefined ? lookup : lookup(shape);
     };

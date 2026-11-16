@@ -120,7 +120,7 @@ const isolated = await testDatabase({
   schema: appSchema,
   prefix: "symmetria_import",
 });
-const database = isolated.database;
+const db = isolated.database;
 
 try {
   const feed: FeedPost[] = Array.from({ length: 500 }, (_, index) => ({
@@ -135,10 +135,10 @@ try {
   }));
   feed.push({ ...feed[0]!, title: "Last source record wins" });
 
-  const first = await database.$transaction((transaction) =>
+  const first = await db.$transaction((transaction) =>
     importPosts(transaction, feed),
   );
-  const repeated = await database.$transaction((transaction) =>
+  const repeated = await db.$transaction((transaction) =>
     importPosts(transaction, feed),
   );
   assert.deepEqual(first, { posts: 500, linksAdded: 1000 });
@@ -146,15 +146,15 @@ try {
 
   const cancel = new Error("demonstrate whole-import rollback");
   await assert.rejects(
-    database.$transaction(async (transaction) => {
+    db.$transaction(async (transaction) => {
       await importPosts(transaction, [{ ...feed[0]!, slug: "rolled-back" }]);
       throw cancel;
     }),
     (error) => error === cancel,
   );
-  assert.equal(await database.posts.by.slug("rolled-back").maybeOne(), null);
+  assert.equal(await db.posts.by.slug("rolled-back").maybeOne(), null);
 
-  const stored = await database.posts.by
+  const stored = await db.posts.by
     .slug("source-0")((post) => ({
       title: post.title,
       views: post.views,

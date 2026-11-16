@@ -6,6 +6,10 @@ import {
   bigint,
   text,
   bool,
+  index,
+  sum,
+  count,
+  maximum,
 } from "../../../packages/runtime/src";
 
 type AreEqual<Actual, Expected> = [Actual] extends [Expected]
@@ -71,6 +75,67 @@ const model = schema({ users, posts, logs });
 }
 
 {
+  const accounts = table({
+    id: int.auto,
+    email: text.unique,
+    tenant: text,
+    handle: text,
+  }).indexes((account) => ({
+    identity: index(account.tenant, account.handle).unique,
+  }));
+  const lines = table({ line: text.unique });
+  const keyed = schema({ accounts, lines });
+
+  const account = await keyed.accounts.get({ email: "ada@x.test" });
+  type Account = Expect<
+    AreEqual<
+      typeof account,
+      { id: number; email: string; tenant: string; handle: string }
+    >
+  >;
+  const card = await keyed.accounts.find(
+    { tenant: "team", handle: "ada" },
+    (found) => ({ id: found.id }),
+  );
+  type Card = Expect<AreEqual<typeof card, { id: number } | null>>;
+  await keyed.accounts.find({ id: 1 });
+  // A table without a primary key is read by its unique column.
+  const line = await keyed.lines.find({ line: "started" });
+  type Line = Expect<AreEqual<typeof line, { line: string } | null>>;
+  // @ts-expect-error the email is text
+  keyed.accounts.get({ email: 1 });
+  // @ts-expect-error half of a composite key
+  keyed.accounts.get({ tenant: "team" });
+  // @ts-expect-error not a key
+  keyed.accounts.get({ handle: "ada" });
+  // @ts-expect-error without a primary key there is no bare value
+  keyed.lines.get("started");
+}
+
+{
+  const running = await model.posts((post) => ({
+    views: sum(post.views).over({ orderBy: post.id.asc }),
+    seen: count().over({ partitionBy: [post.authorId] }),
+    top: maximum(post.views).over(),
+    plain: sum(post.views),
+  }));
+  type Running = Expect<
+    AreEqual<
+      typeof running,
+      {
+        views: `${number}` | null;
+        seen: number;
+        top: bigint | null;
+        plain: `${number}` | null;
+      }[]
+    >
+  >;
+  model.posts((post) => ({ id: post.id }), {
+    orderBy: (post) => [{ id: "descending", title: "ascending" }, post.id.desc],
+  });
+}
+
+{
   const totals = await model.posts.aggregate((post, { count, sum }) => ({
     posts: count(),
     views: sum(post.views),
@@ -94,6 +159,22 @@ const model = schema({ users, posts, logs });
   type First = Expect<
     AreEqual<typeof first, { id: number; name: string; active: boolean } | null>
   >;
+  const ranked = model
+    .posts((post) => ({
+      id: post.id,
+      views: post.views,
+      author: { name: post.author.name },
+    }))
+    .cte("ranked");
+  const top = await ranked({ where: (post) => post.views.above(1n) });
+  type Top = Expect<
+    AreEqual<
+      typeof top,
+      { id: number; views: bigint; author: { name: string } }[]
+    >
+  >;
+  // @ts-expect-error a bare CTE is not a query
+  ranked.execute();
   model.posts((post) => ({ id: post.id }), {
     where: { views: 1n, title: undefined },
     orderBy: { id: "desc", title: "asc" },

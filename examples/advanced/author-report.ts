@@ -3,7 +3,7 @@ import { connect } from "../database";
 import { appSchema } from "../schema";
 
 // Works offline too: prepare() binds values without opening a connection.
-const database = process.env.DATABASE_URL ? connect() : appSchema;
+const db = process.env.DATABASE_URL ? connect() : appSchema;
 
 const serialize = (value: unknown): string =>
   JSON.stringify(value, (_key, field) =>
@@ -14,7 +14,7 @@ try {
   const report = prepare(
     { since: timestamptz, top: int, minimumPosts: int },
     (parameters) => {
-      const ranked = database
+      const ranked = db
         .posts(
           (post, { rowNumber }) => ({
             id: post.id,
@@ -24,7 +24,7 @@ try {
             }),
           }),
           {
-            where: (post, { rowNumber }) => [
+            where: (post) => [
               post.state.is.published,
               post.createdAt.atLeast(parameters.since),
             ],
@@ -33,7 +33,7 @@ try {
         .cte("ranked_posts");
 
       // These totals cover all qualifying posts, not just the top-N projection.
-      const totals = database
+      const totals = db
         .posts(
           (post, { count, sum, maximum }) => ({
             authorId: post.authorId,
@@ -42,11 +42,11 @@ try {
             latestPublication: maximum(post.createdAt),
           }),
           {
-            where: (post, { count, sum, maximum }) => [
+            where: (post) => [
               post.state.is.published,
               post.createdAt.atLeast(parameters.since),
             ],
-            groupBy: (post, { count, sum, maximum }) => [post.authorId],
+            groupBy: (post) => [post.authorId],
           },
         )
         .cte("author_totals");
@@ -63,7 +63,7 @@ try {
         },
       ).cte("eligible_authors");
 
-      return database.users(
+      return db.users(
         (user, { innerJoin }) => {
           const stats = innerJoin(eligible, (total) =>
             total.authorId.is(user.id),
@@ -122,14 +122,14 @@ try {
   console.log("author report SQL", report.toSQL(parameters));
 
   if (process.env.DATABASE_URL) {
-    const rows = await report.execute(parameters);
+    const rows = await report(parameters);
     // Bigint fields become strings at the HTTP/JSON boundary; SUM is already exact text.
     console.log("author report JSON", serialize(rows));
     console.log(
       "author report top 1 JSON",
-      serialize(await report.execute({ ...parameters, top: 1 })),
+      serialize(await report({ ...parameters, top: 1 })),
     );
   }
 } finally {
-  await database.$close();
+  await db.$close();
 }

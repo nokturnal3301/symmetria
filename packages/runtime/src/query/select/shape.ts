@@ -182,9 +182,11 @@ const fieldOrdering = (
       return [];
     }
 
-    if (direction !== "asc" && direction !== "desc") {
+    const ascending = direction === "asc" || direction === "ascending";
+
+    if (!ascending && direction !== "desc" && direction !== "descending") {
       throw new Error(
-        `symmetria: orderBy: "${key}" must be "asc" or "desc", received ${JSON.stringify(direction) ?? String(direction)}`,
+        `symmetria: orderBy: "${key}" must be "asc" or "desc" ("ascending" or "descending"), received ${JSON.stringify(direction) ?? String(direction)}`,
       );
     }
 
@@ -195,7 +197,7 @@ const fieldOrdering = (
         : sourceColumn(columns, "orderBy", key)
     ) as RuntimeScope[string][string];
 
-    return [direction === "asc" ? expression.ascending : expression.descending];
+    return [ascending ? expression.ascending : expression.descending];
   });
 
 export const applyShape = (

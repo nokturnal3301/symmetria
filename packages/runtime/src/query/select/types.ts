@@ -524,10 +524,11 @@ export type EqualityFilter<Columns> = {
  */
 export type FieldOrder<Columns> = {
   readonly [Name in keyof RowColumns<Columns> & string]?:
-    | "asc"
-    | "desc"
+    | OrderDirection
     | undefined;
-} & { readonly [field: string]: "asc" | "desc" | undefined };
+} & { readonly [field: string]: OrderDirection | undefined };
+/** A direction of an `orderBy` object, short or spelled out like the column property. */
+export type OrderDirection = "asc" | "desc" | "ascending" | "descending";
 /** A projection callback's tools: the shared ones and the source's own columns as `row`. */
 type ProjectionTools<
   Rows extends SchemaRows,
@@ -977,24 +978,70 @@ export type QueryTable<
         readonly byId: (
           value: LookupKey<Rows[RootTable], KeyNames>,
         ) => KeyLookup<Rows, Relations, RootTable, Insert>;
-        /** The row with this primary key; rejects with `NotFoundError` when there is none. */
-        readonly get: KeyRead<Rows, Relations, RootTable, KeyNames, never>;
-        /** The row with this primary key, or `null`. */
-        readonly find: KeyRead<Rows, Relations, RootTable, KeyNames, null>;
-      });
+      }) &
+  ([KeyNames] extends [never]
+    ? [keyof UniqueKeys] extends [never]
+      ? {}
+      : KeyReads<Rows, Relations, RootTable, never, UniqueKeys>
+    : KeyReads<Rows, Relations, RootTable, KeyNames, UniqueKeys>);
+type KeyReads<
+  Rows extends SchemaRows,
+  Relations extends SchemaRelations,
+  RootTable extends string,
+  KeyNames extends StringKeys<Rows[RootTable]>,
+  UniqueKeys,
+> = {
+  /**
+   * The row with this primary key, or with a unique key given by its columns
+   * (`get({ email })`); rejects with `NotFoundError` when there is none.
+   */
+  readonly get: KeyRead<
+    Rows,
+    Relations,
+    RootTable,
+    KeyNames,
+    UniqueKeys,
+    never
+  >;
+  /** The row with this primary key or unique key (`find({ email })`), or `null`. */
+  readonly find: KeyRead<
+    Rows,
+    Relations,
+    RootTable,
+    KeyNames,
+    UniqueKeys,
+    null
+  >;
+};
+/** A key as an object of its columns: the primary key or any unique key. */
+type KeyObject<Row, KeyNames extends keyof Row, UniqueKeys> =
+  | ([KeyNames] extends [never] ? never : KeyColumns<Row, KeyNames>)
+  | {
+      [Name in keyof UniqueKeys]: KeyColumns<Row, UniqueKeys[Name] & keyof Row>;
+    }[keyof UniqueKeys];
+type KeyColumns<Row, Names extends keyof Row> = {
+  readonly [Name in Names]:
+    | NonNullable<Row[Name]>
+    | Parameter<NonNullable<Row[Name]>>;
+};
 /** `get()` / `find()`: the whole row, or the fields a shape selects. */
 type KeyRead<
   Rows extends SchemaRows,
   Relations extends SchemaRelations,
   RootTable extends string,
   KeyNames extends StringKeys<Rows[RootTable]>,
+  UniqueKeys,
   Missing,
 > = {
   (
-    value: LookupKey<Rows[RootTable], KeyNames>,
+    value:
+      | LookupKey<Rows[RootTable], KeyNames>
+      | KeyObject<Rows[RootTable], KeyNames, UniqueKeys>,
   ): Promise<ProjectionRow<Columns<Rows[RootTable]>> | Missing>;
   <const Shape extends Record<string, unknown>>(
-    value: LookupKey<Rows[RootTable], KeyNames>,
+    value:
+      | LookupKey<Rows[RootTable], KeyNames>
+      | KeyObject<Rows[RootTable], KeyNames, UniqueKeys>,
     shape: (
       columns: RelatedColumns<Rows, Relations, RootTable>,
       tools: ProjectionTools<

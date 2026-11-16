@@ -5,6 +5,11 @@ import {
   int,
   text,
   bool,
+  index,
+  sum,
+  count,
+  maximum,
+  over,
   type CompiledQuery,
 } from "../../../packages/runtime/src";
 
@@ -31,6 +36,16 @@ const recording = (rows: Record<string, unknown>[] = []) => {
 
   return { database, calls, last: () => calls.at(-1)! };
 };
+
+const accounts = table({
+  id: int.auto,
+  email: text.unique,
+  tenant: text,
+  handle: text,
+}).indexes((account) => ({
+  identity: index(account.tenant, account.handle).unique,
+}));
+const logs = table({ line: text.unique });
 
 const failing = () =>
   schema(
@@ -119,7 +134,7 @@ test("get() and find() read one row by primary key", async () => {
   });
   // A malformed key rejects instead of throwing from the call.
   await expect(empty.memberships.get({ org: "a" } as never)).rejects.toThrow(
-    "byId() requires exactly these key fields: org, member",
+    '"org" is not the primary key or a unique key of "memberships"; its keys: [org, member]',
   );
   await expect(empty.users.find(null as never)).rejects.toThrow(
     'primary key "id" cannot be null or undefined',
@@ -257,8 +272,20 @@ test("orderBy takes field names, and selected is among the tools", () => {
     'ORDER BY "users"."id" ASC',
   );
 
+  // The words of the column properties, and the short properties, mean the same.
+  expect(report({ written: "descending", id: "ascending" })).toBe(
+    report({ written: "desc", id: "asc" }),
+  );
+  expect(
+    sql(
+      database.users((user) => ({ name: user.name }), {
+        orderBy: (user) => [user.name.asc, user.id.desc.nullsLast],
+      }),
+    ),
+  ).toEndWith('ORDER BY "users"."name" ASC, "users"."id" DESC NULLS LAST');
+
   expect(() => report({ id: "up" })).toThrow(
-    'symmetria: orderBy: "id" must be "asc" or "desc", received "up"',
+    'symmetria: orderBy: "id" must be "asc" or "desc" ("ascending" or "descending"), received "up"',
   );
   expect(() => report({ nmae: "asc" })).toThrow('did you mean "name"');
   expect(() => report({ posts: "asc" })).toThrow(
@@ -291,6 +318,21 @@ test("a query given options and no fields reads the whole row", async () => {
       .toSQL().sql,
   ).toStartWith('SELECT "users"."name" AS "name"\n');
 
+  // A CTE and a derived table read the fields they were built with.
+  const ranked = database
+    .posts((post) => ({ id: post.id, author: { name: post.author.name } }))
+    .cte("ranked");
+
+  await ranked({ where: { id: 1 }, limit: 3 });
+  expect(last().sql).toEndWith(
+    'SELECT "ranked"."id" AS "id", "ranked"."author" AS "author"\nFROM "ranked" AS "ranked"\nWHERE "ranked"."id" = $1\nLIMIT 3',
+  );
+  await database
+    .users((user) => ({ name: user.name }))
+    .as("named")({ limit: 1 })
+    .first();
+  expect(last().sql).toStartWith('SELECT "named"."name" AS "name"\nFROM (');
+
   // A bare table or alias is not a query: awaiting one by accident reads nothing.
   expect(() =>
     (database.users as unknown as { toSQL: () => unknown }).toSQL(),
@@ -300,6 +342,9 @@ test("a query given options and no fields reads the whole row", async () => {
       database.users.as("u") as unknown as { execute: () => Promise<unknown> }
     ).execute(),
   ).rejects.toThrow("select fields in a shape");
+  expect(() => (ranked as unknown as { toSQL: () => unknown }).toSQL()).toThrow(
+    "select fields in a shape",
+  );
   expect(() =>
     (
       database.users({ groupBy: (user) => [user.active] }) as unknown as {
@@ -561,4 +606,91 @@ WHERE "posts"."version" = $2) AS "__symmetria_row") AS "q2"`,
       executor: async () => [],
     }),
   ).toThrow('reserved table name "$batch"');
+});
+
+test("get() and find() read one row by a unique key given as an object", async () => {
+  const calls: CompiledQuery[] = [];
+  const database = schema(
+    { accounts, logs },
+    {
+      executor: async (query) => {
+        calls.push(query);
+
+        return [];
+      },
+    },
+  );
+  const where = () => calls.at(-1)!.sql.split("\n").at(-2);
+
+  expect(await database.accounts.find({ email: "ada@x.test" })).toBeNull();
+  expect(where()).toBe('WHERE "accounts"."email" = $1');
+  expect(calls.at(-1)!.parameters).toEqual(["ada@x.test"]);
+  // The same statement as the lookup it shortens.
+  await database.accounts.by.email("ada@x.test").maybeOne();
+  expect(calls.at(-1)).toEqual(calls.at(-2)!);
+
+  // A composite unique index is found by its columns, in any order.
+  await database.accounts.find({ handle: "ada", tenant: "team" });
+  expect(where()).toBe(
+    'WHERE "accounts"."tenant" = $1 AND "accounts"."handle" = $2',
+  );
+  expect(calls.at(-1)!.parameters).toEqual(["team", "ada"]);
+  await database.accounts.find({ id: 7 });
+  expect(where()).toBe('WHERE "accounts"."id" = $1');
+  await database.accounts.find({ email: "ada@x.test" }, (account) => ({
+    id: account.id,
+  }));
+  expect(calls.at(-1)!.sql).toStartWith('SELECT "accounts"."id" AS "id"\n');
+  // A table without a primary key is read by its unique column.
+  await database.logs.find({ line: "started" });
+  expect(where()).toBe('WHERE "logs"."line" = $1');
+
+  await expect(
+    database.accounts.get({ email: "ada@x.test" }),
+  ).rejects.toMatchObject({ code: "SYMMETRIA_RECORD_NOT_FOUND" });
+  await expect(
+    database.accounts.get({ tenant: "team" } as never),
+  ).rejects.toThrow(
+    '"tenant" is not the primary key or a unique key of "accounts"; its keys: id, email, [tenant, handle]',
+  );
+  await expect(
+    database.accounts.find({ email: null } as never),
+  ).rejects.toThrow('unique key "email" cannot be null or undefined');
+});
+
+test("an aggregate has over() like the ranking functions", () => {
+  const { database } = recording();
+  const method = database
+    .posts((post) => ({
+      running: sum(post.version).over({
+        partitionBy: [post.authorId],
+        orderBy: post.id.ascending,
+        rows: ["unbounded preceding", "current row"],
+      }),
+      seen: count().over({ partitionBy: [post.authorId] }),
+      latest: maximum(post.title).over(),
+    }))
+    .toSQL();
+  const helper = database
+    .posts((post) => ({
+      running: over(sum(post.version), {
+        partitionBy: [post.authorId],
+        orderBy: post.id.ascending,
+        rows: ["unbounded preceding", "current row"],
+      }),
+      seen: over(count(), { partitionBy: [post.authorId] }),
+      latest: over(maximum(post.title)),
+    }))
+    .toSQL();
+
+  expect(method).toEqual(helper);
+  expect(method.sql).toContain(
+    'SUM("posts"."version") OVER (PARTITION BY "posts"."author_id" ORDER BY "posts"."id" ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)',
+  );
+  // Without over() it is still the plain aggregate.
+  expect(
+    database.posts((post) => ({ total: sum(post.version) })).toSQL().sql,
+  ).toBe(
+    'SELECT SUM("posts"."version")::numeric AS "total"\nFROM "posts" AS "posts"',
+  );
 });

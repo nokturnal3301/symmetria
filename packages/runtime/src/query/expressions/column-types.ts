@@ -605,6 +605,10 @@ export type ColumnMethods<Value, OutputName extends string, Traits, Stored> = {
   readonly quotient: Arithmetic<Stored, Traits, OutputName, "quotient">;
   readonly ascending: Ordering;
   readonly descending: Ordering;
+  /** Short for `ascending`. */
+  readonly asc: Ordering;
+  /** Short for `descending`. */
+  readonly desc: Ordering;
 };
 
 export interface ScalarQuery<Value> extends QueryReference {

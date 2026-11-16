@@ -453,6 +453,16 @@ export class ColumnHandle {
     }));
   }
 
+  /** Short for `ascending`. */
+  get asc(): Ordering {
+    return this.ascending;
+  }
+
+  /** Short for `descending`. */
+  get desc(): Ordering {
+    return this.descending;
+  }
+
   match(branches: Record<string, unknown>) {
     return matchExpression(this[COLUMN_EXPRESSION], branches);
   }

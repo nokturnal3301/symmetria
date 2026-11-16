@@ -48,10 +48,10 @@ const isolated = await testDatabase({
   max: 4,
 });
 
-const database = isolated.database;
+const db = isolated.database;
 
 const claim = (worker: string, size: number) =>
-  database.$transaction(async (transaction) => {
+  db.$transaction(async (transaction) => {
     // One database clock, independent of worker-machine clock skew.
     const now = sql<Date>`CURRENT_TIMESTAMP`;
     const candidates = await transaction.jobs(
@@ -100,7 +100,7 @@ const claim = (worker: string, size: number) =>
 type ClaimedJob = Awaited<ReturnType<typeof claim>>[number];
 
 const acknowledge = async (claimed: ClaimedJob): Promise<boolean> => {
-  const result = await database.jobs
+  const result = await db.jobs
     .update({
       state: "done",
       leaseToken: null,
@@ -130,7 +130,7 @@ const deliver = async (jobs: readonly ClaimedJob[]) => {
 };
 
 try {
-  await database.jobs.insert(
+  await db.jobs.insert(
     Array.from({ length: 6 }, (_, index) => ({
       key: `notification-${index}`,
       payload: {
@@ -143,7 +143,7 @@ try {
   const [abandoned] = await claim("crashed-worker", 1);
   assert.ok(abandoned);
   // Simulate a crashed worker's expired lease without waiting thirty seconds.
-  await database.jobs
+  await db.jobs
     .update({ leaseUntil: sql<Date>`CURRENT_TIMESTAMP - interval '1 second'` })
     .where((job) => job.id.is(abandoned.id));
 
@@ -159,7 +159,7 @@ try {
   await Promise.all([deliver(first), deliver(second)]);
   await deliver(await claim("worker-c", 2));
 
-  const completed = await database.jobs(
+  const completed = await db.jobs(
     (job) => ({
       id: job.id,
       state: job.state,

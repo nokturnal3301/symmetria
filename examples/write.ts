@@ -1,34 +1,29 @@
 import { connect } from "./database";
 
-const database = connect();
+const db = connect();
 
 try {
-  const post = await database.posts
+  const post = await db.posts
     .insert({
       slug: `nested-${crypto.randomUUID()}`,
       title: "Atomic nested insert",
       author: { connect: { email: "ada@example.test" } },
       tags: { connectOrCreate: [{ label: "postgres" }] },
     })
-    .returning((posts) => [posts.id, posts.title])
-    .execute();
+    .returning("id", "title");
 
   console.log(post);
 
   if (post) {
     console.log(
-      await database.posts
-        .update((posts) => ({ views: posts.views.plus(1n) }))
-        .where((posts) => posts.id.is(post.id))
-        .returning((posts) => [posts.id, posts.views])
-        .execute(),
+      await db.posts
+        .byId(post.id)
+        .update((row) => ({ views: row.views.plus(1n) }))
+        .returning("id", "views"),
     );
 
-    await database.posts
-      .delete()
-      .where((posts) => posts.id.is(post.id))
-      .execute();
+    await db.posts.byId(post.id).delete();
   }
 } finally {
-  await database.$close();
+  await db.$close();
 }

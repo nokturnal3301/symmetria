@@ -24,14 +24,14 @@ const articles = table({
   ).using("gin"),
 }));
 
-const { database, close } = await testDatabase({
+const { database: db, close } = await testDatabase({
   url,
   schema: schema({ articles }),
   prefix: "symmetria_search",
 });
 
 try {
-  await database.articles.insert([
+  await db.articles.insert([
     {
       title: "Typed SQL for Bun",
       body: "Symmetria compiles shapes into one SQL statement for Bun.",
@@ -44,7 +44,7 @@ try {
   ]);
 
   // One weighted document per use: titles count more than bodies.
-  const results = database.articles(
+  const results = db.articles(
     (article) => ({
       title: article.title,
       relevance: searchDocument(
@@ -79,7 +79,7 @@ try {
   assert.match(rows[0]?.snippet ?? "", /\[SQL\]|\[Bun\]/);
 
   // A filtered source answers how many and whether, without a projection.
-  const matching = database.articles({
+  const matching = db.articles({
     where: (article) =>
       searchDocument(
         { A: article.title, B: article.body },
@@ -92,9 +92,7 @@ try {
   });
   assert.equal(await matching.count(), 1);
   assert.equal(
-    await database
-      .articles({ where: (a) => a.title.ilike("%kotlin%") })
-      .exists(),
+    await db.articles({ where: (a) => a.title.ilike("%kotlin%") }).exists(),
     false,
   );
 

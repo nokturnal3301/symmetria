@@ -92,11 +92,15 @@ const rows = await query; // { title: string; views: bigint }[]
 Options accept values or synchronous callbacks. Each callback also receives SQL
 tools as its second argument, for example `where: ({ views }, { and }) => ...`.
 The projection only selects fields; everything that picks or orders rows lives
-in the options object.
+in the options object. Two tools of the projection are the exception, because
+the type of a field they return depends on the filter they add: an explicit
+`innerJoin()` ([section 4](#4-use-an-explicit-join-when-its-behavior-matters))
+and `whereNotNull(column)`, which adds `IS NOT NULL` and returns the column
+without `null` in its type.
 
 Queries are immutable. Building a query or calling `toSQL()` does not execute
-it. `await query` and `query.execute()` both run it. Choose a terminal method to
-express cardinality:
+it. `await query` runs it (`query.execute()` is the same as a method, for where
+a promise is needed). Choose a terminal method to express cardinality:
 
 | Method             | Result                | What it checks                |
 | ------------------ | --------------------- | ----------------------------- |
@@ -105,9 +109,10 @@ express cardinality:
 | `query.maybeOne()` | One row or `null`     | Rejects multiple rows         |
 | `query.one()`      | One row               | Rejects zero or multiple rows |
 
-Use an ordering when "first" must be predictable. For a primary-key lookup,
-`await db.posts.byId(1).one()` selects the table's row and checks that it
-exists.
+Use an ordering when "first" must be predictable. A row is read by its key with
+`await db.posts.get(1)`, which rejects when there is none, or
+`await db.posts.find(1)`, which resolves to `null`; a unique key is given by its
+columns, `db.users.find({ email })`.
 
 ## 3. Choose a flat field or a nested result
 
@@ -212,14 +217,14 @@ custom ON conditions.
 
 ## 5. Write rows and group work in a transaction
 
-Writes use scalar columns such as `authorId`. Shape callbacks select returned
-fields:
+Writes use scalar columns such as `authorId`. `returning()` names the returned
+columns, or takes a shape callback:
 
 ```ts
 await db.$transaction(async (transaction) => {
   const author = await transaction.users
     .insert({ name: "Ada" })
-    .returning((user) => ({ id: user.id }));
+    .returning("id");
 
   await transaction.posts.insert({
     title: "A first post",
