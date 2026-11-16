@@ -159,8 +159,9 @@ describe.skipIf(!url)("moving from Prisma", () => {
       expect(
         pulled.warnings
           .map((warning) => String(warning.code))
-          // The shared test database holds other suites' schemas.
-          .filter((code) => code !== "other-schema")
+          // The shared test database holds other suites' schemas, and its
+          // image may ship extensions in schemas of their own.
+          .filter((code) => code !== "other-schema" && code !== "extension")
           .sort(),
       ).toEqual(
         [
@@ -223,8 +224,7 @@ describe.skipIf(!url)("moving from Prisma", () => {
       expect(
         repulled.warnings
           .map((warning) => String(warning.code))
-          // The shared test database holds other suites' schemas.
-          .filter((code) => code !== "other-schema")
+          .filter((code) => code !== "other-schema" && code !== "extension")
           .sort(),
       ).toEqual(["migration-table", "view"]);
       expect(repulled.source).toContain("id: int.auto.byDefault,");

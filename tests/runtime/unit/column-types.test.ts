@@ -325,9 +325,11 @@ test("numeric columns reject text that is not a number before it reaches Postgre
     );
   }
 
-  // Past the types: a number's text is exact, anything else is not a number.
-  expect(decimal.encode(12.5 as never)).toBe(12.5);
-  expect(decimal.encode(12n as never)).toBe(12n);
+  // Past the types: a number is sent as its exact text, which a driver that
+  // binds floats would round; anything else is not a number.
+  expect(decimal.encode(12.5 as never)).toBe("12.5");
+  expect(decimal.encode((0.1 + 0.2) as never)).toBe("0.30000000000000004");
+  expect(decimal.encode(12n as never)).toBe("12");
   expect(() => decimal.encode(true as never)).toThrow(/received boolean/);
   expect(() => codecFor("numeric[]")!.encode(["1", "x"] as never)).toThrow(
     /received "x"/,

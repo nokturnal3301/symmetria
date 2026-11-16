@@ -64,7 +64,7 @@ test("distance operators compile with a cast vector parameter and no array metho
     `("documents"."embedding" <-> "documents"."optional") AS "between"`,
   );
   expect(query.sql).toContain(
-    `WHERE ("documents"."embedding" <=> $2::text::vector) < $5`,
+    `IS NOT NULL AND ("documents"."embedding" <=> $2::text::vector) < $5`,
   );
   expect(query.sql).toContain(
     `ORDER BY ("documents"."embedding" <=> $2::text::vector) ASC`,

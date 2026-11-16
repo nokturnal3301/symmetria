@@ -353,13 +353,19 @@ export const detectDrift = async (
         });
       }
 
+      // A generated column keeps its expression where a default would be.
+      const expected = column.generated ?? column.default;
+      const stored = (generated: boolean, expression: string): string =>
+        generated ? `GENERATED ALWAYS AS (${expression}) STORED` : expression;
+
       if (
-        (column.default === undefined) !== (details.default === null) ||
-        (column.default !== undefined &&
+        (expected === undefined) !== (details.default === null) ||
+        (column.generated !== undefined) !== details.generated ||
+        (expected !== undefined &&
           details.default !== null &&
           !(await expressionsMatch(
             [
-              `(${column.default})::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
+              `(${expected})::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
             ],
             [
               `(${details.default})::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
@@ -372,8 +378,14 @@ export const detectDrift = async (
           kind: "default-mismatch",
           table: table.name,
           column: column.name,
-          ...(column.default === undefined ? {} : { expected: column.default }),
-          ...(details.default === null ? {} : { actual: details.default }),
+          ...(expected === undefined
+            ? {}
+            : {
+                expected: stored(column.generated !== undefined, expected),
+              }),
+          ...(details.default === null
+            ? {}
+            : { actual: stored(details.generated, details.default) }),
         });
       }
     }

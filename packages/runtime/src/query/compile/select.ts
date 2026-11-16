@@ -4,6 +4,7 @@
 import {
   paginatesRootFirst,
   sharedAggregates,
+  type SharedAggregates,
 } from "../expressions/aggregates";
 import type { ValueNode } from "../expressions";
 import { sameExpression } from "../plan/equivalence";
@@ -121,6 +122,85 @@ export const selectSql = (
   }
 };
 
+const DISTANCES = new Set(["<->", "<=>", "<#>", "<+>"]);
+
+/**
+ * A condition for "the nearest N rows": true, and it reads no column, so
+ * PostgreSQL evaluates it once, before the scan it guards. pgvector's HNSW
+ * index hands back `hnsw.ef_search` rows (40 unless set) and meets the other
+ * filters only afterwards, so a filtered or a long LIMIT would come up short
+ * without an error. For this statement the index returns as many rows as are
+ * asked for (1000 is its ceiling) and, from pgvector 0.8, keeps scanning until
+ * enough rows pass the filters. `set_config(…, true)` lasts for the
+ * transaction, which outside `$transaction()` is this one statement.
+ */
+const nearestScanSql = (
+  query: SelectPlan,
+  relaxed: boolean,
+): string | undefined => {
+  const first = query.ordering[0];
+  const node = first?.expression.node;
+
+  if (
+    query.limit === undefined ||
+    first?.direction !== "ASC" ||
+    node?.kind !== "binary" ||
+    !DISTANCES.has(node.operator)
+  ) {
+    return undefined;
+  }
+
+  const rows =
+    typeof query.limit === "number"
+      ? query.limit + (typeof query.offset === "number" ? query.offset : 0)
+      : 0;
+  const setting = (name: string, value: string) =>
+    `CASE WHEN current_setting('${name}', true) IS NULL THEN '' ELSE set_config('${name}', ${value}, true) END`;
+
+  return `(SELECT ${[
+    ...(rows > 40
+      ? [
+          setting(
+            "hnsw.ef_search",
+            `greatest(current_setting('hnsw.ef_search')::integer, ${Math.min(rows, 1000)})::text`,
+          ),
+        ]
+      : []),
+    setting("hnsw.iterative_scan", "'strict_order'"),
+    setting("hnsw.max_scan_tuples", "'2147483647'"),
+    ...(relaxed ? [setting("ivfflat.iterative_scan", "'relaxed_order'")] : []),
+  ].join(" || ")}) IS NOT NULL`;
+};
+
+/**
+ * Whether the schema declares an IVFFlat index on the column the query takes
+ * its nearest rows by. Such an index reads the lists nearest to the question
+ * and stops, so a filter can leave it short of rows; it can read on (pgvector
+ * 0.8), but then returns rows only roughly in order. The statement lets it,
+ * and sorts the rows it returned once more, exactly.
+ */
+const ordersThroughIvfflat = (query: SelectPlan): boolean => {
+  const node = query.ordering[0]?.expression.node;
+  const column =
+    node?.kind === "binary" && node.left.kind === "column"
+      ? node.left.description
+      : undefined;
+
+  return (
+    !!column &&
+    !query.locking &&
+    !query.distinct &&
+    !query.grouping.length &&
+    (column.binding.table.indexes ?? []).some(
+      (definition) =>
+        definition.method === "ivfflat" &&
+        definition.keys[0]?.startsWith(quoteIdentifier(column.column.sqlName)),
+    )
+  );
+};
+
+const NO_SHARED_AGGREGATES: SharedAggregates = { inner: [], outer: [] };
+
 const renderSelect = (
   compilation: Compilation,
   query: SelectPlan,
@@ -147,21 +227,27 @@ const renderSelect = (
   // A grouped or distinct query must repeat an expression as the same text.
   // An ordering by a selected field repeats it too: with the same text and
   // parameters PostgreSQL computes the expression once, not once per clause.
-  if (
-    query.grouping.length ||
-    query.distinct ||
+  const repeatsText = !!query.grouping.length || query.distinct;
+  // A shape identifies the query across releases (page cursors), so it is
+  // rendered plainly, without the rewrites that only make a statement faster.
+  const ordersBySelected =
+    !repeatsText &&
+    !compilation.shapeOnly &&
     query.ordering.some(
       ({ expression }) =>
         expression.node.kind !== "column" &&
         query.selection.some((selected) =>
           sameExpression(selected.node, expression.node),
         ),
-    )
-  ) {
+    );
+
+  if (repeatsText || ordersBySelected) {
     (compilation.expressionCaches ??= new Map()).set(bindings, []);
   }
 
-  const aggregates = sharedAggregates(query);
+  const aggregates = compilation.shapeOnly
+    ? NO_SHARED_AGGREGATES
+    : sharedAggregates(query);
   const shared = {
     inner: [] as { alias: string; query: SelectPlan }[],
     outer: [] as { alias: string; query: SelectPlan }[],
@@ -244,9 +330,14 @@ const renderSelect = (
 
   fragments.push(...lateral("inner"));
 
-  if (query.predicates.length) {
+  const relaxed = !compilation.shapeOnly && ordersThroughIvfflat(query);
+  const nearest = compilation.shapeOnly
+    ? undefined
+    : nearestScanSql(query, relaxed);
+
+  if (query.predicates.length || nearest) {
     fragments.push(
-      `WHERE ${query.predicates.map((description) => predicateSql(compilation, description, bindings)).join(" AND ")}`,
+      `WHERE ${[...(nearest ? [nearest] : []), ...query.predicates.map((description) => predicateSql(compilation, description, bindings))].join(" AND ")}`,
     );
   }
 
@@ -299,7 +390,34 @@ const renderSelect = (
   }
 
   if (aggregates.inner.length || !paginatesRootFirst(query)) {
-    return [projection, source, ...body, ...fragments].join("\n");
+    if (!nearest || !relaxed) {
+      return [projection, source, ...body, ...fragments].join("\n");
+    }
+
+    // The ordering keys travel as extra columns. PostgreSQL trusts the inner
+    // ORDER BY, so the first key is sorted as `key + 0`, an order it has to
+    // establish itself.
+    const keys = query.ordering.map(
+      (ordering, position) =>
+        `${valueSql(compilation, ordering.expression.node, bindings)} AS ${quoteIdentifier(`__symmetria_order_${position}`)}`,
+    );
+    const inner = [
+      `${projection}, ${keys.join(", ")}`,
+      source,
+      ...body,
+      ...fragments,
+    ].join("\n");
+
+    return [
+      `SELECT ${query.selection.map((expression) => quoteIdentifier(expression.outputName)).join(", ")}`,
+      `FROM (${inner}) AS "__symmetria_nearest"`,
+      `ORDER BY ${query.ordering
+        .map(
+          (ordering, position) =>
+            `${quoteIdentifier(`__symmetria_order_${position}`)}${position ? "" : " + 0"} ${ordering.direction}${ordering.nulls ? ` NULLS ${ordering.nulls}` : ""}`,
+        )
+        .join(", ")}`,
+    ].join("\n");
   }
 
   const carried = query.root.table.columns

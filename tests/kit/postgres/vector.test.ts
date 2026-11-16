@@ -123,12 +123,13 @@ describe.skipIf(!available)("pgvector in migrations, drift and pull", () => {
         vectorModule: resolve("packages/runtime/src/entries/vector.ts"),
       });
 
-      expect(result.extensions).toEqual(["vector"]);
+      // The server image may ship other extensions; they are declared too.
+      expect(result.extensions).toContain("vector");
       expect(result.source).toContain("embedding: vector(3),");
       expect(result.source).toContain(
         'embedding: index(operatorClass(documents.embedding, "vector_cosine_ops")).using("hnsw").with({ ef_construction: 64, m: 16 }),',
       );
-      expect(result.source).toContain('extensions: ["vector"],');
+      expect(result.source).toMatch(/extensions: \[[^\]]*"vector"[^\]]*\],/);
       expect(result.source).toContain("import { vector } from ");
 
       const path = join(directory, "schema.ts");

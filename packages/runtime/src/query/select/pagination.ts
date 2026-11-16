@@ -169,6 +169,10 @@ export type PageOptions<Row> = {
 };
 
 /** The reverse of an ORDER BY entry; an implicit NULLS placement is made explicit first so it flips too. */
+const byDistance = ({ expression: { node } }: OrderingDescription): boolean =>
+  node.kind === "binary" &&
+  ["<->", "<=>", "<#>", "<+>"].includes(node.operator);
+
 const reversed = (ordering: OrderingDescription): OrderingDescription => {
   const nulls =
     ordering.nulls ?? postgresRenderer.nullsDefault(ordering.direction);
@@ -280,10 +284,36 @@ export const executePage = async (
   )
     ? windowPagePlan(plan)
     : plan;
+  // Pages must cover every row once, which an approximate vector index does
+  // not promise: `+ 0` is an ordering it cannot produce, so rows are compared
+  // exactly.
+  const exactPlan = declaredPlan.ordering.some(byDistance)
+    ? {
+        ...declaredPlan,
+        ordering: declaredPlan.ordering.map(
+          (ordering): OrderingDescription =>
+            byDistance(ordering)
+              ? {
+                  ...ordering,
+                  expression: {
+                    ...ordering.expression,
+                    node: {
+                      kind: "binary" as const,
+                      left: ordering.expression.node,
+                      operator: "+" as const,
+                      right: { kind: "parameter" as const, value: 0 },
+                      sqlType: "double precision",
+                    },
+                  },
+                }
+              : ordering,
+        ),
+      }
+    : declaredPlan;
   // Backward pages run the reversed order and are flipped back before returning.
   const pagePlan = backward
-    ? { ...declaredPlan, ordering: declaredPlan.ordering.map(reversed) }
-    : declaredPlan;
+    ? { ...exactPlan, ordering: exactPlan.ordering.map(reversed) }
+    : exactPlan;
   const predicates = [...pagePlan.predicates];
 
   const cursorValue = (value: unknown, position: number): ValueNode => {

@@ -241,6 +241,10 @@ export type SchemaOptions<
     string,
     Record<string, unknown>
   >,
+  Indexes extends Record<string, IndexDefinition> = Record<
+    string,
+    IndexDefinition
+  >,
 > = {
   readonly executor?: QueryExecutor;
   readonly driver?: Driver;
@@ -255,9 +259,34 @@ export type SchemaOptions<
   readonly casing?: Casing;
   readonly indexes?: (
     scope: {
-      readonly [TableName in keyof Rows]: Columns<Rows[TableName]>;
+      readonly [TableName in keyof Rows]: Columns<
+        Rows[TableName],
+        false,
+        TableName & string
+      >;
     },
-  ) => Record<string, IndexDefinition>;
+  ) => Indexes;
+};
+
+/** The unique indexes of the schema options that are keys of one table, by index name. */
+export type SchemaKeys<Indexes, TableName extends string> = {
+  [Name in keyof Indexes as Indexes[Name] extends IndexDefinition<
+    infer Names,
+    true,
+    true,
+    TableName
+  >
+    ? [Names] extends [never]
+      ? never
+      : Name
+    : never]: Indexes[Name] extends IndexDefinition<
+    infer Names,
+    true,
+    true,
+    TableName
+  >
+    ? Names
+    : never;
 };
 
 /** Per-table predicates applied to every read, update and delete of a scoped database. */
@@ -270,6 +299,8 @@ export type ScopeDefinitions<Definition extends SchemaDefinitions> = {
 export type Database<
   Definition extends SchemaDefinitions,
   Relations extends RelationMap = RelationGraph<Definition>,
+  /** The indexes declared in the schema options: the unique ones are keys too. */
+  Indexes = {},
 > = {
   readonly [TableName in StringKeys<Definition> &
     StringKeys<Relations>]: QueryTable<
@@ -280,7 +311,7 @@ export type Database<
     PrimaryKeyNames<Definition[TableName]>[number] &
       keyof QueryRows<Definition>[TableName] &
       string,
-    UniqueKeys<Definition[TableName]>
+    UniqueKeys<Definition[TableName]> & SchemaKeys<Indexes, TableName>
   > & {
     readonly insert: {
       (
@@ -306,11 +337,13 @@ export type Database<
       readonly $insert: Insert<Definition, TableName>;
     };
 } & {
-  readonly [SCHEMA_BIND]: (driver: Driver) => Database<Definition, Relations>;
+  readonly [SCHEMA_BIND]: (
+    driver: Driver,
+  ) => Database<Definition, Relations, Indexes>;
   /** Tenant or visibility filters that follow the tables into joins, paths, collections and writes. */
   $scope: (
     scopes: ScopeDefinitions<Definition>,
-  ) => Database<Definition, Relations>;
+  ) => Database<Definition, Relations, Indexes>;
   /**
    * Several reads as one statement: one round trip, one snapshot of the data.
    * The callback returns them at once, as an array or an object:
@@ -319,14 +352,14 @@ export type Database<
   $batch: <
     const Reads extends readonly unknown[] | Readonly<Record<string, unknown>>,
   >(
-    callback: (database: Database<Definition, Relations>) => Reads,
+    callback: (database: Database<Definition, Relations, Indexes>) => Reads,
   ) => Promise<{ -readonly [Key in keyof Reads]: Awaited<Reads[Key]> }>;
   $snapshot: () => SchemaSnapshot;
   $close: () => Promise<void>;
   $createIndexes: (options?: CreateIndexesOptions) => IndexQuery;
   $transaction: <Result>(
     callback: (
-      transaction: TransactionDatabase<Definition, Relations>,
+      transaction: TransactionDatabase<Definition, Relations, Indexes>,
     ) => PromiseLike<Result>,
     options?: TransactionOptions,
   ) => Promise<Result>;
@@ -337,18 +370,19 @@ export declare const TRANSACTION_SCOPE: unique symbol;
 export type TransactionDatabase<
   Definition extends SchemaDefinitions,
   Relations extends RelationMap = RelationGraph<Definition>,
+  Indexes = {},
 > = Omit<
-  Database<Definition, Relations>,
+  Database<Definition, Relations, Indexes>,
   "$close" | "$transaction" | "$createIndexes" | "$scope" | typeof SCHEMA_BIND
 > & {
   /** Type-only distinction between a reserved transaction and a pool-bound database. */
   readonly [TRANSACTION_SCOPE]: true;
   readonly $scope: (
     scopes: ScopeDefinitions<Definition>,
-  ) => TransactionDatabase<Definition, Relations>;
+  ) => TransactionDatabase<Definition, Relations, Indexes>;
   readonly $transaction: <Result>(
     callback: (
-      transaction: TransactionDatabase<Definition, Relations>,
+      transaction: TransactionDatabase<Definition, Relations, Indexes>,
     ) => PromiseLike<Result>,
   ) => Promise<Result>;
   readonly $createIndexes: (

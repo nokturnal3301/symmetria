@@ -1,6 +1,7 @@
 /**
  * Shared pool contract for the Bun and pg adapters plus the driver factory that wires sessions and transactions.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   CompiledQuery,
   Driver,
@@ -28,6 +29,8 @@ export type PostgresPool = {
   readonly connect: () => Promise<PostgresConnection>;
   readonly cancel: (pid: number) => Promise<void>;
   readonly close: () => Promise<void>;
+  /** How many connections the pool opens at most. */
+  readonly max: number;
 };
 
 export type PostgresDriver = Driver & {
@@ -62,6 +65,7 @@ const classified = (pool: PostgresPool): PostgresPool => ({
   },
   cancel: (pid) => pool.cancel(pid),
   close: () => pool.close(),
+  max: pool.max,
 });
 
 /** SQL compilation and row codecs are shared; adapters own only the transport. */
@@ -81,20 +85,41 @@ export const createPostgresDriver = (
     return pending.track(operation());
   };
 
+  // How many of the pool's connections the transactions and sessions around
+  // the running code hold. When that is all of them, a request to the pool
+  // from inside would wait for a connection its own caller is holding.
+  const held = new AsyncLocalStorage<number>();
+  const holding = <Argument, Result>(
+    callback: (driver: Argument) => Promise<Result>,
+  ) => {
+    const count = (held.getStore() ?? 0) + 1;
+
+    return (driver: Argument) => held.run(count, () => callback(driver));
+  };
+  const free = <Value>(operation: () => Promise<Value>): Promise<Value> =>
+    (held.getStore() ?? 0) >= pool.max
+      ? Promise.reject(
+          new Error(
+            `symmetria: this query asks the pool for a connection from inside ${pool.max === 1 ? "a transaction that holds the only one" : `transactions that hold all ${pool.max} of them`}, and would wait forever; run it on the transaction's own database (the callback's argument) or raise max`,
+          ),
+        )
+      : track(operation);
+
   const driver: PostgresDriver = {
-    execute: (query) => track(() => pool.execute(query)),
+    execute: (query) => free(() => pool.execute(query)),
     transaction: (callback, options) =>
-      track(async () => {
+      free(async () => {
         transactionOptionsSQL(options);
         const connection = await pool.connect();
 
         try {
-          return await runTransaction(connection, callback, options);
+          return await runTransaction(connection, holding(callback), options);
         } finally {
           connection.release();
         }
       }),
-    session: (callback) => track(() => runPostgresSession(pool, callback)),
+    session: (callback) =>
+      free(() => runPostgresSession(pool, holding(callback))),
     close: () => (closing ??= pending.settle().then(() => pool.close())),
   };
 

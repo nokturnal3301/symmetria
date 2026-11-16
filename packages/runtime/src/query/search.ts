@@ -7,7 +7,8 @@
 import { primaryKeyColumns, type TableSnapshot } from "../schema/assembly";
 import {
   declaredSearches,
-  wordsDocument,
+  wordsColumn,
+  type wordsDocument,
   type EmbeddingModel,
   type Search,
   type SearchCallback,
@@ -53,7 +54,8 @@ type Input = { text?: string; vector?: readonly number[] };
 
 const readInput = (name: string, value: unknown): Input => {
   if (typeof value === "string") {
-    return { text: value };
+    // PostgreSQL text cannot hold a zero byte.
+    return { text: value.replaceAll("\0", "") };
   }
 
   if (Array.isArray(value)) {
@@ -82,7 +84,7 @@ const readInput = (name: string, value: unknown): Input => {
     }
 
     return {
-      ...(text !== undefined ? { text } : {}),
+      ...(text !== undefined ? { text: text.replaceAll("\0", "") } : {}),
       ...(vector !== undefined ? { vector: vector as number[] } : {}),
     };
   }
@@ -97,7 +99,23 @@ type List = {
   readonly label: string;
   readonly filter: (row: Row) => unknown;
   readonly order: (row: Row) => unknown;
+  /**
+   * What `order` sorts by, when it carries the question. Selected next to the
+   * position, it makes the list send the question once for both, and so read
+   * as one expression to PostgreSQL, whichever plan it runs.
+   */
+  readonly rank?: (row: Row) => unknown;
+  /** Rows of equal rank come in key order, so a search repeats its answer. */
+  readonly ties?: boolean;
+  /** Ranked by distance from a vector, through the column's HNSW index. */
+  readonly vector?: boolean;
 };
+
+/**
+ * Up to this many rows that pass the filters are ranked by comparing every
+ * one of them; beyond it the vector index answers.
+ */
+const EXACT_ROWS = 10_000;
 
 /** Rows found without one of the searches asked for, and why. */
 export type PartialSearch = {
@@ -118,6 +136,8 @@ export const createSearch = (
   callbacks: readonly SearchCallback[],
   /** The searches read once against the table's own columns: names and models. */
   declared: readonly Search[],
+  /** Whether a $scope() filter narrows every read of the table. */
+  scoped: boolean,
 ) => {
   const source = queryTable as Source;
   const keys = primaryKeyColumns(table);
@@ -207,6 +227,11 @@ export const createSearch = (
 
       for (const { search, input } of inputs) {
         const { name } = search;
+
+        // An empty question finds nothing, whichever way it is searched.
+        if (!input.vector && !input.text?.trim()) {
+          continue;
+        }
         const words =
           search.words && input.text !== undefined ? input.text : undefined;
         let vector = search.meaning ? input.vector : undefined;
@@ -230,6 +255,12 @@ export const createSearch = (
           );
         }
 
+        if (vector && vector.length !== search.meaning!.model.size) {
+          throw new Error(
+            `symmetria: search "${name}" compares vectors of ${search.meaning!.model.size} numbers, received ${vector.length}`,
+          );
+        }
+
         if (words === undefined && !vector) {
           throw new Error(
             `symmetria: search "${name}" matches ${search.words ? "words" : "meaning"}; give it ${search.words ? "text" : "text or a vector"}`,
@@ -245,7 +276,7 @@ export const createSearch = (
                   ascending: unknown;
                 };
               }
-            ).cosineDistance(embedding).ascending;
+            ).cosineDistance(embedding);
 
           result.push({
             label: `${name}_meaning`,
@@ -253,7 +284,9 @@ export const createSearch = (
               (
                 row[name] as unknown as { isNot: (value: null) => unknown }
               ).isNot(null),
-            order: distance,
+            order: (row) => distance(row).ascending,
+            rank: distance,
+            vector: true,
           });
         }
 
@@ -262,8 +295,18 @@ export const createSearch = (
 
           if (kind === "fullText") {
             const query = anyWord(words);
-            const document = (row: Row) =>
-              wordsDocument(searchOf(row, name).words!);
+            const { language } = search.words!;
+            // The document as its generated column stores it.
+            const stored = (row: Row) =>
+              row[wordsColumn(name)] as unknown as ReturnType<
+                typeof wordsDocument
+              >;
+            const document = (row: Row) => ({
+              search: (text: string, options: { mode: "raw" }) =>
+                stored(row).search(text, { ...options, language }),
+              searchRank: (text: string, options: { mode: "raw" }) =>
+                stored(row).searchRank(text, { ...options, language }),
+            });
 
             if (query) {
               result.push({
@@ -271,6 +314,8 @@ export const createSearch = (
                 filter: (row) => document(row).search(query, { mode: "raw" }),
                 order: (row) =>
                   document(row).searchRank(query, { mode: "raw" }).descending,
+                rank: (row) => document(row).searchRank(query, { mode: "raw" }),
+                ties: true,
               });
             }
           } else if (words.trim()) {
@@ -316,18 +361,81 @@ export const createSearch = (
         return undefined;
       }
 
-      const tables = ranked.map((list) =>
+      const order = (list: List, row: Row): unknown[] => [
+        list.order(row),
+        ...(list.ties
+          ? [(row[key] as unknown as { ascending: unknown }).ascending]
+          : []),
+      ];
+      // A condition on no row at all: PostgreSQL checks it before it scans.
+      type Gated = List & { readonly gate?: (tools: Tools) => unknown[] };
+      const narrowed = where !== undefined || scoped;
+      const gated = ranked.flatMap((list): Gated[] => {
+        if (!list.vector) {
+          return [list];
+        }
+
+        if (!narrowed) {
+          return [list];
+        }
+
+        // The index finds a query's neighbours and only then meets the
+        // filters, so the fewer rows they keep, the further it has to look.
+        // Few enough rows are faster, and exactly, ranked one by one; the
+        // list that does not apply is skipped without reading the table.
+        const probe = source((row: Row) => ({ id: row[key] }), {
+          where: (row: Row, tools: unknown) => [
+            ...filtered(row, tools),
+            list.filter(row),
+          ],
+          limit: EXACT_ROWS + 1,
+        }).cte(`search_${list.label}_probe`);
+        const matches = (tools: Tools) =>
+          (
+            probe((_row: Row) => ({
+              matches: (tools.count as () => unknown)(),
+            })) as unknown as {
+              scalar: () => {
+                atMost: (value: number) => unknown;
+                above: (value: number) => unknown;
+              };
+            }
+          ).scalar();
+        // `+ 0` keeps the index out of it: an ordering it cannot produce.
+        const exact = (row: Row) =>
+          template(["(", ") + 0"], list.rank!(row)) as unknown as {
+            ascending: unknown;
+          };
+
+        return [
+          {
+            ...list,
+            label: `${list.label}_exact`,
+            order: (row) => exact(row).ascending,
+            rank: exact,
+            ties: true,
+            gate: (tools) => [matches(tools).atMost(EXACT_ROWS)],
+          },
+          {
+            ...list,
+            gate: (tools) => [matches(tools).above(EXACT_ROWS)],
+          },
+        ];
+      });
+      const tables = gated.map((list) =>
         source(
           (row: Row) => ({
             id: row[key],
-            position: rowNumber().over({ orderBy: [list.order(row) as never] }),
+            position: rowNumber().over({ orderBy: order(list, row) as never }),
+            ...(list.rank ? { rank: list.rank(row) } : {}),
           }),
           {
             where: (row: Row, tools: unknown) => [
+              ...(list.gate?.(tools as Tools) ?? []),
               ...filtered(row, tools),
               list.filter(row),
             ],
-            orderBy: (row: Row) => list.order(row),
+            orderBy: (row: Row) => order(list, row),
             limit: size,
           },
         ).cte(`search_${list.label}`),

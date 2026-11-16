@@ -385,7 +385,7 @@ export const createQueryTables = (
 
       if (!keys.length) {
         throw new Error(
-          `symmetria: byId() requires a primary key on "${table.name}"`,
+          `symmetria: "${table.name}" has no primary key to look a row up by`,
         );
       }
 
@@ -397,7 +397,7 @@ export const createQueryTables = (
           keys.some((column) => !Object.hasOwn(value, column.name)))
       ) {
         throw new Error(
-          `symmetria: byId() requires exactly these key fields: ${keys.map((column) => column.name).join(", ")}`,
+          `symmetria: the primary key of "${table.name}" takes exactly these fields: ${keys.map((column) => column.name).join(", ")}`,
         );
       }
 
@@ -520,7 +520,7 @@ export const createQueryTables = (
       const primary = primaryKeyColumns(table);
 
       if (!plainRecord(value)) {
-        // A missing or composite primary key is reported by byId().
+        // byId() reports a missing or composite primary key.
         return primary.length === 1
           ? { label: "primary key", keys: primary, values: [value] }
           : undefined;

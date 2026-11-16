@@ -3,6 +3,7 @@
  * only that key, so contextual typing does not depend on another table's body.
  * Runtime lowering reuses the snapshot assembler; queries use the typed graph.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { extendBuilder } from "../query/expressions/callable";
 import {
   COLUMN_CODEC,
@@ -37,6 +38,7 @@ import {
   type RuntimeScope,
   type TableScopes,
 } from "../query/select";
+import { endStreams } from "../query/select/query";
 import type { SchemaCodecs } from "../query/codecs";
 import type { SchemaTables } from "../query/select/registry";
 import {
@@ -85,6 +87,7 @@ import type {
   KeyInference,
   TableDefinition,
   NormalizeDefinitions,
+  RelationGraph,
   ColumnMetadata,
   ValidateDirectReferences,
   ValidateSchema,
@@ -235,6 +238,9 @@ const schemaRuntime = (
   ),
 });
 
+/** The drivers whose transaction callback the current async context runs in. */
+const openTransactions = new AsyncLocalStorage<ReadonlySet<object>>();
+
 const declaredByTable = new WeakMap<object, readonly Search[]>();
 
 /** A table's searches, read once against its own columns: names, kinds and models. */
@@ -266,6 +272,7 @@ const createTableHandle = (
   tableName: string,
   queryTable: object,
   runTransaction: Parameters<typeof createNestedInsert>[3],
+  scoped: boolean,
 ): object => {
   const tableSnapshot = schemaTables.tablesByName.get(tableName)!;
   const relations = relationNames.get(tableName)!;
@@ -312,6 +319,7 @@ const createTableHandle = (
               tableSnapshot,
               searches,
               searchesOf(tableSnapshot),
+              scoped,
             ),
             { reindex: createReindex(queryTable, tableSnapshot, embedded) },
           ),
@@ -391,7 +399,14 @@ const bindDatabase = (
   const hold: ConnectionHold | undefined = transactionDriver
     ? (run) => run(transactionDriver.execute)
     : driver?.transaction
-      ? (run) => driver.transaction!((connection) => run(connection.execute))
+      ? Object.assign(
+          ((run) =>
+            driver.transaction!((connection) =>
+              run(connection.execute),
+            )) as ConnectionHold,
+          // $close() ends the streams open on this driver.
+          { owner: driver },
+        )
       : undefined;
   const queryTables = createQueryTables(
     schemaTables,
@@ -440,8 +455,14 @@ const bindDatabase = (
       );
     }
 
+    const held = new Set(openTransactions.getStore()).add(driver);
+
     return retryTransaction(
-      (settings) => driver.transaction!(run, settings),
+      (settings) =>
+        driver.transaction!(
+          (connection) => openTransactions.run(held, () => run(connection)),
+          settings,
+        ),
       options,
     );
   };
@@ -459,6 +480,7 @@ const bindDatabase = (
         tableName,
         queryTables.table(tableName),
         runTransaction,
+        !!scopes[tableName],
       );
 
       handle = profile ? profile.trackBuilder(table) : table;
@@ -521,6 +543,18 @@ const bindDatabase = (
         ? {}
         : {
             $close: async () => {
+              // Closing waits for open transactions, and this one would
+              // wait for the close: neither would ever finish.
+              if (driver && openTransactions.getStore()?.has(driver)) {
+                throw new Error(
+                  "symmetria: $close() was called inside a $transaction() of the same database; close it after the transaction ends",
+                );
+              }
+
+              if (driver) {
+                await endStreams(driver);
+              }
+
               await driver?.close();
             },
           }),
@@ -536,6 +570,7 @@ const createSchema = <
     TableNames,
     Record<string, Exclude<ColumnInput, undefined> | LinkMetadata>
   >,
+  const Indexes extends Record<string, IndexDefinition> = {},
 >(
   definitions: Record<TableNames, unknown> & {
     // Column records of tables declared without a callback; keyed links carry them.
@@ -562,9 +597,14 @@ const createSchema = <
     ValidateDirectReferences<NoInfer<Definition>> &
     ValidateSlots<NoInfer<Definition>>,
   options: SchemaOptions<
-    NoInfer<QueryRows<NormalizeDefinitions<Definition>>>
+    NoInfer<QueryRows<NormalizeDefinitions<Definition>>>,
+    Indexes
   > = {},
-): Database<NormalizeDefinitions<Definition>> => {
+): Database<
+  NormalizeDefinitions<Definition>,
+  RelationGraph<NormalizeDefinitions<Definition>>,
+  Indexes
+> => {
   const tableNames = Object.keys(definitions);
   const references = Object.freeze(
     Object.fromEntries(
@@ -895,7 +935,11 @@ const createSchema = <
     options.executor ?? options.driver?.execute,
     undefined,
     options.driver,
-  ) as Database<NormalizeDefinitions<Definition>>;
+  ) as Database<
+    NormalizeDefinitions<Definition>,
+    RelationGraph<NormalizeDefinitions<Definition>>,
+    Indexes
+  >;
 };
 
 type KeyValuesOf<Keys extends Record<string, Column<ColumnTypeMetadata>>> = {
@@ -905,7 +949,10 @@ type KeyValuesOf<Keys extends Record<string, Column<ColumnTypeMetadata>>> = {
 /** Anchor key types before checking mutually recursive table callbacks. */
 const withKeys =
   <const Keys extends Record<string, Column<ColumnTypeMetadata>>>(keys: Keys) =>
-  <const Definition extends Record<keyof Keys & string, TableDefinition>>(
+  <
+    const Definition extends Record<keyof Keys & string, TableDefinition>,
+    const Indexes extends Record<string, IndexDefinition> = {},
+  >(
     definitions: {
       [Name in keyof Definition]:
         | Definition[Name]
@@ -914,8 +961,8 @@ const withKeys =
             references: TableReferences<keyof Keys & string, KeyValuesOf<Keys>>,
           ) => Definition[Name] | Table<Definition[Name]>);
     } & ValidateSchema<NoInfer<Definition>>,
-    options: SchemaOptions<NoInfer<QueryRows<Definition>>> = {},
-  ): Database<Definition> => {
+    options: SchemaOptions<NoInfer<QueryRows<Definition>>, Indexes> = {},
+  ): Database<Definition, RelationGraph<Definition>, Indexes> => {
     for (const [name, key] of Object.entries(keys)) {
       if (!isColumn(key)) {
         throw new Error(
@@ -974,7 +1021,7 @@ const withKeys =
     return createSchema(
       anchored as never,
       options as never,
-    ) as unknown as Database<Definition>;
+    ) as unknown as Database<Definition, RelationGraph<Definition>, Indexes>;
   };
 
 export const schema = Object.assign(createSchema, { keys: withKeys });

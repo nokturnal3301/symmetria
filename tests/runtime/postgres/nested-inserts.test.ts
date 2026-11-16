@@ -600,23 +600,23 @@ describe.skipIf(!databaseUrl)("atomic nested inserts on PostgreSQL", () => {
         },
       }),
     );
-    // The connected tags in one read, the author in another, two tags
-    // upserted: 1 + 1 + 1 + 1 + 2 + 1.
+    // The connected tags in one read, the author in another; "y" was read
+    // already, "z" is looked for and then upserted: 1 + 1 + 1 + 1 + 2 + 1.
     expect(linked).toHaveLength(7);
-    expect(linked.filter((sql) => sql.startsWith("SELECT"))).toHaveLength(2);
+    expect(linked.filter((sql) => sql.startsWith("SELECT"))).toHaveLength(3);
     expect(
       linked.filter((sql) => sql.startsWith('INSERT INTO "post_tags"')),
     ).toHaveLength(2);
     expect(linked.filter((sql) => sql.startsWith(insert("tags")))).toHaveLength(
-      2,
+      1,
     );
     expect(
       await database.postTags((postTags) => ({ tagId: postTags.tagId }), {
         where: (postTags) => postTags.postId.is(9),
         orderBy: (postTags) => postTags.tagId.ascending,
       }),
-      // The upsert of the existing "y" used up identity 3.
-    ).toEqual([{ tagId: 1 }, { tagId: 2 }, { tagId: 4 }]);
+      // The existing "y" was only read, so "z" takes the next identity.
+    ).toEqual([{ tagId: 1 }, { tagId: 2 }, { tagId: 3 }]);
   });
 
   test("a batch of siblings keeps defaults, codecs, value errors and rolls back as a whole", async () => {

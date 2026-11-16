@@ -8,7 +8,7 @@ import {
   renameExpressionIdentifiers,
 } from "./expression-tokens";
 import { expressionKey, indexKeyKey } from "./expressions";
-import { typeConversion, utcConversion } from "./conversions";
+import { typeConversion, utcConversion, widens } from "./conversions";
 import type { CompiledQuery, SchemaSnapshot } from "symmetria";
 import {
   columnSQL,
@@ -443,7 +443,7 @@ const direction = (
       throw new Error("symmetria: duplicate column rename target");
     }
 
-    const columns = previous.columns.flatMap((column): ColumnPair[] => {
+    const matched = previous.columns.flatMap((column): ColumnPair[] => {
       const target = next.columns.find(
         (candidate) =>
           candidate.name === (columnNames[column.name] ?? column.name),
@@ -459,6 +459,28 @@ const direction = (
           ]
         : [];
     });
+    const retyped = matched
+      .filter((pair) => pair.typeChanged)
+      .map((pair) => quoteIdentifier(pair.before.name));
+    const renamedColumns = new Map(
+      Object.entries(columnNames).map(
+        ([from, to]) => [quoteIdentifier(from), quoteIdentifier(to)] as const,
+      ),
+    );
+    // A generated column cannot be altered into another expression, and
+    // PostgreSQL refuses to retype a column it is computed from. Unless it
+    // stays exactly what it was, it is dropped and added again, like a column
+    // that leaves and one that arrives.
+    const columns = matched.filter(({ before, after, typeChanged }) =>
+      before.generated === undefined && after.generated === undefined
+        ? true
+        : before.generated !== undefined &&
+          after.generated !== undefined &&
+          !typeChanged &&
+          renameExpressionIdentifiers(before.generated, renamedColumns) ===
+            after.generated &&
+          !retyped.some((name) => before.generated!.includes(name)),
+    );
     const primaryChanged =
       !equal(
         previous.primaryKey.map((name) => columnNames[name] ?? name),
@@ -469,11 +491,16 @@ const direction = (
           column.typeChanged &&
           previous.primaryKey.includes(column.before.name),
       );
+    // A widened column keeps its indexes and checks: PostgreSQL changes its
+    // declaration in place, and rebuilding an index of a large table for it
+    // would hold a lock for nothing.
     const affected = previous.columns
       .filter(
         (column) =>
           !columns.some(
-            (pair) => pair.before.name === column.name && !pair.typeChanged,
+            (pair) =>
+              pair.before.name === column.name &&
+              (!pair.typeChanged || widens(pair.before, pair.after)),
           ),
       )
       .map((column) => quoteIdentifier(column.name));
@@ -869,7 +896,11 @@ const direction = (
     const alter = `ALTER TABLE ${quoteIdentifier(pair.after.name)}`;
 
     for (const column of pair.after.columns) {
-      if (pair.columns.some((match) => match.after.name === column.name)) {
+      if (
+        pair.columns.some((match) => match.after.name === column.name) ||
+        // Computed from the other columns: added once they are what they will be.
+        column.generated !== undefined
+      ) {
         continue;
       }
 
@@ -988,6 +1019,15 @@ const direction = (
         (column.typeChanged || previous.default !== next.default)
       ) {
         statements.push(`${prefix} SET DEFAULT ${next.default}`);
+      }
+    }
+
+    for (const column of pair.after.columns) {
+      if (
+        column.generated !== undefined &&
+        !pair.columns.some((match) => match.after.name === column.name)
+      ) {
+        statements.push(`${alter} ADD COLUMN ${columnSQL(column)}`);
       }
     }
 

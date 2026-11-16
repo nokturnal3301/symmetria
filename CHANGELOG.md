@@ -1,5 +1,135 @@
 # Changelog
 
+## 2.5.0 — 2026-11-17
+
+Fixes from a bug hunt over 2.4.0: five areas (reads, bulk writes, key lookups
+and windows, search, concurrency and migrations) were run against databases of
+300 thousand to 10 million rows on both drivers.
+
+### Runtime (`symmetria`)
+
+- **Nearest-neighbour queries no longer lose rows.** pgvector's HNSW index picks
+  40 candidates and applies the other filters afterwards, so `orderBy` a
+  distance with `limit: 100` returned 40 rows, and with a `where` that the
+  neighbours failed it returned none. A query ordered by an ascending distance
+  with a `limit` now widens the index scan for its own statement
+  (`hnsw.ef_search`, and `hnsw.iterative_scan` from pgvector 0.8). `page()`
+  ordered by a distance compares rows exactly. See "pgvector" in the reference.
+- **`search()` by meaning with `where` or `$scope()` returned nothing** when the
+  nearest rows failed the filter, and a hybrid search silently became a search
+  by words. Up to 10,000 rows that pass the filter are now ranked exactly (a
+  search within one tenant of 300 thousand documents: 4 ms, with the 10 right
+  rows instead of none); more are ranked through the index, which keeps
+  scanning. `limit` above 40 returns `limit` rows.
+- **`stream()` returns the rows `await` returns.** PostgreSQL planned the cursor
+  to start fast and could pick an approximate vector index: a query that
+  returned 7,143 rows streamed one. The cursor is now planned to be read to the
+  end (`SET LOCAL cursor_tuple_fraction = 1`).
+- **`connectOrCreate` no longer deadlocks.** Its upsert locked every existing
+  row it met until the transaction ended, so two inserts naming the same tags in
+  opposite orders aborted each other (39 of 64 concurrent inserts). An existing
+  row is now only read, and rows that have to be created are created in key
+  order. Existing rows are no longer rewritten, and no longer use up an identity
+  value.
+- 2.4.0 regression, node-postgres: a query ordered by a selected expression
+  failed with `inconsistent types deduced for parameter $1` when the same bare
+  `sql` value stood in the select list and in `where`. A bare parameter is no
+  longer shared between clauses.
+- 2.4.0 regression: `page()` cursors issued by 2.3.0 were refused for queries
+  whose SQL 2.4.0 had made faster. The cursor's fingerprint is now taken from
+  the plain form of the query, so it survives such changes; cursors issued by
+  2.3.0 work again. Cursors issued by 2.4.0 itself for those queries (two
+  aggregates of one relation, an ordering by a selected expression) are refused
+  once.
+- 2.4.0 regression: a bulk insert whose values in one column exceeded 1 GB
+  closed the connection, since one array is one protocol message. Above 128
+  million characters the insert goes row by row in pieces, as before 2.4.0.
+- 2.4.0 regression: a custom type that encodes to a `Date` failed for years
+  before 1 and after 9999 in bulk inserts of 100 rows or more; on Bun it failed
+  below 100 rows as well. Both forms now send the text PostgreSQL reads.
+- A chunked `upsert()` let the later of two duplicate keys win silently when the
+  keys only met after the column rounded them (two instants of one second in a
+  `timestamptz(0)` key). Timestamp keys are compared at the column's precision,
+  and `…+00:00` equals `…Z`.
+- A JavaScript number in a `numeric` column lost digits on Bun in inserts below
+  100 rows (`0.1 + 0.2` was stored as `0.3`). Numbers are sent as their exact
+  text.
+- Full-text `search()` returned rows of equal rank in a different order on every
+  call; ties are now broken by the primary key. Each list also sends its
+  question once instead of three times, which halves the slowdown Bun's prepared
+  statements show on a frequent word (a generic plan computed the rank twice).
+- `forUpdate` / `forShare` on a read from a CTE locked nothing, as PostgreSQL
+  defines it, without a word; it is now an error.
+- **Full-text `search()` keeps its document in a stored generated column**
+  (`<search>Words`, hidden like the embedding) instead of an expression index.
+  Ranking parsed the text of every matching row again: a search for a common
+  word that matched 115 thousand of 300 thousand documents took 0.5 s, and on
+  Bun 2.4 s after the fifth call, when PostgreSQL stops spreading the work over
+  several cores. It now takes 40 ms, and 0.2 s on Bun after the fifth call.
+  **This needs a migration**: `symmetria-kit generate` adds the column and moves
+  the GIN index to it; adding the column rewrites the table once.
+- `$close()` ends open streams instead of waiting for their loops: a loop that
+  called `$close()` waited for itself forever. A loop that stops there ends
+  quietly; one that reads on fails with "the database was closed while this
+  stream was open". A stream read by other code while the database is being
+  closed now fails the same way instead of holding the close back.
+- An IVFFlat index declared in the schema no longer comes up short of rows under
+  a filter either: it reads on past its nearest lists (pgvector 0.8), and the
+  statement sorts the rows once more, since that mode returns them only roughly
+  in order.
+- A unique index declared in the schema options (`schema(defs, { indexes })`) is
+  a key in the types: `find({ tenant, cover })` and `by.<index>` compile.
+- `$close()` called inside a `$transaction()` of the same database waited
+  forever; it is now an error.
+- `column.asc.desc` (outside the types) silently dropped the ordering; it is now
+  an error. `over()` refuses unknown options (`partition` for `partitionBy`)
+  instead of ignoring them, and a `partitionBy` that is not a list.
+- `get()` and `find()` types: an object with a column beside the key, or with
+  two keys at once, is a type error (it was refused only at run time), and so is
+  a `prepare()` parameter, which a lookup that runs at once cannot wait for. A
+  unique index on a descending column is a key for lookups and
+  `connectOrCreate`, in the types as well; a unique index with an expression
+  among its keys no longer makes its other columns a key in the types. The
+  errors about a missing or composite primary key no longer name `byId()` when
+  `get()` or `find()` was called.
+- A query through the database itself from inside transactions that hold every
+  connection of the pool (with `max: 1`, any `db.…` call inside
+  `db.$transaction()`) waited forever for a connection its own caller held. It
+  is now refused with an error that says to use the transaction's database or
+  raise `max`. Such a call that was not awaited used to run after the
+  transaction; it is refused as well.
+- PostgreSQL 18 reports a `RESTRICT` foreign key with SQLSTATE 23001 instead of
+  23503; it is a `ForeignKeyViolation` (`kind: "foreign-key"`) there too.
+- Values of the wrong JavaScript type, which only code outside the types can
+  send, are refused the same way on both drivers and in both insert forms
+  instead of depending on them: a number or string in a `boolean` column, a
+  boolean in an `integer` column, a number in a `date`, `timestamp` or
+  `timestamptz` column.
+- `QueryError.column` on Bun was a number (the engine's source position) when
+  PostgreSQL named no column; it is `undefined`.
+- `search()`: an empty question finds nothing without asking the model, a vector
+  of the wrong size is refused with the expected size, and a zero byte in the
+  question no longer fails the BM25 search.
+- `where: { embedding: [...] }` compares a vector column with the vector.
+- An invalid `Date` in a `date` column is refused instead of being sent as
+  `0NaN-NaN-NaN`. In array literals a boolean is `true` / `false`, as in a plain
+  parameter.
+- A bulk insert keeps the array form when a `jsonb`, `real` or `vector` column
+  is NULL in every row.
+
+### Kit (`symmetria-kit`)
+
+- A migration that only widens a column (`numeric(14,2)` to `numeric(16,2)`, a
+  longer `varchar`, `varchar` to `text`) no longer drops and recreates the
+  indexes and checks on it. PostgreSQL changes such a column in place, so the
+  migration of a large table no longer rebuilds its indexes under a lock.
+- Stored generated columns (those of full-text searches) are created, compared
+  by `drift`, and dropped and added again around a change of the columns they
+  are computed from, which PostgreSQL does not allow in place. `lint` reports
+  the table rewrite as a caution and never counts such a column as lost data.
+- `lint` said an enum "is rebuilt" when the migration only adds labels with
+  `ALTER TYPE … ADD VALUE`; it now says which of the two happens.
+
 ## 2.4.0 — 2026-11-16
 
 ### Runtime (`symmetria`)

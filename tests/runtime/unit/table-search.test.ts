@@ -72,28 +72,44 @@ test("search() lowers to a hidden vector column, two indexes and the extension",
   const chunks = snapshot.tables.find((entry) => entry.name === "chunks")!;
 
   expect(snapshot.extensions).toEqual(["vector"]);
-  expect(chunks.columns.at(-1)).toEqual({
-    name: "about",
-    sqlName: "about",
-    sqlType: "vector(2)",
-    notNull: false,
-    unique: false,
-    primaryKey: false,
-    hidden: true,
-  });
+  expect(chunks.columns.slice(-2)).toEqual([
+    {
+      name: "about",
+      sqlName: "about",
+      sqlType: "vector(2)",
+      notNull: false,
+      unique: false,
+      primaryKey: false,
+      hidden: true,
+    },
+    // The document is stored, so ranking does not parse the text again.
+    {
+      name: "aboutWords",
+      sqlName: "about_words",
+      sqlType: "tsvector",
+      notNull: false,
+      unique: false,
+      primaryKey: false,
+      hidden: true,
+      generated: `setweight(to_tsvector('simple', coalesce("title", '')), 'A') || setweight(to_tsvector('simple', coalesce("content", '')), 'B')`,
+    },
+  ]);
   expect(
     chunks.indexes!.map(({ sqlName, method, keys }) => [sqlName, method, keys]),
   ).toEqual([
     ["chunks_note_id_idx", "btree", ['"note_id"']],
     ["chunks_about_meaning_idx", "hnsw", ['"about"']],
-    [
-      "chunks_about_words_idx",
-      "gin",
-      [
-        `(setweight(to_tsvector('simple', coalesce("title", '')), 'A') || setweight(to_tsvector('simple', coalesce("content", '')), 'B'))`,
-      ],
-    ],
+    ["chunks_about_words_idx", "gin", ['"about_words"']],
   ]);
+  expect(() =>
+    schema({
+      notes: table({ id: int.auto, title: text, aboutWords: text }).search(
+        (note) => ({ about: { words: fullText(note.title) } }),
+      ),
+    }),
+  ).toThrow(
+    'symmetria: search "about" keeps its document in a column named "aboutWords", which the table already has',
+  );
 });
 
 test("bm25() indexes the key and the columns, and asks for pg_search", () => {
@@ -298,35 +314,52 @@ test("search() ranks by words and meaning in one statement", async () => {
 
   expect(sql).toBe(
     [
-      'WITH "search_about_meaning" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ("chunks"."about" <=> $1::text::vector) ASC) AS "position"',
+      'WITH "search_about_meaning_probe" AS (SELECT "chunks"."id" AS "id"',
       'FROM "chunks" AS "chunks"',
-      'WHERE "chunks"."owner" = $2 AND "chunks"."about" IS NOT NULL',
-      'ORDER BY ("chunks"."about" <=> $3::text::vector) ASC',
-      "LIMIT 40),",
-      `"search_about_words" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ts_rank((setweight(to_tsvector('simple', coalesce("chunks"."title", '')), 'A') || setweight(to_tsvector('simple', coalesce("chunks"."content", '')), 'B')), to_tsquery('simple', $4)) DESC) AS "position"`,
+      'WHERE "chunks"."owner" = $1 AND "chunks"."about" IS NOT NULL',
+      "LIMIT 10001),",
+      '"search_about_meaning_exact" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY (("chunks"."about" <=> $2::text::vector)) + 0 ASC, "chunks"."id" ASC) AS "position", (("chunks"."about" <=> $2::text::vector)) + 0 AS "rank"',
       'FROM "chunks" AS "chunks"',
-      `WHERE "chunks"."owner" = $5 AND (setweight(to_tsvector('simple', coalesce("chunks"."title", '')), 'A') || setweight(to_tsvector('simple', coalesce("chunks"."content", '')), 'B')) @@ to_tsquery('simple', $6)`,
-      `ORDER BY ts_rank((setweight(to_tsvector('simple', coalesce("chunks"."title", '')), 'A') || setweight(to_tsvector('simple', coalesce("chunks"."content", '')), 'B')), to_tsquery('simple', $7)) DESC`,
+      'WHERE (SELECT COUNT(*) AS "matches"',
+      'FROM "search_about_meaning_probe" AS "search_about_meaning_probe") <= $3 AND "chunks"."owner" = $4 AND "chunks"."about" IS NOT NULL',
+      'ORDER BY (("chunks"."about" <=> $2::text::vector)) + 0 ASC, "chunks"."id" ASC',
       "LIMIT 40),",
-      '"search_fused" AS (SELECT coalesce("search_about_meaning"."id", "search_about_words"."id") AS "id", (coalesce(1.0 / (60 + "search_about_meaning"."position"), 0)) + (coalesce(1.0 / (60 + "search_about_words"."position"), 0)) AS "score"',
-      'FROM "search_about_meaning" AS "search_about_meaning"',
-      'FULL JOIN "search_about_words" AS "search_about_words" ON ("search_about_meaning"."id" = "search_about_words"."id"))',
-      'SELECT "chunks"."title" AS "title", "__symmetria_path_0"."title" AS "note"',
+      '"search_about_meaning" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ("chunks"."about" <=> $5::text::vector) ASC) AS "position", ("chunks"."about" <=> $5::text::vector) AS "rank"',
+      'FROM "chunks" AS "chunks"',
+      `WHERE (SELECT CASE WHEN current_setting('hnsw.iterative_scan', true) IS NULL THEN '' ELSE set_config('hnsw.iterative_scan', 'strict_order', true) END || CASE WHEN current_setting('hnsw.max_scan_tuples', true) IS NULL THEN '' ELSE set_config('hnsw.max_scan_tuples', '2147483647', true) END) IS NOT NULL AND (SELECT COUNT(*) AS "matches"`,
+      'FROM "search_about_meaning_probe" AS "search_about_meaning_probe") > $6 AND "chunks"."owner" = $7 AND "chunks"."about" IS NOT NULL',
+      'ORDER BY ("chunks"."about" <=> $5::text::vector) ASC',
+      "LIMIT 40),",
+      '"search_fused" AS (SELECT coalesce("search_about_meaning_exact"."id", "search_about_meaning"."id") AS "id", (coalesce(1.0 / (60 + "search_about_meaning_exact"."position"), 0)) + (coalesce(1.0 / (60 + "search_about_meaning"."position"), 0)) AS "score"',
+      'FROM "search_about_meaning_exact" AS "search_about_meaning_exact"',
+      'FULL JOIN "search_about_meaning" AS "search_about_meaning" ON ("search_about_meaning_exact"."id" = "search_about_meaning"."id")),',
+      `"search_about_words" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ts_rank("chunks"."about_words", to_tsquery('simple', $8)) DESC, "chunks"."id" ASC) AS "position", ts_rank("chunks"."about_words", to_tsquery('simple', $8)) AS "rank"`,
+      'FROM "chunks" AS "chunks"',
+      `WHERE "chunks"."owner" = $9 AND "chunks"."about_words" @@ to_tsquery('simple', $10)`,
+      `ORDER BY ts_rank("chunks"."about_words", to_tsquery('simple', $8)) DESC, "chunks"."id" ASC`,
+      "LIMIT 40),",
+      '"search_fused_2" AS (SELECT coalesce("search_fused"."id", "search_about_words"."id") AS "id", coalesce("search_fused"."score", 0) + (coalesce(1.0 / (60 + "search_about_words"."position"), 0)) AS "score"',
       'FROM "search_fused" AS "search_fused"',
-      'INNER JOIN "chunks" AS "chunks" ON ("chunks"."id" = "search_fused"."id")',
+      'FULL JOIN "search_about_words" AS "search_about_words" ON ("search_fused"."id" = "search_about_words"."id"))',
+      'SELECT "chunks"."title" AS "title", "__symmetria_path_0"."title" AS "note"',
+      'FROM "search_fused_2" AS "search_fused_2"',
+      'INNER JOIN "chunks" AS "chunks" ON ("chunks"."id" = "search_fused_2"."id")',
       'INNER JOIN "notes" AS "__symmetria_path_0" ON "chunks"."note_id" = "__symmetria_path_0"."id"',
-      'ORDER BY "search_fused"."score" DESC, "search_fused"."id" ASC',
+      'ORDER BY "search_fused_2"."score" DESC, "search_fused_2"."id" ASC',
       "LIMIT 3",
     ].join("\n"),
   );
   // Any of the question's words matches; punctuation cannot reach the query syntax.
   expect(parameters).toEqual([
-    "[19,1]",
     "u",
     "[19,1]",
-    "where | are | the | keys",
+    10000,
+    "u",
+    "[19,1]",
+    10000,
     "u",
     "where | are | the | keys",
+    "u",
     "where | are | the | keys",
   ]);
   expect(await run).toEqual([{ title: "found" } as never]);
@@ -360,6 +393,77 @@ test("one way of searching needs no fusion", async () => {
   expect(asked).toEqual([]);
   expect(both.sql).toContain("search_fused");
   expect(both.parameters[0]).toBe("[0,1]");
+});
+
+test("a filtered search by meaning ranks few rows exactly and many through the index", async () => {
+  const { database } = recording(tables());
+  const filtered = await database.chunks
+    .search({ about: [1, 0], where: { owner: "u" }, limit: 5 })
+    .toSQL();
+
+  // The filters are counted once, up to the limit of an exact ranking.
+  expect(filtered.sql).toContain(
+    'WITH "search_about_meaning_probe" AS (SELECT "chunks"."id" AS "id"\nFROM "chunks" AS "chunks"\nWHERE "chunks"."owner" = $1 AND "chunks"."about" IS NOT NULL\nLIMIT 10001)',
+  );
+  // `+ 0` is an ordering the vector index cannot produce.
+  expect(filtered.sql).toContain(
+    'ORDER BY (("chunks"."about" <=> $2::text::vector)) + 0 ASC, "chunks"."id" ASC',
+  );
+  expect(filtered.sql).toContain(
+    'FROM "search_about_meaning_probe" AS "search_about_meaning_probe") <= $3 AND',
+  );
+  expect(filtered.sql).toContain(
+    'FROM "search_about_meaning_probe" AS "search_about_meaning_probe") > $6 AND',
+  );
+  expect(filtered.parameters).toEqual([
+    "u",
+    "[1,0]",
+    10000,
+    "u",
+    "[1,0]",
+    10000,
+    "u",
+  ]);
+
+  // A $scope() filter narrows the rows like a `where` does.
+  const scoped = await database
+    .$scope({ chunks: (chunk) => chunk.owner.is("u") })
+    .chunks.search({ about: [1, 0] })
+    .toSQL();
+
+  expect(scoped.sql).toContain('"search_about_meaning_probe"');
+
+  // Without a filter the index answers alone, with room for every candidate.
+  const open = await database.chunks
+    .search({ about: [1, 0], limit: 50 })
+    .toSQL();
+
+  expect(open.sql).not.toContain("probe");
+  expect(open.sql).toContain(
+    "set_config('hnsw.ef_search', greatest(current_setting('hnsw.ef_search')::integer, 200)::text, true)",
+  );
+});
+
+test("an empty question and a vector of the wrong size never reach PostgreSQL", async () => {
+  const { model, asked } = counting();
+  const { database, calls } = recording(tables(model), [{ id: 1 }]);
+
+  expect(await database.chunks.search({ about: "" })).toEqual([]);
+  expect(await database.chunks.search({ about: "   " })).toEqual([]);
+  expect(asked).toEqual([]);
+  expect(calls).toHaveLength(0);
+  await expect(
+    database.chunks.search({ about: [1, 2, 3] }).execute(),
+  ).rejects.toThrow(
+    'symmetria: search "about" compares vectors of 2 numbers, received 3',
+  );
+
+  // PostgreSQL text cannot hold a zero byte; the words on both sides survive.
+  const zero = await database.chunks
+    .search({ about: { text: "data\0base", vector: [1, 0] } })
+    .toSQL();
+
+  expect(zero.parameters).toContain("database");
 });
 
 test("a model that fails at search time leaves the words, and says so", async () => {

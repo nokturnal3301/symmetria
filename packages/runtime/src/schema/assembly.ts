@@ -58,6 +58,11 @@ export type ColumnSnapshot = {
   };
   /** Not part of the row: read and written only when named (a search's embedding). */
   hidden?: true;
+  /**
+   * The expression PostgreSQL computes and stores the column from
+   * (`GENERATED ALWAYS AS (…) STORED`); such a column is never written.
+   */
+  generated?: string;
 };
 
 export type RelationSnapshot =
@@ -145,9 +150,17 @@ export const uniqueColumnIndexes = (
       return [];
     }
 
-    const columns = definition.keys.map((key) =>
-      table.columns.find((column) => quoteIdentifier(column.sqlName) === key),
-    );
+    // The direction of a key orders the index; it is as unique either way.
+    const columns = definition.keys.map((key) => {
+      const name = key.replace(
+        /\s+(?:ASC|DESC)(?:\s+NULLS\s+(?:FIRST|LAST))?$|\s+NULLS\s+(?:FIRST|LAST)$/i,
+        "",
+      );
+
+      return table.columns.find(
+        (column) => quoteIdentifier(column.sqlName) === name,
+      );
+    });
 
     return columns.every((column) => column !== undefined)
       ? [{ name: definition.name, columns }]

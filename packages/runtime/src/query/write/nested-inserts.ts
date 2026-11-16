@@ -12,6 +12,7 @@ import {
   type SchemaSnapshot,
   type TableSnapshot,
 } from "../../schema/assembly";
+import { plainRecord } from "../select/shape";
 import { returningProjection, returningSelector } from "../select/projections";
 import { conditionWrite, nestedInput, uniqueKeys } from "./nested-input";
 
@@ -401,6 +402,18 @@ export const createNestedInsert = (
             return { ...value, ...extra };
           };
 
+          /** The unique key a connectOrCreate payload is looked up and upserted by. */
+          const upsertKey = (
+            target: string,
+            payload: Record<string, unknown>,
+          ): readonly string[] | undefined =>
+            uniqueKeys(tableByName.get(target)!).find((names) =>
+              names.every(
+                (field) =>
+                  payload[field] !== null && payload[field] !== undefined,
+              ),
+            );
+
           const resolveRow = async (
             target: string,
             operation: string,
@@ -418,17 +431,43 @@ export const createNestedInsert = (
               return (await insertRow(target, payload)).row;
             }
 
-            const key = uniqueKeys(tableByName.get(target)!).find((names) =>
-              names.every(
-                (field) =>
-                  payload[field] !== null && payload[field] !== undefined,
-              ),
-            );
+            const key = upsertKey(target, payload);
 
             if (!key) {
               throw new Error(
                 `symmetria: connectOrCreate on "${target}" requires a non-null unique key`,
               );
+            }
+
+            // A row that is already there is only read. The upsert below
+            // locks the row it meets until the transaction ends, and two
+            // inserts naming the same rows in opposite orders would then wait
+            // on each other until PostgreSQL aborts one as a deadlock.
+            const read =
+              key.length === 1
+                ? found
+                    .get(target)
+                    ?.get(key[0]!)
+                    ?.get(lookupKey(payload[key[0]!]) as never)
+                : undefined;
+
+            if (read) {
+              return read as Record<string, unknown>;
+            }
+
+            const [existing] = await (database[target] as RuntimeQuery)(
+              (columns) => ({ ...columns }),
+              {
+                where: (columns) =>
+                  and(
+                    ...key.map((field) => columns[field]!.is(payload[field]!)),
+                  ),
+                limit: 1,
+              },
+            ).execute();
+
+            if (existing) {
+              return existing as Record<string, unknown>;
             }
 
             // Under $scope() the upsert throws SYMMETRIA_OUT_OF_SCOPE when the
@@ -499,6 +538,58 @@ export const createNestedInsert = (
               };
 
               const links: Record<string, unknown>[] = [];
+              // Rows that have to be created are created in key order, not
+              // input order: two inserts that create the same rows then wait
+              // for each other in one direction only, and cannot deadlock.
+              const upserted = new Map<unknown, Record<string, unknown>>();
+
+              if (operation === "connectOrCreate" && entries.length > 1) {
+                const extra =
+                  relation.kind === "through"
+                    ? {}
+                    : { [relation.foreignKey]: parentKey };
+                const keyed = entries.map((entry) => {
+                  const payload = plainRecord(entry)
+                    ? { ...entry, ...extra }
+                    : undefined;
+                  const key = payload && upsertKey(relation.target, payload);
+
+                  return {
+                    entry,
+                    text: key
+                      ? JSON.stringify(
+                          key.map((field: string) => String(payload![field])),
+                        )
+                      : undefined,
+                  };
+                });
+
+                // An entry without a key fails where it stands, in the loop below.
+                if (keyed.every(({ text }) => text !== undefined)) {
+                  keyed.sort((left, right) =>
+                    left.text! < right.text!
+                      ? -1
+                      : left.text! > right.text!
+                        ? 1
+                        : 0,
+                  );
+
+                  for (const { entry } of keyed) {
+                    if (!upserted.has(entry)) {
+                      upserted.set(
+                        entry,
+                        await resolveRow(
+                          relation.target,
+                          operation,
+                          entry,
+                          extra,
+                          scalarKey(name, relation),
+                        ),
+                      );
+                    }
+                  }
+                }
+              }
 
               for (const entry of entries) {
                 const extra =
@@ -530,13 +621,15 @@ export const createNestedInsert = (
                 }
 
                 await insertSiblings();
-                const target = await resolveRow(
-                  relation.target,
-                  operation,
-                  entry,
-                  operation === "connect" ? {} : extra,
-                  scalarKey(name, relation),
-                );
+                const target =
+                  upserted.get(entry) ??
+                  (await resolveRow(
+                    relation.target,
+                    operation,
+                    entry,
+                    operation === "connect" ? {} : extra,
+                    scalarKey(name, relation),
+                  ));
 
                 if (relation.kind === "through") {
                   links.push({

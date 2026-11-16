@@ -152,6 +152,8 @@ export type DatabaseError = {
 const KINDS: Record<string, DatabaseErrorKind> = {
   "23505": "unique",
   "23503": "foreign-key",
+  // PostgreSQL 18 reports a RESTRICT foreign key as restrict_violation.
+  "23001": "foreign-key",
   "23502": "not-null",
   "23514": "check",
   "23P01": "exclusion",

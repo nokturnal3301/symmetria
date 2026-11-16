@@ -153,6 +153,18 @@ export class OrderingHandle {
   }
 }
 
+// Outside the types, `column.asc.desc` would read `undefined`, which an
+// orderBy takes for "no ordering" and silently drops.
+for (const direction of ["asc", "desc", "ascending", "descending"]) {
+  Object.defineProperty(OrderingHandle.prototype, direction, {
+    get() {
+      throw new Error(
+        `symmetria: this ordering already has a direction; remove the second one (.${direction})`,
+      );
+    },
+  });
+}
+
 export const ordering = (description: OrderingDescription): Ordering =>
   freeze(new OrderingHandle(description)) as unknown as Ordering;
 

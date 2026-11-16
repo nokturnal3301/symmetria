@@ -13,7 +13,7 @@ import { scopeViolation } from "../../../packages/runtime/src/driver/errors";
 const statement = (sql: string): CompiledQuery => ({ sql, parameters: [] });
 
 /** A pool whose connections log statements and record how many overlap. */
-const recordingPool = () => {
+const recordingPool = (max = 10) => {
   const log: string[] = [];
   const connections = { released: 0, discarded: 0 };
   let running = 0;
@@ -59,6 +59,7 @@ const recordingPool = () => {
     connect: async () => connection(),
     cancel: async () => {},
     close: async () => {},
+    max,
   });
 
   return { driver, log, connections, overlap: () => overlap };
@@ -359,4 +360,38 @@ test("databaseError() describes lost and refused connections on both drivers", (
   // A cancelled statement leaves the connection usable.
   expect(databaseError({ code: "57014" })).toMatchObject({ kind: "other" });
   expect(databaseError(new Error("symmetria: invalid"))).toBeUndefined();
+});
+
+test("a pool request from inside the transactions that hold every connection is refused", async () => {
+  const single = recordingPool(1);
+
+  // Awaited, it would wait for the connection its own transaction holds.
+  await expect(
+    single.driver.transaction(async () => {
+      await single.driver.execute(statement("outside"));
+    }),
+  ).rejects.toThrow(
+    "symmetria: this query asks the pool for a connection from inside a transaction that holds the only one, and would wait forever; run it on the transaction's own database (the callback's argument) or raise max",
+  );
+  expect(single.log).not.toContain("outside");
+  await expect(
+    single.driver.transaction(() => single.driver.transaction(async () => {})),
+  ).rejects.toThrow("would wait forever");
+  // The transaction's own connection, and the pool afterwards, work as ever.
+  await single.driver.transaction((tx) => tx.execute(statement("inside")));
+  await single.driver.execute(statement("after"));
+  expect(single.log).toContain("inside");
+  expect(single.log).toContain("after");
+
+  const pair = recordingPool(2);
+
+  await pair.driver.transaction(async () => {
+    await pair.driver.execute(statement("second connection"));
+    await pair.driver.session(async () => {
+      await expect(pair.driver.execute(statement("third"))).rejects.toThrow(
+        "transactions that hold all 2 of them",
+      );
+    });
+  });
+  expect(pair.log).toContain("second connection");
 });

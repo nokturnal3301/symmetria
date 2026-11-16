@@ -24,7 +24,7 @@ export const enumerationSQL = (
   `CREATE TYPE ${quoteIdentifier(name)} AS ENUM (${values.map(quoteLiteral).join(", ")})`;
 
 export const columnSQL = (column: MigrationColumn): string =>
-  `${quoteIdentifier(column.name)} ${columnTypeSQL(column)}${column.identity ? ` ${identitySQL(column)}` : ""}${column.default === undefined ? "" : ` DEFAULT ${column.default}`}${column.notNull ? " NOT NULL" : ""}`;
+  `${quoteIdentifier(column.name)} ${columnTypeSQL(column)}${column.identity ? ` ${identitySQL(column)}` : ""}${column.default === undefined ? "" : ` DEFAULT ${column.default}`}${column.generated === undefined ? "" : ` GENERATED ALWAYS AS (${column.generated}) STORED`}${column.notNull ? " NOT NULL" : ""}`;
 
 export const primaryKeySQL = (table: MigrationTable): string =>
   `CONSTRAINT ${quoteIdentifier(objectName(table.name, "pkey"))} PRIMARY KEY (${table.primaryKey.map(quoteIdentifier).join(", ")})`;

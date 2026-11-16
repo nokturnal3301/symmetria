@@ -46,11 +46,17 @@ import { migrationDirectory } from "../../support/directories";
 
 /**
  * The test database is shared: the schemas of other suites come and go, so the
- * `other-schema` entry is left out here and checked in a test of its own.
+ * `other-schema` entry is left out here and checked in a test of its own. A
+ * server image may also ship extensions in schemas of their own (ParadeDB
+ * does), which `pull` rightly mentions and no suite here is about.
  */
 const ownSchema = <Warning extends Pick<PullWarning, "code">>(
   warnings: readonly Warning[],
-): Warning[] => warnings.filter((warning) => warning.code !== "other-schema");
+): Warning[] =>
+  warnings.filter(
+    (warning) =>
+      warning.code !== "other-schema" && warning.code !== "extension",
+  );
 
 const pullSchema = async (options: Parameters<typeof pullWholeDatabase>[0]) => {
   const result = await pullWholeDatabase(options);
@@ -698,16 +704,19 @@ describe.skipIf(!url)("pull", () => {
           execute: driver.execute,
           module: runtime,
         });
-        const summary = result.warnings.map((warning) =>
-          [
-            warning.code,
-            warning.table ?? "",
-            warning.column ?? "",
-            warning.fix === undefined ? "" : "fix",
-          ]
-            .join(" ")
-            .trim(),
-        );
+        const summary = result.warnings
+          // Extensions the server image ships are not this test's subject.
+          .filter((warning) => warning.code !== "extension")
+          .map((warning) =>
+            [
+              warning.code,
+              warning.table ?? "",
+              warning.column ?? "",
+              warning.fix === undefined ? "" : "fix",
+            ]
+              .join(" ")
+              .trim(),
+          );
 
         expect(summary.sort()).toEqual(
           [
@@ -876,7 +885,7 @@ describe.skipIf(!url)("pull", () => {
       expect(first.exitCode).toBe(0);
       expect(first.stdout).toContain("Created");
       // Other suites' schemas may be listed; nothing of this schema is.
-      expect(first.stdout).not.toMatch(/^ +\[(?!other-schema\])/m);
+      expect(first.stdout).not.toMatch(/^ +\[(?!other-schema\]|extension\])/m);
       expect(await readFile(target, "utf8")).toContain(
         "author: one(users).noIndex.cascade,",
       );

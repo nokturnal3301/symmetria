@@ -101,7 +101,9 @@ export class QueryError extends Error {
       }
     }
 
-    Object.assign(this, fields);
+    // JavaScriptCore gives every Error a `column` of its own: where in the
+    // source it was created. Unless PostgreSQL named a column, there is none.
+    Object.assign(this, { column: undefined }, fields);
   }
 }
 
@@ -110,7 +112,7 @@ export class UniqueViolation extends QueryError {
   override name = "UniqueViolation";
 }
 
-/** SQLSTATE 23503: the referenced row is missing, or a referencing row still exists. */
+/** SQLSTATE 23503, or 23001 from PostgreSQL 18 for a RESTRICT key: the referenced row is missing, or a referencing row still exists. */
 export class ForeignKeyViolation extends QueryError {
   override name = "ForeignKeyViolation";
 }

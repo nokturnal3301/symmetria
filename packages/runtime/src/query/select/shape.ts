@@ -161,7 +161,9 @@ export const equalityPredicates = (
 
     if (
       Array.isArray(value) &&
-      !/(?:\[\]|^jsonb?)$/.test(expressionSqlType(readColumn(column)))
+      !/(?:\[\]|^jsonb?|^vector(?:\(\d+\))?)$/.test(
+        expressionSqlType(readColumn(column)),
+      )
     ) {
       throw new Error(
         `symmetria: where: "${key}" takes one value; write a list as a callback, ${key}.in([...])`,

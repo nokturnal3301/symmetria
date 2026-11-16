@@ -438,6 +438,16 @@ export const lockPlan = (
     throw new Error("symmetria: row locks require existing query aliases");
   }
 
+  // PostgreSQL accepts FOR UPDATE over a WITH query and locks none of its rows.
+  if (
+    (state.root.cte || state.root.cteReference) &&
+    (!options.of || options.of.includes(state.root.alias))
+  ) {
+    throw new Error(
+      `symmetria: a row lock does not reach the rows of CTE "${state.root.alias}"; lock them in the query that reads the table`,
+    );
+  }
+
   return freeze({
     ...state,
     locking: freeze({

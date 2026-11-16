@@ -46,6 +46,9 @@ const scopeCheckSql = (
 /** From this many rows on, a plain multi-row INSERT sends one array per column. */
 const ARRAY_INSERT_THRESHOLD = 100;
 
+/** Text an array insert carries at most; UTF-8 and quoting can triple it on the wire. */
+const ARRAY_INSERT_CHARACTERS = 128 * 1024 * 1024;
+
 /** Column types whose values bind as they are; the array is cast to the type without its length or scale, which assignment then applies. */
 const ARRAY_TYPES =
   /^(smallint|integer|bigint|text|uuid|boolean|date|double precision|timestamptz|timestamp|numeric|varchar|character varying)(?:\(\d+(?:,\s*\d+)?\))?$/;
@@ -65,6 +68,7 @@ const columnArrays = (
   }
 
   const arrays: { values: unknown[]; type: string }[] = [];
+  let characters = 0;
 
   for (const column of columns) {
     const values: unknown[] = [];
@@ -93,7 +97,17 @@ const columnArrays = (
         typed = true;
       }
 
+      if (typeof value.value === "string") {
+        characters += value.value.length;
+      }
+
       values.push(value.value);
+    }
+
+    // One array is one protocol message, which PostgreSQL caps at 1 GB;
+    // row by row the same values are sent in pieces.
+    if (characters > ARRAY_INSERT_CHARACTERS) {
+      return undefined;
     }
 
     if (cast) {
@@ -109,7 +123,17 @@ const columnArrays = (
     const base = ARRAY_TYPES.exec(column.sqlType)?.[1];
 
     if (!base) {
-      return undefined;
+      // These bind with a cast, which a column of nothing but NULL never shows.
+      const empty = /^(jsonb|json|real|vector)(?:\(\d+\))?$/.exec(
+        column.sqlType,
+      )?.[1];
+
+      if (!empty) {
+        return undefined;
+      }
+
+      arrays.push({ values, type: `text[]::${empty}[]` });
+      continue;
     }
 
     arrays.push({

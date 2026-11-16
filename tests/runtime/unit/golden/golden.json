@@ -57,7 +57,7 @@
   },
   "aggregates/relation": {
     "sql": "SELECT \"users\".\"id\" AS \"id\", \"__symmetria_shared_0\".\"count\" AS \"posts\", \"__symmetria_shared_0\".\"sum\" AS \"views\", \"__symmetria_shared_0\".\"maximum\" AS \"latest\", \"__symmetria_shared_1\".\"average\" AS \"average\", \"__symmetria_shared_1\".\"minimum\" AS \"first\", EXISTS (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"editor_id\") AS \"any\", (SELECT COUNT(*) FROM (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\"\nLIMIT 2\nOFFSET 1) AS \"__symmetria_count\") AS \"paged\", EXISTS (SELECT 1 AS \"present\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\"\nLIMIT 0) AS \"none\"\nFROM \"users\" AS \"users\"\nLEFT JOIN LATERAL (SELECT COUNT(*) AS \"count\", SUM(\"__symmetria_aggregate_0\".\"views\")::numeric AS \"sum\", MAX(\"__symmetria_aggregate_0\".\"created_at\") AS \"maximum\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_shared_0\" ON TRUE\nLEFT JOIN LATERAL (SELECT AVG(\"__symmetria_aggregate_0\".\"score\")::numeric AS \"average\", MIN(\"__symmetria_aggregate_0\".\"id\") AS \"minimum\"\nFROM \"comments\" AS \"__symmetria_aggregate_0\"\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_shared_1\" ON TRUE\nWHERE \"__symmetria_shared_0\".\"count\" > $1 AND \"__symmetria_shared_0\".\"sum\" > $2\nORDER BY \"__symmetria_shared_0\".\"count\" DESC",
-    "parameters": [2, 10]
+    "parameters": [2, "10"]
   },
   "aggregates/nested": {
     "sql": "SELECT \"users\".\"id\" AS \"id\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"title\" AS \"title\", (\"__symmetria_shared_0\".\"count\")::text AS \"comments\", \"__symmetria_shared_0\".\"maximum\" AS \"best\", ((SELECT COUNT(*) AS \"count\"\nFROM \"post_tags\" AS \"__symmetria_junction_0\"\nINNER JOIN \"tags\" AS \"__symmetria_aggregate_1\" ON \"__symmetria_junction_0\".\"tag_id\" = \"__symmetria_aggregate_1\".\"id\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_junction_0\".\"post_id\"))::text AS \"tags\"\nFROM \"posts\" AS \"__symmetria_aggregate_0\"\nLEFT JOIN LATERAL (SELECT COUNT(*) AS \"count\", MAX(\"__symmetria_aggregate_1\".\"score\") AS \"maximum\"\nFROM \"comments\" AS \"__symmetria_aggregate_1\"\nWHERE \"__symmetria_aggregate_0\".\"id\" = \"__symmetria_aggregate_1\".\"post_id\") AS \"__symmetria_shared_0\" ON TRUE\nWHERE \"users\".\"id\" = \"__symmetria_aggregate_0\".\"author_id\") AS \"__symmetria_row\") AS \"posts\"\nFROM \"users\" AS \"users\"",
@@ -323,8 +323,8 @@
   "nested-insert/connect-or-create-forward": {
     "statements": [
       {
-        "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\") VALUES ($1, $2)\nON CONFLICT (\"email\") DO UPDATE SET \"email\" = \"excluded\".\"email\"\nRETURNING \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"",
-        "parameters": ["ada", "Ada"]
+        "sql": "SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\", \"users\".\"name\" AS \"name\", \"users\".\"active\" AS \"active\", \"users\".\"visits\" AS \"visits\", \"users\".\"balance\" AS \"balance\", \"users\".\"settings\" AS \"settings\", \"users\".\"tenant_id\" AS \"tenantId\", \"users\".\"created_at\" AS \"createdAt\"\nFROM \"users\" AS \"users\"\nWHERE (\"users\".\"email\" = $1)\nLIMIT 1",
+        "parameters": ["ada"]
       },
       {
         "sql": "INSERT INTO \"posts\" AS \"posts\"\n(\"slug\", \"title\", \"author_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"posts\".\"id\", 'slug', \"posts\".\"slug\", 'title', \"posts\".\"title\", 'body', \"posts\".\"body\", 'authorId', \"posts\".\"author_id\", 'editorId', \"posts\".\"editor_id\", 'views', (\"posts\".\"views\")::text, 'metadata', \"posts\".\"metadata\", 'document', \"posts\".\"document\", 'status', \"posts\".\"status\", 'labels', \"posts\".\"labels\", 'createdAt', \"posts\".\"created_at\") AS \"row\"",
@@ -359,11 +359,11 @@
         "parameters": [1, 1, 1, 1]
       },
       {
-        "sql": "INSERT INTO \"tags\" AS \"tags\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"",
+        "sql": "SELECT \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"\nFROM \"tags\" AS \"tags\"\nWHERE (\"tags\".\"label\" = $1)\nLIMIT 1",
         "parameters": ["bun"]
       },
       {
-        "sql": "INSERT INTO \"tags\" AS \"tags\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"",
+        "sql": "SELECT \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"\nFROM \"tags\" AS \"tags\"\nWHERE (\"tags\".\"label\" = $1)\nLIMIT 1",
         "parameters": ["postgres"]
       },
       {
@@ -447,8 +447,8 @@
         "parameters": ["acme", "Acme"]
       },
       {
-        "sql": "INSERT INTO \"records\" AS \"records\"\n(\"tenant_id\", \"external_id\", \"title\") VALUES ($1, $2, $3)\nON CONFLICT (\"external_id\", \"tenant_id\") DO UPDATE SET \"external_id\" = \"excluded\".\"external_id\", \"tenant_id\" = \"excluded\".\"tenant_id\"\nRETURNING \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\"",
-        "parameters": ["v1", "r3", "t"]
+        "sql": "SELECT \"records\".\"tenant_id\" AS \"tenantId\", \"records\".\"external_id\" AS \"externalId\", \"records\".\"title\" AS \"title\", \"records\".\"amount\" AS \"amount\"\nFROM \"records\" AS \"records\"\nWHERE (\"records\".\"external_id\" = $1 AND \"records\".\"tenant_id\" = $2)\nLIMIT 1",
+        "parameters": ["r3", "v1"]
       },
       {
         "sql": "UPDATE \"records\" AS \"records\" SET \"tenant_id\" = $1\nWHERE (\"records\".\"external_id\" = $2 AND \"records\".\"tenant_id\" = $3)",
@@ -463,8 +463,8 @@
         "parameters": ["core"]
       },
       {
-        "sql": "INSERT INTO \"memberships\" AS \"memberships\"\n(\"user_id\", \"group_id\", \"role\") VALUES ($1, $2, $3)\nON CONFLICT (\"group_id\", \"user_id\") DO UPDATE SET \"group_id\" = \"excluded\".\"group_id\", \"user_id\" = \"excluded\".\"user_id\"\nRETURNING \"memberships\".\"user_id\" AS \"userId\", \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"role\" AS \"role\"",
-        "parameters": [3, 1, "owner"]
+        "sql": "SELECT \"memberships\".\"user_id\" AS \"userId\", \"memberships\".\"group_id\" AS \"groupId\", \"memberships\".\"role\" AS \"role\"\nFROM \"memberships\" AS \"memberships\"\nWHERE (\"memberships\".\"group_id\" = $1 AND \"memberships\".\"user_id\" = $2)\nLIMIT 1",
+        "parameters": [1, 3]
       },
       {
         "sql": "UPDATE \"memberships\" AS \"memberships\" SET \"group_id\" = $1\nWHERE (\"memberships\".\"group_id\" = $2 AND \"memberships\".\"user_id\" = $3)",
@@ -475,8 +475,8 @@
   "nested-insert/deep": {
     "statements": [
       {
-        "sql": "INSERT INTO \"tenants\" AS \"tenants\"\n(\"code\", \"title\") VALUES ($1, $2)\nON CONFLICT (\"code\") DO UPDATE SET \"code\" = \"excluded\".\"code\"\nRETURNING \"tenants\".\"code\" AS \"code\", \"tenants\".\"title\" AS \"title\"",
-        "parameters": ["acme", "Acme"]
+        "sql": "SELECT \"tenants\".\"code\" AS \"code\", \"tenants\".\"title\" AS \"title\"\nFROM \"tenants\" AS \"tenants\"\nWHERE (\"tenants\".\"code\" = $1)\nLIMIT 1",
+        "parameters": ["acme"]
       },
       {
         "sql": "INSERT INTO \"users\" AS \"users\"\n(\"email\", \"name\", \"tenant_id\") VALUES ($1, $2, $3)\nRETURNING json_build_object('id', \"users\".\"id\", 'email', \"users\".\"email\", 'name', \"users\".\"name\", 'active', \"users\".\"active\", 'visits', \"users\".\"visits\", 'balance', (\"users\".\"balance\")::text, 'settings', \"users\".\"settings\", 'tenantId', \"users\".\"tenant_id\", 'createdAt', \"users\".\"created_at\") AS \"row\", json_build_object('id', \"users\".\"id\") AS \"result\"",
@@ -487,7 +487,7 @@
         "parameters": ["p", "P", 1]
       },
       {
-        "sql": "INSERT INTO \"tags\" AS \"tags\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"",
+        "sql": "SELECT \"tags\".\"id\" AS \"id\", \"tags\".\"label\" AS \"label\"\nFROM \"tags\" AS \"tags\"\nWHERE (\"tags\".\"label\" = $1)\nLIMIT 1",
         "parameters": ["x"]
       },
       {
@@ -563,8 +563,8 @@
   "nested-insert/connect-or-create-unique-index": {
     "statements": [
       {
-        "sql": "INSERT INTO \"handles\" AS \"handles\"\n(\"tenant\", \"handle\", \"active\") VALUES ($1, $2, $3)\nON CONFLICT (\"tenant\", \"handle\") DO UPDATE SET \"tenant\" = \"excluded\".\"tenant\", \"handle\" = \"excluded\".\"handle\"\nRETURNING \"handles\".\"id\" AS \"id\", \"handles\".\"tenant\" AS \"tenant\", \"handles\".\"handle\" AS \"handle\", \"handles\".\"active\" AS \"active\"",
-        "parameters": ["one", "ada", 1]
+        "sql": "SELECT \"handles\".\"id\" AS \"id\", \"handles\".\"tenant\" AS \"tenant\", \"handles\".\"handle\" AS \"handle\", \"handles\".\"active\" AS \"active\"\nFROM \"handles\" AS \"handles\"\nWHERE (\"handles\".\"tenant\" = $1 AND \"handles\".\"handle\" = $2)\nLIMIT 1",
+        "parameters": ["one", "ada"]
       },
       {
         "sql": "INSERT INTO \"aliases\" AS \"aliases\"\n(\"handle_id\", \"label\") VALUES ($1, $2)\nRETURNING json_build_object('id', \"aliases\".\"id\", 'handleId', \"aliases\".\"handle_id\", 'label', \"aliases\".\"label\") AS \"row\"",
@@ -988,7 +988,7 @@
     ]
   },
   "invalid/by-id-missing-field": {
-    "error": "symmetria: byId() requires exactly these key fields: externalId, tenantId"
+    "error": "symmetria: the primary key of \"records\" takes exactly these fields: externalId, tenantId"
   },
   "invalid/by-id-null": {
     "error": "symmetria: primary key \"id\" cannot be null or undefined"
@@ -1048,7 +1048,7 @@
     "error": "symmetria: relation \"notes.person\" is one() and resolves to the first match by the primary key of \"people\", which has none; declare a primary key or use many()"
   },
   "invalid/by-id-without-key": {
-    "error": "symmetria: byId() requires a primary key on \"plain\""
+    "error": "symmetria: \"plain\" has no primary key to look a row up by"
   },
   "invalid/transaction-retries": {
     "error": "symmetria: retries must be an integer between 0 and 20"
@@ -1181,7 +1181,7 @@
         "parameters": ["Notes", "10.00", 1]
       },
       {
-        "sql": "INSERT INTO \"genres\" AS \"genres\"\n(\"label\") VALUES ($1)\nON CONFLICT (\"label\") DO UPDATE SET \"label\" = \"excluded\".\"label\"\nRETURNING \"genres\".\"id\" AS \"id\", \"genres\".\"label\" AS \"label\"",
+        "sql": "SELECT \"genres\".\"id\" AS \"id\", \"genres\".\"label\" AS \"label\"\nFROM \"genres\" AS \"genres\"\nWHERE (\"genres\".\"label\" = $1)\nLIMIT 1",
         "parameters": ["math"]
       },
       {

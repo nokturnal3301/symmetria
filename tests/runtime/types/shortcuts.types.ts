@@ -10,6 +10,7 @@ import {
   sum,
   count,
   maximum,
+  sql,
 } from "../../../packages/runtime/src";
 
 type AreEqual<Actual, Expected> = [Actual] extends [Expected]
@@ -110,6 +111,49 @@ const model = schema({ users, posts, logs });
   keyed.accounts.get({ handle: "ada" });
   // @ts-expect-error without a primary key there is no bare value
   keyed.lines.get("started");
+  // A unique index on a descending column is a key like any other.
+  const ordered = table({ id: int.auto, tenant: text, slug: text }).indexes(
+    (row) => ({
+      slug: index(row.slug.desc).unique,
+      mixed: index(row.tenant, sql<string>`lower(${row.slug})`.desc).unique,
+    }),
+  );
+  const orderedKeys = schema({ ordered });
+  const bySlug = await orderedKeys.ordered.find({ slug: "a" });
+  type BySlug = Expect<
+    AreEqual<typeof bySlug, { id: number; tenant: string; slug: string } | null>
+  >;
+  // @ts-expect-error an index with an expression key is no key of columns
+  orderedKeys.ordered.find({ tenant: "t" });
+  // A unique index declared in the schema options is a key of its table.
+  const wide = schema(
+    {
+      handles: table({ id: int.auto, tenant: text, cover: text, low: text }),
+      others: table({ id: int.auto, tenant: text }),
+    },
+    {
+      indexes: ({ handles }) => ({
+        handles_wide: index(handles.tenant, handles.cover).unique,
+        handles_low: index(handles.low),
+      }),
+    },
+  );
+  const byCover = await wide.handles.find({ tenant: "t", cover: "c" });
+  type ByCover = Expect<
+    AreEqual<
+      typeof byCover,
+      { id: number; tenant: string; cover: string; low: string } | null
+    >
+  >;
+  wide.handles.by.handles_wide({ tenant: "t", cover: "c" });
+  // @ts-expect-error not unique
+  wide.handles.find({ low: "x" });
+  // @ts-expect-error the index belongs to another table
+  wide.others.find({ tenant: "t", cover: "c" });
+  // @ts-expect-error two keys at once name none
+  keyed.accounts.get({ id: 1, email: "ada@x.test" });
+  // @ts-expect-error a column beside the key
+  keyed.accounts.get({ tenant: "team", handle: "ada", email: "ada@x.test" });
 }
 
 {

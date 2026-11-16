@@ -83,15 +83,18 @@ test("stream() declares a cursor, fetches in batches and closes it inside one tr
     { id: 3, name: "Grace", views: 30n },
   ]);
   expect(statements.map((statement) => statement.sql.split(" ")[0])).toEqual([
+    "SET",
     "DECLARE",
     "FETCH",
     "FETCH",
     "CLOSE",
   ]);
-  expect(statements[0]!.sql).toMatch(
+  // Planned to be read to the end, like the plain query.
+  expect(statements[0]!.sql).toBe("SET LOCAL cursor_tuple_fraction = 1");
+  expect(statements[1]!.sql).toMatch(
     /^DECLARE "__symmetria_stream_\d+" NO SCROLL CURSOR FOR SELECT "users"\."id" AS "id"/,
   );
-  expect(statements[1]!.sql).toMatch(
+  expect(statements[2]!.sql).toMatch(
     /^FETCH FORWARD 2 FROM "__symmetria_stream_\d+"$/,
   );
   expect(events).toEqual(["begin", "commit"]);
@@ -115,6 +118,7 @@ test("breaking out of a stream closes the cursor and ends the transaction", asyn
   }
 
   expect(statements.map((statement) => statement.sql.split(" ")[0])).toEqual([
+    "SET",
     "DECLARE",
     "FETCH",
     "CLOSE",

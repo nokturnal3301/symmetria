@@ -46,7 +46,9 @@ export type Compilation = {
   scopes: ScopeSlot[] | undefined;
   /**
    * Renders every $scope() filter as a fixed marker without parameters, so
-   * the result describes the query whatever the callbacks currently return.
+   * the result describes the query whatever the callbacks currently return,
+   * and skips the rewrites that only make a statement faster, so the text
+   * stays the same from one release to the next.
    */
   readonly shapeOnly: boolean;
   readonly commonTables: Map<string, CommonTableExpression>;

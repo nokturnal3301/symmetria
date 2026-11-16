@@ -68,6 +68,56 @@ const decimalKey = (text: string, scale: number | undefined): string => {
   return `${parts[1] === "-" && digits !== 0n ? "-" : ""}${digits}e-${places}`;
 };
 
+const TIMESTAMP_TYPE =
+  /^(timestamptz|timestamp)(?:\s*\(\s*(\d)\s*\))?(?:\s+with(out)?\s+time\s+zone)?$/;
+const TIMESTAMP_TEXT =
+  /^(\d{4})-(\d\d)-(\d\d)[t ](\d\d):(\d\d):(\d\d)(?:\.(\d{1,6}))?\s*(z|[+-]\d\d(?::?\d\d)?)?$/;
+
+/**
+ * A timestamp as the microsecond its column stores: `timestamptz(0)` rounds
+ * two instants of one second to the same key, and `…+00:00` is `…Z`. Text in
+ * another spelling keeps its own.
+ */
+const timestampKey = (text: string, type: string): string | undefined => {
+  const column = TIMESTAMP_TYPE.exec(type);
+  const parts = column && TIMESTAMP_TEXT.exec(text.trim().toLowerCase());
+
+  if (!column || !parts) {
+    return undefined;
+  }
+
+  const zoned = column[1] === "timestamptz" || /with\s+time/.test(type);
+  const zone = parts[8];
+
+  // Without an offset the session's time zone decides, which only PostgreSQL knows.
+  if (zoned && !zone) {
+    return undefined;
+  }
+
+  const offset =
+    zoned && zone !== "z"
+      ? (zone![0] === "-" ? -1 : 1) *
+        (Number(zone!.slice(1, 3)) * 60 +
+          Number(zone!.slice(-2)) * (zone!.length > 3 ? 1 : 0))
+      : 0;
+  const milliseconds =
+    Date.UTC(
+      Number(parts[1]),
+      Number(parts[2]) - 1,
+      Number(parts[3]),
+      Number(parts[4]),
+      Number(parts[5]),
+      Number(parts[6]),
+    ) -
+    offset * 60_000;
+  const micros =
+    BigInt(milliseconds) * 1000n + BigInt((parts[7] ?? "").padEnd(6, "0"));
+  const unit = 10n ** BigInt(6 - Number(column[2] ?? 6));
+  const rest = ((micros % unit) + unit) % unit;
+
+  return `timestamp:${micros - rest + (rest * 2n >= unit ? unit : 0n)}`;
+};
+
 /**
  * The key of a text value as its column's type compares it: decimals by
  * value, UUIDs without regard to case, hyphens or braces, `char(n)` without
@@ -87,6 +137,12 @@ const typedKey = (text: string, sqlType: string): string => {
 
   if (type === "uuid") {
     return text.toLowerCase().replace(/[-{}]/g, "");
+  }
+
+  const timestamp = timestampKey(text, type);
+
+  if (timestamp) {
+    return timestamp;
   }
 
   return /^(?:char|character|bpchar)(?:\(|$)/.test(type)
@@ -111,7 +167,9 @@ const conflictKey = (
   const bound = value.value;
 
   if (bound instanceof Date) {
-    return `date:${bound.getTime()}`;
+    return Number.isNaN(bound.getTime())
+      ? undefined
+      : `value:${typedKey(bound.toISOString(), sqlType)}`;
   }
 
   return bound !== null && typeof bound === "object"

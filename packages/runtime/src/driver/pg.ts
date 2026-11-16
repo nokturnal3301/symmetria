@@ -237,6 +237,7 @@ export const postgres = (
           await cancellation?.end();
         }
       },
+      max: pool.options.max,
     },
     profiler,
   );

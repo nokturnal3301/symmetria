@@ -96,6 +96,8 @@ export const postgres = (
           await cancellation?.close();
         }
       },
+      // Bun.SQL opens ten connections unless told otherwise.
+      max: options.max ?? 10,
     },
     profiler,
   );

@@ -78,6 +78,8 @@ export const readCatalog = async (options: CatalogOptions) => {
     not_null: boolean;
     identity: string;
     default: string | null;
+    /** Whether `default` is the expression of a stored generated column. */
+    generated: boolean;
     /** The column's collation when it is not its type's default. */
     collation: string | null;
   }>(`
@@ -88,6 +90,7 @@ export const readCatalog = async (options: CatalogOptions) => {
       attribute.attnotnull AND NOT EXISTS (SELECT 1 FROM pg_constraint not_null WHERE not_null.conrelid = attribute.attrelid AND not_null.contype = 'n' AND NOT not_null.convalidated AND not_null.conkey[1] = attribute.attnum) AS not_null,
       attribute.attidentity AS identity,
       pg_get_expr(definition.adbin, definition.adrelid) AS default,
+      attribute.attgenerated <> '' AS generated,
       CASE WHEN attribute.attcollation <> typ.typcollation THEN collation_entry.collname::text ELSE NULL END AS collation
     FROM pg_attribute attribute JOIN pg_class relation ON relation.oid = attribute.attrelid
     JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace

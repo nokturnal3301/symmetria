@@ -156,6 +156,7 @@ const catalog = (
           not_null: !column.nullable,
           identity: column.identity ?? "",
           default: column.default ?? null,
+          generated: false,
           collation: column.collation ?? null,
         })),
     ),

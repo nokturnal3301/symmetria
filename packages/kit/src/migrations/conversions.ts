@@ -114,6 +114,50 @@ const lossy = (effect: string): TypeConversion => ({
 });
 
 /**
+ * A type change that only makes room: more digits before the decimal point, a
+ * longer `varchar`, `varchar` to `text`. PostgreSQL changes the column's
+ * declaration without rewriting the table or the indexes and constraints on
+ * it, so nothing that uses the column has to be dropped and built again.
+ */
+export const widens = (
+  before: MigrationColumn,
+  after: MigrationColumn,
+): boolean => {
+  if (
+    before.enumeration ||
+    after.enumeration ||
+    before.collation !== after.collation
+  ) {
+    return false;
+  }
+
+  const source = parse(before.sqlType);
+  const target = parse(after.sqlType);
+
+  if (source.array || target.array) {
+    return false;
+  }
+
+  if (DECIMALS.has(source.base) && DECIMALS.has(target.base)) {
+    return (
+      target.first === undefined ||
+      (source.first !== undefined &&
+        (source.second ?? 0) === (target.second ?? 0) &&
+        target.first >= source.first)
+    );
+  }
+
+  const VARYING = ["character varying", "varchar"];
+
+  return (
+    VARYING.includes(source.base) &&
+    (target.base === "text" ||
+      (VARYING.includes(target.base) &&
+        lengthLimit(target) >= lengthLimit(source)))
+  );
+};
+
+/**
  * How a column type change treats existing values, or undefined for a change
  * the generic type-change caution covers.
  */

@@ -12,6 +12,7 @@ import {
   timestamptz,
   oneOf,
   customType,
+  index,
 } from "../../../packages/runtime/src";
 import {
   diffSchemas,
@@ -651,4 +652,50 @@ test("schema lint passes renames like SQL lint does", () => {
   const plan = diffSchemas(before.$snapshot(), after.$snapshot(), { renames });
   expect(lintMigration(plan, renames)).toEqual([]);
   expect(lintMigrationSQL(formatMigrationSQL(plan.up))).toEqual([]);
+});
+
+test("a widened column keeps its indexes and checks; a narrowed one rebuilds them", () => {
+  const narrow = schema({
+    orders: table({ id: int.auto, total: numeric(14, 2), code: varchar(10) })
+      .indexes((order) => ({
+        total: index(order.total),
+        code: index(order.code),
+      }))
+      .checks((order) => ({ positive: order.total.atLeast("0") })),
+  }).$snapshot();
+  const wide = schema({
+    orders: table({ id: int.auto, total: numeric(16, 2), code: text })
+      .indexes((order) => ({
+        total: index(order.total),
+        code: index(order.code),
+      }))
+      .checks((order) => ({ positive: order.total.atLeast("0") })),
+  }).$snapshot();
+  const rescaled = schema({
+    orders: table({ id: int.auto, total: numeric(16, 4), code: varchar(10) })
+      .indexes((order) => ({
+        total: index(order.total),
+        code: index(order.code),
+      }))
+      .checks((order) => ({ positive: order.total.atLeast("0") })),
+  }).$snapshot();
+  const plan = diffSchemas(narrow, wide);
+
+  // PostgreSQL changes the declaration in place: nothing is rebuilt.
+  expect(plan.up).toEqual([
+    'ALTER TABLE "orders" ALTER COLUMN "total" TYPE numeric(16,2) USING "total"::numeric(16,2)',
+    'ALTER TABLE "orders" ALTER COLUMN "code" TYPE text USING "code"::text',
+  ]);
+  // The way back narrows, which every index and check has to follow.
+  expect(plan.down.filter((sql) => sql.startsWith("DROP INDEX"))).toEqual([
+    'DROP INDEX "orders_code_idx"',
+    'DROP INDEX "orders_total_idx"',
+  ]);
+  expect(plan.down).toContain(
+    'ALTER TABLE "orders" DROP CONSTRAINT "orders_positive_check"',
+  );
+  // A change of scale moves every value.
+  expect(diffSchemas(narrow, rescaled).up).toContain(
+    'DROP INDEX "orders_total_idx"',
+  );
 });

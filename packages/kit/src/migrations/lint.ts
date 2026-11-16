@@ -83,6 +83,18 @@ export const lintMigration = (
     );
   };
 
+  const rewritten = (table: string, column: MigrationColumn): void => {
+    if (column.generated !== undefined) {
+      report(
+        "caution",
+        table,
+        `Column "${column.name}" is computed and stored for every existing row; PostgreSQL rewrites the table while it holds a lock.`,
+        "On a large table run the migration in a quiet hour.",
+        column.name,
+      );
+    }
+  };
+
   const compareColumns = (
     before: MigrationTable,
     after: MigrationTable,
@@ -99,6 +111,12 @@ export const lintMigration = (
       const renamedTo = renamedColumns[column.name];
       const next = afterColumns.get(renamedTo ?? column.name);
 
+      // A generated column holds nothing of its own: PostgreSQL computes it
+      // again from the columns that stay.
+      if (!next && column.generated !== undefined) {
+        continue;
+      }
+
       if (!next) {
         report(
           "destructive",
@@ -107,6 +125,14 @@ export const lintMigration = (
           "Stop reading and writing the column in a release first, then drop it in a later migration.",
           column.name,
         );
+        continue;
+      }
+
+      if (column.generated !== undefined || next.generated !== undefined) {
+        if (column.generated !== next.generated) {
+          rewritten(after.name, next);
+        }
+
         continue;
       }
 
@@ -194,6 +220,11 @@ export const lintMigration = (
         beforeColumns.has(column.name) ||
         Object.values(renamedColumns).includes(column.name)
       ) {
+        continue;
+      }
+
+      if (column.generated !== undefined) {
+        rewritten(after.name, column);
         continue;
       }
 
@@ -343,11 +374,21 @@ export const lintMigration = (
     } else if (
       JSON.stringify(enumeration.values) !== JSON.stringify(next.values)
     ) {
+      const added = plan.up.some((statement) =>
+        statement.startsWith(
+          `ALTER TYPE ${quoteIdentifier(enumeration.name)} ADD VALUE `,
+        ),
+      );
+
       report(
         "caution",
         enumeration.name,
-        `Enum "${enumeration.name}" is rebuilt to change its labels.`,
-        "Dependent columns are rewritten while the type is replaced; plan for the lock.",
+        added
+          ? `Enum "${enumeration.name}" gains labels in place.`
+          : `Enum "${enumeration.name}" is rebuilt to change its labels.`,
+        added
+          ? "A new label can be used only after the migration that adds it commits."
+          : "Dependent columns are rewritten while the type is replaced; plan for the lock.",
       );
     }
   }

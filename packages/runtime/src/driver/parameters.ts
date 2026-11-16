@@ -20,8 +20,19 @@ const arrayLiteral = (values: unknown[]): string =>
 /**
  * node-postgres prints -0 as "0" and a Date in local time with a whole-minute
  * offset, which shifts historic instants whose offset has seconds. Bun.SQL
- * binds both exactly.
+ * binds both exactly, except a Date before year 1 or after 9999, which it
+ * prints in a form PostgreSQL does not read.
  */
+const farDate = (value: unknown): value is Date => {
+  if (!(value instanceof Date)) {
+    return false;
+  }
+
+  const year = value.getUTCFullYear();
+
+  return year < 1 || year > 9999;
+};
+
 const nodePostgresValue = (value: unknown): unknown => {
   if (isNegativeZero(value)) {
     return "-0";
@@ -46,14 +57,17 @@ export const postgresParameters = (
   for (const value of parameters) {
     if (
       Array.isArray(value) ||
-      (nodePostgres && (isNegativeZero(value) || value instanceof Date))
+      (nodePostgres && (isNegativeZero(value) || value instanceof Date)) ||
+      farDate(value)
     ) {
       return parameters.map((value) =>
         Array.isArray(value)
           ? arrayLiteral(value)
           : nodePostgres
             ? nodePostgresValue(value)
-            : value,
+            : farDate(value)
+              ? timestampText(value)
+              : value,
       );
     }
   }

@@ -51,6 +51,21 @@ import {
 /** Query handles share one prototype per database so methods stay cached. */
 let streamOrdinal = 0;
 
+const streams = new WeakMap<object, Set<() => Promise<void>>>();
+
+/**
+ * Ends the streams open on a driver, for `$close()`. A stream holds a
+ * transaction until its loop ends, and a loop that awaits `$close()` would
+ * wait for the close while the close waited for the loop. The loop's next
+ * step fails instead, and one that stops there (`break`, `return`) just ends.
+ */
+export const endStreams = async (owner: object): Promise<void> => {
+  await Promise.all([...(streams.get(owner) ?? [])].map((end) => end()));
+};
+
+const closedStream = () =>
+  new Error("symmetria: the database was closed while this stream was open");
+
 /**
  * Rows through a server-side cursor on a reserved connection. The hold callback
  * publishes the connection's executor and stays open until iteration finishes,
@@ -75,6 +90,38 @@ async function* streamRows(
   let failed = false;
   let execute: QueryExecutor | undefined;
   let declared = false;
+  // Between two rows the stream waits for its reader and owns no statement,
+  // so it can be ended there at once; a fetch in flight ends when it returns.
+  let waiting = false;
+  let closing = false;
+  let ended: Promise<void> | undefined;
+  const owner = (hold as { owner?: object }).owner;
+  const end = async () => {
+    closing = true;
+
+    if (waiting && execute) {
+      const run = execute;
+
+      await (ended ??= (async () => {
+        if (declared) {
+          await run({ sql: `CLOSE ${cursor}`, parameters: [] }).catch(() => {});
+        }
+
+        finished.resolve();
+        await held.catch(() => {});
+      })());
+    }
+  };
+
+  if (owner) {
+    let open = streams.get(owner);
+
+    if (!open) {
+      streams.set(owner, (open = new Set()));
+    }
+
+    open.add(end);
+  }
 
   try {
     execute = await Promise.race([
@@ -84,6 +131,13 @@ async function* streamRows(
       }),
     ]);
 
+    // A stream reads to the end, so its cursor is planned like the plain
+    // query. PostgreSQL otherwise plans a cursor to start fast, and may pick
+    // an approximate index (pgvector's) that returns only some of the rows.
+    await execute({
+      sql: "SET LOCAL cursor_tuple_fraction = 1",
+      parameters: [],
+    });
     await execute({
       sql: `DECLARE ${cursor} NO SCROLL CURSOR FOR ${compiled.sql}`,
       parameters: compiled.parameters,
@@ -98,8 +152,18 @@ async function* streamRows(
         }),
       );
 
+      if (closing) {
+        throw closedStream();
+      }
+
       for (const row of rows) {
+        waiting = true;
         yield decode(row);
+        waiting = false;
+
+        if (closing) {
+          throw closedStream();
+        }
       }
 
       if (rows.length < size) {
@@ -111,6 +175,22 @@ async function* streamRows(
     failed = true;
     throw error;
   } finally {
+    if (owner) {
+      streams.get(owner)?.delete(end);
+    }
+
+    // $close() has ended the transaction already; only the error, if the
+    // reader went on, is left to report.
+    if (ended) {
+      await ended;
+
+      if (failed) {
+        throw failure;
+      }
+
+      return;
+    }
+
     // Runs on completion, on an early `break` and on errors.
     if (!failed && declared && execute) {
       try {

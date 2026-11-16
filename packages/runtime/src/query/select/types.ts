@@ -50,6 +50,12 @@ declare const COLUMN_ORIGIN: unique symbol;
 export type ScopedColumn = SelectedColumn & {
   readonly [COLUMN_ORIGIN]: { readonly alias: string; readonly name: string };
 };
+/** The table a scoped column belongs to, when its type says which. */
+export type ColumnTable<Column> = Column extends {
+  readonly [COLUMN_ORIGIN]: { readonly alias: infer Alias extends string };
+}
+  ? Alias
+  : string;
 export type RootScope<Rows extends SchemaRows, RootTable extends string> = {
   [TableName in RootTable]: {
     row: Rows[RootTable];
@@ -73,6 +79,12 @@ export type Columns<
       readonly alias: Alias;
       readonly name: ColumnName;
     };
+    // The ordering of a column remembers it: a unique index on a descending
+    // column is a key of the table all the same.
+    readonly ascending: Ordering<ColumnName>;
+    readonly descending: Ordering<ColumnName>;
+    readonly asc: Ordering<ColumnName>;
+    readonly desc: Ordering<ColumnName>;
   };
 };
 export const RELATION_SOURCE = Symbol("symmetria.query.relation");
@@ -320,7 +332,9 @@ type ForeignKeyFields<
   Nullable extends boolean,
 > = {
   readonly [Name in keyof Relations[TableName] &
-    string as Relations[TableName][Name] extends { origin: `forward:${string}` }
+    string as Relations[TableName][Name] extends {
+    origin: `forward:${string}`;
+  }
     ? `${Name}Id`
     : never]: ForeignKeyReference<
     Relations[TableName][Name]["target"],
@@ -1019,11 +1033,14 @@ type KeyObject<Row, KeyNames extends keyof Row, UniqueKeys> =
   | {
       [Name in keyof UniqueKeys]: KeyColumns<Row, UniqueKeys[Name] & keyof Row>;
     }[keyof UniqueKeys];
+/**
+ * The columns of one key and no others: a key is tried as a whole, so a column
+ * beside it would name no key at all. The lookup runs at once, which leaves a
+ * `prepare()` parameter nothing to wait for; `byId()` and `by` take those.
+ */
 type KeyColumns<Row, Names extends keyof Row> = {
-  readonly [Name in Names]:
-    | NonNullable<Row[Name]>
-    | Parameter<NonNullable<Row[Name]>>;
-};
+  readonly [Name in Names]: NonNullable<Row[Name]>;
+} & { readonly [Other in Exclude<keyof Row, Names>]?: never };
 /** `get()` / `find()`: the whole row, or the fields a shape selects. */
 type KeyRead<
   Rows extends SchemaRows,

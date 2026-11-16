@@ -4,11 +4,16 @@ import { readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   schema,
+  table,
+  index,
+  createDatabase,
   int,
   text,
   varchar,
+  numeric,
   oneOf,
 } from "../../../packages/runtime/src";
+import { fullText } from "../../../packages/runtime/src/entries/search";
 import {
   postgres,
   transactionPooling,
@@ -226,6 +231,156 @@ describe.skipIf(!url)("migration engine on PostgreSQL", () => {
       expect(await runner().migrate()).toEqual([shorten.id]);
       expect(await runner().rollback()).toEqual([shorten.id]);
       expect(await rows("SELECT name FROM users")).toEqual([{ name: "Alex" }]);
+    }));
+
+  test("a full-text search added to a table with rows stores its document, and follows its columns", () =>
+    sandbox(async ({ directory, driver, namespace, rows, runner }) => {
+      const columns = (length: number) => ({
+        id: int.auto,
+        title: varchar(length),
+        body: text,
+      });
+      const plain = schema({ notes: table(columns(40)) });
+      const notes = (length: number) =>
+        schema({
+          notes: table(columns(length)).search((note) => ({
+            about: { words: fullText({ A: note.title, B: note.body }) },
+          })),
+        });
+      const clean = (model: { $snapshot: typeof plain.$snapshot }) =>
+        detectDrift({
+          execute: driver.execute,
+          snapshot: model.$snapshot(),
+          schemaName: namespace,
+          ignoreTables: ["_symmetria_migrations"],
+        });
+
+      await generateMigration({
+        directory,
+        name: "initial",
+        snapshot: plain.$snapshot(),
+      });
+      await runner().migrate();
+      await rows(
+        "INSERT INTO notes (title, body) VALUES ('Garage keys', 'On the hook by the door'), ('Passport', 'Top drawer of the desk')",
+      );
+
+      const searched = (await generateMigration({
+        directory,
+        name: "search",
+        snapshot: notes(40).$snapshot(),
+      }))!;
+
+      expect(searched.up).toContain("GENERATED ALWAYS AS");
+      await runner().migrate();
+      expect(await clean(notes(40))).toEqual([]);
+
+      // Rows written before the search are found: PostgreSQL computed their documents.
+      const database = createDatabase({ schema: notes(40), driver });
+
+      expect(
+        await database.notes.search((note) => ({ title: note.title }), {
+          about: "garage",
+        }),
+      ).toEqual([{ title: "Garage keys" }]);
+      await database.notes.insert({
+        title: "Bike",
+        body: "Keys are in the shed",
+      });
+      await database.notes.update(
+        { body: "Sold it" },
+        { where: { title: "Bike" } },
+      );
+      expect(
+        await database.notes.search((note) => ({ title: note.title }), {
+          about: "shed",
+        }),
+      ).toEqual([]);
+
+      // PostgreSQL refuses to retype a column the document is computed from.
+      const wider = (await generateMigration({
+        directory,
+        name: "wider",
+        snapshot: notes(80).$snapshot(),
+      }))!;
+
+      await runner().migrate();
+      expect(await clean(notes(80))).toEqual([]);
+      expect(
+        await database.notes.search((note) => ({ title: note.title }), {
+          about: "passport",
+        }),
+      ).toEqual([{ title: "Passport" }]);
+      expect(await runner().rollback()).toEqual([wider.id]);
+      expect(await clean(notes(40))).toEqual([]);
+      expect(await runner().rollback()).toEqual([searched.id]);
+      expect(await clean(plain)).toEqual([]);
+    }));
+
+  test("widening a column rewrites neither the table nor its indexes", () =>
+    sandbox(async ({ directory, driver, namespace, rows, runner }) => {
+      const orders = (total: 14 | 16, wideCode: boolean) =>
+        schema({
+          orders: table({
+            id: int.auto,
+            total: numeric(total, 2),
+            code: wideCode ? text : varchar(10),
+          })
+            .indexes((order) => ({
+              total: index(order.total),
+              code: index(order.code),
+            }))
+            .checks((order) => ({ positive: order.total.atLeast("0") })),
+        });
+
+      await generateMigration({
+        directory,
+        name: "initial",
+        snapshot: orders(14, false).$snapshot(),
+      });
+      await runner().migrate();
+      await rows(
+        "INSERT INTO orders (total, code) SELECT n, 'c' || n FROM generate_series(1, 500) AS n",
+      );
+
+      // A file on disk per table and index: a rewrite or a rebuild gives a new one.
+      const files = () =>
+        rows(
+          "SELECT c.relname, c.relfilenode FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname LIKE 'orders%' AND c.relkind IN ('r', 'i') ORDER BY 1",
+          [namespace],
+        );
+      const before = await files();
+      const widen = (await generateMigration({
+        directory,
+        name: "widen",
+        snapshot: orders(16, true).$snapshot(),
+      }))!;
+
+      expect(widen.up).not.toContain("DROP INDEX");
+      expect(await runner().migrate()).toEqual([widen.id]);
+      expect(await files()).toEqual(before);
+      expect(
+        await detectDrift({
+          execute: driver.execute,
+          snapshot: orders(16, true).$snapshot(),
+          schemaName: namespace,
+          ignoreTables: ["_symmetria_migrations"],
+        }),
+      ).toEqual([]);
+      await rows(
+        "INSERT INTO orders (total, code) VALUES (12345678901234.56, 'a code of any length')",
+      );
+      await rows("DELETE FROM orders WHERE id > 500");
+      // The way back narrows again, with the indexes rebuilt around it.
+      expect(await runner().rollback()).toEqual([widen.id]);
+      expect(
+        await detectDrift({
+          execute: driver.execute,
+          snapshot: orders(14, false).$snapshot(),
+          schemaName: namespace,
+          ignoreTables: ["_symmetria_migrations"],
+        }),
+      ).toEqual([]);
     }));
 
   test(

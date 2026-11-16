@@ -13,9 +13,14 @@ import {
 } from "../query/expressions";
 import { createScope } from "../query/select/scope";
 import type { RuntimeScope } from "../query/select/types";
-import { hiddenColumn } from "./column";
+import { hiddenColumn, tsvector } from "./column";
 import { vector } from "../entries/vector";
-import { index, operatorClass, type IndexDefinition } from "./indexes";
+import {
+  index,
+  operatorClass,
+  storedIndex,
+  type IndexDefinition,
+} from "./indexes";
 import {
   searchLowering,
   type TableIndexCallback,
@@ -306,7 +311,10 @@ export const declaredSearches = (
   return Object.freeze(searches);
 };
 
-/** The document a full-text search matches and its GIN index stores. */
+/** The hidden column that stores a full-text search's document. */
+export const wordsColumn = (search: string): string => `${search}Words`;
+
+/** The document a full-text search matches; a generated column stores it. */
 export const wordsDocument = (words: NonNullable<Search["words"]>) =>
   searchDocument(
     Object.fromEntries(
@@ -366,6 +374,24 @@ export const lowerSearch = (
         vector(search.meaning.model.size).nullable,
       );
     }
+
+    if (search.words?.kind === "fullText") {
+      const stored = wordsColumn(search.name);
+
+      if (
+        names.has(stored) ||
+        Object.hasOwn(columns, stored) ||
+        Object.hasOwn(state.slots, stored) ||
+        Object.hasOwn(state.throughs, stored)
+      ) {
+        throw new Error(
+          `symmetria: search "${search.name}" keeps its document in a column named "${stored}", which the table already has`,
+        );
+      }
+
+      // PostgreSQL computes it from the text columns on every write.
+      columns[stored] = hiddenColumn(tsvector.nullable);
+    }
   }
 
   const indexes: TableIndexCallback = (table) => {
@@ -382,9 +408,12 @@ export const lowerSearch = (
       }
 
       if (search.words?.kind === "fullText") {
-        definitions[`${search.name}Words`] = index(
-          wordsDocument(search.words),
-        ).using("gin");
+        // Ranking reads the stored document; parsing the text of every
+        // matching row again is what made a common word slow.
+        definitions[`${search.name}Words`] = storedIndex(
+          index(wordsDocument(search.words)).using("gin"),
+          wordsColumn(search.name),
+        );
       }
 
       if (search.words?.kind === "bm25") {

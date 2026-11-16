@@ -328,8 +328,12 @@ export interface Predicate {
   readonly or: (...conditions: OptionalPredicate[]) => Predicate;
 }
 
-export interface Ordering {
+declare const ORDERED_COLUMN: unique symbol;
+
+export interface Ordering<Column extends string = string> {
   readonly [ORDERING_EXPRESSION]: OrderingDescription;
-  readonly nullsFirst: Ordering;
-  readonly nullsLast: Ordering;
+  /** In the types only: the table column sorted by, when the ordering is of one. */
+  readonly [ORDERED_COLUMN]?: Column;
+  readonly nullsFirst: Ordering<Column>;
+  readonly nullsLast: Ordering<Column>;
 }

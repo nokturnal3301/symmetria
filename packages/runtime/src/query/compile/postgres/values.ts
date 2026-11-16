@@ -1,3 +1,5 @@
+import { timestampText } from "../../codecs";
+
 /** PostgreSQL array literal, retaining null elements and codec-encoded JSON. */
 export const postgresArrayLiteral = (values: readonly unknown[]): string =>
   `{${values
@@ -8,16 +10,12 @@ export const postgresArrayLiteral = (values: readonly unknown[]): string =>
 
       const text =
         value instanceof Date
-          ? value.toISOString()
+          ? timestampText(value)
           : value instanceof Uint8Array
             ? `\\x${Buffer.from(value).toString("hex")}`
-            : typeof value === "boolean"
-              ? value
-                ? "t"
-                : "f"
-              : typeof value === "object"
-                ? JSON.stringify(value)
-                : String(value);
+            : typeof value === "object"
+              ? JSON.stringify(value)
+              : String(value);
 
       return `"${text.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
     })

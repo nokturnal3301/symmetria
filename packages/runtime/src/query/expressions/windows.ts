@@ -48,6 +48,23 @@ export const over = <Expression extends SelectedColumn>(
   OutputNameOf<Expression>,
   TraitsOf<Expression>
 > => {
+  for (const key of Object.keys(options)) {
+    if (key !== "partitionBy" && key !== "orderBy" && key !== "rows") {
+      throw new Error(
+        `symmetria: over() takes partitionBy, orderBy and rows, not "${key}"`,
+      );
+    }
+  }
+
+  if (
+    options.partitionBy !== undefined &&
+    !Array.isArray(options.partitionBy)
+  ) {
+    throw new Error(
+      "symmetria: over() partitionBy is a list, such as [post.authorId]",
+    );
+  }
+
   const description = readColumn(expression);
   const ordering = options.orderBy
     ? Array.isArray(options.orderBy)

@@ -549,9 +549,9 @@ A query that is given options and no fields reads the source's own columns,
 computed fields included: `await db.users({ where: { active: true } })`. A CTE
 or a derived table reads the fields it was built with the same way,
 `await ranked({ where: (post) => post.position.atMost(3) })`. A bare table is
-not such a query (`await db.users` reads nothing and is a type error), and
-neither is a grouped source. Inside a shape, the tools carry the same columns as
-`row`, for "everything plus":
+not such a query (`await db.users` reads nothing and is refused when awaited),
+and neither is a grouped source. Inside a shape, the tools carry the same
+columns as `row`, for "everything plus":
 
 ```ts
 db.posts((post, { row }) => ({ ...row, author: post.author.name }));
@@ -1120,7 +1120,9 @@ a connection, declares a `NO SCROLL` cursor, fetches `size` rows at a time
 `break` or an error. Memory stays flat regardless of the result size. Inside
 `$transaction` the stream uses the transaction's connection and sees its
 uncommitted writes; the transaction stays usable between rows, and a stream
-still open when the callback returns rolls the transaction back. Unlike
+still open when the callback returns rolls the transaction back. `$close()` does
+not wait for a stream: it ends the stream's transaction, and a loop that reads
+on fails with "the database was closed while this stream was open". Unlike
 `pages()`, no ordering key is required, but the reserved connection is held
 until the loop finishes, so do not keep a stream open while waiting on unrelated
 work.
@@ -1502,9 +1504,14 @@ await db.posts
 - `connectOrCreate` takes a **flat insert payload**, including every required
   target field. `undefined` fields, operations and relations are omitted. It
   chooses the first populated unique key (PK, unique columns, then indexes) and
-  uses `ON CONFLICT DO UPDATE` on those key fields. Existing non-key fields are
-  preserved; database UPDATE triggers can run. Supply only the intended
-  identifying key when several alternatives exist.
+  first reads the row by those key fields. Only when there is none does it
+  insert, with `ON CONFLICT DO UPDATE` on the key in case another transaction
+  created the row meanwhile. An existing row is therefore not locked or
+  rewritten, and its non-key fields are preserved. Several `connectOrCreate`
+  entries of one relation are resolved in key order, not input order, so two
+  inserts that create the same rows cannot deadlock; the links keep the input
+  order. Supply only the intended identifying key when several alternatives
+  exist.
 
 Reverse `connect` reparents the existing child; junction `connect` adds a link.
 Supply a forward relation or its scalar FK, never both. Relation targets require
@@ -1534,8 +1541,9 @@ and one INSERT of the posts. A row or child whose only nested operations connect
 what it references (an order item and its product) therefore joins the multi-row
 INSERT of its neighbours. A row this insert creates itself is still found by a
 later `connect`, with a statement of its own. `connectOrCreate` and targets
-created through a junction resolve one by one; the junction rows of one
-operation are then one multi-row INSERT.
+created through a junction resolve one by one (a row a `connect` of the same
+insert has read already is not read again); the junction rows of one operation
+are then one multi-row INSERT.
 
 ## CTEs and window functions
 
@@ -2282,6 +2290,26 @@ another vector column or expression, or a `prepare()` parameter declared with
 `orderBy` a distance plus `limit`, which lets HNSW and IVFFlat indexes serve
 them.
 
+An HNSW index is approximate in a way that can silently lose rows: it picks
+`hnsw.ef_search` candidates (40 unless set) and applies the query's other
+filters afterwards, so `limit: 100`, or a `where` that most neighbours fail,
+would return fewer rows than exist. Every query ordered by an ascending distance
+with a `limit` therefore widens the index scan for its own statement: the index
+returns as many rows as `limit` and `offset` ask for (1000 is pgvector's
+ceiling) and, from pgvector 0.8, keeps scanning in exact order until enough rows
+pass the filters (`hnsw.iterative_scan = strict_order`). The settings are made
+with `set_config(…, true)`, which lasts for the transaction; outside
+`$transaction()` that is the one statement. A filter that keeps very few rows
+makes the index look far, so index the filter column as well: PostgreSQL then
+sorts those few rows exactly instead. An IVFFlat index the schema declares on
+the column reads on past its nearest lists in the same way
+(`ivfflat.iterative_scan = relaxed_order`); it then returns rows only roughly in
+order, so the statement sorts the rows it got once more, exactly. How many lists
+it starts with is still `ivfflat.probes`, yours to set. `page()` ordered by a
+distance compares rows exactly, without the vector index, since pages must cover
+every row once; `stream()` plans its cursor to read every row
+(`cursor_tuple_fraction = 1`), so it returns what `await` returns.
+
 `schema(defs, { extensions: ["vector"] })` records the extension in the
 snapshot: generated migrations start with `CREATE EXTENSION IF NOT EXISTS`,
 `drift` reports `missing-extension`, and removing it from the schema leaves a
@@ -2326,14 +2354,19 @@ const found = await db.chunks.search(
 `.search()` call or in several. Each has `words`, `meaning` or both:
 
 - `words: fullText(parts, { language })` uses PostgreSQL's own full-text search,
-  which every server has, and creates a GIN index. `words: bm25(parts)` ranks
-  with BM25, which weighs rare words more than common ones and long texts more
-  fairly; it needs the `pg_search` extension (ParadeDB, for example the
-  `paradedb/paradedb` image) and creates its `bm25` index. The server must load
-  the library (`shared_preload_libraries = 'pg_search'`); the image sets that
-  when it creates a data directory, so a database first created by another image
-  needs the setting and a restart. `parts` is a column, an array of columns, or
-  a weight map `{ A, B, C, D }` in which `A` counts most. `language` is a text
+  which every server has. The document is kept in a hidden generated column
+  (`aboutWords`, `tsvector GENERATED ALWAYS AS (…) STORED`) with a GIN index:
+  PostgreSQL computes it on every write, also for rows written outside
+  Symmetria, and ranking reads it instead of parsing the text of every matching
+  row again. Adding the search to a table with rows computes the column for all
+  of them, which rewrites the table once. `words: bm25(parts)` ranks with BM25,
+  which weighs rare words more than common ones and long texts more fairly; it
+  needs the `pg_search` extension (ParadeDB, for example the `paradedb/paradedb`
+  image) and creates its `bm25` index. The server must load the library
+  (`shared_preload_libraries = 'pg_search'`); the image sets that when it
+  creates a data directory, so a database first created by another image needs
+  the setting and a restart. `parts` is a column, an array of columns, or a
+  weight map `{ A, B, C, D }` in which `A` counts most. `language` is a text
   search configuration; the default `"simple"` does no stemming and works for
   any language.
 - `meaning: model(...columns)` keeps an embedding of those columns' text and
@@ -2408,6 +2441,13 @@ A string is matched by words where the search declares them and embedded by the
 model where it declares a meaning. An array is an embedding you computed
 yourself, and `{ text, vector }` gives both without a call to the model. Any
 word of the question may match: a question shares few words with its answer.
+
+With `where`, or under `$scope()`, a search by meaning first counts the rows
+that pass the filter, up to 10,001. Up to 10,000 of them are ranked exactly, one
+by one, which a filter on an indexed column (a tenant, an owner, a note) makes a
+matter of milliseconds; more than that are ranked through the vector index,
+which then keeps scanning until `candidates` rows have passed the filter. An
+empty question finds nothing and asks no model.
 
 Each way of searching is a ranked list of primary keys in a CTE, limited to
 `candidates`; several lists are merged by reciprocal rank fusion, where a row
@@ -2757,7 +2797,9 @@ locally; query, row and insert types are still fully resolved.
 
 Schema-level `schema(definitions, { indexes: ({ posts }) => ({ ... }) })` is
 also supported, with fully resolved FK value types. Its keys are schema-wide SQL
-names (snake_case, without the table prefix or `_idx` suffix).
+names (snake_case, without the table prefix or `_idx` suffix). A unique index
+declared there is a key of its table like one declared with `.indexes()`:
+`find({ tenant, cover })` and `by.<index name>` accept it, in the types too.
 
 Index metadata lives in `$snapshot().tables[].indexes`.
 `createIndexesSQL(snapshot, options)` also compiles it independently. DDL

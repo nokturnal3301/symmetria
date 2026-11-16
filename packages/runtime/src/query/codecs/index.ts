@@ -49,6 +49,24 @@ export const booleanCodec: Codec<boolean> & { readonly sqlType: "boolean" } = {
   decode: (value) => value === true || value === 1 || value === 1n,
 };
 
+/**
+ * A boolean column takes `true` or `false`. Past the types, Bun binds `1` as
+ * an integer, which PostgreSQL refuses for one row and reads as true in an
+ * array of a hundred; both fail here instead, with the value in the message.
+ */
+const booleanColumnCodec: RuntimeCodec = {
+  encode: (value: unknown) => {
+    if (typeof value !== "boolean") {
+      throw new Error(
+        `symmetria: boolean values are true or false, received ${typeof value === "string" ? JSON.stringify(value) : String(value)}`,
+      );
+    }
+
+    return value;
+  },
+  decode: (value) => value,
+};
+
 /** COUNT and ranking results are safe integers in practice; decode them as numbers. */
 export const countCodec: Codec<number> = {
   encode: (value) => value,
@@ -94,7 +112,8 @@ export const numericCodec: Codec<string> = {
       );
     }
 
-    return value;
+    // A driver may bind a JavaScript number as a float and round it.
+    return typeof value === "string" ? value : String(value);
   },
   decode: (value) => String(value),
 };
@@ -237,7 +256,8 @@ const integerCodec = (
         (typeof value === "number" &&
           !(Number.isInteger(value) && value >= -limit && value < limit)) ||
         (typeof value === "bigint" &&
-          (value < -BigInt(limit) || value >= BigInt(limit)))
+          (value < -BigInt(limit) || value >= BigInt(limit))) ||
+        typeof value === "boolean"
       ) {
         throw new Error(
           `symmetria: ${sqlType} values are integers from ${-limit} to ${limit - 1}, received ${String(value)}`,
@@ -267,8 +287,24 @@ const dateText = (year: number, month: number, day: number): string =>
 /** Calendar dates stay text in PostgreSQL's form; a driver Date is read in UTC (Bun) or local time (pg midnight). */
 export const dateCodec: RuntimeCodec = {
   sqlType: "date",
-  encode: (value) =>
-    (value as unknown) instanceof Date ? dateCodec.decode(value) : value,
+  encode: (value) => {
+    if (!((value as unknown) instanceof Date)) {
+      // Past the types: the drivers disagree on what a number is as a date.
+      if (typeof value !== "string") {
+        throw new Error(
+          `symmetria: date values are text such as "2024-01-31" or Dates, received ${typeof value}`,
+        );
+      }
+
+      return value;
+    }
+
+    if (Number.isNaN((value as unknown as Date).getTime())) {
+      throw new Error("symmetria: date values cannot be an invalid Date");
+    }
+
+    return dateCodec.decode(value);
+  },
   decode: (value) => {
     if (value instanceof Date) {
       // Bun parses dates as UTC midnight; node-postgres as local midnight.
@@ -481,6 +517,13 @@ const timestampParameter =
   (sqlType: string) =>
   (value: unknown): unknown => {
     if (!(value instanceof Date)) {
+      // Past the types: the drivers disagree on what a number is as a time.
+      if (typeof value !== "string") {
+        throw new Error(
+          `symmetria: ${sqlType} values are Dates or text, received ${typeof value}`,
+        );
+      }
+
       return value;
     }
 
@@ -518,6 +561,10 @@ export const codecFor = (sqlType: string): RuntimeCodec | undefined => {
 
   if (sqlType === "date") {
     return dateCodec;
+  }
+
+  if (sqlType === "boolean") {
+    return booleanColumnCodec;
   }
 
   if (sqlType === "interval") {

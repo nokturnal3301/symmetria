@@ -64,6 +64,8 @@ export const jsonPrecisionSql = (
   return compilation.renderer.cast(value, { kind: "text", array: !!array });
 };
 
+const BARE_PARAMETER = /^\(*\$\d+\)*$/;
+
 const buildsJson = (node: ValueNode): boolean =>
   node.kind === "jsonObject" || node.kind === "jsonRows";
 
@@ -92,7 +94,8 @@ export const valueSql = (
   const existing = cache?.find(
     (entry) =>
       sameExpression(entry.node, node) &&
-      (entry.jsonOutput === jsonOutput || !containsNode(node, buildsJson)),
+      (entry.jsonOutput === jsonOutput ||
+        (!compilation.shapeOnly && !containsNode(node, buildsJson))),
   );
 
   if (existing) {
@@ -100,7 +103,12 @@ export const valueSql = (
   }
 
   const sql = renderValue(compilation, node, bindings, jsonOutput);
-  cache?.push({ node, sql, jsonOutput });
+
+  // A bare `$1` takes its type from where it stands, so two clauses that
+  // shared one could give it two types; each keeps a parameter of its own.
+  if (!BARE_PARAMETER.test(sql)) {
+    cache?.push({ node, sql, jsonOutput });
+  }
 
   return sql;
 };

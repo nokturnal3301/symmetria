@@ -21,6 +21,7 @@ import {
   type RuntimeScope,
   type ScopedColumn,
 } from "../query/select";
+import type { ColumnTable } from "../query/select/types";
 import type {
   CompiledQuery,
   QueryExecutor,
@@ -103,7 +104,21 @@ type IndexDescription = {
   readonly include: readonly SelectedColumn[];
   readonly where?: ConditionDescription;
   readonly with?: IndexStorageOptions;
+  /** The column that stores the single key's expression; the index is on the column. */
+  readonly stored?: string;
 };
+
+/**
+ * An index on an expression that a generated column keeps: the column stores
+ * what the expression computes, so a query reads it instead of computing it
+ * again for every row. For `search()`; not part of the public API.
+ * @internal
+ */
+export const storedIndex = (
+  definition: IndexDefinition,
+  column: string,
+): IndexDefinition =>
+  defineIndex({ ...definition[INDEX_DEFINITION], stored: column });
 
 /** Attaches a PostgreSQL operator class to an index key (`text_pattern_ops`, `vector_cosine_ops`, ...). */
 export const operatorClass = <Key extends SelectedColumn | Ordering>(
@@ -162,29 +177,32 @@ export interface IndexDefinition<
   ColumnNames extends string = string,
   Unique extends boolean = boolean,
   Complete extends boolean = boolean,
+  /** The table of the keys, where a schema-level callback names it. */
+  Table extends string = string,
 > {
   readonly [INDEX_TYPES]: {
     columns: ColumnNames;
     unique: Unique;
     complete: Complete;
+    table: Table;
   };
   readonly [INDEX_DEFINITION]: IndexDescription;
-  readonly unique: IndexDefinition<ColumnNames, true, Complete>;
+  readonly unique: IndexDefinition<ColumnNames, true, Complete, Table>;
   readonly using: (
     method: IndexMethod,
-  ) => IndexDefinition<ColumnNames, Unique, Complete>;
+  ) => IndexDefinition<ColumnNames, Unique, Complete, Table>;
   readonly include: (
     first: SelectedColumn,
     ...columns: SelectedColumn[]
-  ) => IndexDefinition<ColumnNames, Unique, Complete>;
+  ) => IndexDefinition<ColumnNames, Unique, Complete, Table>;
   /** A partial index: a predicate, or a boolean expression such as ``sql<boolean>`${posts.deletedAt} IS NULL` ``. */
   readonly where: (
     condition: SchemaCondition,
-  ) => IndexDefinition<ColumnNames, Unique, false>;
+  ) => IndexDefinition<ColumnNames, Unique, false, Table>;
   /** Storage parameters: `index(...).using("hnsw").with({ m: 16, ef_construction: 64 })`. */
   readonly with: (
     options: Record<string, string | number>,
-  ) => IndexDefinition<ColumnNames, Unique, Complete>;
+  ) => IndexDefinition<ColumnNames, Unique, Complete, Table>;
 }
 export type IndexSnapshot = {
   readonly name: string;
@@ -241,11 +259,28 @@ type KeyName<Key> =
     ? Name
     : Key extends ScopedColumn & SelectedColumn<unknown, infer Name>
       ? Name
-      : never;
+      : Key extends Ordering<infer Name>
+        ? // An ordering of an expression names no column.
+          string extends Name
+          ? never
+          : Name
+        : never;
+
+/** Whether every key is a column: an expression among them leaves no key of columns. */
+type ColumnKeys<Keys> = Keys extends readonly [infer First, ...infer Rest]
+  ? [KeyName<First>] extends [never]
+    ? false
+    : ColumnKeys<Rest>
+  : true;
 
 export const index = <const Keys extends readonly [IndexKey, ...IndexKey[]]>(
   ...[first, ...keys]: Keys
-): IndexDefinition<KeyName<Keys[number]>, false, true> => {
+): IndexDefinition<
+  KeyName<Keys[number]>,
+  false,
+  ColumnKeys<Keys>,
+  ColumnTable<Keys[number]>
+> => {
   if (!first) {
     throw new Error("symmetria: an index requires at least one key");
   }
@@ -255,7 +290,12 @@ export const index = <const Keys extends readonly [IndexKey, ...IndexKey[]]>(
     unique: false,
     method: "btree",
     include: Object.freeze([]),
-  }) as IndexDefinition<KeyName<Keys[number]>, false, true>;
+  }) as IndexDefinition<
+    KeyName<Keys[number]>,
+    false,
+    ColumnKeys<Keys>,
+    ColumnTable<Keys[number]>
+  >;
 };
 
 /**
@@ -415,6 +455,16 @@ export const applyIndexes = (
 
     if (!owner) {
       throw new Error("symmetria: index keys must reference a table column");
+    }
+
+    if (description.stored) {
+      const column = owner.table.columns.find(
+        (candidate) => candidate.name === description.stored,
+      )!;
+
+      // The key is `(expression)`; the column stores it and takes its place.
+      column.generated = keys[0]!.slice(1, -1);
+      keys[0] = quoteIdentifier(column.sqlName);
     }
 
     const include = description.include.map((column) =>
