@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.0.0 — 2026-11-17
 
 Fixes from a bug hunt over 2.5.0: complex reads, cursor pages, tenant scopes,
 transactions, value round trips, search and about ninety schema migrations were
