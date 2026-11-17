@@ -617,7 +617,8 @@ export const localJoin = (
     context.registry,
     context.plan,
     kind === "AUTO"
-      ? relation.nullable
+      ? relation.nullable ||
+        Object.hasOwn(context.registry.scopes, relation.target)
         ? "LEFT"
         : "INNER"
       : relationKind(kind),

@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased
+
+Fixes from a bug hunt over 2.5.0: complex reads, cursor pages, tenant scopes,
+transactions, value round trips, search and about ninety schema migrations were
+compared with hand-written SQL on PostgreSQL 16 and 18.
+
+### Changed behaviour
+
+- **An UPDATE or DELETE whose filter holds for every row is refused.** A list
+  that filtered down to nothing
+  (`where: (post) => [userId && post.authorId.is(userId)]` without a user),
+  `where: []`, `and()`, `not(or())` and `notIn([])` used to write the whole
+  table; they now throw "where() leaves no condition", as `where: {}` already
+  did. `.all()` remains the way to write every row. A filter no row passes
+  (`in([])`, `or()`) still writes nothing.
+- **A `$scope()` no longer stands in for a filter.** `tenant.posts.delete()`
+  deleted every post of the tenant; it is refused like an unscoped
+  `posts.delete()`, and `tenant.posts.delete().all()` says it.
+- **Under `$scope()`, a path to a scoped table keeps the row.** A required
+  relation was an INNER JOIN with the scope in its `ON`, so a comment whose
+  author the scope hides vanished from any query that read, filtered or ordered
+  by `comment.author.name`, and `post.comments.every(…)` did not count it. The
+  path is now a LEFT JOIN when its target has a scope: the row stays and the
+  field is `null` (its type still says `string`). The smart `join()` follows;
+  `innerJoin()` keeps the old result.
+
+### Runtime (`symmetria`)
+
+- 2.5.0 regression: code started inside a `$transaction()` and still running
+  after it (a timer, a background loop, a promise nobody awaited) was refused
+  with "would wait forever" on every later query through the database, although
+  the connection was free again; with `max: 1` one `setTimeout` was enough. Only
+  transactions that are still open count now.
+- `forUpdate` / `forShare` failed with "FOR UPDATE cannot be applied to the
+  nullable side of an outer join" when the query followed an optional relation
+  (`post.editor.name`). Without `of`, such a query locks its root table and the
+  tables joined with INNER JOIN.
+- `symmetria/pg` asks every new connection for PostgreSQL's default output of
+  intervals, `bytea` and doubles, as it did for dates: with
+  `bytea_output = escape` every `bytea` read threw, `IntervalStyle` changed the
+  text of an interval, and `extra_float_digits = 0` read `0.30000000000000004`
+  as `0.3`. `bytea` is read in the `escape` form on both adapters.
+- `sql` is a template tag only: `sql(["now()"])`, called as a function, ran its
+  argument as SQL.
+- Refused by name instead of by PostgreSQL or not at all: an array as a key of
+  `get()` / `find()` / `byId()`, `limit: "5"`, and an object or array written to
+  a `text` or `varchar` column (it was stored as its JSON text).
+- `symmetria/better-auth`: `incrementOne` without a filter says `.all()`.
+
+### Kit (`symmetria-kit`)
+
+- Dropping a column that a full-text search read failed with "cannot drop column
+  … because other objects depend on it": the generated document column is now
+  dropped first.
+- Replacing an embedding model by one of another length failed on the first
+  stored embedding ("expected 1536 dimensions, not 1024"). The migration empties
+  the column (`USING NULL`) and `lint` reports it as destructive; run
+  `search.reindex()` afterwards.
+- A type change PostgreSQL has no cast for (`integer` to `uuid`, a value to an
+  array of it) produced SQL that failed even on an empty table; `generate`
+  refuses it and asks for the conversion under `using` in the `--diff` file.
+
 ## 2.5.0 — 2026-11-17
 
 Fixes from a bug hunt over 2.4.0: five areas (reads, bulk writes, key lookups

@@ -85,19 +85,28 @@ export const createPostgresDriver = (
     return pending.track(operation());
   };
 
-  // How many of the pool's connections the transactions and sessions around
-  // the running code hold. When that is all of them, a request to the pool
-  // from inside would wait for a connection its own caller is holding.
-  const held = new AsyncLocalStorage<number>();
-  const holding = <Argument, Result>(
+  // The transactions and sessions around the running code, each holding one
+  // of the pool's connections while it is open. When they hold all of them, a
+  // request to the pool from inside would wait for a connection its own caller
+  // is holding. Code started inside one and still running after it ended
+  // (a timer, a background loop) inherits the list, so only open ones count.
+  type Holder = { open: boolean };
+  const held = new AsyncLocalStorage<readonly Holder[]>();
+  const holding = async <Argument, Result>(
+    run: (callback: (driver: Argument) => Promise<Result>) => Promise<Result>,
     callback: (driver: Argument) => Promise<Result>,
-  ) => {
-    const count = (held.getStore() ?? 0) + 1;
+  ): Promise<Result> => {
+    const holder: Holder = { open: true };
+    const holders = [...(held.getStore() ?? []), holder];
 
-    return (driver: Argument) => held.run(count, () => callback(driver));
+    try {
+      return await run((driver) => held.run(holders, () => callback(driver)));
+    } finally {
+      holder.open = false;
+    }
   };
   const free = <Value>(operation: () => Promise<Value>): Promise<Value> =>
-    (held.getStore() ?? 0) >= pool.max
+    (held.getStore() ?? []).filter((holder) => holder.open).length >= pool.max
       ? Promise.reject(
           new Error(
             `symmetria: this query asks the pool for a connection from inside ${pool.max === 1 ? "a transaction that holds the only one" : `transactions that hold all ${pool.max} of them`}, and would wait forever; run it on the transaction's own database (the callback's argument) or raise max`,
@@ -113,13 +122,18 @@ export const createPostgresDriver = (
         const connection = await pool.connect();
 
         try {
-          return await runTransaction(connection, holding(callback), options);
+          return await holding(
+            (inside) => runTransaction(connection, inside, options),
+            callback,
+          );
         } finally {
           connection.release();
         }
       }),
     session: (callback) =>
-      free(() => runPostgresSession(pool, holding(callback))),
+      free(() =>
+        holding((inside) => runPostgresSession(pool, inside), callback),
+      ),
     close: () => (closing ??= pending.settle().then(() => pool.close())),
   };
 

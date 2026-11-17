@@ -266,7 +266,12 @@ export const mutationSql = (
       }
     }
   } else {
-    if (!query.predicates.length && !query.unrestricted) {
+    // A $scope() bounds the write but does not choose its rows: every row of
+    // a tenant still takes all().
+    if (
+      !query.predicates.some((predicate) => predicate.kind !== "scope") &&
+      !query.unrestricted
+    ) {
       throw new Error(
         `symmetria: ${query.kind}() on "${query.root.table.name}" has no where(); call .all() to ${query.kind === "update" ? "update" : "delete"} every row`,
       );

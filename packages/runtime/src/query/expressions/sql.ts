@@ -61,6 +61,14 @@ export const sqlTemplate = <Value, Traits = RawTraits>(
   codec?: RuntimeCodec,
   sqlType?: string,
 ): SqlTemplate<Value, Traits> => {
+  // Called as a function, `sql(text)` would run its argument as SQL: only a
+  // template literal, whose text the source code wrote, is accepted.
+  if (!Array.isArray(strings) || !Array.isArray(strings.raw)) {
+    throw new Error(
+      "symmetria: sql is a template tag: write sql`…${value}…`, not sql(text)",
+    );
+  }
+
   const parts: (string | ValueNode)[] = [];
   strings.forEach((text, index) => {
     parts.push(text);

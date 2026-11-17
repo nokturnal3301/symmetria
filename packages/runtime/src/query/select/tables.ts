@@ -283,6 +283,20 @@ export const createQueryTables = (
     ): SelectPlan => {
       const binding = shapeFrame.bindings ? freeze({ ...root }) : root;
       const values = keyValues.map((value, position) => {
+        if (
+          Array.isArray(value) &&
+          !keys[position]!.sqlType.endsWith("[]") &&
+          !keys[position]!.sqlType.startsWith("json")
+        ) {
+          dataError(
+            new Error(
+              `symmetria: ${label} "${keys[position]!.name}" takes one value, received an array`,
+            ),
+          );
+
+          return null;
+        }
+
         if (value !== null && value !== undefined) {
           return value;
         }

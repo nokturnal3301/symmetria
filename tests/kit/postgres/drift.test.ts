@@ -269,7 +269,11 @@ describe.skipIf(!databaseUrl)("PostgreSQL drift definitions", () => {
           Object.fromEntries(
             Object.entries(conditions).map(([name, condition]) => [
               name,
-              sql<boolean>([condition] as unknown as TemplateStringsArray),
+              sql<boolean>(
+                // The tag takes template literals only; text built at run
+                // time has to be made into one on purpose.
+                Object.assign([condition], { raw: [condition] }),
+              ),
             ]),
           ),
         )

@@ -364,6 +364,30 @@ export const bytesCodec: RuntimeCodec = {
       return Uint8Array.from(Buffer.from(value.slice(2), "hex"));
     }
 
+    // `bytea_output = escape`, which a pooler may keep where a SET does not
+    // reach: printable bytes as they are, two backslashes for one, and a
+    // backslash with three octal digits for any other byte.
+    if (
+      typeof value === "string" &&
+      /^(?:[\x20-\x5b\x5d-\x7e]|\\\\|\\[0-3][0-7]{2})*$/.test(value)
+    ) {
+      const bytes: number[] = [];
+
+      for (let index = 0; index < value.length; index += 1) {
+        if (value[index] !== "\\") {
+          bytes.push(value.charCodeAt(index));
+        } else if (value[index + 1] === "\\") {
+          bytes.push(92);
+          index += 1;
+        } else {
+          bytes.push(Number.parseInt(value.slice(index + 1, index + 4), 8));
+          index += 3;
+        }
+      }
+
+      return Uint8Array.from(bytes);
+    }
+
     throw new Error(
       `symmetria: cannot read bytea value ${JSON.stringify(value)}`,
     );

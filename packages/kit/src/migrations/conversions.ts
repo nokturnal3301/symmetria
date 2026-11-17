@@ -22,6 +22,11 @@ export type TypeConversion = {
    * so the migration fails until they are moved or changed.
    */
   readonly refused?: boolean;
+  /**
+   * No value can be converted, so the column is emptied (`USING NULL`): an
+   * embedding of one length says nothing as an embedding of another.
+   */
+  readonly cleared?: boolean;
 };
 
 type ParsedType = {
@@ -158,6 +163,34 @@ export const widens = (
 };
 
 /**
+ * A type change PostgreSQL has no cast for, so `USING "column"::type` fails
+ * even on an empty table: a `uuid` from or to anything but text, and a value
+ * from or to an array of it unless one side is text.
+ */
+export const castless = (
+  before: MigrationColumn,
+  after: MigrationColumn,
+): boolean => {
+  if (before.enumeration || after.enumeration) {
+    return false;
+  }
+
+  const source = parse(before.sqlType);
+  const target = parse(after.sqlType);
+  const textual = (type: ParsedType) => !type.array && STRINGS.has(type.base);
+
+  if (textual(source) || textual(target)) {
+    return false;
+  }
+
+  return (
+    source.array !== target.array ||
+    (source.base !== target.base &&
+      (source.base === "uuid" || target.base === "uuid"))
+  );
+};
+
+/**
  * How a column type change treats existing values, or undefined for a change
  * the generic type-change caution covers.
  */
@@ -176,6 +209,26 @@ export const typeConversion = (
 
   if (source.array !== target.array) {
     return undefined;
+  }
+
+  // pgvector refuses a vector of another length, so every stored embedding
+  // would fail the cast. A nullable column is emptied instead, and the model
+  // of the new length computes the embeddings again.
+  if (
+    source.base === "vector" &&
+    target.base === "vector" &&
+    !source.array &&
+    source.first !== undefined &&
+    target.first !== undefined &&
+    source.first !== target.first &&
+    !after.notNull
+  ) {
+    return {
+      ...lossy(
+        `stored vectors of ${source.first} numbers cannot become vectors of ${target.first}, so the column is emptied`,
+      ),
+      cleared: true,
+    };
   }
 
   if (STRINGS.has(target.base)) {
@@ -309,4 +362,4 @@ export const conversionMessage = (
   after: MigrationColumn,
   conversion: TypeConversion,
 ): string =>
-  `Column "${after.name}" narrows from ${before.enumeration ?? before.sqlType} to ${after.enumeration ?? after.sqlType}: ${conversion.effect}.`;
+  `Column "${after.name}" ${conversion.cleared ? "changes" : "narrows"} from ${before.enumeration ?? before.sqlType} to ${after.enumeration ?? after.sqlType}: ${conversion.effect}.`;

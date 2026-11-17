@@ -8,7 +8,7 @@ import {
   renameExpressionIdentifiers,
 } from "./expression-tokens";
 import { expressionKey, indexKeyKey } from "./expressions";
-import { typeConversion, utcConversion, widens } from "./conversions";
+import { castless, typeConversion, utcConversion, widens } from "./conversions";
 import type { CompiledQuery, SchemaSnapshot } from "symmetria";
 import {
   columnSQL,
@@ -806,12 +806,20 @@ const direction = (
   }
 
   for (const pair of pairs) {
-    for (const column of pair.before.columns) {
-      if (!pair.columns.some((match) => match.before.name === column.name)) {
-        statements.push(
-          `ALTER TABLE ${quoteIdentifier(pair.after.name)} DROP COLUMN ${quoteIdentifier(column.name)}`,
-        );
-      }
+    const leaving = pair.before.columns.filter(
+      (column) =>
+        !pair.columns.some((match) => match.before.name === column.name),
+    );
+
+    // A generated column goes before the columns it is computed from, which
+    // PostgreSQL refuses to drop while it depends on them.
+    for (const column of [
+      ...leaving.filter((column) => column.generated !== undefined),
+      ...leaving.filter((column) => column.generated === undefined),
+    ]) {
+      statements.push(
+        `ALTER TABLE ${quoteIdentifier(pair.after.name)} DROP COLUMN ${quoteIdentifier(column.name)}`,
+      );
     }
   }
 
@@ -944,13 +952,22 @@ const direction = (
         // A cast would use the migrating session's time zone.
         const atUtc =
           supplied === undefined ? utcConversion(previous, next) : undefined;
+        if (supplied === undefined && castless(previous, next)) {
+          throw new Error(
+            `symmetria: PostgreSQL has no cast from ${previous.sqlType} to ${next.sqlType} for "${pair.after.name}"."${next.name}", so the migration could not run; give the conversion for both directions in the --diff file: { "using": { "${pair.after.name}": { "${next.name}": { "up": "…", "down": "…" } } } }`,
+          );
+        }
+
+        const change = typeConversion(previous, next);
         const conversion =
           supplied ??
-          (typeConversion(previous, next)?.assignmentCast
+          (change?.assignmentCast
             ? undefined
-            : atUtc === "value"
-              ? `${quoteIdentifier(current)} AT TIME ZONE 'UTC'`
-              : `${quoteIdentifier(current)}${previous.enumeration || next.enumeration ? "::text" : ""}::${columnTypeSQL(next)}`);
+            : change?.cleared
+              ? "NULL"
+              : atUtc === "value"
+                ? `${quoteIdentifier(current)} AT TIME ZONE 'UTC'`
+                : `${quoteIdentifier(current)}${previous.enumeration || next.enumeration ? "::text" : ""}::${columnTypeSQL(next)}`);
 
         // An array has no AT TIME ZONE and USING takes no subquery, so the
         // cast itself runs with the zone set to UTC.

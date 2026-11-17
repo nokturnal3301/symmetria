@@ -357,8 +357,8 @@ export const symmetriaAdapter = (
           },
 
           incrementOne: async ({ model, where, increment, set }) => {
-            const [row] = await table(model)
-              .update((current: Loose) => ({
+            const [row] = await filtered(
+              table(model).update((current: Loose) => ({
                 ...set,
                 ...Object.fromEntries(
                   Object.entries(increment).map(([field, delta]) => [
@@ -366,9 +366,9 @@ export const symmetriaAdapter = (
                     current[field].plus(delta),
                   ]),
                 ),
-              }))
-              .where(filter(where))
-              .returning();
+              })),
+              where,
+            ).returning();
 
             return row ?? null;
           },

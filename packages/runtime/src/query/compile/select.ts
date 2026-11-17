@@ -377,11 +377,34 @@ const renderSelect = (
   );
 
   if (query.locking) {
+    // PostgreSQL cannot lock the nullable side of an outer join and refuses a
+    // lock that names no tables there. A relation path adds such a JOIN by
+    // itself (`post.editor.name`), so the lock then names the tables it can
+    // reach: the root and the inner-joined ones.
+    const outer = query.joins.some((join) => join.kind === "LEFT");
+    const reachable =
+      !query.locking.of &&
+      outer &&
+      query.joins.every((join) => join.kind !== "RIGHT" && join.kind !== "FULL")
+        ? [
+            query.root,
+            ...query.joins
+              .filter(
+                (join) =>
+                  join.kind !== "LEFT" &&
+                  !join.binding.cte &&
+                  !join.binding.cteReference,
+              )
+              .map((join) => join.binding),
+          ].map((binding) => aliasSql(compilation, binding))
+        : undefined;
     const lock = compilation.renderer.rowLock({
       mode: query.locking.mode,
-      of: query.locking.of?.map((alias) =>
-        aliasSql(compilation, query.bindings[alias]!),
-      ),
+      of:
+        reachable ??
+        query.locking.of?.map((alias) =>
+          aliasSql(compilation, query.bindings[alias]!),
+        ),
       noWait: !!query.locking.noWait,
       skipLocked: !!query.locking.skipLocked,
     });

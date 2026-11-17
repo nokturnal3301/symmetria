@@ -350,6 +350,11 @@ export const countValue = (
   count: number | Parameter<number>,
 ): number | PlaceholderNode => {
   if (typeof count !== "number") {
+    // Such as "5" from a request's query string.
+    if (count === null || typeof count !== "object") {
+      throw new Error(`symmetria: ${name} must be a nonnegative safe integer`);
+    }
+
     const node = readColumn(count).node;
 
     if (node.kind !== "placeholder") {

@@ -22,6 +22,7 @@ import { columnsOnly } from "../select/suggest";
 import { PREPARE_QUERY, preparePlan } from "../select/prepared";
 import {
   and,
+  COLUMN_EXPRESSION,
   readPredicate,
   valueNode,
   jsonNullNode,
@@ -62,6 +63,49 @@ const jsonNullValue = (
   }
 };
 
+/**
+ * A condition every row passes whatever the data: a list that filtered down to
+ * nothing (`[userId && …]` without a user), `and()`, `not(or())`, `notIn([])`.
+ */
+const unconditional = (description: PredicateDescription): boolean => {
+  switch (description.kind) {
+    case "group":
+      return description.operator === "AND"
+        ? description.predicates.every(unconditional)
+        : description.predicates.some(unconditional);
+    case "not":
+      return impossible(description.predicate);
+    case "membership":
+      return (
+        description.negated &&
+        Array.isArray(description.values) &&
+        !description.values.length
+      );
+    default:
+      return false;
+  }
+};
+
+/** A condition no row passes: `or()`, `in([])`. */
+const impossible = (description: PredicateDescription): boolean => {
+  switch (description.kind) {
+    case "group":
+      return description.operator === "OR"
+        ? description.predicates.every(impossible)
+        : description.predicates.some(impossible);
+    case "not":
+      return unconditional(description.predicate);
+    case "membership":
+      return (
+        !description.negated &&
+        Array.isArray(description.values) &&
+        !description.values.length
+      );
+    default:
+      return false;
+  }
+};
+
 export const createMutation = (
   kind: MutationPlan["kind"],
   root: TableBinding,
@@ -96,12 +140,28 @@ export const createMutation = (
       return Array.isArray(result) ? and(...result) : (result as Predicate);
     };
 
+    // A filter that holds for every row is a missing filter: the write would
+    // reach the whole table without saying so.
+    const conditional = (
+      description: PredicateDescription,
+    ): PredicateDescription => {
+      if (unconditional(description)) {
+        throw new Error(
+          `symmetria: ${kind}() where() leaves no condition (an empty list, and() or notIn([]) holds for every row); call .all() to ${kind} every row`,
+        );
+      }
+
+      return description;
+    };
+
     if (!options.context) {
-      return readPredicate(evaluate(scope[root.alias]!));
+      return conditional(readPredicate(evaluate(scope[root.alias]!)));
     }
 
     const context = options.context(initialPlan(root));
-    const description = readPredicate(evaluate(context.scope()[root.alias]!));
+    const description = conditional(
+      readPredicate(evaluate(context.scope()[root.alias]!)),
+    );
 
     if (!context.plan.joins.length) {
       return description;
@@ -197,6 +257,24 @@ export const createMutation = (
         dataError(
           new Error(
             `symmetria: "${root.alias}.${name}" is generated always; use defaultValue`,
+          ),
+        );
+      }
+
+      // A text column would store an object as its JSON text without a word.
+      if (
+        typeof value === "object" &&
+        value !== null &&
+        !root.codecs[name] &&
+        !(COLUMN_EXPRESSION in value) &&
+        /^(?:text|varchar|character varying|char|character|bpchar)\b/.test(
+          column.sqlType,
+        ) &&
+        !column.sqlType.endsWith("[]")
+      ) {
+        dataError(
+          new Error(
+            `symmetria: "${root.alias}.${name}" is ${column.sqlType} and takes a string, received ${Array.isArray(value) ? "an array" : "an object"}`,
           ),
         );
       }

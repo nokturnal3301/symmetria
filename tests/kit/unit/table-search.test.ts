@@ -119,3 +119,59 @@ test("adding a search to an existing table adds the column and indexes, and remo
   // The same declaration again is no change.
   expect(diffSchemas(after, after).up).toEqual([]);
 });
+
+test("a source column that leaves is dropped after the document computed from it", () => {
+  const both = schema({
+    documents: table({ id: int.auto, title: text, body: text }).search(
+      (document) => ({
+        about: { words: fullText([document.title, document.body]) },
+      }),
+    ),
+  }).$snapshot();
+  const titleOnly = schema({
+    documents: table({ id: int.auto, title: text }).search((document) => ({
+      about: { words: fullText([document.title]) },
+    })),
+  }).$snapshot();
+  const { up, down } = diffSchemas(both, titleOnly);
+
+  // PostgreSQL refuses to drop a column a generated column depends on.
+  expect(up.indexOf('ALTER TABLE "documents" DROP COLUMN "about_words"')).toBe(
+    up.indexOf('ALTER TABLE "documents" DROP COLUMN "body"') - 1,
+  );
+  expect(up.filter((statement) => statement.includes("DROP COLUMN"))).toEqual([
+    'ALTER TABLE "documents" DROP COLUMN "about_words"',
+    'ALTER TABLE "documents" DROP COLUMN "body"',
+  ]);
+  expect(
+    down.findIndex((statement) => statement.includes('ADD COLUMN "body"')),
+  ).toBeLessThan(
+    down.findIndex((statement) =>
+      statement.includes('ADD COLUMN "about_words"'),
+    ),
+  );
+});
+
+test("a model of another length empties the embeddings instead of failing on them", () => {
+  const eight = embedder(8, async (texts) => texts.map(() => Array(8).fill(0)));
+  const declared = (meaning: typeof model) =>
+    schema({
+      documents: plain().search((document) => ({
+        about: { meaning: meaning(document.body) },
+      })),
+    }).$snapshot();
+  const plan = diffSchemas(declared(model), declared(eight));
+
+  expect(plan.up).toContain(
+    'ALTER TABLE "documents" ALTER COLUMN "about" TYPE vector(8) USING NULL',
+  );
+  expect(plan.down).toContain(
+    'ALTER TABLE "documents" ALTER COLUMN "about" TYPE vector(4) USING NULL',
+  );
+  expect(
+    lintMigration(plan).map((finding) => [finding.level, finding.message]),
+  ).toContainEqual([
+    "destructive",
+    'Column "about" changes from vector(4) to vector(8): stored vectors of 4 numbers cannot become vectors of 8, so the column is emptied.',
+  ]);
+});

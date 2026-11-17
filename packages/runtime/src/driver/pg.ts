@@ -138,13 +138,19 @@ export const postgres = (
 
   const pool = new Pool(config);
   pool.on("error", () => {});
-  // The parsers read PostgreSQL's ISO output. A database or role may set
-  // another DateStyle (`SQL, DMY` prints 05/03/2024), which would read as the
-  // wrong day or not at all, so every new connection asks for ISO first. The
-  // statement is queued ahead of the first query; it only fails with its
-  // connection, which the query behind it then reports.
+  // The parsers read PostgreSQL's default output forms. A database or role
+  // may set others: DateStyle `SQL, DMY` prints 05/03/2024, which would read
+  // as the wrong day or not at all; IntervalStyle changes an interval's text;
+  // `bytea_output = escape` is not the hex form; `extra_float_digits = 0`
+  // prints a double short of its last digits. Every new connection asks for
+  // the defaults first. The statement is queued ahead of the first query; it
+  // only fails with its connection, which the query behind it then reports.
   pool.on("connect", (client) => {
-    client.query("SET DateStyle TO ISO").catch(() => {});
+    client
+      .query(
+        "SET DateStyle TO ISO; SET IntervalStyle TO postgres; SET bytea_output TO hex; SET extra_float_digits TO 1",
+      )
+      .catch(() => {});
   });
 
   let cancellation: Pool | undefined;

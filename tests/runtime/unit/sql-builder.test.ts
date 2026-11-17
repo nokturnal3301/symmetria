@@ -20,6 +20,7 @@ import {
   coalesce,
   exists,
   not,
+  or,
   defaultValue,
   table,
   index,
@@ -715,7 +716,11 @@ test("$scope filters reads, writes, paths, joins and collections of scoped table
   expect(tenant.posts.byId(3).toSQL().sql).toContain(
     'WHERE "posts"."author_id" = $1 AND "posts"."id" = $2',
   );
-  expect(tenant.posts.delete().toSQL()).toEqual({
+  // The scope bounds a write; every row inside it still takes all().
+  expect(() => tenant.posts.delete().toSQL()).toThrow(
+    'delete() on "posts" has no where(); call .all() to delete every row',
+  );
+  expect(tenant.posts.delete().all().toSQL()).toEqual({
     sql: 'DELETE FROM "posts" AS "posts"\nWHERE "posts"."author_id" = $1',
     parameters: [7],
   });
@@ -870,12 +875,31 @@ test("UPDATE and DELETE where() combines predicate arrays with AND, like the whe
       .where((posts) => [posts.author.name.is("Ada"), posts.views.is(0n)])
       .toSQL().sql,
   ).toContain('"__symmetria_path_0"."name" = $1 AND "posts"."views" = $2');
+  // A list that filtered down to nothing is a missing filter, not "every row".
+  const nobody: number | undefined = undefined;
+
+  for (const empty of [
+    () => model.posts.delete().where(() => []),
+    () =>
+      model.posts
+        .delete()
+        .where((posts) => [nobody && posts.authorId.is(nobody)]),
+    () => model.posts.delete().where(() => and()),
+    () => model.posts.delete().where(() => not(or())),
+    () => model.posts.delete({ where: [] }),
+    () => model.posts.delete({ where: (posts) => posts.id.notIn([]) }),
+    () => model.posts.update({ title: "x" }, { where: () => [and(), and()] }),
+  ]) {
+    expect(empty).toThrow("leaves no condition");
+  }
+
+  // A filter no row passes is a filter: it writes nothing.
   expect(
     model.posts
       .delete()
-      .where(() => [])
+      .where(() => or())
       .toSQL().sql,
-  ).toBe('DELETE FROM "posts" AS "posts"\nWHERE TRUE');
+  ).toBe('DELETE FROM "posts" AS "posts"\nWHERE FALSE');
 });
 
 test("UPDATE and DELETE accept relation paths and quantifiers through primary-key subqueries", () => {

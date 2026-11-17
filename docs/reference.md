@@ -637,7 +637,12 @@ including generic plans.
 
 For row-lock controls, PostgreSQL emits the requested lock. Choose one lock mode
 and one of `noWait` / `skipLocked`. `of` names must identify sources in the
-query, including aliases introduced by local JOINs.
+query, including aliases introduced by local JOINs. PostgreSQL cannot lock the
+rows of the optional side of a LEFT JOIN, which a path such as
+`post.editor.name` adds by itself. Without `of`, a query that has a LEFT JOIN
+therefore locks what can be locked, its root table and the tables joined with
+INNER JOIN (`FOR UPDATE OF "posts"`); a query without one locks every table, as
+before.
 
 #### Local JOINs
 
@@ -1027,10 +1032,12 @@ which is every value `condition && predicate` can produce, so optional filters
 read `[q && title.ilike(q), minPrice !== undefined && price.atLeast(minPrice)]`
 without branching and type-check for `q: string | undefined`. An empty search
 string adds no filter; use `when()` or an explicit comparison when `0` or `""`
-is a real value; a mutation list that filters down to nothing still means
-`WHERE TRUE`, and a single `false` returned from a mutation callback is an error
-rather than "no filter". `whereNotNull()` adds a predicate and returns a
-narrowed expression.
+is a real value. A read whose list filters down to nothing reads every row; an
+UPDATE or DELETE whose list does is refused, because `[userId && …]` without a
+user would otherwise write the whole table (see
+[INSERT, UPDATE, DELETE](#insert-update-delete)). A single `false` returned from
+a mutation callback is an error rather than "no filter". `whereNotNull()` adds a
+predicate and returns a narrowed expression.
 
 ### Several reads in one statement
 
@@ -1387,13 +1394,18 @@ columns accept safe integers on write and in comparisons. Relation paths in
 `where()` compile to a primary-key subquery
 (`WHERE "posts"."id" IN (SELECT ... JOIN ...)`), so they need a primary key.
 UPDATE/DELETE without `where()` are refused when compiled; `.all()` spells out a
-deliberate whole-table write. Scoped databases and lookups count as
-restrictions. `where()` may return an array of predicates combined with `AND`,
-like the `where` option; an empty array adds no restriction.
-`onConflict().doNothing()` handles conflicts. `doUpdate("name", "active")`
-assigns those fields from `excluded`; object and callback forms support custom
-assignments. `doUpdate(values, { where: (current, incoming) => … })` updates the
-conflicting row only when the condition holds, for example
+deliberate whole-table write. A lookup (`byId()`, `by.email()`) counts as a
+filter; a `$scope()` does not: it bounds the write, and every row inside it
+still takes `.all()`. `where()` may return an array of predicates combined with
+`AND`, like the `where` option. A filter that holds for every row is refused
+like a missing one, with "where() leaves no condition": an empty array, a list
+whose entries were all skipped (`[userId && post.authorId.is(userId)]` without a
+user), `and()`, `not(or())` and `notIn([])`. A filter no row passes, such as
+`in([])` or `or()`, is a filter and writes nothing. `onConflict().doNothing()`
+handles conflicts. `doUpdate("name", "active")` assigns those fields from
+`excluded`; object and callback forms support custom assignments.
+`doUpdate(values, { where: (current, incoming) => … })` updates the conflicting
+row only when the condition holds, for example
 `incoming.version.above(current.version)`; otherwise nothing is written,
 `affectedRows` is `0` and a single-row `returning()` resolves to `null`. In a
 scoped database, a conflicting row outside the scope throws
@@ -1805,8 +1817,10 @@ another column) instead.
 ### Raw SQL expressions
 
 `sql<Value>` is a typed template escape hatch: interpolated values become
-parameters and column expressions remain identifiers. The caller supplies the
-result type and any PostgreSQL casts needed by raw SQL, for example:
+parameters and column expressions remain identifiers. It is a template tag only:
+`sql(text)` called as a function would run its argument as SQL and throws. The
+caller supplies the result type and any PostgreSQL casts needed by raw SQL, for
+example:
 ``sql<string>`concat(${"Hello "}::text, ${users.name})`.as("greeting")``.
 
 `sql.of(column)` types and decodes the fragment like that column type, on every
@@ -2055,9 +2069,17 @@ PostgreSQL SQL and normalize execution results to `{ rows, affectedRows }`. The
 declarations describe those options themselves, so TypeScript projects need no
 `@types/pg`. The Bun adapter accepts Bun SQL PostgreSQL options plus `profiler`.
 Both preserve bigint and numeric values. The `pg` adapter installs parsers per
-pool, leaving global node-postgres configuration untouched, and sets `DateStyle`
-to ISO on every new connection, so a database or role that prints dates another
-way (`SQL, DMY`) still reads correctly.
+pool, leaving global node-postgres configuration untouched, and sets the output
+settings its parsers rely on for every new connection (`DateStyle` ISO,
+`IntervalStyle` postgres, `bytea_output` hex, `extra_float_digits` 1), so a
+database or role that prints dates, intervals, binary values or doubles another
+way still reads correctly. `bytea` is also read in the `escape` form on either
+adapter. Bun's pool has no place to run such a statement and sends most values
+in binary, which these settings do not touch; where a database or role changes
+`IntervalStyle` or `extra_float_digits`, give the defaults to the Bun adapter
+yourself:
+`postgres({ url, connection: { IntervalStyle: "postgres", extra_float_digits: 1 } })`
+(a connection pooler must allow these start-up parameters).
 
 Transactions and nested savepoints reserve a single connection, and its
 operations run one at a time in call order on both drivers. Use
@@ -2460,6 +2482,11 @@ If the model fails at search time and the search also declares words, the rows
 are found by words alone and the result says so: `rows.partial` is
 `{ search: "about", error }`. A search that has only a meaning rejects instead.
 
+A model replaced by one of another length changes the column's type
+(`vector(1024)` to `vector(1536)`). No stored embedding can be converted, so the
+migration empties the column (`USING NULL`), `lint` reports that as destructive,
+and `reindex()` computes the embeddings again afterwards.
+
 Not included: a search inside a nested relation (`note.chunks.search(...)`),
 inside `$batch()`, and a migration warning when a model is replaced by another
 of the same size (embeddings of different models cannot be compared; clear the
@@ -2545,7 +2572,9 @@ has already run some of its statements. A scope that is NULL for a row counts as
 outside. The check runs in the same statement (its `RETURNING` clause evaluates
 the scope for every written row), so it costs no extra round trip, and unscoped
 databases add nothing to their SQL. Deletes remove only rows the scope admits.
-To write a row that deliberately belongs elsewhere, use the unscoped database.
+An UPDATE or DELETE of every row of the scope takes `.all()`, as in an unscoped
+database: `tenant.posts.delete()` is refused. To write a row that deliberately
+belongs elsewhere, use the unscoped database.
 
 An upsert never rewrites a row outside the scope either:
 `ON CONFLICT … DO UPDATE` checks the conflicting row first, and a row the scope
@@ -2563,6 +2592,17 @@ statement: the operations after it and the transaction itself reject with the
 same `SYMMETRIA_OUT_OF_SCOPE` error. Chunked and nested inserts run in a
 savepoint there, as does `transaction.$transaction()`, so a violation caught
 from one of them leaves the transaction usable.
+
+A scope can hide the row a required key points at: a comment of this tenant
+written by a user of another, or by a user a "not deleted" scope leaves out. The
+comment stays in the result. A path through the relation (`comment.author.name`,
+also in `where`, `orderBy` and the smart `join()`) is a LEFT JOIN whenever its
+target table has a scope, so the field reads as `null` there, although its type
+still says `string`: the types do not know which tables a database scopes.
+`every()` counts such a comment as failing its condition. The nested form
+`comment.author(shape)` is typed as nullable and returns `null` in the same
+case; `innerJoin(comment.author)` keeps only the comments whose author the scope
+admits.
 
 Scopes compose: a scoped database can be scoped again and the predicates are
 ANDed. Transactions inherit the scope, and `transaction.$scope()` narrows it
@@ -3072,11 +3112,14 @@ length-limited string type is generated without a `USING` cast: an explicit
 own assignment cast refuses the long value, so the migration fails and rolls
 back with the data intact. The same holds for the `down.sql` of a widening
 change: a rollback to the shorter type fails on values that no longer fit
-instead of cutting them. A rename needs a `--diff` hint; it is never guessed
-from similar names. The API uses `allowDestructive: true` for intentional
-removals. Column declarations keep their order in `CREATE TABLE`; snapshot
-hashes ignore column order so reordering source declarations does not create a
-migration.
+instead of cutting them. A type change PostgreSQL has no cast for (a number to
+`uuid`, a value to an array of it) is refused when the migration is generated,
+since its SQL could not run even on an empty table; give the conversion for both
+directions under `using` in the `--diff` file. A rename needs a `--diff` hint;
+it is never guessed from similar names. The API uses `allowDestructive: true`
+for intentional removals. Column declarations keep their order in
+`CREATE TABLE`; snapshot hashes ignore column order so reordering source
+declarations does not create a migration.
 
 `diff` compares the current declaration to the latest local snapshot, not to the
 live database. CHECK expressions, partial-index predicates and index key

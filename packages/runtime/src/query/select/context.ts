@@ -182,7 +182,10 @@ export const createContext = (
           ) ||
           relation.kind !== "one" ||
           relation.reverse === true ||
-          relation.nullable;
+          relation.nullable ||
+          // The scope may hide the row a required key points at; the row that
+          // points at it stays, with the path's fields NULL.
+          Object.hasOwn(registry.scopes, relation.target);
         let base: SelectPlan | undefined;
         let related: TableBinding;
 

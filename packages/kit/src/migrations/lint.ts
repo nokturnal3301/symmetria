@@ -296,9 +296,11 @@ export const lintMigration = (
         conversionMessage(before, after, change),
         change.assignmentCast
           ? "Shorten or move longer values first, then generate with --allow-destructive; the SQL has no truncating cast, so PostgreSQL refuses values that still do not fit."
-          : change.refused
-            ? "Move or change the values that do not fit first, then generate with --allow-destructive; PostgreSQL refuses values that still do not fit."
-            : "Copy the column or back up the table if the lost precision matters, then generate with --allow-destructive.",
+          : change.cleared
+            ? "Generate with --allow-destructive, then compute the embeddings again after the migration (search.reindex() for a search's own column)."
+            : change.refused
+              ? "Move or change the values that do not fit first, then generate with --allow-destructive; PostgreSQL refuses values that still do not fit."
+              : "Copy the column or back up the table if the lost precision matters, then generate with --allow-destructive.",
         after.name,
       );
     } else if (retyped) {

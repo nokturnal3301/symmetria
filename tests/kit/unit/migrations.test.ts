@@ -1089,3 +1089,38 @@ test("checks, predicates and computed keys written either way need no migration"
     `CREATE INDEX "items_live_idx" ON "items" USING btree ("score") WHERE "state" = E'closed'`,
   ]);
 });
+
+test("a type change PostgreSQL has no cast for asks for the conversion", () => {
+  const number = schema({
+    items: table({ id: int.auto, value: int }),
+  }).$snapshot();
+  const identifier = schema({
+    items: table({ id: int.auto, value: uuid }),
+  }).$snapshot();
+  const list = schema({
+    items: table({ id: int.auto, value: int.array }),
+  }).$snapshot();
+  const words = schema({
+    items: table({ id: int.auto, value: text }),
+  }).$snapshot();
+
+  expect(() => diffSchemas(number, identifier)).toThrow(
+    'PostgreSQL has no cast from integer to uuid for "items"."value"',
+  );
+  expect(() => diffSchemas(number, list)).toThrow(
+    "PostgreSQL has no cast from integer to integer[]",
+  );
+  // Text reads as any type, and a supplied conversion is used as written.
+  expect(diffSchemas(words, identifier).up).toEqual([
+    'ALTER TABLE "items" ALTER COLUMN "value" TYPE uuid USING "value"::uuid',
+  ]);
+  expect(
+    diffSchemas(number, identifier, {
+      using: {
+        items: { value: { up: "gen_random_uuid()", down: "0" } },
+      },
+    }).up,
+  ).toEqual([
+    'ALTER TABLE "items" ALTER COLUMN "value" TYPE uuid USING gen_random_uuid()',
+  ]);
+});

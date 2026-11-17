@@ -839,7 +839,7 @@ export const collectGolden = async (): Promise<Record<string, GoldenEntry>> => {
   compiled("delete/condition-path", () =>
     model.notes.delete().where((notes) => notes.record.amount.is(0)),
   );
-  compiled("delete/scoped", () => scoped.posts.delete());
+  compiled("delete/scoped", () => scoped.posts.delete().all());
   compiled("upsert/do-update-where", () =>
     model.users
       .insert({ email: "a", name: "Ada" })
