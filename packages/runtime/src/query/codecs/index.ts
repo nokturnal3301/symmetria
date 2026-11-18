@@ -14,6 +14,8 @@ export type RuntimeCodec = {
   readonly sqlType?: string;
   /** Element codec of an array column. */
   readonly element?: RuntimeCodec;
+  /** Decoding returns the value as it came; row decoders skip the call. */
+  readonly passthrough?: boolean;
 };
 
 export type SchemaCodecs = Readonly<
@@ -686,13 +688,45 @@ export const createRowDecoder = (
       );
   }
 
+  // The same fields are selected again and again; the factory is found by
+  // comparing their names, without rendering the decoder's source first.
+  const known = knownDecoders.get(selection[0]?.outputName ?? "");
+
+  if (known) {
+    search: for (const entry of known) {
+      if (entry.names.length !== selection.length) {
+        continue;
+      }
+
+      const codecs: RuntimeCodec[] = [];
+
+      for (let position = 0; position < selection.length; position++) {
+        const { outputName, codec } = selection[position]!;
+        const decoded = !!codec && !codec.passthrough;
+
+        if (
+          entry.names[position] !== outputName ||
+          entry.decoded[position] !== decoded
+        ) {
+          continue search;
+        }
+
+        if (decoded) {
+          codecs.push(codec);
+        }
+      }
+
+      return entry.factory(codecs);
+    }
+  }
+
   // A generated decoder reads and writes literal keys, which keeps property
   // access monomorphic; a generic loop over dynamic keys is several times slower.
   const codecs: RuntimeCodec[] = [];
   const fields = selection.map((expression) => {
     const key = JSON.stringify(expression.outputName);
 
-    if (!expression.codec) {
+    if (!expression.codec || expression.codec.passthrough) {
       return `${key}: row[${key}]`;
     }
 
@@ -709,9 +743,34 @@ return (row) => { let v; return { ${fields.join(", ")} }; };`;
 
     // FIFO bounds retention of dynamic projections; live decoders remain valid.
     if (decoderFactories.size >= 256) {
-      decoderFactories.delete(decoderFactories.keys().next().value!);
+      const [oldest, evicted] = decoderFactories.entries().next().value!;
+      const first = knownFirstNames.get(evicted)!;
+      const remaining = knownDecoders
+        .get(first)!
+        .filter((entry) => entry.factory !== evicted);
+
+      decoderFactories.delete(oldest);
+      knownFirstNames.delete(evicted);
+
+      if (remaining.length) {
+        knownDecoders.set(first, remaining);
+      } else {
+        knownDecoders.delete(first);
+      }
     }
 
+    const first = selection[0]?.outputName ?? "";
+    const entries = knownDecoders.get(first) ?? [];
+
+    entries.push({
+      names: selection.map((expression) => expression.outputName),
+      decoded: selection.map(
+        (expression) => !!expression.codec && !expression.codec.passthrough,
+      ),
+      factory,
+    });
+    knownDecoders.set(first, entries);
+    knownFirstNames.set(factory, first);
     decoderFactories.set(source, factory);
   }
 
@@ -724,6 +783,17 @@ type DecoderFactory = (
 
 /** Generated code depends only on field names and codec positions, so factories are shared. */
 const decoderFactories = new Map<string, DecoderFactory>();
+
+/** The same factories by the first selected name, then by every name and whether its field is decoded. */
+const knownDecoders = new Map<
+  string,
+  {
+    readonly names: readonly string[];
+    readonly decoded: readonly boolean[];
+    readonly factory: DecoderFactory;
+  }[]
+>();
+const knownFirstNames = new Map<DecoderFactory, string>();
 
 /** Primitive parameter values can be reused; object-backed values are cloned defensively. */
 export const cloneParameter = (value: unknown): unknown => {

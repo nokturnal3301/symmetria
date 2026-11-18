@@ -2074,10 +2074,26 @@ settings its parsers rely on for every new connection (`DateStyle` ISO,
 `IntervalStyle` postgres, `bytea_output` hex, `extra_float_digits` 1), so a
 database or role that prints dates, intervals, binary values or doubles another
 way still reads correctly. `bytea` is also read in the `escape` form on either
-adapter. Bun's pool has no place to run such a statement and sends most values
-in binary, which these settings do not touch; where a database or role changes
-`IntervalStyle` or `extra_float_digits`, give the defaults to the Bun adapter
-yourself:
+adapter.
+
+`postgres({ url, prepare: true })` on the `pg` adapter sends every read and
+write that has values as a named prepared statement, which PostgreSQL parses
+once per connection instead of on every call: on a local database a point read
+took 15% less time and a list with a JOIN 27% less, a nested read 6%. It is off
+unless set, for three reasons that are PostgreSQL's own. A connection pooler in
+transaction mode must support prepared statements (PgBouncer 1.21+ with
+`max_prepared_statements`). After several executions PostgreSQL may switch a
+prepared statement to one general plan for all values, which is usually as good
+and occasionally much worse than a plan made for each value
+(`plan_cache_mode = force_custom_plan` keeps the latter). And a statement
+prepared before a migration changed the type of a column it reads fails once
+with "cached plan must not change result type" on connections opened before the
+migration. At most 500 statement texts get a name; texts beyond that (IN lists
+and literal limits of every length) are sent unnamed. Bun's pool prepares
+statements by default and turns it off with `prepare: false`. Bun's pool has no
+place to run such a statement and sends most values in binary, which these
+settings do not touch; where a database or role changes `IntervalStyle` or
+`extra_float_digits`, give the defaults to the Bun adapter yourself:
 `postgres({ url, connection: { IntervalStyle: "postgres", extra_float_digits: 1 } })`
 (a connection pooler must allow these start-up parameters).
 

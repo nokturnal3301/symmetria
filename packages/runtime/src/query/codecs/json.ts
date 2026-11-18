@@ -37,9 +37,14 @@ export const jsonRowCodec = (
 ): RuntimeCodec => {
   // Queries are built far more often than executed; generate the decoder on first use.
   let rowDecoder: ReturnType<typeof createRowDecoder> | undefined;
+  // Rows of fields that need no decoding are the driver's parsed JSON as it is.
+  const passthrough = selection.every(
+    (expression) => !expression.codec || expression.codec.passthrough,
+  );
 
   return freeze({
     parameterCast: "jsonb",
+    passthrough,
     encode: (value: unknown) => {
       const encodeRow = (row: Record<string, unknown>) =>
         Object.fromEntries(
@@ -56,6 +61,10 @@ export const jsonRowCodec = (
       );
     },
     decode: (value: unknown) => {
+      if (passthrough) {
+        return value;
+      }
+
       const decode = (rowDecoder ??= createRowDecoder(selection));
 
       return many

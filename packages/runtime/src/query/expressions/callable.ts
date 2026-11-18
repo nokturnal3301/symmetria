@@ -1,22 +1,3 @@
-/**
- * Relation handles live only inside one shape callback, so they are not frozen:
- * freezing a function with many properties costs more than building it.
- */
-export const callable = <Arguments extends unknown[]>(
-  invoke: (...argumentsList: Arguments) => unknown,
-  properties: object,
-  relatedColumns = false,
-): object => {
-  if (relatedColumns) {
-    Object.defineProperties(invoke, {
-      name: { get: () => undefined },
-      length: { get: () => undefined },
-    });
-  }
-
-  return Object.assign(invoke, properties);
-};
-
 /** Lazy binding preserves detached calls without allocating every method per query. */
 export const boundMethodDescriptors = (
   methods: object,

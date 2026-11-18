@@ -202,7 +202,8 @@ export const mergeBindings = (
 ): SelectPlan["bindings"] => {
   const bindings = { ...local };
 
-  for (const [name, binding] of Object.entries(outer)) {
+  for (const name in outer) {
+    const binding = outer[name]!;
     let key = name;
 
     while (Object.hasOwn(bindings, key) && bindings[key] !== binding) {

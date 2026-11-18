@@ -227,3 +227,49 @@ describe.skipIf(!databaseUrl || transactionPooling)(
     });
   },
 );
+
+describe.skipIf(!databaseUrl || transactionPooling)(
+  "named prepared statements (node-postgres, prepare: true)",
+  () => {
+    test("a statement with values is prepared once per connection; the rest is sent as before", async () => {
+      const prepared = async (prepare: boolean) => {
+        const driver = pg({ url: databaseUrl!, max: 1, prepare });
+        const run = async (sql: string, parameters: unknown[] = []) => {
+          const result = await driver.execute({ sql, parameters });
+
+          return Array.isArray(result) ? result : result.rows;
+        };
+
+        try {
+          for (const value of [1, 2, 3]) {
+            expect(await run("SELECT $1::int AS value", [value])).toEqual([
+              { value },
+            ]);
+          }
+
+          expect(await run("SELECT $1::text AS word", ["a"])).toEqual([
+            { word: "a" },
+          ]);
+          // No values: the simple protocol, which takes several commands.
+          await run("SELECT 1; SELECT 2");
+          // Not a read or a write: never prepared.
+          await run("SET LOCAL statement_timeout = $1", []).catch(() => {});
+
+          return (
+            await run(
+              "SELECT name, statement FROM pg_prepared_statements ORDER BY name",
+            )
+          ).map((row) => `${row.name}: ${row.statement}`);
+        } finally {
+          await driver.close();
+        }
+      };
+
+      expect(await prepared(true)).toEqual([
+        "symmetria_0: SELECT $1::int AS value",
+        "symmetria_1: SELECT $1::text AS word",
+      ]);
+      expect(await prepared(false)).toEqual([]);
+    });
+  },
+);

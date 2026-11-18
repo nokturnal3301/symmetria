@@ -21,6 +21,12 @@ import {
 export type PostgresOptions = {
   readonly url?: string | undefined;
   readonly profiler?: QueryProfiler | undefined;
+  /**
+   * Send reads and writes as named prepared statements, which PostgreSQL
+   * parses once per connection instead of on every call. Off unless set:
+   * a connection pooler in transaction mode needs its own support for them.
+   */
+  readonly prepare?: boolean | undefined;
   readonly connectionString?: string | undefined;
   readonly host?: string | undefined;
   readonly port?: number | undefined;
@@ -114,6 +120,10 @@ const parsers: NonNullable<PoolConfig["types"]> = {
   },
 };
 
+/** Statements worth preparing: one SELECT or write, not DDL, cursors or transaction control. */
+const PREPARABLE = /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/;
+const PREPARED_LIMIT = 500;
+
 /**
  * A failure that leaves the client unusable: the connection was lost or the
  * server ended the session, or node-postgres failed without a SQLSTATE, so not
@@ -128,7 +138,7 @@ const brokenConnection = (error: unknown): boolean =>
 export const postgres = (
   connection: string | PostgresOptions,
 ): PostgresDriver => {
-  const { profiler, url, ...options } =
+  const { profiler, url, prepare, ...options } =
     typeof connection === "string" ? { url: connection } : connection;
   const config = {
     ...options,
@@ -154,6 +164,26 @@ export const postgres = (
   });
 
   let cancellation: Pool | undefined;
+
+  // One name per statement text, shared by the pool's connections; each
+  // connection prepares a name the first time it runs it. Texts beyond the
+  // limit (IN lists and literal LIMITs of every length) stay unnamed, so a
+  // connection never holds more than that many prepared statements.
+  const statementNames = new Map<string, string>();
+  const statementName = (sql: string): string | undefined => {
+    if (!prepare || !PREPARABLE.test(sql)) {
+      return undefined;
+    }
+
+    let name = statementNames.get(sql);
+
+    if (!name && statementNames.size < PREPARED_LIMIT) {
+      name = `symmetria_${statementNames.size}`;
+      statementNames.set(sql, name);
+    }
+
+    return name;
+  };
 
   const result = (value: QueryResult | QueryResult[]): ExecutionResult => {
     if (Array.isArray(value)) {
@@ -197,11 +227,15 @@ export const postgres = (
           throw failure;
         }
 
+        const values = postgresParameters(query.parameters, true);
+        // Without values node-postgres uses the simple protocol, which also
+        // takes several commands in one text; a prepared statement takes one.
+        const name = values.length ? statementName(query.sql) : undefined;
+
         return result(
-          await client.query(
-            query.sql,
-            postgresParameters(query.parameters, true),
-          ),
+          await (name
+            ? client.query({ name, text: query.sql, values })
+            : client.query(query.sql, values)),
         );
       },
       release,

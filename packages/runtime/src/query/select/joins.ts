@@ -120,6 +120,27 @@ const firstMatch = (
       });
 };
 
+const relationNameSets = new WeakMap<
+  TableRegistry["snapshot"],
+  ReadonlySet<string>
+>();
+
+/** Every relation name of the schema: a generated junction alias avoids them all. */
+const schemaRelationNames = (registry: TableRegistry): ReadonlySet<string> => {
+  let names = relationNameSets.get(registry.snapshot);
+
+  if (!names) {
+    names = new Set(
+      registry.snapshot.tables.flatMap((table) =>
+        table.relations.map((relation) => relation.name),
+      ),
+    );
+    relationNameSets.set(registry.snapshot, names);
+  }
+
+  return names;
+};
+
 export const joinRelation = (
   registry: TableRegistry,
   state: SelectPlan,
@@ -258,18 +279,16 @@ export const joinRelation = (
         : firstMatch(registry, source, relationName, target, declaredCondition),
     );
   } else if (relation.kind === "through") {
-    const reservedAliases = new Set([
-      ...outerAliases,
-      ...Object.keys(state.bindings),
-      ...joins.map((join) => join.binding.alias),
-      alias,
-      ...registry.snapshot.tables.flatMap((table) =>
-        table.relations.map((relation) => relation.name),
-      ),
-    ]);
+    const relationNames = schemaRelationNames(registry);
+    const reserved = (name: string): boolean =>
+      name === alias ||
+      outerAliases.includes(name) ||
+      Object.hasOwn(state.bindings, name) ||
+      joins.some((join) => join.binding.alias === name) ||
+      relationNames.has(name);
     let junctionNumber = 0;
 
-    while (reservedAliases.has(`__symmetria_junction_${junctionNumber}`)) {
+    while (reserved(`__symmetria_junction_${junctionNumber}`)) {
       junctionNumber += 1;
     }
 

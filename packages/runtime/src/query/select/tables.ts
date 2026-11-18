@@ -213,10 +213,41 @@ export const createQueryTables = (
       scope: () => registry.scopePredicates(root),
       context: (plan: SelectPlan) => createContext(registry, plan),
     });
+    // `byId(7).one()` is `get(7)`: while the lookup is still the plan
+    // keyLookup built (no shape, no options), its row comes from the statement
+    // compiled once for the key.
+    const lookupKeys = new WeakMap<
+      SelectPlan,
+      {
+        readonly label: "primary key" | "unique key";
+        readonly keys: readonly ColumnSnapshot[];
+        readonly values: readonly unknown[];
+      }
+    >();
+    const lookupRow = (handle: QueryHandle, required: boolean) => {
+      const key = lookupKeys.get(handle[QUERY_STATE].plan);
+
+      return (
+        (key && compiledRow(key, required)) ??
+        (
+          Reflect.get(
+            queryPrototype,
+            required ? "one" : "maybeOne",
+            handle,
+          ) as () => Promise<Record<string, unknown> | null>
+        )()
+      );
+    };
     const lookupPrototype = Object.freeze(
       Object.create(
         queryPrototype,
         boundMethodDescriptors({
+          one(this: QueryHandle) {
+            return lookupRow(this, true);
+          },
+          maybeOne(this: QueryHandle) {
+            return lookupRow(this, false);
+          },
           update(
             this: QueryHandle,
             values:
@@ -266,6 +297,10 @@ export const createQueryTables = (
       const [plan, failure] = collectDataErrors(() =>
         keyPlan(label, keys, values),
       );
+
+      if (!failure) {
+        lookupKeys.set(plan, { label, keys, values });
+      }
 
       return createQuery(
         failure ? freeze({ ...plan, failure }) : plan,
@@ -591,6 +626,19 @@ export const createQueryTables = (
       value: unknown,
       required: boolean,
     ): Promise<Record<string, unknown> | null> | undefined => {
+      const key = resolveKey(value);
+
+      return key && compiledRow(key, required);
+    };
+
+    const compiledRow = (
+      key: {
+        readonly label: "primary key" | "unique key";
+        readonly keys: readonly ColumnSnapshot[];
+        readonly values: readonly unknown[];
+      },
+      required: boolean,
+    ): Promise<Record<string, unknown> | null> | undefined => {
       if (
         !executor ||
         shapeFrame.bindings ||
@@ -602,10 +650,7 @@ export const createQueryTables = (
         return undefined;
       }
 
-      const key = resolveKey(value);
-
       if (
-        !key ||
         !key.values.every(
           (item) =>
             typeof item === "string" ||

@@ -121,12 +121,24 @@ export const valueNode = (value: unknown, codec?: RuntimeCodec): ValueNode => {
     throw new Error("symmetria: undefined is not a SQL value");
   }
 
-  return freeze({
-    kind: "parameter",
-    value: cloneParameter(encodeValue(value, codec)),
-    ...(codec?.parameterCast ? { cast: codec.parameterCast } : {}),
-    ...(codec?.sqlType ? { sqlType: codec.sqlType } : {}),
-  });
+  // Literal shapes instead of spreads: a bulk insert builds one node per value.
+  const encoded = cloneParameter(encodeValue(value, codec));
+  const cast = codec?.parameterCast;
+  const sqlType = codec?.sqlType;
+
+  if (cast) {
+    return freeze(
+      sqlType
+        ? { kind: "parameter", value: encoded, cast, sqlType }
+        : { kind: "parameter", value: encoded, cast },
+    );
+  }
+
+  return freeze(
+    sqlType
+      ? { kind: "parameter", value: encoded, sqlType }
+      : { kind: "parameter", value: encoded },
+  );
 };
 
 export const readQuery = (query: QueryReference): SelectPlan => {

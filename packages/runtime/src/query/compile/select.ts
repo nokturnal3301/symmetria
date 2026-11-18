@@ -199,6 +199,35 @@ const ordersThroughIvfflat = (query: SelectPlan): boolean => {
   );
 };
 
+const carriedLists = new WeakMap<TableBinding["table"], Map<string, string>>();
+
+/** Every column of the root under its own name, for a page taken before its nested rows. */
+const carriedColumns = (root: TableBinding, alias: string): string => {
+  let lists = carriedLists.get(root.table);
+
+  if (!lists) {
+    carriedLists.set(root.table, (lists = new Map()));
+  }
+
+  let list = lists.get(alias);
+
+  if (list === undefined) {
+    list = root.table.columns
+      .map(
+        (column) =>
+          `${alias}.${quoteIdentifier(column.sqlName)} AS ${quoteIdentifier(column.sqlName)}`,
+      )
+      .join(", ");
+
+    // A table is read under a handful of aliases; generated ones stay bounded.
+    if (lists.size < 64) {
+      lists.set(alias, list);
+    }
+  }
+
+  return list;
+};
+
 const NO_SHARED_AGGREGATES: SharedAggregates = { inner: [], outer: [] };
 
 const renderSelect = (
@@ -443,12 +472,7 @@ const renderSelect = (
     ].join("\n");
   }
 
-  const carried = query.root.table.columns
-    .map(
-      (column) =>
-        `${aliasSql(compilation, query.root)}.${quoteIdentifier(column.sqlName)} AS ${quoteIdentifier(column.sqlName)}`,
-    )
-    .join(", ");
+  const carried = carriedColumns(query.root, aliasSql(compilation, query.root));
   const inner = [`SELECT ${carried}`, source, ...body, ...fragments].join("\n");
 
   return [

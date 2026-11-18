@@ -28,7 +28,19 @@ export const bun: typeof bunSQL = (connection) =>
       })
     : bunSQL(connection);
 
-export const postgres = process.env.SYMMETRIA_TEST_DRIVER === "pg" ? pg : bun;
+/** node-postgres with named prepared statements (`SYMMETRIA_TEST_DRIVER=pg-prepared`). */
+const pgPrepared: typeof pg = (connection) =>
+  pg({
+    ...(typeof connection === "string" ? { url: connection } : connection),
+    prepare: true,
+  });
+
+export const postgres =
+  process.env.SYMMETRIA_TEST_DRIVER === "pg"
+    ? pg
+    : process.env.SYMMETRIA_TEST_DRIVER === "pg-prepared"
+      ? pgPrepared
+      : bun;
 
 /** The test URL whose connections start with `search_path` set to `namespace`. */
 export const searchPathURL = (namespace: string, ...rest: string[]): string => {

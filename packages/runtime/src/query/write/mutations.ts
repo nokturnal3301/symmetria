@@ -202,6 +202,12 @@ export const createMutation = (
 
   // Captured by the initial immutable plan; conflict assignments are walked separately.
   let atomicValues = true;
+  const columnsByName = new Map(
+    root.table.columns.map((column) => [column.name, column]),
+  );
+  const requiredColumns = root.table.columns.filter(
+    (column) => column.notNull && !column.default,
+  );
 
   const readValues = (
     values: Record<string, unknown>,
@@ -220,7 +226,7 @@ export const createMutation = (
 
     for (const name of Object.keys(values)) {
       const value = values[name];
-      const column = root.table.columns.find((column) => column.name === name);
+      const column = columnsByName.get(name);
 
       if (!column) {
         throw new Error(`symmetria: unknown column "${root.alias}.${name}"`);
@@ -300,12 +306,8 @@ export const createMutation = (
     }
 
     if (insert) {
-      for (const column of root.table.columns) {
-        if (
-          column.notNull &&
-          !column.default &&
-          values[column.name] === undefined
-        ) {
+      for (const column of requiredColumns) {
+        if (values[column.name] === undefined) {
           dataError(
             new Error(
               `symmetria: missing required column "${root.alias}.${column.name}"`,

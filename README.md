@@ -52,9 +52,9 @@ string, timestamps become Dates, nested JSON included.
 **The shape is the query.** You write the result you want; Symmetria compiles it
 into one SQL statement, however deep the nesting, with per-parent filters,
 limits and aggregates. There is no N+1, no data loader and no ORM runtime
-between your code and PostgreSQL: the nested read above runs within 1% of a
-hand-written `LATERAL` query and about twice as fast as Prisma's join strategy
-([benchmarks](#performance)).
+between your code and PostgreSQL: the nested read above runs within a few
+percent of a hand-written `LATERAL` query and about twice as fast as Prisma's
+join strategy ([benchmarks](#performance)).
 
 **The type is the result.** Every field, nullable join, `bigint`, decimal and
 nested collection is inferred from the projection, so the editor already knows
@@ -332,13 +332,13 @@ dataset, correctness checked before timing;
 
 | Adapter                  | Point | List + JOIN | Nested keyset | INSERT 1 | INSERT 500 | UPDATE |
 | ------------------------ | ----: | ----------: | ------------: | -------: | ---------: | -----: |
-| Bun.SQL (direct LATERAL) | 0.011 |       0.082 |         0.990 |    0.492 |      4.145 |  0.512 |
-| Bun.SQL (page first)     | 0.011 |       0.083 |         0.998 |    0.538 |      3.955 |  0.517 |
-| Symmetria                | 0.018 |       0.110 |         1.003 |    0.526 |      4.614 |  0.546 |
-| Drizzle                  | 0.021 |       0.137 |         1.235 |    0.535 |      7.325 |  0.536 |
-| Kysely                   | 0.016 |       0.128 |         0.940 |    0.509 |      4.718 |  0.533 |
-| Prisma (join)            | 0.041 |       0.111 |         2.113 |    0.555 |     19.542 |  0.592 |
-| Prisma (query)           | 0.040 |       0.129 |         1.757 |    0.550 |     19.010 |  0.574 |
+| Bun.SQL (direct LATERAL) | 0.011 |       0.083 |         0.990 |    0.530 |      3.780 |  0.510 |
+| Bun.SQL (page first)     | 0.012 |       0.079 |         1.002 |    0.497 |      3.828 |  0.507 |
+| Symmetria                | 0.015 |       0.057 |         0.986 |    0.549 |      4.009 |  0.533 |
+| Drizzle                  | 0.020 |       0.136 |         1.236 |    0.531 |      8.213 |  0.550 |
+| Kysely                   | 0.015 |       0.130 |         0.944 |    0.520 |      4.466 |  0.550 |
+| Prisma (join)            | 0.041 |       0.123 |         2.113 |    0.570 |     18.837 |  0.566 |
+| Prisma (query)           | 0.037 |       0.129 |         1.707 |    0.565 |     18.891 |  0.575 |
 
 Median p50 per pass in ms per operation, lower is better; INSERT 500 is ms per
 500-row batch. Bun 1.4.4 · PostgreSQL 16.10 · Linux/arm64 · Apple M3 Pro /

@@ -77,6 +77,57 @@ export const shapeFrame: {
   depth: number;
 } = { bindings: undefined, depth: 0 };
 
+const SCOPE_STATE = Symbol("symmetria.scope.state");
+
+type ScopeState = {
+  readonly binding: TableBinding;
+  /** Column handles by position, made when first read. */
+  readonly handles: (QueryColumn<unknown, string> | undefined)[];
+};
+
+const tableGetters = new WeakMap<
+  TableBinding["table"],
+  PropertyDescriptorMap
+>();
+
+/** One getter per column, shared by every binding of the table; the binding is read from the scope. */
+const columnGetters = (table: TableBinding["table"]): PropertyDescriptorMap => {
+  let getters = tableGetters.get(table);
+
+  if (!getters) {
+    getters = Object.fromEntries(
+      table.columns.map((column, position) => [
+        column.name,
+        {
+          // A hidden column is reachable by name and left out of `{ ...row }`.
+          enumerable: !column.hidden,
+          get(this: { readonly [SCOPE_STATE]: ScopeState }) {
+            const { binding, handles } = this[SCOPE_STATE];
+
+            // Handles are cached and shared by every query of the binding, so
+            // they are frozen for real, once.
+            return (handles[position] ??= Object.freeze(
+              createExpression({
+                node: freeze({
+                  kind: "column",
+                  description: freeze({ binding, column }),
+                }),
+                outputName: column.name,
+                ...(binding.codecs[column.name]
+                  ? { codec: binding.codecs[column.name] }
+                  : {}),
+              }),
+            ) as QueryColumn<unknown, string>);
+          },
+        },
+      ]),
+    );
+    tableGetters.set(table, getters);
+  }
+
+  return getters;
+};
+
 /** Lazy column handles for one binding; computed fields are evaluated once per binding. */
 export const bindingScope = (
   binding: TableBinding,
@@ -89,36 +140,10 @@ export const bindingScope = (
   }
 
   // Aliases and nested scopes often use only a few of the table's columns.
-  const columns = Object.defineProperties(
-    {},
-    Object.fromEntries(
-      binding.table.columns.map((column) => {
-        let expression: QueryColumn<unknown, string> | undefined;
-
-        return [
-          column.name,
-          {
-            // A hidden column is reachable by name and left out of `{ ...row }`.
-            enumerable: !column.hidden,
-            // Handles are cached and shared by every query of the binding, so
-            // they are frozen for real, once.
-            get: () =>
-              (expression ??= Object.freeze(
-                createExpression({
-                  node: freeze({
-                    kind: "column",
-                    description: freeze({ binding, column }),
-                  }),
-                  outputName: column.name,
-                  ...(binding.codecs[column.name]
-                    ? { codec: binding.codecs[column.name] }
-                    : {}),
-                }),
-              )),
-          },
-        ];
-      }),
-    ),
+  const columns = Object.defineProperty(
+    Object.defineProperties({}, columnGetters(binding.table)),
+    SCOPE_STATE,
+    { value: { binding, handles: [] } },
   ) as RuntimeScope[string];
 
   for (const callback of computedFields.get(binding.table) ?? []) {

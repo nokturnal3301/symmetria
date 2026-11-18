@@ -1,5 +1,38 @@
 # Changelog
 
+## 3.1.0 — 2026-11-17
+
+### Runtime (`symmetria`)
+
+- `symmetria/pg`: `postgres({ url, prepare: true })` sends reads and writes as
+  named prepared statements, parsed once per connection. Measured through
+  node-postgres on a local database: a point read 123 µs to 105 µs, a list with
+  a JOIN 208 µs to 152 µs, a nested read 6% faster. Off unless set; the
+  reference says when not to turn it on (an old connection pooler, general
+  plans, a column retyped under running connections).
+- `byId(key).one()` and `.maybeOne()`, and the same on a unique lookup
+  (`by.email(…).one()`), use the statement `get()` and `find()` compile once per
+  table and key instead of building and compiling a query on every call: 2.5 µs
+  of client work became 0.9 µs, about 4 µs off an 80 µs point read on a local
+  database. A shape, options, a scope or a profiler take the ordinary path, as
+  with `get()`.
+- A path through a to-one relation (`post.author.name`) no longer builds the
+  relation's methods (`count()`, `sum`, `some()`, …) it does not use, and `sum`
+  / `average` / `minimum` / `maximum` of any relation are built when first read:
+  building a list query with one path takes 3.3 µs instead of 4.7 µs.
+- A read with nested rows does less work per call. Measured on a page of 50
+  users with three posts each and their tags, without a database: building and
+  compiling the query 18 µs to 11 µs, decoding the rows 8 µs to 4 µs, the whole
+  call 31 µs to 17 µs. Nested rows whose fields need no decoding are returned as
+  the driver parsed them instead of being copied; a row decoder is found by its
+  field names; the tools a shape callback receives (`join`, `whereNotNull`,
+  `row`) and a relation's methods are made when they are read; column handles
+  share one set of getters per table; the first shape of a relation reads the
+  relation's own sources instead of a copy of them.
+- Bulk inserts spend half the client time per row (170 µs to 81 µs for 500 rows
+  of three columns): a value node is built without object spreads and a column
+  is found by name in a map instead of a search per value.
+
 ## 3.0.0 — 2026-11-17
 
 Fixes from a bug hunt over 2.5.0: complex reads, cursor pages, tenant scopes,

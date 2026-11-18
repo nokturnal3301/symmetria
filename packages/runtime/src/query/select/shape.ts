@@ -202,6 +202,99 @@ const fieldOrdering = (
     return [ascending ? expression.ascending : expression.descending];
   });
 
+const TOOL_STATE = Symbol("symmetria.shape.tools");
+const TOOL_SELECTED = Symbol("symmetria.shape.selected");
+
+type ToolState = {
+  readonly context: QueryContext;
+  columns: RuntimeScope[string] | undefined;
+  active: boolean;
+};
+
+/** What a shape callback receives next to its columns; each tool is made when it is read. */
+class ShapeTools {
+  readonly [TOOL_STATE]: ToolState;
+  /** Set while an option callback that takes the selected fields runs. */
+  [TOOL_SELECTED]: (() => object) | undefined = undefined;
+
+  constructor(state: ToolState) {
+    this[TOOL_STATE] = state;
+  }
+}
+
+const assertActive = (state: ToolState) => {
+  if (!state.active || shapeFrame.bindings !== state.context.bindings) {
+    throw new Error(
+      "symmetria: local JOIN helpers and whereNotNull can only be used inside their shape callback",
+    );
+  }
+};
+
+const joinTool = (
+  kind: "LEFT" | "INNER" | "AUTO" | "CROSS" | "FULL",
+): PropertyDescriptor => ({
+  enumerable: true,
+  get(this: ShapeTools) {
+    const state = this[TOOL_STATE];
+
+    return (
+      input: LocalJoinInput,
+      condition?: (columns: RuntimeScope[string]) => ShapePredicate,
+    ) => {
+      assertActive(state);
+
+      return localJoin(state.context, kind, input, condition);
+    };
+  },
+});
+
+Object.setPrototypeOf(ShapeTools.prototype, shapeExpressions);
+Object.defineProperties(ShapeTools.prototype, {
+  join: joinTool("AUTO"),
+  innerJoin: joinTool("INNER"),
+  leftJoin: joinTool("LEFT"),
+  crossJoin: joinTool("CROSS"),
+  // Not public: a full join makes the root nullable, which the types do not model.
+  [FULL_JOIN]: joinTool("FULL"),
+  whereNotNull: {
+    enumerable: true,
+    get(this: ShapeTools) {
+      const state = this[TOOL_STATE];
+
+      return (column: SelectedColumn): SelectedColumn => {
+        assertActive(state);
+        const { context } = state;
+        const expression = readColumn(column);
+        validateNode(expression.node, context.bindings());
+        context.plan = freeze({
+          ...context.plan,
+          predicates: freeze([
+            ...context.plan.predicates,
+            freeze(notNullPredicate(expression)),
+          ]),
+        });
+
+        return column;
+      };
+    },
+  },
+  // The source's own columns, for `{ ...row, extra }`; relations are not among them.
+  row: {
+    enumerable: true,
+    get(this: ShapeTools) {
+      return { ...this[TOOL_STATE].columns };
+    },
+  },
+  // The selected fields under a name, for the option callbacks that take them.
+  selected: {
+    get(this: ShapeTools) {
+      return this[TOOL_SELECTED]?.();
+    },
+  },
+});
+delete (ShapeTools.prototype as { constructor?: unknown }).constructor;
+Object.freeze(ShapeTools.prototype);
+
 export const applyShape = (
   context: QueryContext,
   binding: TableBinding,
@@ -242,41 +335,7 @@ export const applyShape = (
     );
   }
 
-  let active = true;
-
-  const assertActive = () => {
-    if (!active || shapeFrame.bindings !== context.bindings) {
-      throw new Error(
-        "symmetria: local JOIN helpers and whereNotNull can only be used inside their shape callback",
-      );
-    }
-  };
-
-  const join =
-    (kind: "LEFT" | "INNER" | "AUTO" | "CROSS" | "FULL") =>
-    (
-      input: LocalJoinInput,
-      condition?: (columns: RuntimeScope[string]) => ShapePredicate,
-    ) => {
-      assertActive();
-
-      return localJoin(context, kind, input, condition);
-    };
-
-  const whereNotNull = (column: SelectedColumn): SelectedColumn => {
-    assertActive();
-    const expression = readColumn(column);
-    validateNode(expression.node, context.bindings());
-    context.plan = freeze({
-      ...context.plan,
-      predicates: freeze([
-        ...context.plan.predicates,
-        freeze(notNullPredicate(expression)),
-      ]),
-    });
-
-    return column;
-  };
+  const toolState: ToolState = { context, columns: undefined, active: true };
 
   let result: Record<string, unknown>;
   let controls: [string, unknown][] | undefined;
@@ -284,47 +343,32 @@ export const applyShape = (
   try {
     result = evaluateContext(context, () => {
       const columns = context.columns(binding);
-      // Tools live only for these callbacks; freezing them is pure overhead.
-      const tools = {
-        __proto__: shapeExpressions,
-        join: join("AUTO"),
-        innerJoin: join("INNER"),
-        leftJoin: join("LEFT"),
-        crossJoin: join("CROSS"),
-        // Not public: a full join makes the root nullable, which the types do not model.
-        [FULL_JOIN]: join("FULL"),
-        whereNotNull,
-        // The source's own columns, for `{ ...row, extra }`; relations are not among them.
-        get row() {
-          return { ...columns };
-        },
-      };
+      // Tools live only for these callbacks; each is made when it is read.
+      const tools = new ShapeTools(toolState);
+      toolState.columns = columns;
       const projection = callback(columns, tools as never);
 
       if (options !== undefined) {
         let fields: object | undefined;
         const selected = () =>
           (fields ??= selectedFields(projection, context.plan));
-        let selectedTools: object | undefined;
-
         controls = Object.entries(options).map(([name, value]) => {
           if (!queryOptionNames.has(name as keyof QueryOptions<never, never>)) {
             throw new Error(`symmetria: unknown query option "${name}"`);
           }
 
-          const resolved =
-            typeof value !== "function"
-              ? value
-              : selectedOptionNames.has(name)
-                ? value(
-                    columns,
-                    // The same fields under a name, next to the third argument.
-                    (selectedTools ??= Object.create(tools, {
-                      selected: { get: selected },
-                    })),
-                    selected(),
-                  )
-                : value(columns, tools);
+          let resolved = value;
+
+          if (typeof value === "function") {
+            if (selectedOptionNames.has(name)) {
+              // The same fields under a name, next to the third argument.
+              tools[TOOL_SELECTED] = selected;
+              resolved = value(columns, tools, selected());
+              tools[TOOL_SELECTED] = undefined;
+            } else {
+              resolved = value(columns, tools);
+            }
+          }
 
           if (name === "where" && plainRecord(resolved)) {
             return [name, equalityPredicates(columns, resolved)];
@@ -352,7 +396,7 @@ export const applyShape = (
       return projection;
     });
   } finally {
-    active = false;
+    toolState.active = false;
   }
 
   if (
