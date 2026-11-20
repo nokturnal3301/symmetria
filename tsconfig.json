@@ -31,6 +31,9 @@
       "symmetria/better-auth": [
         "./packages/runtime/src/entries/better-auth.ts"
       ],
+      "symmetria/opentelemetry": [
+        "./packages/runtime/src/entries/opentelemetry.ts"
+      ],
       "symmetria/internal": ["./packages/runtime/src/entries/internal.ts"],
       "symmetria-kit": ["./packages/kit/src/index.ts"],
       "symmetria-kit/inspect": [

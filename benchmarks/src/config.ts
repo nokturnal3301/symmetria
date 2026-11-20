@@ -12,6 +12,7 @@ export type RunConfig = {
   sequentialMs: number;
   concurrentMs: number;
   minimumSamples: number;
+  warmupMs?: number;
   concurrency: number;
   orderSeed: number;
 };
@@ -34,6 +35,7 @@ export const defaultConfig = (): RunConfig => ({
     "BENCH_MIN_SAMPLES",
     process.env.BENCH_MIN_SAMPLES ?? 100,
   ),
+  warmupMs: integer("BENCH_WARMUP_MS", process.env.BENCH_WARMUP_MS ?? 1000, 0),
   concurrency: POOL_SIZE,
   orderSeed: 20261021,
 });

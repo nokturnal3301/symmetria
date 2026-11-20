@@ -43,7 +43,10 @@ Includes empty relations, timestamp ties and bigint values above 2^53.
 - **Independent passes:** fresh process/database per adapter/pass, deterministic
   inputs, changing adapter order, full-pool warmup and identical seed checksums.
 - **Read timing:** at least 2 seconds and 100 sequential operations; at least 2
-  seconds at concurrency 16. Actual wall time includes in-flight drain.
+  seconds at concurrency 16. Actual wall time includes in-flight drain. Before
+  timing, every read runs 8 times on each connection and then sequentially for
+  one second (`BENCH_WARMUP_MS`), so a pass does not depend on when the runtime
+  finishes compiling the library's code.
 - **Write timing:** fixed budgets equalize table growth; reset between phases.
   INSERT 1: 256 sequential / 64 per concurrent worker; INSERT 500: 32 / 4;
   UPDATE: 512 / 128. These are short bursts, not sustained ingestion tests.
@@ -81,7 +84,7 @@ README. The animated WebP and its still in `docs/assets/` are rendered outside
 the repository from `report/summary.json`. For a pipeline check only:
 
 ```sh
-BENCH_PASSES=1 BENCH_SEQ_MS=50 BENCH_CONC_MS=50 BENCH_MIN_SAMPLES=5 bun run docker
+BENCH_PASSES=1 BENCH_SEQ_MS=50 BENCH_CONC_MS=50 BENCH_WARMUP_MS=0 BENCH_MIN_SAMPLES=5 bun run docker
 ```
 
 Publishing also packs the run (manifest, raw samples, plans and the measured

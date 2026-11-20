@@ -193,11 +193,13 @@ import { embedV4 } from "symmetria/cohere";
 import { geminiEmbedding } from "symmetria/google";
 import { mistralEmbed } from "symmetria/mistral";
 import { jinaV3 } from "symmetria/jina";
+import { traced as withTracing } from "symmetria/opentelemetry";
 import { createSchemaSQL, migrator, generateMigration, loadMigrationState, type MigrationState } from "symmetria-kit";
 import { testDatabase } from "symmetria-kit/testing";
 
 const users = table({ id: int.auto, email: text.unique });
 assert.equal(typeof vector, "function");
+assert.equal(typeof withTracing, "function");
 const embeddings = table({ id: int.auto, embedding: vector(3) });
 const embeddingRow: Vector | undefined = undefined;
 void embeddings;

@@ -55,6 +55,21 @@ export const executorProfiling = (
 ): ExecutorProfiling | undefined =>
   executor ? executorProfiles.get(executor) : undefined;
 
+/**
+ * Makes a wrapper around a profiled executor count as that executor, so the
+ * profiler still sees queries that pass through it.
+ */
+export const inheritProfiling = (
+  wrapper: QueryExecutor,
+  executor: QueryExecutor,
+): void => {
+  const profile = executorProfiles.get(executor);
+
+  if (profile) {
+    executorProfiles.set(wrapper, profile);
+  }
+};
+
 const serialize = (value: unknown) =>
   JSON.stringify(value, (_name, entry) =>
     typeof entry === "bigint" ? entry.toString() : entry,

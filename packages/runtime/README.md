@@ -361,6 +361,9 @@ decode timings. Pass it to `postgres({ url, profiler })`, wrap requests with
 `SYMMETRIA_PROFILE_TOKEN` for the application and the CLI, then open
 `bunx --package symmetria-kit symmetria profile`.
 
+`traced(driver, { tracer })` from `symmetria/opentelemetry` reports every
+statement and transaction as an OpenTelemetry span.
+
 ## Drivers
 
 Official drivers ship with `symmetria` and are maintained and released together:

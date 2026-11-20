@@ -117,6 +117,7 @@ export const markdown = (
     `| Host / VM | ${env.host?.cpu ?? env.cpu ?? "unknown"} / ${env.host?.docker?.os ?? "unspecified"} |`,
     `| Runner cgroup | CPU quota \`${env.cgroup.cpuMax}\`; RAM \`${env.cgroup.memoryMax}\` bytes |`,
     `| Read phase | ≥ ${manifest.config.sequentialMs} ms and ${manifest.config.minimumSamples} samples; concurrent ≥ ${manifest.config.concurrentMs} ms |`,
+    `| Read warm-up | 8 calls on each of ${manifest.config.concurrency} connections, then ${manifest.config.warmupMs ?? 0} ms of sequential calls |`,
     `| Pool / concurrency | 16 / ${manifest.config.concurrency} |`,
     `| Dataset | ${Object.entries(manifest.dataset ?? {})
       .map(([name, data]) => `${name}: ${count(data.rows)}`)

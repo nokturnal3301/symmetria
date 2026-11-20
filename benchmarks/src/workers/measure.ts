@@ -71,6 +71,15 @@ try {
 
     if (writes(scenario)) {
       await seed(maintenance);
+    } else {
+      // The measured phase is sequential: a short concurrent burst leaves the
+      // library's code half compiled, and a pass then lands on either side.
+      const invoke = operation(bench, scenario);
+      const until = performance.now() + (config.warmupMs ?? 0);
+
+      while (performance.now() < until) {
+        await invoke();
+      }
     }
 
     const fixedSequential = writes(scenario)

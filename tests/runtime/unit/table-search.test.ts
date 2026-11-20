@@ -283,6 +283,43 @@ test("a model that fails rejects the insert before anything is sent", async () =
   ).rejects.toThrow("custom returned 1 numbers; 2 expected");
 });
 
+test("rows the write refuses never reach the model", async () => {
+  const { model, asked } = counting();
+  const { database, calls } = recording(tables(model), [{ id: 1 }]);
+  const row = { noteId: 1, owner: "u", title: "One", content: "first" };
+
+  // A required column is missing.
+  await expect(
+    database.chunks
+      .insert({ noteId: 1, title: "One", content: "first" } as never)
+      .execute(),
+  ).rejects.toThrow("owner");
+  // A value its column cannot hold.
+  await expect(
+    database.chunks.insert({ ...row, noteId: 1.5 }).execute(),
+  ).rejects.toThrow();
+  // A column the table does not have.
+  await expect(
+    database.chunks.insert({ ...row, missing: 1 } as never).execute(),
+  ).rejects.toThrow("missing");
+  // A chained call that cannot be made.
+  await expect(
+    (
+      database.chunks.insert(row) as unknown as {
+        returning: (name: string) => { execute: () => Promise<unknown> };
+      }
+    )
+      .returning("missing")
+      .execute(),
+  ).rejects.toThrow("missing");
+  expect(asked).toEqual([]);
+  expect(calls).toHaveLength(0);
+
+  await database.chunks.insert(row).returning("id");
+  expect(asked).toHaveLength(1);
+  expect(calls).toHaveLength(1);
+});
+
 test("an UPDATE of the text clears the embedding that described it", async () => {
   const { database, last } = recording(tables());
 

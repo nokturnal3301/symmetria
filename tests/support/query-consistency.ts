@@ -741,6 +741,19 @@ export const queryConsistencyTests = (): void => {
           name: whereNotNull(owner.name),
         })),
       ).toEqual([{ name: "named" }]);
+      // is(null) agrees with what the path reads back: a missing key and a
+      // key holding JSON null are both null.
+      expect(
+        await database.items((item) => ({ id: item.id }), {
+          where: (item) => item.meta.path("size").is(null),
+          orderBy: (item) => item.id.ascending,
+        }),
+      ).toEqual([{ id: 1 }, { id: 2 }]);
+      expect(
+        await database.items((item) => ({ id: item.id }), {
+          where: (item) => item.meta.path("size").isNot(null),
+        }),
+      ).toEqual([{ id: 3 }]);
     } finally {
       await close();
     }

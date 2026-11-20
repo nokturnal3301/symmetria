@@ -13,8 +13,8 @@ nullability and bigint, read [Core concepts](guide.md).
 - [Shape-first queries](#shape-first-queries)
 - [Reusable projections](#reusable-projections) and
   [enum mappings](#enum-mappings)
-- [Query inspector](#query-inspector) and
-  [live profiler](#live-request-profiler)
+- [Query inspector](#query-inspector), [live profiler](#live-request-profiler)
+  and [OpenTelemetry](#opentelemetry)
 - [Prepared queries](#prepared-queries)
 - [Writes](#insert-update-delete), [unique lookups](#unique-key-lookups) and
   [nested inserts](#atomic-nested-inserts)
@@ -1039,6 +1039,14 @@ user would otherwise write the whole table (see
 a mutation callback is an error rather than "no filter". `whereNotNull()` adds a
 predicate and returns a narrowed expression.
 
+A condition Symmetria has no method for is written as SQL:
+``sql<boolean>`${post.title} ~* ${pattern}` `` is accepted wherever a predicate
+is (`where`, `having`, a predicate list, `and()`, `or()`, `not()`, a JOIN's
+condition, a mutation's `where()`, a scope) and has `.and()` and `.or()` itself.
+It compiles to `(…) = (TRUE)`, which PostgreSQL folds away while planning. The
+template must be typed as boolean; an untyped `` sql`…` `` is not a condition
+for the compiler.
+
 ### Several reads in one statement
 
 ```ts
@@ -1251,6 +1259,49 @@ EXPLAIN runs on the pool's connection context, so a saved transactional query's
 plan may reflect different data or session settings. Only retained SELECTs can
 be explained. Parameters remain visible in the local development endpoint. Stop
 the endpoint with `await profilingServer.stop()` during shutdown.
+
+## OpenTelemetry
+
+`symmetria/opentelemetry` reports every statement and transaction as a span to a
+tracer the application passes in. Symmetria itself does not depend on
+`@opentelemetry/api`; setting up the SDK and its exporter stays with the
+application.
+
+```ts
+import { trace } from "@opentelemetry/api";
+import { postgres } from "symmetria/pg";
+import { traced } from "symmetria/opentelemetry";
+
+const db = createDatabase({
+  schema,
+  driver: traced(postgres({ url }), {
+    tracer: trace.getTracer("my-service"),
+    attributes: { "server.address": "db.internal", "db.namespace": "app" },
+  }),
+});
+```
+
+A statement is a client span named after its operation and table
+(`SELECT users`) and is a child of the span active when it runs, such as the
+HTTP request's. `$transaction` is a `transaction` span with its statements as
+children; a nested transaction is a `savepoint` span. Following a transaction's
+statements needs a context manager, which the OpenTelemetry Node SDK registers.
+
+| Attribute                   | Value                                                  |
+| --------------------------- | ------------------------------------------------------ |
+| `db.system.name`            | `postgresql`                                           |
+| `db.operation.name`         | First keyword of the statement: `SELECT`, `INSERT`…    |
+| `db.collection.name`        | The first table the statement names                    |
+| `db.query.summary`          | The span's name                                        |
+| `db.query.text`             | The SQL with placeholders; `text: false` leaves it out |
+| `db.response.returned_rows` | Rows the statement returned                            |
+| `db.response.status_code`   | SQLSTATE of a failed statement (`23505`)               |
+| `error.type`                | SQLSTATE, or the error's class name without one        |
+
+Values are never recorded: they travel as parameters, and the text holds `$1` in
+their place. A failed statement records the exception and sets the span's status
+to error, as does the transaction it aborts. `traced()` wraps any driver,
+including one that already carries a profiler.
 
 ## Prepared queries
 
@@ -2451,11 +2502,13 @@ shapes were also exercised through a running application.
 need an embedding, before the statement is sent, including rows created by a
 nested insert. A row that brings its own (`{ ...row, about: vector }`), or whose
 text is empty or a SQL expression, is written as it is. If the model fails, the
-write is rejected and nothing is sent. The write is still chained as usual
-(`returning()`, `onConflict()`); only `toSQL()` and `prepare()` on such a write
-throw, because the statement does not exist until the embedding does. Inside
-`$transaction` the connection is held while the model answers; embed beforehand
-and pass the vectors when that matters.
+write is rejected and nothing is sent. A write the rows already fail (a missing
+required column, a value its column cannot hold, an unknown column, a chained
+call that cannot be made) is rejected before the model is asked. The write is
+still chained as usual (`returning()`, `onConflict()`); only `toSQL()` and
+`prepare()` on such a write throw, because the statement does not exist until
+the embedding does. Inside `$transaction` the connection is held while the model
+answers; embed beforehand and pass the vectors when that matters.
 
 An `UPDATE` that changes one of the embedded columns sets the embedding to
 `NULL` in the same statement, because it would describe the old text; an
@@ -2620,6 +2673,15 @@ still says `string`: the types do not know which tables a database scopes.
 case; `innerJoin(comment.author)` keeps only the comments whose author the scope
 admits.
 
+A junction table is a table like any other and takes a scope under its own name
+(`db.$scope({ postsTags: (link) => link.tenantId.is(tenantId) })`). Every read
+through the relation then sees only the links the scope admits: nested
+collections, `count()`, `some()` / `none()` / `every()` and `join(post.tags)`. A
+nested `connect` writes a link of two keys, so a column the scope reads must
+have a default that lands inside the scope; otherwise the insert fails with
+`SYMMETRIA_OUT_OF_SCOPE` and nothing is written. Insert such links through the
+junction itself (`tenant.postsTags.insert({ postsId, tagsId, tenantId })`).
+
 Scopes compose: a scoped database can be scoped again and the predicates are
 ANDed. Transactions inherit the scope, and `transaction.$scope()` narrows it
 further inside the callback.
@@ -2697,9 +2759,10 @@ JSON paths check keys and numeric array positions, compile to `#>` with bound
 path components, and retain JSON value types. On a `jsonb(schema)` column, and
 inside such a field of a nested result, they follow the stored (input) shape,
 since that is what the database holds. Missing paths and JSON null decode to
-null. `is(null)` tests SQL NULL (including a missing path); a present JSON null
-is a JSON value, while `coalesce()` and `whereNotNull()` treat it as null, as
-its type says. `contains()` uses `@>` and accepts partial objects/subarrays.
+null, and `is(null)`, `isNot(null)`, `coalesce()` and `whereNotNull()` agree
+with that: a missing path and a present JSON null both count as null. To tell
+the two apart, compare in SQL (``sql<boolean>`${doc.meta} ? 'size'` ``).
+`contains()` uses `@>` and accepts partial objects/subarrays.
 
 `set(key, value)` changes one key of a jsonb value and keeps the rest, where
 assigning the column would replace the whole document:

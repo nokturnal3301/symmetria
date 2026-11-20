@@ -639,25 +639,28 @@ const TERMINALS = new Set(["then", "catch", "finally", "execute"]);
 /**
  * A write that has to wait for its embeddings: the calls chained onto it
  * (`returning()`, `onConflict()`…) are remembered and made on the real
- * builder once it exists.
+ * builder once it exists. `start` receives them as a function, so it can
+ * try the whole write on the rows as given before it asks a model.
  */
 export const deferredWrite = (
-  start: () => Promise<{ readonly builder: object }>,
+  start: (
+    chained: (builder: object) => object,
+  ) => Promise<{ readonly builder: object }>,
   chain: readonly (readonly [string, readonly unknown[]])[] = [],
 ): object => {
   let running: Promise<unknown> | undefined;
+  const chained = (builder: object) =>
+    chain.reduce(
+      (current, [method, argumentsList]) =>
+        (current as Record<string, (...values: readonly unknown[]) => object>)[
+          method
+        ]!(...argumentsList),
+      builder,
+    );
   const run = () =>
-    (running ??= start().then(({ builder }) => {
-      const built = chain.reduce(
-        (current, [method, argumentsList]) =>
-          (
-            current as Record<string, (...values: readonly unknown[]) => object>
-          )[method]!(...argumentsList),
-        builder,
-      );
-
-      return (built as { execute: () => Promise<unknown> }).execute();
-    }));
+    (running ??= start(chained).then(({ builder }) =>
+      (chained(builder) as { execute: () => Promise<unknown> }).execute(),
+    ));
 
   return new Proxy(Object.create(null) as object, {
     get: (_target, key) => {

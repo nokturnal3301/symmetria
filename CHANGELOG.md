@@ -1,5 +1,38 @@
 # Changelog
 
+## 3.2.0 — 2026-11-20
+
+### Runtime (`symmetria`)
+
+- New entry `symmetria/opentelemetry`: `traced(driver, { tracer })` reports
+  every statement as a client span (`SELECT users`, with `db.system.name`,
+  `db.operation.name`, `db.collection.name`, `db.query.text`, returned rows and
+  the SQLSTATE of a failure) and every transaction as a span around its
+  statements. The tracer is passed in, so the package gains no dependency.
+  Values are never recorded. It also wraps a driver that carries a profiler.
+- ``sql<boolean>`…` `` is accepted wherever a predicate is: `where`, `having`,
+  predicate lists, `and()` / `or()` / `not()`, JOIN conditions, mutation
+  `where()` and scopes, and it has `.and()` / `.or()`. Before, it had to be
+  written ``sql<boolean>`…`.is(true)``.
+- **Changed:** `is(null)` and `isNot(null)` on a JSON path
+  (`doc.meta.path("size").is(null)`) count a key that holds JSON null as null,
+  like a missing key. The path already read back as `null` in both cases and
+  `coalesce()` / `whereNotNull()` already treated them alike; `is(null)` used to
+  match only the missing key.
+- A table with an embedding no longer asks the model for rows the write then
+  refuses: a missing required column, a value its column cannot hold, an unknown
+  column or an impossible chained call rejects the insert or upsert first.
+- A scope on a junction table (`$scope({ postsTags: … })`) is now covered by
+  tests and described in the reference: reads through the relation see only the
+  admitted links, and a nested `connect` is checked like any other insert.
+
+### Benchmarks
+
+- Reads warm up sequentially for one second (`BENCH_WARMUP_MS`) after the
+  concurrent burst. With 128 warm-up calls a pass could start before the runtime
+  had finished compiling the library's code, and the same scenario then differed
+  by a factor of two or three between passes.
+
 ## 3.1.0 — 2026-11-17
 
 ### Runtime (`symmetria`)

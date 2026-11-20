@@ -38,7 +38,7 @@ import type {
   VectorOperator,
   QueryColumn,
 } from "./column-types";
-import { castNode, jsonScalar, arithmetic } from "./arithmetic";
+import { castNode, jsonScalar, arithmetic, isJsonValue } from "./arithmetic";
 import {
   searchLanguage,
   searchMode,
@@ -87,8 +87,15 @@ export const chained = (
     ]),
   });
 
+/**
+ * A `sql` template is a value that can also stand where a condition is
+ * expected; it counts as a predicate only there (`readPredicate`).
+ */
 export const isPredicate = (value: unknown): value is Predicate =>
-  typeof value === "object" && value !== null && PREDICATE_EXPRESSION in value;
+  typeof value === "object" &&
+  value !== null &&
+  PREDICATE_EXPRESSION in value &&
+  !(COLUMN_EXPRESSION in value);
 
 export const readPredicate = (value: Predicate): PredicateDescription => {
   if (!value || typeof value !== "object" || !(PREDICATE_EXPRESSION in value)) {
@@ -276,9 +283,24 @@ export const nullPredicate = (
   description: ExpressionDescription,
   negated: boolean,
 ): Predicate => {
+  // A JSON path reads a missing key as SQL NULL and a key holding JSON null
+  // as a JSON value; both decode to null, so both count as null here.
   const check: PredicateDescription = {
     kind: "nullCheck",
-    value: description.node,
+    value:
+      description.node.kind === "jsonPath" && isJsonValue(description)
+        ? freeze({
+            kind: "raw",
+            parts: freeze([
+              "NULLIF(",
+              expressionSqlType(description) === "json"
+                ? castNode(description.node, "jsonb")
+                : description.node,
+              ", 'null'::jsonb)",
+            ]),
+            sqlType: "jsonb",
+          })
+        : description.node,
     negated,
   };
 

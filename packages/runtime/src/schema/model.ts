@@ -40,6 +40,7 @@ import {
 } from "../query/select";
 import { endStreams } from "../query/select/query";
 import type { SchemaCodecs } from "../query/codecs";
+import { collectDataErrors } from "../query/codecs/deferred";
 import type { SchemaTables } from "../query/select/registry";
 import {
   createIndexQuery,
@@ -297,7 +298,18 @@ const createTableHandle = (
         );
       }
 
-      return deferredWrite(async () => {
+      return deferredWrite(async (chained) => {
+        // A write the rows already fail is refused before a model is paid for.
+        const [, failure] = collectDataErrors(() =>
+          chained(
+            (write as (...argumentsList: unknown[]) => object)(values, ...rest),
+          ),
+        );
+
+        if (failure) {
+          throw failure.error;
+        }
+
         const filled = await embedRows(embedded, rows);
 
         return {

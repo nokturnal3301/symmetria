@@ -179,3 +179,49 @@ test("predicate lists skip undefined, null and false", () => {
       .toSQL().sql,
   ).toContain("WHERE");
 });
+
+test("sql<boolean> stands where a condition is expected", () => {
+  const where = (query: { toSQL: () => { sql: string } }) =>
+    query.toSQL().sql.split("\nWHERE ")[1];
+
+  expect(
+    where(
+      model.users((user) => ({ id: user.id }), {
+        where: (user) => sql<boolean>`${user.id} > ${0}`,
+      }),
+    ),
+  ).toBe('("users"."id" > $1) = (TRUE)');
+  expect(
+    where(
+      model.users((user) => ({ id: user.id }), {
+        where: (user) => [
+          sql<boolean>`${user.id} > ${0}`.or(user.active.is(true)),
+          and(sql<boolean>`length(${user.name}) > ${2}`, user.id.is(1)),
+        ],
+      }),
+    ),
+  ).toBe(
+    '(("users"."id" > $1) = (TRUE) OR "users"."active" = $2) AND ((length("users"."name") > $3) = (TRUE) AND "users"."id" = $4)',
+  );
+  expect(
+    where(
+      model.users
+        .update({ active: false })
+        .where((user) => sql<boolean>`${user.id} > ${0}`),
+    ),
+  ).toBe('("users"."id" > $2) = (TRUE)');
+  // Selected, the template is still a value.
+  expect(
+    model.users((user) => ({ positive: sql<boolean>`${user.id} > 0` })).toSQL()
+      .sql,
+  ).toStartWith('SELECT "users"."id" > 0 AS "positive"');
+  // Only a template typed as boolean is a condition for the compiler.
+  model.users((user) => ({ id: user.id }), {
+    // @ts-expect-error a number is not a condition
+    where: (user) => sql<number>`${user.id}`,
+  });
+  model.users((user) => ({ id: user.id }), {
+    // @ts-expect-error an untyped template is not a condition
+    where: (user) => sql`${user.id} > 0`,
+  });
+});

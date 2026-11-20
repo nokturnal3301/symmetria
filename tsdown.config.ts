@@ -35,6 +35,7 @@ export default defineConfig([
       mistral: "src/entries/mistral.ts",
       jina: "src/entries/jina.ts",
       "better-auth": "src/entries/better-auth.ts",
+      opentelemetry: "src/entries/opentelemetry.ts",
       internal: "src/entries/internal.ts",
     },
     copy: [{ from: "../../LICENSE", to: "." }],

@@ -332,13 +332,13 @@ dataset, correctness checked before timing;
 
 | Adapter                  | Point | List + JOIN | Nested keyset | INSERT 1 | INSERT 500 | UPDATE |
 | ------------------------ | ----: | ----------: | ------------: | -------: | ---------: | -----: |
-| Bun.SQL (direct LATERAL) | 0.011 |       0.083 |         0.990 |    0.530 |      3.780 |  0.510 |
-| Bun.SQL (page first)     | 0.012 |       0.079 |         1.002 |    0.497 |      3.828 |  0.507 |
-| Symmetria                | 0.015 |       0.057 |         0.986 |    0.549 |      4.009 |  0.533 |
-| Drizzle                  | 0.020 |       0.136 |         1.236 |    0.531 |      8.213 |  0.550 |
-| Kysely                   | 0.015 |       0.130 |         0.944 |    0.520 |      4.466 |  0.550 |
-| Prisma (join)            | 0.041 |       0.123 |         2.113 |    0.570 |     18.837 |  0.566 |
-| Prisma (query)           | 0.037 |       0.129 |         1.707 |    0.565 |     18.891 |  0.575 |
+| Bun.SQL (direct LATERAL) | 0.011 |       0.084 |         0.985 |    0.494 |      3.848 |  0.518 |
+| Bun.SQL (page first)     | 0.011 |       0.084 |         0.992 |    0.486 |      3.955 |  0.513 |
+| Symmetria                | 0.013 |       0.098 |         0.974 |    0.519 |      4.109 |  0.541 |
+| Drizzle                  | 0.020 |       0.138 |         1.249 |    0.532 |      7.656 |  0.516 |
+| Kysely                   | 0.015 |       0.128 |         0.941 |    0.505 |      4.263 |  0.511 |
+| Prisma (join)            | 0.039 |       0.113 |         2.095 |    0.568 |     18.692 |  0.559 |
+| Prisma (query)           | 0.037 |       0.152 |         1.736 |    0.588 |     19.250 |  0.580 |
 
 Median p50 per pass in ms per operation, lower is better; INSERT 500 is ms per
 500-row batch. Bun 1.4.4 · PostgreSQL 16.10 · Linux/arm64 · Apple M3 Pro /

@@ -10,9 +10,19 @@ import {
   type SqlDefault,
   type MetadataTraits,
 } from "../../schema/column";
-import type { ValueNode, ExpressionDescription } from "./nodes";
+import {
+  COLUMN_EXPRESSION,
+  PREDICATE_EXPRESSION,
+  type ValueNode,
+  type ExpressionDescription,
+  type Predicate,
+  type PredicateDescription,
+} from "./nodes";
 import type { QueryColumn } from "./column-types";
-import { valueNode, ColumnHandle } from "./core";
+import { valueNode, ColumnHandle, chained } from "./core";
+import type { OptionalPredicate } from "./functions";
+
+const TRUE: ValueNode = freeze({ kind: "raw", parts: freeze(["TRUE"]) });
 
 export const SQL_TEMPLATE = Symbol("symmetria.query.sql");
 
@@ -31,6 +41,27 @@ export class SqlHandle extends ColumnHandle {
   ) {
     super(description);
     this[SQL_TEMPLATE] = { strings, interpolated };
+  }
+
+  /**
+   * The template as a condition, for `where: sql<boolean>\`…\``: compared with
+   * TRUE, which PostgreSQL folds away while planning.
+   */
+  get [PREDICATE_EXPRESSION](): PredicateDescription {
+    return freeze({
+      kind: "comparison",
+      left: this[COLUMN_EXPRESSION].node,
+      operator: "=",
+      right: TRUE,
+    });
+  }
+
+  and(...conditions: OptionalPredicate[]): Predicate {
+    return chained(this[PREDICATE_EXPRESSION], "AND", conditions);
+  }
+
+  or(...conditions: OptionalPredicate[]): Predicate {
+    return chained(this[PREDICATE_EXPRESSION], "OR", conditions);
   }
 
   get sql(): string {
@@ -53,7 +84,14 @@ export type SqlTemplate<Value, Traits = RawTraits> = QueryColumn<
   SqlDefault & {
     kind: "sql";
     sql: string;
-  };
+  } & BooleanCondition<Value>;
+
+/** `sql<boolean>` is also a condition: `where`, `and()`, a JOIN's ON take it as it is. */
+type BooleanCondition<Value> = unknown extends Value
+  ? unknown
+  : [Value] extends [boolean | null]
+    ? Predicate
+    : unknown;
 
 export const sqlTemplate = <Value, Traits = RawTraits>(
   strings: TemplateStringsArray,
