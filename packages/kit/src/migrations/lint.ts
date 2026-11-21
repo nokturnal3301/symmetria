@@ -11,7 +11,11 @@ import {
   type MigrationPlan,
   type RenameHints,
 } from "./diff";
-import { conversionMessage, typeConversion } from "./conversions";
+import {
+  conversionMessage,
+  embeddingChange,
+  typeConversion,
+} from "./conversions";
 import type { MigrationColumn, MigrationTable } from "./snapshot";
 
 /**
@@ -83,13 +87,25 @@ export const lintMigration = (
     );
   };
 
-  const rewritten = (table: string, column: MigrationColumn): void => {
+  const rewritten = (table: MigrationTable, column: MigrationColumn): void => {
     if (column.generated !== undefined) {
+      // Rewriting a table builds every index on it again; a vector index is
+      // the slowest of them by far.
+      const vectors = table.indexes.filter(
+        (definition) =>
+          definition.method === "hnsw" || definition.method === "ivfflat",
+      );
+      const indexes = vectors.length
+        ? ` and builds every index on it again, the vector ${vectors.length === 1 ? "index" : "indexes"} ${vectors.map((definition) => `"${definition.sqlName}"`).join(", ")} too,`
+        : " and builds every index on it again";
+
       report(
         "caution",
-        table,
-        `Column "${column.name}" is computed and stored for every existing row; PostgreSQL rewrites the table while it holds a lock.`,
-        "On a large table run the migration in a quiet hour.",
+        table.name,
+        `Column "${column.name}" is computed and stored for every existing row; PostgreSQL rewrites the table${indexes} while it holds a lock that blocks reads and writes.`,
+        vectors.length
+          ? "On a large table run the migration in a quiet hour; a vector index of many rows takes minutes to build."
+          : "On a large table run the migration in a quiet hour.",
         column.name,
       );
     }
@@ -130,7 +146,7 @@ export const lintMigration = (
 
       if (column.generated !== undefined || next.generated !== undefined) {
         if (column.generated !== next.generated) {
-          rewritten(after.name, next);
+          rewritten(after, next);
         }
 
         continue;
@@ -139,7 +155,7 @@ export const lintMigration = (
       // Renames are catalog-only changes, and SQL lint passes the generated
       // RENAME statements; reporting them here would fail --strict only until
       // the migration is generated.
-      compareColumn(after, column, next);
+      compareColumn(after, column, next, renamedColumns);
 
       // A new foreign key validates every existing value; a changed action on
       // the same target column cannot fail, as the old key held.
@@ -224,7 +240,7 @@ export const lintMigration = (
       }
 
       if (column.generated !== undefined) {
-        rewritten(after.name, column);
+        rewritten(after, column);
         continue;
       }
 
@@ -282,12 +298,24 @@ export const lintMigration = (
     table: MigrationTable,
     before: MigrationColumn,
     after: MigrationColumn,
+    renamedColumns: Readonly<Record<string, string>> = {},
   ): void => {
     const retyped =
       before.sqlType !== after.sqlType ||
       (before.enumeration !== after.enumeration &&
         !renamedEnumeration(before.enumeration, after.enumeration));
     const change = retyped ? typeConversion(before, after) : undefined;
+    const stale = embeddingChange(before, after, renamedColumns);
+
+    if (stale && !change?.cleared) {
+      report(
+        "destructive",
+        table.name,
+        `The embeddings in "${after.name}" are cleared: ${stale}, so the stored ones describe other text. Every row of the table is updated.`,
+        "Generate with --allow-destructive, then run search.reindex() after the migration to compute them again; search.missing() counts what is left.",
+        after.name,
+      );
+    }
 
     if (change?.lossy) {
       report(

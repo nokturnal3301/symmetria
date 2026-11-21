@@ -18,10 +18,13 @@ export {
   type RenameHints,
 } from "./migrations/diff";
 export {
+  discardMigration,
   generateMigration,
   loadMigrations,
   loadMigrationState,
   squashMigrations,
+  type DiscardMigrationOptions,
+  type DiscardedMigration,
   type Migration,
   type GeneratedMigration,
   type MigrationState,

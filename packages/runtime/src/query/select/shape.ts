@@ -17,6 +17,7 @@ import {
   type TableBinding,
 } from "../plan/types";
 import { expressionSqlType } from "../plan/metadata";
+import { isVectorType } from "../../schema/column";
 import { SHAPE_SOURCE, shapeExpressions } from "./projections";
 import {
   countValue,
@@ -161,9 +162,8 @@ export const equalityPredicates = (
 
     if (
       Array.isArray(value) &&
-      !/(?:\[\]|^jsonb?|^vector(?:\(\d+\))?)$/.test(
-        expressionSqlType(readColumn(column)),
-      )
+      !/(?:\[\]|^jsonb?)$/.test(expressionSqlType(readColumn(column))) &&
+      !isVectorType(expressionSqlType(readColumn(column)))
     ) {
       throw new Error(
         `symmetria: where: "${key}" takes one value; write a list as a callback, ${key}.in([...])`,

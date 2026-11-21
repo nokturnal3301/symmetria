@@ -166,13 +166,14 @@ export const columnType = (
     };
   }
 
-  const vectorType = /^vector(?:\((\d+)\))?$/.exec(base);
+  const vectorType = /^(vector|halfvec)(?:\((\d+)\))?$/.exec(base);
 
   if (vectorType && !array) {
     return {
       type: {
         kind: "vector",
-        ...(vectorType[1] ? { dimensions: Number(vectorType[1]) } : {}),
+        ...(vectorType[1] === "halfvec" ? { half: true as const } : {}),
+        ...(vectorType[2] ? { dimensions: Number(vectorType[2]) } : {}),
       },
       array: false,
     };

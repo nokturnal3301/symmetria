@@ -18,7 +18,7 @@ import type {
 import type { TransactionOptions } from "../query/plan/types";
 import { SCHEMA_BIND } from "./binding";
 import type { NestedInsertQuery } from "../query/write/types";
-import type { TableTraits } from "./infer";
+import type { TableTraits, WriteValue } from "./infer";
 import type { LinkMetadata } from "./links";
 import type {
   SchemaDefinitions,
@@ -59,8 +59,9 @@ export type UniqueKeys<Columns> = {
   [Name in UniqueColumnNames<Columns>]: Name;
 } & (Columns extends { readonly [TABLE_UNIQUE_KEYS]: infer Keys } ? Keys : {});
 
+/** A key's columns, valued as a write takes them (a `bigint` key accepts a safe integer). */
 export type KeyFields<Row, Names extends keyof Row> = {
-  [Name in Names]: NonNullable<Row[Name]>;
+  [Name in Names]: WriteValue<NonNullable<Row[Name]>>;
 };
 export type PrimaryConnect<
   Definition extends SchemaDefinitions,
@@ -75,7 +76,7 @@ export type PrimaryConnect<
       | KeyFields<Row<Definition, TableName>, Names>
       | (IsUnion<Names> extends true
           ? never
-          : NonNullable<Row<Definition, TableName>[Names]>);
+          : WriteValue<NonNullable<Row<Definition, TableName>[Names]>>);
 
 export type ConnectValue<
   Definition extends SchemaDefinitions,
@@ -84,8 +85,11 @@ export type ConnectValue<
 > =
   | (By extends string
       ? // A reference through by(): the scalar is the referenced column's value.
-          | NonNullable<
-              Row<Definition, TableName>[By & keyof Row<Definition, TableName>]
+          | WriteValue<
+              NonNullable<
+                Row<Definition, TableName>[By &
+                  keyof Row<Definition, TableName>]
+              >
             >
           | KeyFields<
               Row<Definition, TableName>,

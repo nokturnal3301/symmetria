@@ -424,7 +424,7 @@ test("pull needs a connection and keeps --force to itself", () =>
 
     const scoped = await run(directory, "drift", "--force");
     expect(scoped.exitCode).toBe(1);
-    expect(scoped.stderr).toContain("--force is a pull/graph option");
+    expect(scoped.stderr).toContain("--force is a pull/graph/discard option");
   }));
 
 test("graph prints a Mermaid diagram offline and writes fenced Markdown", () =>

@@ -264,7 +264,7 @@ const makeColumn = (
       );
     }
 
-    if (/^vector(\(|$)/.test(definition.sqlType)) {
+    if (isVectorType(definition.sqlType)) {
       throw new Error("symmetria: vector columns cannot be arrays");
     }
 
@@ -817,6 +817,10 @@ export const tsvector = customType<TsVector>("tsvector", {
   encode: (value) => value,
   decode: (value) => String(value) as TsVector,
 });
+
+/** pgvector's types: `vector(n)` and, in half precision, `halfvec(n)`. */
+export const isVectorType = (sqlType: string): boolean =>
+  /^(?:vector|halfvec)(?:\(|$)/.test(sqlType);
 
 /** A pgvector embedding; declared with `vector(n)` from `symmetria/vector`, written as `number[]`. */
 export type Vector = Branded<number[], "vector">;

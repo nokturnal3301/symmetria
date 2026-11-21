@@ -230,6 +230,12 @@ export const generate = async (
     }),
   );
   const directory = project.directory;
+  // What the migration does to existing data and to the running application:
+  // the same review as lint, shown where the migration is made.
+  const findings = migration ? lintMigration(plan, diffOptions.renames) : [];
+  const review = findings.length
+    ? `\n\nReview before applying:\n${formatLintFindings(findings)}`
+    : "";
   context.emit({
     json: migration
       ? {
@@ -238,11 +244,12 @@ export const generate = async (
           metadataDirectory: resolve(directory, "meta"),
           up: migration.up,
           down: migration.down,
+          findings,
         }
       : { id: null, changed: false },
     pretty: () =>
       migration
-        ? formatCreated(
+        ? `${formatCreated(
             directory,
             [
               `${migration.id}/up.sql`,
@@ -251,9 +258,9 @@ export const generate = async (
               "meta/migration.json",
             ],
             color,
-          )
+          )}${review}`
         : "No schema changes.",
     plain: () =>
-      migration ? `Generated ${migration.id}` : "No schema changes.",
+      migration ? `Generated ${migration.id}${review}` : "No schema changes.",
   });
 };

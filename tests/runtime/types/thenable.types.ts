@@ -121,3 +121,27 @@ const model = schema({
   // @ts-expect-error without junction() there is no M:N relation
   plain.users((users) => ({ value: users.teams.count() }));
 }
+
+// Queries and writes fit where a Promise is expected, without .execute().
+{
+  const rows: Promise<{ id: number }[]> = model.users((users) => ({
+    id: users.id,
+  }));
+  const load = (): Promise<{ name: string }[]> =>
+    model.users((users) => ({ name: users.name }));
+  const write = (): Promise<{ affectedRows: number }> =>
+    model.users.insert({ name: "Ada" });
+  const created: Promise<{ id: number }> = model.users
+    .insert({ name: "Ada" })
+    .returning("id");
+  const removed: Promise<{ affectedRows: number }> = model.users
+    .byId(1)
+    .delete();
+  const all: Promise<unknown[]> = Promise.all([rows, load(), write()]);
+  type Rows = Expect<AreEqual<Awaited<typeof rows>, { id: number }[]>>;
+  // @ts-expect-error the rows are what the projection says, not any type
+  const wrong: Promise<{ id: string }[]> = model.users((users) => ({
+    id: users.id,
+  }));
+  void [created, removed, all, wrong];
+}

@@ -11,6 +11,7 @@ export const help = `symmetria <command>
   graph [file]         Print or write a Mermaid entity-relationship diagram
   profile              Observe live application requests and SQL timings
   generate <name>      Generate up.sql and down.sql, and update the snapshot
+  discard [id]         Take back the latest migration while no database has applied it
   migrate              Apply pending migrations atomically
   status               Show applied and pending migrations
   rollback             Revert the latest migration
@@ -46,7 +47,7 @@ export const help = `symmetria <command>
   --steps <number>      Number of migrations to rollback (default: 1)
   --yes                rollback: run down.sql without asking (required without a terminal)
   --strict             Exit with code 1 when lint or drift report findings
-  --force              Overwrite the file written by pull or graph
+  --force              pull/graph: overwrite the file; discard: without a database, or an edited up.sql
   --compact            graph: entities and relations without column lists
   --sql                Print executable SQL for diff
   --json               Machine-readable output
@@ -76,6 +77,7 @@ const COMMANDS = [
   "verify",
   "repair",
   "recover",
+  "discard",
 ] as const;
 export type Command = (typeof COMMANDS)[number];
 
@@ -136,6 +138,7 @@ const NAMED: readonly Command[] = [
   "graph",
   "squash",
   "repair",
+  "discard",
 ];
 
 /** Flags that belong to specific commands, with the exact refusal wording. */
@@ -230,8 +233,8 @@ const SCOPED_FLAGS: readonly {
   },
   {
     flags: ["force"],
-    commands: ["pull", "graph"],
-    message: "symmetria: --force is a pull/graph option",
+    commands: ["pull", "graph", "discard"],
+    message: "symmetria: --force is a pull/graph/discard option",
   },
   {
     flags: ["compact"],

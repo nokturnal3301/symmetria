@@ -11,6 +11,8 @@ import {
   index,
   sql,
   customType,
+  one,
+  many,
 } from "../../../packages/runtime/src";
 
 const users = table({
@@ -91,4 +93,69 @@ const model = schema({ users, posts, tags, postTags, handles, wallets });
   };
   const query = model.posts.insert(input);
   expectTypeOf(query).not.toHaveProperty("toSQL");
+}
+
+// A bigint key takes a safe integer, as writes and filters do.
+{
+  const events = table({
+    id: bigint.auto,
+    ref: bigint.unique.nullable,
+    body: text,
+    replies: many,
+  });
+  const replies = table({
+    id: int.auto,
+    event: one(events.replies),
+    body: text,
+  });
+  const store = schema({ events, replies });
+
+  expectTypeOf(await store.events.find(1)).toEqualTypeOf<{
+    id: bigint;
+    ref: bigint | null;
+    body: string;
+  } | null>();
+  await store.events.get(1n);
+  await store.events.byId(1).one();
+  await store.events.by.ref(10).maybeOne();
+  await store.events.find({ ref: 10 });
+  await store.events.byId(1).update({ body: "edited" });
+  await store.replies.insert({ body: "hi", event: { connect: 1 } });
+  await store.replies.insert({ body: "hi", event: { connect: { id: 1 } } });
+  // @ts-expect-error a bigint key is not text
+  await store.events.find("1");
+}
+
+// onConflict() and upsert() take a unique index by the name by.<name> uses.
+{
+  model.handles
+    .insert({ tenant: "team", handle: "ada", active: 1 })
+    .onConflict("identity")
+    .doUpdate("active");
+  model.handles
+    .insert({ tenant: "team", handle: "ada", active: 1 })
+    .onConflict("tenant", "handle")
+    .doNothing();
+  model.handles
+    .insert({ tenant: "team", handle: "ada", active: 1 })
+    .returning("id")
+    .onConflict("identity")
+    .doNothing();
+  model.handles.upsert(
+    { tenant: "team", handle: "ada", active: 1 },
+    { by: "identity" },
+  );
+  model.handles
+    .insert({ tenant: "team", handle: "ada", active: 1 })
+    // @ts-expect-error a partial index is not a key
+    .onConflict("partial");
+  model.handles
+    .insert({ tenant: "team", handle: "ada", active: 1 })
+    // @ts-expect-error an index name is the whole target, not one of its columns
+    .onConflict("identity", "tenant");
+  model.handles.upsert(
+    { tenant: "team", handle: "ada", active: 1 },
+    // @ts-expect-error not a key of the table
+    { by: "nope" },
+  );
 }

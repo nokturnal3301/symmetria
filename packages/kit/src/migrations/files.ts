@@ -6,12 +6,15 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   writeFile,
   access,
 } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { dirname, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 import type { SchemaSnapshot } from "symmetria";
 import { diffSchemas, type MigrationDiffOptions } from "./diff";
 import {
@@ -76,6 +79,25 @@ export type SquashMigrationsOptions = {
 type MigrationJournal = {
   version: 1;
   migrations: MigrationManifest[];
+  /**
+   * The snapshot before the latest migration, so `discard` can take that
+   * migration back while no database has applied it. Releases that do not
+   * know it ignore it.
+   */
+  undo?: { migration: string; snapshot: MigrationSnapshot };
+};
+export type DiscardMigrationOptions = {
+  directory: string;
+  /** The migration expected to be the latest; refused when another one is. */
+  id?: string;
+  /** Discard an up.sql edited after generation, losing the edits. */
+  allowEdited?: boolean;
+};
+export type DiscardedMigration = {
+  /** The removed migration; undefined when only the snapshot was repaired. */
+  id?: string;
+  /** Where the earlier snapshot came from. */
+  source: "journal" | "empty chain" | "git";
 };
 const migrationIdPattern = /^\d{6}_[a-z0-9][a-z0-9_]*$/;
 const hashPattern = /^[a-f0-9]{64}$/;
@@ -153,7 +175,14 @@ const readDirectory = (directory: string) =>
 
 const readMigrationState = async (
   directory: string,
-): Promise<MigrationState> => {
+  options: { readonly snapshotMismatch?: "throw" | "keep" } = {},
+): Promise<
+  MigrationState & {
+    readonly undo?: MigrationJournal["undo"];
+    /** The snapshot is not the schema after the journal's last migration. */
+    readonly mismatch?: true;
+  }
+> => {
   const entries = await readDirectory(directory);
   const directories = entries
     .filter(
@@ -267,13 +296,32 @@ const readMigrationState = async (
     previousOrdinal = Number(id.slice(0, 6));
   }
 
+  const undo =
+    journal.undo &&
+    typeof journal.undo.migration === "string" &&
+    journal.undo.snapshot
+      ? {
+          migration: journal.undo.migration,
+          snapshot: parseMigrationSnapshot(journal.undo.snapshot),
+        }
+      : undefined;
+
   if (snapshotHash(snapshot) !== previousHash) {
+    if (options.snapshotMismatch === "keep") {
+      return {
+        migrations,
+        snapshot,
+        ...(undo ? { undo } : {}),
+        mismatch: true,
+      };
+    }
+
     throw new Error(
-      `symmetria: latest snapshot checksum does not match the migration journal: ${join(directory, "meta", "snapshot.json")} is not the schema after ${migrations.at(-1) ? `"${migrations.at(-1)!.id}"` : "an empty chain"} in ${join(directory, "meta", "migration.json")}`,
+      `symmetria: latest snapshot checksum does not match the migration journal: ${join(directory, "meta", "snapshot.json")} is not the schema after ${migrations.at(-1) ? `"${migrations.at(-1)!.id}"` : "an empty chain"} in ${join(directory, "meta", "migration.json")}. If a migration was removed by hand, "symmetria discard" puts the snapshot back; to remove a migration no database applied, run "symmetria discard" instead of deleting files.`,
     );
   }
 
-  return { migrations, snapshot };
+  return { migrations, snapshot, ...(undo ? { undo } : {}) };
 };
 
 /** One current schema snapshot and a compact journal for the entire SQL chain. */
@@ -341,13 +389,22 @@ const withGenerationLock = async <Result>(
   }
 };
 
+/**
+ * Publishes the metadata and, when given, a new migration's SQL; the
+ * migrations in `replaced` leave the directory. Every step can be rolled
+ * back, and `recover` finishes one a crash interrupted.
+ */
 const writeMigrationFiles = async (
   directory: string,
-  migration: GeneratedMigration,
+  migration:
+    | GeneratedMigration
+    | { readonly id?: undefined; readonly snapshot: MigrationSnapshot },
   manifests: MigrationManifest[],
   replaced: string[] = [],
+  undo?: MigrationJournal["undo"],
 ): Promise<void> => {
   if (
+    migration.id !== undefined &&
     !replaced.includes(migration.id) &&
     (await exists(join(directory, migration.id)))
   ) {
@@ -381,14 +438,24 @@ const writeMigrationFiles = async (
 
   try {
     await Promise.all([
-      mkdir(join(staged, migration.id), { recursive: true }),
+      ...(migration.id === undefined
+        ? []
+        : [mkdir(join(staged, migration.id), { recursive: true })]),
       mkdir(join(staged, "meta"), { recursive: true }),
       mkdir(join(backup, "meta"), { recursive: true }),
     ]);
-    const journal: MigrationJournal = { version: 1, migrations: manifests };
+    const journal: MigrationJournal = {
+      version: 1,
+      migrations: manifests,
+      ...(undo ? { undo } : {}),
+    };
     await Promise.all([
-      writeFile(join(staged, migration.id, "up.sql"), migration.up),
-      writeFile(join(staged, migration.id, "down.sql"), migration.down),
+      ...("up" in migration
+        ? [
+            writeFile(join(staged, migration.id, "up.sql"), migration.up),
+            writeFile(join(staged, migration.id, "down.sql"), migration.down),
+          ]
+        : []),
       writeFile(
         join(staged, "meta", "migration.json"),
         `${JSON.stringify(journal, null, 2)}\n`,
@@ -400,10 +467,14 @@ const writeMigrationFiles = async (
     ]);
 
     for (const path of [
-      join(staged, migration.id, "up.sql"),
-      join(staged, migration.id, "down.sql"),
+      ...(migration.id === undefined
+        ? []
+        : [
+            join(staged, migration.id, "up.sql"),
+            join(staged, migration.id, "down.sql"),
+          ]),
       ...metadataFiles.map((name) => join(staged, "meta", name)),
-      join(staged, migration.id),
+      ...(migration.id === undefined ? [] : [join(staged, migration.id)]),
       join(staged, "meta"),
       staged,
       backup,
@@ -430,7 +501,10 @@ const writeMigrationFiles = async (
       await move(join(staged, "meta", name), path);
     }
 
-    await move(join(staged, migration.id), join(directory, migration.id));
+    if (migration.id !== undefined) {
+      await move(join(staged, migration.id), join(directory, migration.id));
+    }
+
     publication.committed = true;
     await savePublication(directory, publication);
   } catch (error) {
@@ -632,11 +706,174 @@ export const generateMigration = async (
       down,
       checksum: migrationChecksum(manifest, up, down),
     };
-    await writeMigrationFiles(directory, migration, [
-      ...migrations.map((entry) => entry.manifest),
-      manifest,
-    ]);
+    await writeMigrationFiles(
+      directory,
+      migration,
+      [...migrations.map((entry) => entry.manifest), manifest],
+      [],
+      // The way back while no database has applied it: `discard`.
+      { migration: id, snapshot: before },
+    );
 
     return migration;
+  });
+};
+
+const execute = promisify(execFile);
+
+/**
+ * The snapshot with a hash from the history of `meta/snapshot.json` in Git:
+ * the working tree's last commit first, then older ones. Undefined outside a
+ * repository or when no version has it.
+ */
+const snapshotFromHistory = async (
+  directory: string,
+  hash: string,
+): Promise<MigrationSnapshot | undefined> => {
+  // Git names files by their real path; a temporary directory may be a link.
+  const path = await realpath(join(directory, "meta", "snapshot.json")).catch(
+    () => join(directory, "meta", "snapshot.json"),
+  );
+  const git = (from: string, ...argumentsList: string[]) =>
+    execute("git", ["-C", from, ...argumentsList], {
+      maxBuffer: 64 * 1024 * 1024,
+    }).then((result) => result.stdout);
+
+  try {
+    const root = (
+      await git(dirname(path), "rev-parse", "--show-toplevel")
+    ).trim();
+    const file = relative(root, path).split("\\").join("/");
+    const commits = (
+      await git(root, "log", "--format=%H", "-n", "200", "--", file)
+    )
+      .split("\n")
+      .filter(Boolean);
+
+    for (const commit of commits) {
+      try {
+        const snapshot = parseMigrationSnapshot(
+          JSON.parse(await git(root, "show", `${commit}:${file}`)),
+        );
+
+        if (snapshotHash(snapshot) === hash) {
+          return snapshot;
+        }
+      } catch {
+        // A version that does not parse is not the one looked for.
+      }
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+};
+
+/** The snapshot whose hash a chain expects: from the journal, the empty chain or Git. */
+const knownSnapshot = async (
+  directory: string,
+  hash: string,
+  undo: MigrationJournal["undo"],
+): Promise<
+  | { snapshot: MigrationSnapshot; source: DiscardedMigration["source"] }
+  | undefined
+> => {
+  if (undo && snapshotHash(undo.snapshot) === hash) {
+    return { snapshot: undo.snapshot, source: "journal" };
+  }
+
+  if (snapshotHash(emptySnapshot()) === hash) {
+    return { snapshot: emptySnapshot(), source: "empty chain" };
+  }
+
+  const remembered = await snapshotFromHistory(directory, hash);
+
+  return remembered ? { snapshot: remembered, source: "git" } : undefined;
+};
+
+/**
+ * Takes back the latest migration: its SQL leaves the directory, and the
+ * journal and the snapshot are what they were before it was generated. Only
+ * for a migration no database has applied; the CLI checks the configured one.
+ * With the files already removed by hand, it puts the snapshot back.
+ */
+export const discardMigration = async (
+  options: DiscardMigrationOptions,
+): Promise<DiscardedMigration> => {
+  const directory = resolve(options.directory);
+
+  return withGenerationLock(directory, async () => {
+    const state = await readMigrationState(directory, {
+      snapshotMismatch: "keep",
+    });
+    const latest = state.migrations.at(-1);
+
+    // A migration removed by hand left a snapshot of what it made.
+    if (state.mismatch) {
+      if (options.id !== undefined) {
+        throw new Error(
+          `symmetria: ${join(directory, "meta", "snapshot.json")} does not match the journal, so "${options.id}" cannot be discarded; run discard without an ID to put the snapshot back first`,
+        );
+      }
+
+      const expected = latest?.manifest.after ?? snapshotHash(emptySnapshot());
+      const found = await knownSnapshot(directory, expected, state.undo);
+
+      if (!found) {
+        throw new Error(
+          `symmetria: the snapshot after ${latest ? `"${latest.id}"` : "an empty chain"} is not in the journal or in the Git history of ${join(directory, "meta", "snapshot.json")}; restore that file from a backup`,
+        );
+      }
+
+      await writeMigrationFiles(
+        directory,
+        { snapshot: found.snapshot },
+        state.migrations.map((entry) => entry.manifest),
+      );
+
+      return { source: found.source };
+    }
+
+    if (!latest) {
+      throw new Error("symmetria: there is no migration to discard");
+    }
+
+    if (options.id !== undefined && options.id !== latest.id) {
+      throw new Error(
+        `symmetria: only the latest migration can be discarded; it is "${latest.id}", not "${options.id}"`,
+      );
+    }
+
+    if (
+      !options.allowEdited &&
+      latest.manifest.generated !== undefined &&
+      latest.manifest.generated !== sqlChecksum(latest.up)
+    ) {
+      throw new Error(
+        `symmetria: ${latest.id}/up.sql was edited after it was generated; discard would lose the edits, so it needs --force (allowEdited)`,
+      );
+    }
+
+    const found = await knownSnapshot(
+      directory,
+      latest.manifest.before,
+      state.undo?.migration === latest.id ? state.undo : undefined,
+    );
+
+    if (!found) {
+      throw new Error(
+        `symmetria: the snapshot before "${latest.id}" is not in the journal or in the Git history of ${join(directory, "meta", "snapshot.json")}; restore that file as it was before the migration was generated, then delete the "${latest.id}" directory and its journal entry`,
+      );
+    }
+
+    await writeMigrationFiles(
+      directory,
+      { snapshot: found.snapshot },
+      state.migrations.slice(0, -1).map((entry) => entry.manifest),
+      [latest.id],
+    );
+
+    return { id: latest.id, source: found.source };
   });
 };

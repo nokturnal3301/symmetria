@@ -15,6 +15,7 @@ import {
   type SelectPlan,
 } from "../plan/types";
 import { expressionSource, expressionSqlType } from "../plan/metadata";
+import { isVectorType } from "../../schema/column";
 import {
   jsonPathDescription,
   jsonPathTarget,
@@ -674,7 +675,7 @@ export class ColumnHandle {
   private distance(operator: VectorOperator, name: string, query: unknown) {
     const description = this[COLUMN_EXPRESSION];
 
-    if (!/^vector(\(|$)/.test(expressionSqlType(description))) {
+    if (!isVectorType(expressionSqlType(description))) {
       throw new Error(
         "symmetria: distance operators require a vector column or expression",
       );

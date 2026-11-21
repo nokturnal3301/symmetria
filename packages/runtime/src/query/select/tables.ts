@@ -482,9 +482,14 @@ export const createQueryTables = (
         }
       }
 
+      // A key's name (`by: "identity"`, as by.identity) stands for its columns.
       const by: readonly unknown[] = Array.isArray(options.by)
         ? options.by
-        : [options.by];
+        : typeof options.by === "string" &&
+            !table.columns.some((column) => column.name === options.by) &&
+            uniqueKeys.has(options.by)
+          ? uniqueKeys.get(options.by)!
+          : [options.by];
       const keys = [
         primaryKeyColumns(table).map((column) => column.name),
         ...uniqueKeys.values(),
@@ -496,8 +501,21 @@ export const createQueryTables = (
             key.length === by.length && key.every((name) => by.includes(name)),
         )
       ) {
+        const primary = primaryKeyColumns(table).map((column) => column.name);
+        // A unique index by its name and columns, as by.<name> and onConflict() take it.
+        const described = [
+          ...(primary.length
+            ? [primary.length > 1 ? `[${primary.join(", ")}]` : primary[0]!]
+            : []),
+          ...[...uniqueKeys].map(([name, columns]) =>
+            columns.length === 1 && columns[0] === name
+              ? name
+              : `${name} [${columns.join(", ")}]`,
+          ),
+        ];
+
         throw new Error(
-          `symmetria: upsert() by: ${by.map((name) => JSON.stringify(name)).join(", ")} is not the primary key or a unique key of "${table.name}"; its keys: ${keys.map((key) => (key.length > 1 ? `[${key.join(", ")}]` : key[0])).join(", ") || "none"}`,
+          `symmetria: upsert() by: ${by.map((name) => JSON.stringify(name)).join(", ")} is not the primary key or a unique key of "${table.name}"; its keys: ${described.join(", ") || "none"}`,
         );
       }
 

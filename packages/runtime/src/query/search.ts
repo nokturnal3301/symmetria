@@ -14,6 +14,7 @@ import {
   type SearchCallback,
 } from "../schema/search";
 import { rowNumber, sql } from "./expressions";
+import { QUERY_TAG, WRITE_TAG, type Awaitable } from "./plan/types";
 import { FULL_JOIN } from "./select/joins";
 import { equalityPredicates, plainRecord } from "./select/shape";
 import type { RuntimeScope } from "./select/types";
@@ -123,11 +124,9 @@ export type PartialSearch = {
   readonly error: unknown;
 };
 
-export type SearchRun = PromiseLike<Record<string, unknown>[]> & {
+export type SearchRun = Awaitable<Record<string, unknown>[]> & {
   readonly execute: () => Promise<Record<string, unknown>[]>;
   readonly toSQL: () => Promise<{ sql: string; parameters: unknown[] }>;
-  readonly catch: Promise<Record<string, unknown>[]>["catch"];
-  readonly finally: Promise<Record<string, unknown>[]>["finally"];
 };
 
 export const createSearch = (
@@ -514,6 +513,7 @@ export const createSearch = (
 
         return query.toSQL();
       },
+      [Symbol.toStringTag]: QUERY_TAG,
       then: (onFulfilled, onRejected) => run().then(onFulfilled, onRejected),
       catch: (onRejected) => run().catch(onRejected),
       finally: (onFinally) => run().finally(onFinally),
@@ -664,6 +664,10 @@ export const deferredWrite = (
 
   return new Proxy(Object.create(null) as object, {
     get: (_target, key) => {
+      if (key === Symbol.toStringTag) {
+        return WRITE_TAG;
+      }
+
       if (typeof key !== "string") {
         return undefined;
       }
@@ -696,8 +700,87 @@ export const deferredWrite = (
   });
 };
 
-type Lookup = (key: unknown) => {
-  update: (values: Record<string, unknown>) => PromiseLike<unknown>;
+type Writable = Source & {
+  update: (
+    values: (row: Row) => Record<string, unknown>,
+    options: { where: (row: Row) => unknown[] },
+  ) => PromiseLike<{ affectedRows: number }>;
+  count: () => Promise<number>;
+};
+
+type ReindexOptions = {
+  readonly where?: unknown;
+  readonly batch?: number;
+  readonly order?: "asc" | "desc";
+};
+
+/** Separates the source columns of a document, as `documentText` joins them. */
+const PARAGRAPH = "\n\n";
+
+/** The filter of `reindex()` and `missing()`: rows of a search that still need an embedding. */
+const unembedded = (
+  search: Embedded,
+  where: unknown,
+  row: Row,
+  tools: unknown,
+): unknown[] => {
+  const value =
+    typeof where === "function"
+      ? (where as (row: Row, tools: unknown) => unknown)(row, tools)
+      : where;
+  const filter = plainRecord(value) ? equalityPredicates(row, value) : value;
+
+  return [
+    ...(filter === undefined ? [] : Array.isArray(filter) ? filter : [filter]),
+    (row[search.column] as unknown as { is: (value: null) => unknown }).is(
+      null,
+    ),
+    // A row with no text has nothing to embed; it is left out in SQL, so it
+    // is not read again on every call.
+    template(["", " <> ''"], documentSQL(search.sources, row)),
+  ];
+};
+
+/**
+ * The text a row's embedding is made from, computed by PostgreSQL the way
+ * `documentText` computes it: the non-empty source columns, one per
+ * paragraph (`concat_ws(sep, NULLIF(a, ''), NULLIF(b, ''))`).
+ */
+const documentSQL = (sources: readonly string[], row: Row) =>
+  template(
+    [
+      "concat_ws(",
+      ...sources.map((_name, position) =>
+        position === 0 ? ", NULLIF(" : ", ''), NULLIF(",
+      ),
+      ", ''))",
+    ],
+    PARAGRAPH,
+    ...sources.map((name) => row[name]),
+  );
+
+const readOptions = (table: TableSnapshot, options: ReindexOptions) => {
+  const keys = primaryKeyColumns(table);
+
+  if (keys.length !== 1) {
+    throw new Error(
+      `symmetria: reindex() needs a single-column primary key on "${table.name}"`,
+    );
+  }
+
+  const batch = options.batch ?? 100;
+
+  if (!Number.isSafeInteger(batch) || batch < 1) {
+    throw new Error("symmetria: reindex() batch must be a positive integer");
+  }
+
+  const order = options.order ?? "asc";
+
+  if (order !== "asc" && order !== "desc") {
+    throw new Error('symmetria: reindex() order is "asc" or "desc"');
+  }
+
+  return { key: keys[0]!.name, batch, order };
 };
 
 /**
@@ -707,65 +790,50 @@ type Lookup = (key: unknown) => {
  */
 export const createReindex =
   (queryTable: object, table: TableSnapshot, embedded: readonly Embedded[]) =>
-  async (
-    options: { readonly where?: unknown; readonly batch?: number } = {},
-  ): Promise<number> => {
-    const source = queryTable as Source & { byId: Lookup };
-    const keys = primaryKeyColumns(table);
-    const batch = options.batch ?? 100;
-
-    if (keys.length !== 1) {
-      throw new Error(
-        `symmetria: reindex() needs a single-column primary key on "${table.name}"`,
-      );
-    }
-
-    if (!Number.isSafeInteger(batch) || batch < 1) {
-      throw new Error("symmetria: reindex() batch must be a positive integer");
-    }
-
-    const key = keys[0]!.name;
+  async (options: ReindexOptions = {}): Promise<number> => {
+    const source = queryTable as Writable;
+    const { key, batch, order } = readOptions(table, options);
     const { where } = options;
     let embeddedRows = 0;
 
     for (const search of embedded) {
+      const columnType = table.columns.find(
+        (column) => column.name === search.column,
+      )!.sqlType;
       let last: unknown;
 
-      // By key, so a row whose text is empty is passed once, not met forever.
+      // By key, so a row that was not written (its text changed meanwhile)
+      // is passed once, not met forever.
       for (;;) {
         const rows = await source(
-          (row: Row) =>
-            Object.fromEntries(
+          (row: Row) => ({
+            ...Object.fromEntries(
               [key, ...search.sources].map((name) => [name, row[name]]),
             ),
+            // The key as PostgreSQL prints it, to address the row in JSON.
+            [KEY_TEXT]: template(["(", ")::text"], row[key]),
+          }),
           {
-            where: (row: Row, tools: unknown) => {
-              const value =
-                typeof where === "function"
-                  ? (where as (row: Row, tools: unknown) => unknown)(row, tools)
-                  : where;
-              const filter = plainRecord(value)
-                ? equalityPredicates(row, value)
-                : value;
-              const column = row[search.column] as unknown as {
-                is: (value: null) => unknown;
-              };
-              const id = row[key] as unknown as {
-                above: (value: unknown) => unknown;
-              };
-
-              return [
-                ...(filter === undefined
-                  ? []
-                  : Array.isArray(filter)
-                    ? filter
-                    : [filter]),
-                column.is(null),
-                ...(last === undefined ? [] : [id.above(last)]),
-              ];
-            },
+            where: (row: Row, tools: unknown) => [
+              ...unembedded(search, where, row, tools),
+              ...(last === undefined
+                ? []
+                : [
+                    (
+                      row[key] as unknown as Record<
+                        "above" | "below",
+                        (value: unknown) => unknown
+                      >
+                    )[order === "asc" ? "above" : "below"](last),
+                  ]),
+            ],
             orderBy: (row: Row) =>
-              (row[key] as unknown as { ascending: unknown }).ascending,
+              (
+                row[key] as unknown as Record<
+                  "ascending" | "descending",
+                  unknown
+                >
+              )[order === "asc" ? "ascending" : "descending"],
             limit: batch,
           },
         ).execute();
@@ -777,17 +845,90 @@ export const createReindex =
         last = rows.at(-1)![key];
 
         const filled = await embedRows([search], rows);
+        const written = filled.filter(
+          (row) => row[search.column] !== undefined,
+        );
 
-        for (const row of filled) {
-          if (row[search.column] !== undefined) {
-            await source
-              .byId(row[key])
-              .update({ [search.column]: row[search.column] });
-            embeddedRows += 1;
-          }
+        if (!written.length) {
+          continue;
         }
+
+        // One statement for the batch. A row keeps what it has when its
+        // embedding was written meanwhile, or its text changed while the
+        // model was asked: that text is embedded on a later call.
+        const vectors = JSON.stringify(
+          Object.fromEntries(
+            written.map((row) => [
+              row[KEY_TEXT],
+              `[${(row[search.column] as number[]).join(",")}]`,
+            ]),
+          ),
+        );
+        const texts = JSON.stringify(
+          Object.fromEntries(
+            written.map((row) => [
+              row[KEY_TEXT],
+              documentText(search.sources, row),
+            ]),
+          ),
+        );
+        const ids = written.map((row) => row[key]);
+        const { affectedRows } = await source.update(
+          (row) => ({
+            [search.column]: template(
+              ["((", "::text::jsonb) ->> (", `)::text)::${columnType}`],
+              vectors,
+              row[key],
+            ),
+          }),
+          {
+            where: (row) => [
+              (
+                row[key] as unknown as { in: (values: unknown[]) => unknown }
+              ).in(ids),
+              (
+                row[search.column] as unknown as {
+                  is: (value: null) => unknown;
+                }
+              ).is(null),
+              template(
+                ["", " = ((", "::text::jsonb) ->> (", ")::text)"],
+                documentSQL(search.sources, row),
+                texts,
+                row[key],
+              ),
+            ],
+          },
+        );
+
+        embeddedRows += affectedRows;
       }
     }
 
     return embeddedRows;
   };
+
+/** `table.search.missing()`: how many embeddings `reindex()` would compute now. */
+export const createMissing =
+  (queryTable: object, table: TableSnapshot, embedded: readonly Embedded[]) =>
+  async (options: Pick<ReindexOptions, "where"> = {}): Promise<number> => {
+    const source = queryTable as Writable;
+
+    readOptions(table, options);
+
+    let total = 0;
+
+    for (const search of embedded) {
+      total += await (
+        source({
+          where: (row: Row, tools: unknown) =>
+            unembedded(search, options.where, row, tools),
+        }) as unknown as Writable
+      ).count();
+    }
+
+    return total;
+  };
+
+/** The field that carries a row's key as text through `reindex()`. */
+const KEY_TEXT = "__symmetria_key";

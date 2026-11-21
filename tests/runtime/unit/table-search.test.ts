@@ -81,6 +81,8 @@ test("search() lowers to a hidden vector column, two indexes and the extension",
       unique: false,
       primaryKey: false,
       hidden: true,
+      // What the embeddings describe: migrations clear them when it changes.
+      embedding: { model: "counting", sources: ["title", "content"] },
     },
     // The document is stored, so ranking does not parse the text again.
     {
@@ -178,8 +180,34 @@ test("declarations are checked where they are written", () => {
       .search((row) => ({ found: { words: fullText(row.about) } })),
   ).toThrow('duplicate search "found"');
   expect(() => embedder(0, async () => [])).toThrow(
-    "an embedding has between 1 and 2000 dimensions",
+    "an embedding has between 1 and 4000 dimensions",
   );
+  // More than pgvector indexes in full precision: half precision takes it.
+  const large = embedder(3072, async () => [], { name: "large" });
+
+  expect(() =>
+    schema({
+      wide: base().search((row) => ({ found: { meaning: large(row.about) } })),
+    }),
+  ).toThrow(
+    'search "found": pgvector indexes vectors of at most 2000 dimensions and large has 3072; keep it in half precision, large(...).half',
+  );
+
+  const halved = schema({
+    wide: base().search((row) => ({
+      found: { meaning: large(row.about).half },
+    })),
+  }).$snapshot().tables[0]!;
+
+  expect(halved.columns.at(-1)).toMatchObject({
+    name: "found",
+    sqlType: "halfvec(3072)",
+    hidden: true,
+  });
+  expect(halved.indexes!.at(-1)).toMatchObject({
+    method: "hnsw",
+    opclasses: ["halfvec_cosine_ops"],
+  });
   expect(() => ollama("unknown-model")).toThrow(
     'the embedding length of "unknown-model" is not known',
   );
@@ -559,10 +587,10 @@ test("reindex() embeds the rows that have no embedding, a batch at a time", asyn
   const { model, asked } = counting();
   const pages = [
     [
-      { id: 1, title: "A", content: "one" },
-      { id: 2, title: "", content: "" },
+      { id: 1, title: "A", content: "one", __symmetria_key: "1" },
+      { id: 2, title: "C", content: "", __symmetria_key: "2" },
     ],
-    [{ id: 3, title: "B", content: "three" }],
+    [{ id: 3, title: "B", content: "three", __symmetria_key: "3" }],
     [],
   ];
   const calls: CompiledQuery[] = [];
@@ -570,31 +598,65 @@ test("reindex() embeds the rows that have no embedding, a batch at a time", asyn
     executor: async (query) => {
       calls.push(query);
 
-      return query.sql.startsWith("SELECT") ? pages.shift()! : [];
+      return query.sql.startsWith("SELECT")
+        ? pages.shift()!
+        : { rows: [], affectedRows: query.parameters.length === 5 ? 2 : 1 };
     },
   });
 
-  expect(await database.chunks.search.reindex({ batch: 2 })).toBe(2);
+  expect(await database.chunks.search.reindex({ batch: 2 })).toBe(3);
   expect(asked.map((entry) => entry.texts)).toEqual([
-    ["A\n\none"],
+    ["A\n\none", "C"],
     ["B\n\nthree"],
   ]);
 
   const selects = calls.filter((call) => call.sql.startsWith("SELECT"));
 
   expect(selects).toHaveLength(3);
-  expect(selects[0]!.sql).toContain('WHERE "chunks"."about" IS NULL');
-  // Pages continue after the last key, so the row without text is passed once.
-  expect(selects[1]!.sql).toContain(
-    '"chunks"."about" IS NULL AND "chunks"."id" > $1',
+  // Rows without text are left out by the query itself, so no call reads them again.
+  expect(selects[0]!.sql).toContain(
+    `WHERE "chunks"."about" IS NULL AND ((concat_ws($1, NULLIF("chunks"."title", ''), NULLIF("chunks"."content", ''))) <> '') = (TRUE)`,
   );
-  expect(selects[1]!.parameters).toEqual([2]);
-  expect(
-    calls
-      .filter((call) => call.sql.startsWith("UPDATE"))
-      .map((call) => call.parameters),
-  ).toEqual([
-    ["[6,1]", 1],
-    ["[8,1]", 3],
+  // Pages continue after the last key.
+  expect(selects[1]!.sql).toContain('AND "chunks"."id" > $2');
+  expect(selects[1]!.parameters).toEqual(["\n\n", 2]);
+
+  // One UPDATE per batch, which keeps an embedding written meanwhile and
+  // skips a row whose text changed while the model was asked.
+  const updates = calls.filter((call) => call.sql.startsWith("UPDATE"));
+
+  expect(updates).toHaveLength(2);
+  expect(updates[0]!.sql).toBe(
+    `UPDATE "chunks" AS "chunks" SET "about" = (($1::text::jsonb) ->> ("chunks"."id")::text)::vector(2)\nWHERE ("chunks"."id" IN ($2, $3) AND "chunks"."about" IS NULL AND ((concat_ws($4, NULLIF("chunks"."title", ''), NULLIF("chunks"."content", ''))) = (($5::text::jsonb) ->> ("chunks"."id")::text)) = (TRUE))`,
+  );
+  expect(updates[0]!.parameters).toEqual([
+    JSON.stringify({ 1: "[6,1]", 2: "[1,1]" }),
+    1,
+    2,
+    "\n\n",
+    JSON.stringify({ 1: "A\n\none", 2: "C" }),
   ]);
+});
+
+test("reindex() goes by descending key and missing() counts what is left", async () => {
+  const calls: CompiledQuery[] = [];
+  const database = schema(tables(), {
+    executor: async (query) => {
+      calls.push(query);
+
+      return query.sql.includes("COUNT(*)") ? [{ count: 7 }] : [];
+    },
+  });
+
+  expect(await database.chunks.search.reindex({ order: "desc" })).toBe(0);
+  expect(calls[0]!.sql).toContain('ORDER BY "chunks"."id" DESC');
+  expect(
+    await database.chunks.search.missing({ where: { owner: "ada" } }),
+  ).toBe(7);
+  expect(calls[1]!.sql).toContain(
+    `WHERE "chunks"."owner" = $1 AND "chunks"."about" IS NULL AND ((concat_ws(`,
+  );
+  await expect(
+    database.chunks.search.reindex({ order: "newest" as never }),
+  ).rejects.toThrow('reindex() order is "asc" or "desc"');
 });

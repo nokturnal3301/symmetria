@@ -1412,12 +1412,15 @@ await db.products
   .returning("id", "sku");
 ```
 
-`by` is the primary key or a unique key (an array for a composite one). An
-existing row takes the columns in `update`, by default every column the rows
-carry except the key; rows of a bulk upsert must then carry the same columns,
-because a column some rows leave out would be overwritten with its default. It
-is `insert(…).onConflict(…).doUpdate(…)`, with the same scope checks and the
-same refusal of two rows with one key.
+`by` is the primary key or a unique key: a column, an array of the columns of a
+composite key, or the name of a unique index as `by.<name>` takes it
+(`upsert(row, { by: "identity" })` for `identity: index(…).unique`). The same
+name works as the target of `onConflict("identity")`. An existing row takes the
+columns in `update`, by default every column the rows carry except the key; rows
+of a bulk upsert must then carry the same columns, because a column some rows
+leave out would be overwritten with its default. It is
+`insert(…).onConflict(…).doUpdate(…)`, with the same scope checks and the same
+refusal of two rows with one key.
 
 `returning("id", "name")` returns those columns and `returning()` the whole row,
 next to the callback and reusable-shape forms.
@@ -1536,10 +1539,12 @@ await db.handles.by.identity({ tenant: "team", handle: "ada" }).delete();
 unique indexes over plain columns; `get()` and `find()` accept the same keys as
 an object of their columns and read the one row at once. Composite keys require
 all fields. Lookups select all root columns, including computed fields, and
-compose with ordinary query methods and prepared parameters. A null or undefined
-key rejects when the lookup runs. Partial and expression indexes are excluded;
-use explicit predicates for them. Primary-key lookup remains `.byId(...)`,
-including non-`id` and composite keys.
+compose with ordinary query methods and prepared parameters. A key takes what a
+filter on its column takes, so a `bigint` key accepts a safe integer
+(`db.events.find(42)`, `byId(42)`, `connect: 42`) as well as `42n`. A null or
+undefined key rejects when the lookup runs. Partial and expression indexes are
+excluded; use explicit predicates for them. Primary-key lookup remains
+`.byId(...)`, including non-`id` and composite keys.
 
 `.update()` and `.delete()` on a lookup keep the source's write types, `$scope`
 filters and transaction binding, accept prepared parameters in the key, and
@@ -2070,7 +2075,11 @@ prepared query and `$scope()` values are checked at every execution. Messages
 and codes are the same in every case.
 
 Queries and writes are thenable with `catch()` and `finally()` as well, so they
-read like promises; they run each time one of the three is called.
+read like promises and their types fit where a `Promise` is expected
+(`const load = (): Promise<Row[]> => db.users(shape)`, `Promise.all`). They are
+not `Promise` objects: `instanceof Promise` is false,
+`Object.prototype.toString` names them `SymmetriaQuery` or `SymmetriaWrite`, and
+they run each time one of `then()`, `catch()` and `finally()` is called.
 
 ### Error classes
 
@@ -2367,8 +2376,12 @@ const matches = await db.documents(
 ```
 
 `vector(n)` from `symmetria/vector` declares a pgvector column; `vector()`
-accepts any length, but indexes need a fixed one. Embeddings are written and
-read as plain `number[]`; the row type is the branded `Vector`, which has no
+accepts any length, but indexes need a fixed one. `halfvec(n)` is the same in
+half precision (pgvector 0.7+): half the space for the column and its index,
+HNSW indexes of up to 4,000 dimensions instead of 2,000, and the
+`halfvec_l2_ops` / `halfvec_cosine_ops` / `halfvec_ip_ops` operator classes.
+Values, distances and parameters work the same on both. Embeddings are written
+and read as plain `number[]`; the row type is the branded `Vector`, which has no
 array or JSON methods. Distances return `number` (`number | null` when either
 side can be NULL) and work in projections, `where` and `orderBy`: `l2Distance`
 (`<->`), `cosineDistance` (`<=>`, 0 for the same direction, 2 for opposite),
@@ -2463,7 +2476,11 @@ const found = await db.chunks.search(
   column named after the search (`about`, `vector(1024)` for `voyage4`,
   nullable) that is hidden: it is not a field of the row, whole-row reads and
   `returning()` leave it out, and it can still be named in a query
-  (`chunk.about`, untyped).
+  (`chunk.about`, untyped). `model(...columns).half` keeps it in half precision
+  instead (`halfvec`, pgvector 0.7+): each number takes 2 bytes rather than 4,
+  so the column and its index take about half the space, and the order of search
+  results hardly changes. It also lets a model of up to 4,000 numbers be
+  indexed, where `vector` stops at 2,000.
 
 The extensions are recorded by the declaration itself: migrations start with
 `CREATE EXTENSION IF NOT EXISTS` for `vector` and `pg_search` as needed, without
@@ -2489,7 +2506,9 @@ HTTP API directly and add no dependency.
 which becomes the column's type; models that can shorten their output are asked
 for that length, and those whose own output is longer than the 2,000 numbers
 pgvector indexes (`text-embedding-3-large`, `gemini-embedding-001`) default to
-1,536. `openai(model, { baseUrl })` also reaches any server that speaks OpenAI's
+1,536. In half precision they can keep more:
+`meaning: openai("text-embedding-3-large", { size: 3072 })(chunk.content).half`.
+`openai(model, { baseUrl })` also reaches any server that speaks OpenAI's
 embeddings API. A source without a module is one function,
 `embedder(size, async (texts, kind) => vectors)` from `symmetria/search`, where
 `kind` is `"document"` for rows and `"query"` for questions. A model is asked
@@ -2514,9 +2533,21 @@ An `UPDATE` that changes one of the embedded columns sets the embedding to
 `NULL` in the same statement, because it would describe the old text; an
 `UPDATE` that sets the embedding itself keeps what it sets. The row is found by
 its words meanwhile. `await db.chunks.search.reindex()` computes every missing
-embedding (`{ where, batch }` narrow and size the work) and resolves to the
-number of rows it embedded; it is also how rows written before the search was
-declared get theirs.
+embedding and resolves to the number of rows it embedded; it is also how rows
+written before the search was declared get theirs. Options:
+
+- `where` narrows the work, as in any query.
+- `batch` is how many rows go to the model at once and are written by one
+  `UPDATE` (100 unless given).
+- `order: "desc"` starts from the highest primary key instead of the lowest:
+  with increasing keys (`int.auto`, `uuid.v7`) the newest rows come first.
+
+A row whose embedded columns are all empty or NULL has nothing to embed, so
+`reindex()` does not read it. A row whose text changes while the model is
+answering keeps no embedding of the old text: it is skipped and embedded by the
+next call. A row that got an embedding in the meantime keeps it.
+`await db.chunks.search.missing({ where })` counts the embeddings `reindex()`
+would compute now, which makes progress visible without SQL.
 
 **Searching.** `search(shape?, options)` takes the shape of any query, or none
 for whole rows, and resolves to rows ordered best first:
@@ -2551,15 +2582,35 @@ If the model fails at search time and the search also declares words, the rows
 are found by words alone and the result says so: `rows.partial` is
 `{ search: "about", error }`. A search that has only a meaning rejects instead.
 
-A model replaced by one of another length changes the column's type
-(`vector(1024)` to `vector(1536)`). No stored embedding can be converted, so the
-migration empties the column (`USING NULL`), `lint` reports that as destructive,
-and `reindex()` computes the embeddings again afterwards.
+**Changing a search.** Stored embeddings describe the text of the declared
+columns as the declared model reads it, so migrations follow both:
 
-Not included: a search inside a nested relation (`note.chunks.search(...)`),
-inside `$batch()`, and a migration warning when a model is replaced by another
-of the same size (embeddings of different models cannot be compared; clear the
-column and run `reindex()`).
+- A model replaced by one of another length changes the column's type
+  (`vector(1024)` to `vector(1536)`). No stored embedding can be converted, so
+  the migration empties the column (`USING NULL`).
+- Another model of the same length (by its name, the `name` of `embedder()`), or
+  other columns (`voyage4(chunk.content)` becoming
+  `voyage4(chunk.title, chunk.content)`), keeps the type, and the migration
+  empties the column with `UPDATE … SET about = NULL`. A renamed column is the
+  same text and changes nothing.
+- `.half` added or removed converts the stored embeddings in place
+  (`USING about::halfvec(1024)`) and builds the index again with
+  `halfvec_cosine_ops` or `vector_cosine_ops`; nothing has to be embedded again.
+
+Emptying a column is reported as destructive: `generate` refuses it without
+`--allow-destructive`, and `reindex()` computes the embeddings again after the
+migration. Snapshots written by earlier releases did not record the model and
+the columns, so the first such change after an upgrade is not noticed; clear the
+column by hand once.
+
+Changing the parts of `words: fullText(...)` changes the expression of its
+stored column, which PostgreSQL can only compute again: the migration drops and
+adds the column, which rewrites the table and builds every index on it again,
+the vector index included. `generate` and `lint` say so; on a large table run
+such a migration in a quiet hour.
+
+Not included: a search inside a nested relation (`note.chunks.search(...)`) and
+inside `$batch()`.
 
 ## better-auth
 
@@ -3119,6 +3170,8 @@ bun packages/kit/src/cli/index.ts diff --config examples/symmetria.config.ts
 bun packages/kit/src/cli/index.ts diff --sql --config examples/symmetria.config.ts
 
 bun packages/kit/src/cli/index.ts generate change_name --config examples/symmetria.config.ts
+# Take back the latest migration while no database has applied it.
+bun packages/kit/src/cli/index.ts discard --config examples/symmetria.config.ts
 bun packages/kit/src/cli/index.ts migrate --config examples/symmetria.config.ts
 bun packages/kit/src/cli/index.ts status --config examples/symmetria.config.ts
 bun packages/kit/src/cli/index.ts rollback --config examples/symmetria.config.ts
@@ -3156,7 +3209,7 @@ matching config and API options.
 | `--advisory-lock-timeout <ms>` | commands that run migrations                 | Migration lock wait (`advisoryLockTimeoutMs`, default 10000)                                                    |
 | `--lock-timeout <ms>`          | commands that run migrations                 | DDL lock wait (`lockTimeoutMs`, default 5000; 0 disables)                                                       |
 | `--statement-timeout <ms>`     | commands that run migrations                 | Statement duration (`statementTimeoutMs`, default 600000; no default limit in `transaction: "none"` migrations) |
-| `--force`                      | `pull`, `graph`                              | Overwrite the written file                                                                                      |
+| `--force`                      | `pull`, `graph`, `discard`                   | Overwrite the written file; `discard`: no database to ask, or an `up.sql` edited after generation               |
 | `--compact`                    | `graph`                                      | Entities and relations without column lists                                                                     |
 | `--relations`                  | `inspect`                                    | Start on, or list, the relations                                                                                |
 | `--profile-url <url>`          | `profile`                                    | Profiler endpoint (default `http://127.0.0.1:7331`)                                                             |
@@ -3176,29 +3229,32 @@ choices produce explicit rename SQL in the saved migration. `--no-interactive`
 disables prompts; automated runs can provide the existing `--diff` rename-hint
 file.
 
-Generation rejects dropped tables or columns, removed enum labels and type
-changes that narrow existing values unless `--allow-destructive` is explicitly
-supplied; the refusal lists each destructive operation. Narrowing means a value
-can change or stop fitting: a shorter `varchar`/`char` or `bit` length, fewer
-`numeric` decimal places (values are rounded), `numeric` or floating point to an
-integer type, a smaller integer type (`bigint` to `integer`, either to
-`smallint`: the migration fails while a value is out of range), an integer type
-to `boolean` (every value other than 0 becomes true), fewer fractional-second
-digits on `timestamp`/`time`/`interval`, a timestamp to `date` or `time`, or a
-number into a floating-point type that keeps fewer digits. A change to a
-length-limited string type is generated without a `USING` cast: an explicit
-`::varchar(5)` would silently cut `Alexandria` to `Alexa`, while PostgreSQL's
-own assignment cast refuses the long value, so the migration fails and rolls
-back with the data intact. The same holds for the `down.sql` of a widening
-change: a rollback to the shorter type fails on values that no longer fit
-instead of cutting them. A type change PostgreSQL has no cast for (a number to
-`uuid`, a value to an array of it) is refused when the migration is generated,
-since its SQL could not run even on an empty table; give the conversion for both
-directions under `using` in the `--diff` file. A rename needs a `--diff` hint;
-it is never guessed from similar names. The API uses `allowDestructive: true`
-for intentional removals. Column declarations keep their order in
-`CREATE TABLE`; snapshot hashes ignore column order so reordering source
-declarations does not create a migration.
+Generation rejects dropped tables or columns, removed enum labels, cleared
+search embeddings and type changes that narrow existing values unless
+`--allow-destructive` is explicitly supplied; the refusal lists each destructive
+operation. A generated migration is printed with the same review `lint` gives
+it, so cautions such as a rewritten table are seen before it runs. `discard`
+takes the latest migration back while no database has applied it (see the Kit
+README). Narrowing means a value can change or stop fitting: a shorter
+`varchar`/`char` or `bit` length, fewer `numeric` decimal places (values are
+rounded), `numeric` or floating point to an integer type, a smaller integer type
+(`bigint` to `integer`, either to `smallint`: the migration fails while a value
+is out of range), an integer type to `boolean` (every value other than 0 becomes
+true), fewer fractional-second digits on `timestamp`/`time`/`interval`, a
+timestamp to `date` or `time`, or a number into a floating-point type that keeps
+fewer digits. A change to a length-limited string type is generated without a
+`USING` cast: an explicit `::varchar(5)` would silently cut `Alexandria` to
+`Alexa`, while PostgreSQL's own assignment cast refuses the long value, so the
+migration fails and rolls back with the data intact. The same holds for the
+`down.sql` of a widening change: a rollback to the shorter type fails on values
+that no longer fit instead of cutting them. A type change PostgreSQL has no cast
+for (a number to `uuid`, a value to an array of it) is refused when the
+migration is generated, since its SQL could not run even on an empty table; give
+the conversion for both directions under `using` in the `--diff` file. A rename
+needs a `--diff` hint; it is never guessed from similar names. The API uses
+`allowDestructive: true` for intentional removals. Column declarations keep
+their order in `CREATE TABLE`; snapshot hashes ignore column order so reordering
+source declarations does not create a migration.
 
 `diff` compares the current declaration to the latest local snapshot, not to the
 live database. CHECK expressions, partial-index predicates and index key
@@ -3803,7 +3859,12 @@ matching `migrator`.
 
 `symmetria-kit/testing` exports `testDatabase({ url, schema })`: it creates an
 isolated PostgreSQL schema, runs the DDL, binds a pool whose `search_path`
-points at it and drops everything on `close()`.
+points at it and drops everything on `close()`. Extensions the schema needs
+(`vector` for a search by meaning or a vector column, `pg_search` for `bm25()`)
+are created in the database's default schema when they are missing, which needs
+a role allowed to create them, and their schemas follow the test schema on the
+`search_path`, so their types and operators resolve without a `searchPath`
+option. The extension stays installed for later tests.
 
 ## Development
 

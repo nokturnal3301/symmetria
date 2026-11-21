@@ -26,6 +26,8 @@ export type MigrationColumn = {
   default?: string;
   /** `GENERATED ALWAYS AS (…) STORED`: the expression the column is computed from. */
   generated?: string;
+  /** A search's embedding: the model and the columns (SQL names) whose text it embeds. */
+  embedding?: { model: string; sources: string[] };
   references?: {
     table: string;
     column: string;
@@ -271,6 +273,14 @@ export const migrationSnapshot = (
         ...(column.generated === undefined
           ? {}
           : { generated: column.generated }),
+        ...(column.embedding
+          ? {
+              embedding: {
+                model: column.embedding.model,
+                sources: [...column.embedding.sources],
+              },
+            }
+          : {}),
         ...(column.references ? { references: { ...column.references } } : {}),
       };
     }),
@@ -466,6 +476,16 @@ export const parseMigrationSnapshot = (input: unknown): MigrationSnapshot => {
           ...(column.generated === undefined
             ? {}
             : { generated: text(column.generated) }),
+          ...(column.embedding === undefined
+            ? {}
+            : {
+                embedding: {
+                  model: text(column.embedding.model),
+                  sources: Array.isArray(column.embedding.sources)
+                    ? column.embedding.sources.map(identifier)
+                    : fail(),
+                },
+              }),
           ...(column.references
             ? {
                 references: {

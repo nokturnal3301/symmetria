@@ -17,6 +17,7 @@ import type {
   Parameter,
 } from "../expressions";
 import type {
+  Awaitable,
   CompiledQuery,
   QueryReference,
   RowLockOptions,
@@ -32,6 +33,7 @@ import type {
 } from "../../observability/inspection";
 import type { ReusableShape } from "./projections";
 import type { PartialSearch } from "../search";
+import type { WriteValue } from "../../schema/infer";
 import type { shapeExpressions } from "./projections";
 
 type SchemaRows = Record<string, Record<string, unknown>>;
@@ -692,9 +694,10 @@ type Terminals<Selection extends Projection> = Preparable<
   readonly toSQL: () => CompiledQuery;
   readonly execute: () => Promise<ProjectionRow<Selection>[]>;
   /** Queries are thenable: `await query` executes it like `execute()`. */
-  readonly then: PromiseLike<ProjectionRow<Selection>[]>["then"];
-  readonly catch: Promise<ProjectionRow<Selection>[]>["catch"];
-  readonly finally: Promise<ProjectionRow<Selection>[]>["finally"];
+  readonly then: Awaitable<ProjectionRow<Selection>[]>["then"];
+  readonly catch: Awaitable<ProjectionRow<Selection>[]>["catch"];
+  readonly finally: Awaitable<ProjectionRow<Selection>[]>["finally"];
+  readonly [Symbol.toStringTag]: string;
   readonly inspect: (
     options?: InspectQueryOptions,
   ) => Promise<QueryInspection<ProjectionRow<Selection>>>;
@@ -873,12 +876,10 @@ type SearchInput<Declared> = Declared extends { readonly meaning: true }
 /** Rows of a search, best first. `partial` is set when a search asked for could not be used. */
 export type SearchRows<Row> = Row[] & { readonly partial?: PartialSearch };
 
-export type SearchQuery<Row> = PromiseLike<SearchRows<Row>> & {
+export type SearchQuery<Row> = Awaitable<SearchRows<Row>> & {
   readonly execute: () => Promise<SearchRows<Row>>;
   /** The statement, once the question's embedding is known. */
   readonly toSQL: () => Promise<{ sql: string; parameters: unknown[] }>;
-  readonly catch: Promise<SearchRows<Row>>["catch"];
-  readonly finally: Promise<SearchRows<Row>>["finally"];
 };
 
 type SearchOptions<Columns, Tools, Searches> = {
@@ -942,7 +943,17 @@ export type TableSearch<
       RootColumns<RootScope<Rows, RootTable>, Rows, Relations>,
       ShapeTools<Rows, Relations>
     >["where"];
+    /** Rows embedded per call to the model and written per statement; 100 unless given. */
     readonly batch?: number;
+    /** By primary key, lowest first (`"asc"`, the default) or highest first. */
+    readonly order?: "asc" | "desc";
+  }) => Promise<number>;
+  /** How many embeddings `reindex()` would compute now: rows with text and no embedding. */
+  readonly missing: (options?: {
+    readonly where?: QueryOptions<
+      RootColumns<RootScope<Rows, RootTable>, Rows, Relations>,
+      ShapeTools<Rows, Relations>
+    >["where"];
   }) => Promise<number>;
 };
 
@@ -961,7 +972,8 @@ export type QueryTable<
     Insert,
     RootTable,
     keyof Relations[RootTable] & string,
-    RelatedColumns<Rows, Relations, RootTable>
+    RelatedColumns<Rows, Relations, RootTable>,
+    keyof UniqueKeys & string
   > & {
     readonly shape: <const Shape extends ProjectionObject>(
       callback: (
@@ -1039,7 +1051,7 @@ type KeyObject<Row, KeyNames extends keyof Row, UniqueKeys> =
  * `prepare()` parameter nothing to wait for; `byId()` and `by` take those.
  */
 type KeyColumns<Row, Names extends keyof Row> = {
-  readonly [Name in Names]: NonNullable<Row[Name]>;
+  readonly [Name in Names]: WriteValue<NonNullable<Row[Name]>>;
 } & { readonly [Other in Exclude<keyof Row, Names>]?: never };
 /** `get()` / `find()`: the whole row, or the fields a shape selects. */
 type KeyRead<
@@ -1091,12 +1103,13 @@ type KeyLookup<
     >,
     "update" | "delete"
   >;
+/** A key's value as a filter takes it: a `bigint` key also accepts a safe integer. */
 type LookupKey<Row, KeyNames extends keyof Row> = {
   [Name in KeyNames]: [Exclude<KeyNames, Name>] extends [never]
-    ? NonNullable<Row[Name]> | Parameter<NonNullable<Row[Name]>>
+    ? WriteValue<NonNullable<Row[Name]>> | Parameter<NonNullable<Row[Name]>>
     : {
         [Key in KeyNames]:
-          | NonNullable<Row[Key]>
+          | WriteValue<NonNullable<Row[Key]>>
           | Parameter<NonNullable<Row[Key]>>;
       };
 }[KeyNames];

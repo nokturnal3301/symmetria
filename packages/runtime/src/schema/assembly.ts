@@ -63,6 +63,12 @@ export type ColumnSnapshot = {
    * (`GENERATED ALWAYS AS (…) STORED`); such a column is never written.
    */
   generated?: string;
+  /**
+   * What a search's embedding is made of: the model's name and the SQL names
+   * of the columns whose text it embeds. Stored embeddings describe that text
+   * as that model reads it, so migrations clear them when either changes.
+   */
+  embedding?: { model: string; sources: readonly string[] };
 };
 
 export type RelationSnapshot =

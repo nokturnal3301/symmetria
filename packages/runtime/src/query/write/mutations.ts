@@ -30,7 +30,11 @@ import {
   type PredicateDescription,
   type ValueNode,
 } from "../expressions";
-import { primaryKeyColumns, type ColumnSnapshot } from "../../schema/assembly";
+import {
+  primaryKeyColumns,
+  uniqueColumnIndexes,
+  type ColumnSnapshot,
+} from "../../schema/assembly";
 import {
   createScope,
   initialPlan,
@@ -39,6 +43,7 @@ import {
 } from "../select";
 import {
   DEFAULT_VALUE,
+  WRITE_TAG,
   type CompiledQuery,
   type MutationPlan,
   type QueryExecutor,
@@ -542,17 +547,29 @@ export const createMutation = (
           );
         }
 
-        const columns = names.map((name) => {
-          const column = root.table.columns.find(
-            (column) => column.name === name,
-          );
+        // A single name that is no column may be a unique index, as by.<name> names it.
+        const index =
+          names.length === 1 &&
+          !root.table.columns.some((column) => column.name === names[0])
+            ? uniqueColumnIndexes(root.table).find(
+                (definition) => definition.name === names[0],
+              )
+            : undefined;
+        const columns = index
+          ? index.columns
+          : names.map((name) => {
+              const column = root.table.columns.find(
+                (column) => column.name === name,
+              );
 
-          if (!column) {
-            throw new Error(`symmetria: unknown conflict column "${name}"`);
-          }
+              if (!column) {
+                throw new Error(
+                  `symmetria: unknown conflict column "${name}"; the target is columns or the name of a unique key`,
+                );
+              }
 
-          return column;
-        });
+              return column;
+            });
 
         if (new Set(names).size !== names.length) {
           throw new Error("symmetria: duplicate conflict columns");
@@ -686,6 +703,7 @@ export const createMutation = (
       [PREPARE_QUERY]: (scope: object, names: readonly string[]) =>
         preparePlan(state, executor, scope, names, executeUsing),
       execute,
+      [Symbol.toStringTag]: WRITE_TAG,
       then: (
         onFulfilled?: ((value: unknown) => unknown) | null,
         onRejected?: ((reason: unknown) => unknown) | null,

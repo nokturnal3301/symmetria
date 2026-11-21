@@ -9,6 +9,7 @@ import type {
   SelectedColumn,
 } from "../expressions";
 import type {
+  Awaitable,
   CompiledQuery,
   DEFAULT_VALUE,
   QueryExecutor,
@@ -67,10 +68,18 @@ export type WriteOptions<WhereScope> = {
     | undefined;
 };
 /** `upsert()`: the conflict key and, optionally, the columns an existing row takes. */
-export type UpsertOptions<Row extends Record<string, unknown>, Insert> = {
-  /** The primary key or a unique key: one column, or all columns of a composite key. */
+export type UpsertOptions<
+  Row extends Record<string, unknown>,
+  Insert,
+  KeyNames extends string = never,
+> = {
+  /**
+   * The primary key or a unique key: one column, all columns of a composite
+   * key, or the key's name (`by.<name>`).
+   */
   readonly by:
     | ColumnNames<Row>
+    | KeyNames
     | readonly [ColumnNames<Row>, ...ColumnNames<Row>[]];
   /** Columns to overwrite on conflict; by default every column the rows carry except the key. */
   readonly update?: readonly WritableColumnNames<Insert>[] | undefined;
@@ -138,10 +147,7 @@ export type NestedInsertQuery<
     ): NestedInsertQuery<Row, TableName, Single, NextSelection>;
   };
   readonly execute: () => Promise<MutationResult<Selection, Single>>;
-  readonly then: PromiseLike<MutationResult<Selection, Single>>["then"];
-  readonly catch: Promise<MutationResult<Selection, Single>>["catch"];
-  readonly finally: Promise<MutationResult<Selection, Single>>["finally"];
-};
+} & Awaitable<MutationResult<Selection, Single>>;
 type Mutation<
   Row extends Record<string, unknown>,
   Insert extends Record<string, unknown>,
@@ -151,6 +157,8 @@ type Mutation<
   Single extends boolean = false,
   Optional extends boolean = false,
   WhereScope = Columns<Row>,
+  /** Names of the table's unique keys, which onConflict() takes as well as columns. */
+  KeyNames extends string = never,
 > = Preparable<MutationResult<Selection, Single, Optional>, "mutation"> & {
   readonly prepare: () => PreparedQuery<
     MutationResult<Selection, Single, Optional>,
@@ -167,7 +175,8 @@ type Mutation<
       Columns<Row>,
       Single,
       Optional,
-      WhereScope
+      WhereScope,
+      KeyNames
     >;
     /** The named columns. */
     <const Names extends readonly [ColumnNames<Row>, ...ColumnNames<Row>[]]>(
@@ -180,7 +189,8 @@ type Mutation<
       Pick<Columns<Row>, Names[number]>,
       Single,
       Optional,
-      WhereScope
+      WhereScope,
+      KeyNames
     >;
     <const NextSelection extends Projection>(
       selector:
@@ -194,21 +204,19 @@ type Mutation<
       NextSelection,
       Single,
       Optional,
-      WhereScope
+      WhereScope,
+      KeyNames
     >;
   };
   readonly toSQL: () => CompiledQuery;
   readonly execute: () => Promise<MutationResult<Selection, Single, Optional>>;
-  readonly then: PromiseLike<
-    MutationResult<Selection, Single, Optional>
-  >["then"];
-  readonly catch: Promise<MutationResult<Selection, Single, Optional>>["catch"];
-  readonly finally: Promise<
-    MutationResult<Selection, Single, Optional>
-  >["finally"];
-} & (Kind extends "insert"
+} & Awaitable<MutationResult<Selection, Single, Optional>> &
+  (Kind extends "insert"
     ? {
-        readonly onConflict: (...columns: (keyof Row & string)[]) => {
+        /** The conflict target: its columns, or the name of a unique key (`by.<name>`). */
+        readonly onConflict: (
+          ...target: (keyof Row & string)[] | [KeyNames]
+        ) => {
           readonly doNothing: () => Mutation<
             Row,
             Insert,
@@ -277,7 +285,8 @@ type Mutation<
           Selection,
           Single,
           Optional,
-          WhereScope
+          WhereScope,
+          KeyNames
         >;
         /** Confirms a whole-table UPDATE or DELETE; without where() or all() the statement is refused. */
         readonly all: () => Mutation<
@@ -288,7 +297,8 @@ type Mutation<
           Selection,
           Single,
           Optional,
-          WhereScope
+          WhereScope,
+          KeyNames
         >;
       });
 
@@ -298,24 +308,46 @@ export type TableMutations<
   TableName extends string,
   RelationNames extends string = never,
   WhereScope = Columns<Row>,
+  /** Names of the table's unique keys, as `by.<name>` lists them. */
+  KeyNames extends string = never,
 > = {
   readonly insert: {
     (
       values: readonly FlatInsert<Insert, RelationNames>[],
-    ): Mutation<Row, Insert, TableName, "insert", undefined, false>;
+    ): Mutation<
+      Row,
+      Insert,
+      TableName,
+      "insert",
+      undefined,
+      false,
+      false,
+      Columns<Row>,
+      KeyNames
+    >;
     (
       values: FlatInsert<Insert, RelationNames>,
-    ): Mutation<Row, Insert, TableName, "insert", undefined, true>;
+    ): Mutation<
+      Row,
+      Insert,
+      TableName,
+      "insert",
+      undefined,
+      true,
+      false,
+      Columns<Row>,
+      KeyNames
+    >;
   };
   /** Insert, or overwrite the row that has the same key: `upsert(row, { by: "sku" })`. */
   readonly upsert: {
     (
       values: readonly FlatInsert<Insert, RelationNames>[],
-      options: UpsertOptions<Row, Insert>,
+      options: UpsertOptions<Row, Insert, KeyNames>,
     ): Mutation<Row, Insert, TableName, "insert", undefined, false>;
     (
       values: FlatInsert<Insert, RelationNames>,
-      options: UpsertOptions<Row, Insert>,
+      options: UpsertOptions<Row, Insert, KeyNames>,
     ): Mutation<Row, Insert, TableName, "insert", undefined, true>;
   };
   readonly update: (

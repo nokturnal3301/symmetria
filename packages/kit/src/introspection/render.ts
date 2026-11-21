@@ -101,9 +101,9 @@ const typeSource = (type: ColumnType, imports: Set<string>): string => {
 
       return `oneOf(${type.values.map(quoteString).join(", ")})${type.name === undefined ? "" : `.typeName(${quoteString(type.name)})`}`;
     case "vector":
-      imports.add("vector");
+      imports.add(type.half ? "halfvec" : "vector");
 
-      return `vector(${type.dimensions ?? ""})`;
+      return `${type.half ? "halfvec" : "vector"}(${type.dimensions ?? ""})`;
     case "custom":
       imports.add("customType");
 
@@ -625,9 +625,12 @@ export const renderSchema = (
         ]
       : []),
   ];
-  const vectorImport = imports.has("vector")
+  const vectorBuilders = ["halfvec", "vector"].filter((name) =>
+    imports.has(name),
+  );
+  const vectorImport = vectorBuilders.length
     ? [
-        `import { vector } from ${quoteString(options.vectorModule ?? `${module}/vector`)};`,
+        `import { ${vectorBuilders.join(", ")} } from ${quoteString(options.vectorModule ?? `${module}/vector`)};`,
       ]
     : [];
   const sections = [

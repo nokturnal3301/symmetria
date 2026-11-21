@@ -20,6 +20,20 @@ export const TABLE_SOURCE = Symbol("symmetria.query.source");
 export const DEFAULT_VALUE = Symbol("symmetria.query.default");
 
 export type CompiledQuery = { sql: string; parameters: unknown[] };
+
+/**
+ * What `await` runs: queries and writes have a promise's `then`, `catch`,
+ * `finally` and tag, so they fit where a `Promise` is expected, and run each
+ * time one of the three is called.
+ */
+export type Awaitable<Value> = Pick<
+  Promise<Value>,
+  "then" | "catch" | "finally" | typeof Symbol.toStringTag
+>;
+
+/** The tags thenables carry: `Object.prototype.toString` names what they are. */
+export const QUERY_TAG = "SymmetriaQuery";
+export const WRITE_TAG = "SymmetriaWrite";
 export type ExecutionResult = {
   rows: Record<string, unknown>[];
   affectedRows: number;

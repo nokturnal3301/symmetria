@@ -8,7 +8,13 @@ import {
   renameExpressionIdentifiers,
 } from "./expression-tokens";
 import { expressionKey, indexKeyKey } from "./expressions";
-import { castless, typeConversion, utcConversion, widens } from "./conversions";
+import {
+  castless,
+  embeddingChange,
+  typeConversion,
+  utcConversion,
+  widens,
+} from "./conversions";
 import type { CompiledQuery, SchemaSnapshot } from "symmetria";
 import {
   columnSQL,
@@ -1036,6 +1042,23 @@ const direction = (
         (column.typeChanged || previous.default !== next.default)
       ) {
         statements.push(`${prefix} SET DEFAULT ${next.default}`);
+      }
+
+      // Embeddings of other text, or of another model, would rank rows by
+      // what they no longer say; emptied, reindex() computes them again.
+      if (
+        embeddingChange(
+          previous,
+          next,
+          Object.fromEntries(
+            pair.columns.map((match) => [match.before.name, match.after.name]),
+          ),
+        ) &&
+        !(column.typeChanged && typeConversion(previous, next)?.cleared)
+      ) {
+        statements.push(
+          `UPDATE ${quoteIdentifier(pair.after.name)} SET ${quoteIdentifier(next.name)} = NULL WHERE ${quoteIdentifier(next.name)} IS NOT NULL`,
+        );
       }
     }
 

@@ -29,6 +29,32 @@ export type TypeConversion = {
   readonly cleared?: boolean;
 };
 
+/**
+ * Why a search's stored embeddings no longer describe their rows: the model
+ * is another one, or it embeds other columns (`renamed` maps old column
+ * names to new ones, so a renamed column is the same text). Undefined when
+ * they still fit, or when the earlier snapshot did not record them.
+ */
+export const embeddingChange = (
+  before: MigrationColumn,
+  after: MigrationColumn,
+  renamed: Readonly<Record<string, string>> = {},
+): string | undefined => {
+  if (!before.embedding || !after.embedding) {
+    return undefined;
+  }
+
+  if (before.embedding.model !== after.embedding.model) {
+    return `the model changes from ${before.embedding.model} to ${after.embedding.model}`;
+  }
+
+  const sources = before.embedding.sources.map((name) => renamed[name] ?? name);
+
+  return sources.join("\u0000") === after.embedding.sources.join("\u0000")
+    ? undefined
+    : `it embeds ${after.embedding.sources.join(", ")} instead of ${sources.join(", ")}`;
+};
+
 type ParsedType = {
   readonly base: string;
   readonly first: number | undefined;
@@ -51,6 +77,8 @@ const INTEGER_DIGITS: Record<string, number> = {
   bigint: 19,
 };
 const FLOATS = new Set(["real", "double precision", "float"]);
+/** pgvector's types; `vector` and `halfvec` of one length cast into each other. */
+const VECTORS = new Set(["vector", "halfvec"]);
 const DECIMALS = new Set(["numeric", "decimal"]);
 const TIMESTAMPS = new Set([
   "timestamp with time zone",
@@ -215,8 +243,8 @@ export const typeConversion = (
   // would fail the cast. A nullable column is emptied instead, and the model
   // of the new length computes the embeddings again.
   if (
-    source.base === "vector" &&
-    target.base === "vector" &&
+    VECTORS.has(source.base) &&
+    VECTORS.has(target.base) &&
     !source.array &&
     source.first !== undefined &&
     target.first !== undefined &&

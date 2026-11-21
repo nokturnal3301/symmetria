@@ -2,6 +2,7 @@
  * Nested inserts: writes a parent row and its related rows in one transaction, resolving generated keys.
  */
 import { freeze } from "../plan/freeze";
+import { WRITE_TAG } from "../plan/types";
 import { NotFoundError } from "../../errors";
 import { encodeValue, type SchemaCodecs } from "../codecs";
 import { collectDataErrors } from "../codecs/deferred";
@@ -744,6 +745,7 @@ export const createNestedInsert = (
       returning: (next?: unknown, ...names: unknown[]) =>
         build(returningSelector(next, names) as Selector),
       execute: run,
+      [Symbol.toStringTag]: WRITE_TAG,
       then: (
         onFulfilled?: ((value: unknown) => unknown) | null,
         onRejected?: ((reason: unknown) => unknown) | null,

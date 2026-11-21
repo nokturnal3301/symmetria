@@ -73,7 +73,8 @@ export type ColumnType =
   | { kind: "numeric"; precision?: number; scale?: number }
   /** `oneOf(...)`; `name` is set when the type is not `<table>_<column>_enum` or is shared. */
   | { kind: "enum"; values: string[]; name?: string }
-  | { kind: "vector"; dimensions?: number }
+  /** `vector(n)`, or `halfvec(n)` when `half`. */
+  | { kind: "vector"; dimensions?: number; half?: true }
   | { kind: "custom"; sqlType: string; valueType: string };
 
 export type ColumnDefault =

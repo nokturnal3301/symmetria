@@ -14,6 +14,7 @@ import { executePage } from "./pagination";
 import { PREPARE_QUERY, preparePlan } from "./prepared";
 import {
   QUERY_PLAN,
+  QUERY_TAG,
   TABLE_SOURCE,
   normalizeResult,
   type CommonTableExpression,
@@ -517,6 +518,7 @@ export const createQueryFactory = (
           return (await executePlan(runnable(this[QUERY_STATE]), executor))
             .rows;
         },
+        [Symbol.toStringTag]: QUERY_TAG,
         then(
           this: QueryHandle,
           onFulfilled?: ((rows: Record<string, unknown>[]) => unknown) | null,

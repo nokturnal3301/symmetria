@@ -14,7 +14,7 @@ import {
   status,
   verify,
 } from "./database";
-import { recover, squash } from "./files";
+import { discard, recover, squash } from "./files";
 import { graph } from "./graph";
 import { init } from "./init";
 import { profile } from "./profile";
@@ -44,6 +44,8 @@ export const runCommand = async (
       return recover(context, project);
     case "squash":
       return squash(context, project, name!);
+    case "discard":
+      return discard(context, project, name);
     case "dashboard":
       return dashboard(context, project);
     case "inspect":

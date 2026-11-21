@@ -55,6 +55,7 @@ import type {
 import { SCHEMA_BIND } from "./binding";
 import { computedFields, type ComputedCallback } from "./computed";
 import {
+  createMissing,
   createReindex,
   createSearch,
   deferredWrite,
@@ -333,7 +334,10 @@ const createTableHandle = (
               searchesOf(tableSnapshot),
               scoped,
             ),
-            { reindex: createReindex(queryTable, tableSnapshot, embedded) },
+            {
+              reindex: createReindex(queryTable, tableSnapshot, embedded),
+              missing: createMissing(queryTable, tableSnapshot, embedded),
+            },
           ),
         }
       : {}),
@@ -920,6 +924,20 @@ const createSchema = <
             : [],
         ),
       );
+
+      for (const search of searchesOf(table)) {
+        if (search.meaning) {
+          table.columns.find(
+            (column) => column.name === search.name,
+          )!.embedding = {
+            model: search.meaning.model.name,
+            sources: searchColumns(search.meaning).map(
+              (name) =>
+                table.columns.find((column) => column.name === name)!.sqlName,
+            ),
+          };
+        }
+      }
     }
     conditionRelations.set(table, tableRelations.get(table.name) ?? []);
   }

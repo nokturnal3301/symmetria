@@ -87,6 +87,8 @@ test("generation updates one snapshot and journal without changing earlier migra
     ).toEqual({
       version: 1,
       migrations: [initial.manifest, added.manifest],
+      // The way back for `discard`: the snapshot before the latest migration.
+      undo: { migration: added.id, snapshot: initial.snapshot },
     });
     expect(
       (await loadMigrations(directory)).map((migration) => migration.checksum),

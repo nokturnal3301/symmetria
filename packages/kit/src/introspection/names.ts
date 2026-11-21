@@ -180,6 +180,7 @@ export const MODULE_IDENTIFIERS: readonly string[] = [
   "uuid",
   "varchar",
   "vector",
+  "halfvec",
 ];
 
 /** Words a module cannot use as a parameter or binding name. */

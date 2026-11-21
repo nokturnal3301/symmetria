@@ -14,7 +14,7 @@ import {
 import { createScope } from "../query/select/scope";
 import type { RuntimeScope } from "../query/select/types";
 import { hiddenColumn, tsvector } from "./column";
-import { vector } from "../entries/vector";
+import { halfvec, vector } from "../entries/vector";
 import {
   index,
   operatorClass,
@@ -66,7 +66,15 @@ export interface MeaningSearch {
   readonly [MEANING]: {
     readonly model: EmbeddingModel;
     readonly sources: readonly Text[];
+    /** `"half"`: kept as `halfvec`, in half the space; `"full"` (`vector`) unless `.half` says so. */
+    readonly precision: "full" | "half";
   };
+  /**
+   * The embedding in half precision (`halfvec`, pgvector 0.7+): the column and
+   * its index take about half the space, models of up to 4,000 dimensions can
+   * be indexed, and the ranking hardly changes.
+   */
+  readonly half: MeaningSearch;
 }
 
 /** One named search of a table: `about: { words: bm25(...), meaning: voyage4(...) }`. */
@@ -160,8 +168,9 @@ export const fullText = (
     }),
   });
 
-/** pgvector indexes `vector` columns of at most 2,000 dimensions. */
+/** pgvector indexes `vector` columns of at most 2,000 dimensions, `halfvec` of 4,000. */
 const MAX_INDEXED_SIZE = 2000;
+const MAX_INDEXED_HALF_SIZE = 4000;
 
 /**
  * A model for searching by meaning: `embedder(1024, (texts, kind) => …)`.
@@ -175,9 +184,9 @@ export const embedder = (
 ): ((...sources: Text[]) => MeaningSearch) & {
   readonly model: EmbeddingModel;
 } => {
-  if (!Number.isSafeInteger(size) || size < 1 || size > MAX_INDEXED_SIZE) {
+  if (!Number.isSafeInteger(size) || size < 1 || size > MAX_INDEXED_HALF_SIZE) {
     throw new Error(
-      `symmetria: an embedding has between 1 and ${MAX_INDEXED_SIZE} dimensions`,
+      `symmetria: an embedding has between 1 and ${MAX_INDEXED_HALF_SIZE} dimensions (more than ${MAX_INDEXED_SIZE} only in half precision, model(...).half)`,
     );
   }
 
@@ -207,9 +216,19 @@ export const embedder = (
         }
       }
 
-      return Object.freeze({
-        [MEANING]: Object.freeze({ model, sources: Object.freeze(sources) }),
-      });
+      const meaning = (precision: "full" | "half"): MeaningSearch =>
+        Object.freeze({
+          [MEANING]: Object.freeze({
+            model,
+            sources: Object.freeze(sources),
+            precision,
+          }),
+          get half() {
+            return meaning("half");
+          },
+        });
+
+      return meaning("full");
     },
     { model },
   );
@@ -367,11 +386,19 @@ export const lowerSearch = (
         );
       }
 
+      const { model, precision } = search.meaning;
+
+      if (precision === "full" && model.size > MAX_INDEXED_SIZE) {
+        throw new Error(
+          `symmetria: search "${search.name}": pgvector indexes vectors of at most ${MAX_INDEXED_SIZE} dimensions and ${model.name} has ${model.size}; keep it in half precision, ${model.name}(...).half, or ask the model for fewer`,
+        );
+      }
+
       extensions.add("vector");
       // Nullable: a table that already has rows can gain a search, and a row
       // whose embedding is not there yet is still found by its words.
       columns[search.name] = hiddenColumn(
-        vector(search.meaning.model.size).nullable,
+        (precision === "half" ? halfvec : vector)(model.size).nullable,
       );
     }
 
@@ -402,7 +429,9 @@ export const lowerSearch = (
         definitions[`${search.name}Meaning`] = index(
           operatorClass(
             table[search.name] as SelectedColumn,
-            "vector_cosine_ops",
+            search.meaning.precision === "half"
+              ? "halfvec_cosine_ops"
+              : "vector_cosine_ops",
           ),
         ).using("hnsw");
       }

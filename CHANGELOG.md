@@ -1,5 +1,70 @@
 # Changelog
 
+## 3.3.0 — 2026-11-21
+
+Fixes and additions from running Symmetria in production with a search by
+meaning over about 150,000 messages.
+
+### Runtime (`symmetria`)
+
+- `search.reindex()` no longer reads rows that have nothing to embed: a row
+  whose embedded columns are all empty or NULL is left out by the query itself.
+  Before, every call read such rows again; 15,000 of them cost about 235 empty
+  round trips per pass at a batch of 64.
+- `search.reindex()` writes a batch with one `UPDATE` instead of one per row,
+  and no longer stores an embedding of text that changed while the model was
+  answering (the row is embedded by the next call) or overwrites an embedding
+  written in the meantime.
+- `search.reindex({ order: "desc" })` starts from the highest primary key, so
+  with increasing keys the newest rows are embedded first.
+- New `search.missing({ where })`: how many embeddings `reindex()` would compute
+  now.
+- Half precision for embeddings: `meaning: model(...columns).half` keeps the
+  embedding as `halfvec` (pgvector 0.7+) with a `halfvec_cosine_ops` index, in
+  about half the space; models of up to 4,000 dimensions can then be indexed.
+  `halfvec(n)` from `symmetria/vector` declares such a column directly.
+- `find()`, `get()`, `byId()`, `by.<key>()` and a nested `connect` accept a safe
+  integer for a `bigint` key in their types, as writes and filters already did;
+  the runtime already accepted it.
+- `onConflict()` and `upsert({ by })` take the name of a unique index as
+  `by.<name>` names it (`onConflict("identity")` for
+  `identity: index(…).unique`).
+- Queries, writes and searches are assignable to `Promise<…>` in TypeScript:
+  their `then`, `catch` and `finally` are typed as a promise's, and they carry a
+  `Symbol.toStringTag` (`SymmetriaQuery`, `SymmetriaWrite`). A function typed
+  `(): Promise<Row[]>` can return a query without `.execute()`.
+
+### Kit (`symmetria-kit`)
+
+- **Changed:** a search's snapshot records the model and the columns its
+  embeddings are made of. Another model of the same length, or other columns,
+  makes the migration clear the stored embeddings (`UPDATE … SET about = NULL`),
+  which `lint` reports as destructive, so `generate` needs `--allow-destructive`
+  and `reindex()` computes them again. Before, such a change produced no
+  migration and the old embeddings kept describing the old text. Snapshots from
+  earlier releases lack the record, so the first such change after upgrading is
+  not noticed.
+- Turning a search's meaning to `.half` and back converts the stored embeddings
+  in place and builds the index again with the matching operator class; `pull`
+  reads `halfvec` columns back.
+- New command `discard [id]`: takes back the latest migration while no database
+  has applied it, restoring the snapshot and the journal, so it can be generated
+  again. It asks the configured database first (`--force` without one, or for an
+  edited `up.sql`). The journal now keeps the snapshot before the latest
+  migration (`undo`), which older releases ignore; for migrations generated
+  before, the earlier snapshot is taken from the Git history. A migration
+  deleted by hand, which made `generate`, `status` and `diff` refuse with
+  "snapshot checksum does not match the migration journal", is repaired by
+  `discard` too, and that error now says so.
+- `generate` prints the review `lint` gives the new migration, so a caution such
+  as a rewritten table is seen without running `lint`. The caution for a changed
+  `fullText()` says that every index of the table is built again and names the
+  vector index among them.
+- `testDatabase()` creates the extensions a schema needs (`vector`, `pg_search`)
+  when they are missing and puts their schemas on the test schema's
+  `search_path`; a manual `CREATE EXTENSION` and the `searchPath` option are no
+  longer needed for them.
+
 ## 3.2.0 — 2026-11-20
 
 ### Runtime (`symmetria`)
