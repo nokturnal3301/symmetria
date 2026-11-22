@@ -11,6 +11,7 @@ import {
 } from "symmetria/internal";
 import type { MigrationPlan, MigrationStatus, RenameHints } from "../../index";
 import { canonicalJSON, type MigrationColumn } from "../../migrations/snapshot";
+import { renameMaps } from "../../migrations/diff";
 import { heading, panel, theme, fitLine, terminalWidth } from "./style";
 import stringWidth from "string-width";
 
@@ -42,6 +43,8 @@ export const formatDiff = (
   renames: RenameHints = {},
 ): string => {
   const { style } = theme(color);
+  const { tables: renamedTables, columns: renamedColumnsByTable } =
+    renameMaps(renames);
 
   if (!plan.up.length) {
     return color
@@ -68,14 +71,12 @@ export const formatDiff = (
   for (const name of [
     ...new Set(
       [...previous.keys()]
-        .map((name) => renames.tables?.[name] ?? name)
+        .map((name) => renamedTables.get(name) ?? name)
         .concat([...next.keys()]),
     ),
   ].sort()) {
     const originalName =
-      Object.entries(renames.tables ?? {}).find(
-        ([, target]) => target === name,
-      )?.[0] ?? name;
+      [...renamedTables].find(([, target]) => target === name)?.[0] ?? name;
     const before = previous.get(originalName);
     const after = next.get(name);
 
@@ -90,19 +91,19 @@ export const formatDiff = (
         "accent",
       ),
     );
-    const renamedColumns = renames.columns?.[name] ?? {};
+    const renamedColumns =
+      renamedColumnsByTable.get(name) ?? new Map<string, string>();
     const columns = new Set([
       ...(before?.columns.map(
-        (column) => renamedColumns[column.name] ?? column.name,
+        (column) => renamedColumns.get(column.name) ?? column.name,
       ) ?? []),
       ...(after?.columns.map((column) => column.name) ?? []),
     ]);
 
     for (const columnName of columns) {
       const originalColumnName =
-        Object.entries(renamedColumns).find(
-          ([, target]) => target === columnName,
-        )?.[0] ?? columnName;
+        [...renamedColumns].find(([, target]) => target === columnName)?.[0] ??
+        columnName;
       const old = before?.columns.find(
         (column) => column.name === originalColumnName,
       );
@@ -170,14 +171,13 @@ export const formatDiff = (
     for (const column of table.columns) {
       const old = previous
         .get(
-          Object.entries(renames.tables ?? {}).find(
-            ([, target]) => target === table.name,
-          )?.[0] ?? table.name,
+          [...renamedTables].find(([, target]) => target === table.name)?.[0] ??
+            table.name,
         )
         ?.columns.find(
           (candidate) =>
             candidate.name ===
-            (Object.entries(renames.columns?.[table.name] ?? {}).find(
+            ([...(renamedColumnsByTable.get(table.name) ?? [])].find(
               ([, target]) => target === column.name,
             )?.[0] ?? column.name),
         );

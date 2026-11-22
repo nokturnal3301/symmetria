@@ -3,11 +3,12 @@
  * fail on populated tables or need deploy planning.
  */
 import { normalizeSqlType } from "./drift";
-import { quoteIdentifier } from "symmetria/internal";
+import { objectName, quoteIdentifier } from "symmetria/internal";
 import {
   changedDefinition,
   counterparts,
   renamedDefinitions,
+  renameMaps,
   type DefinitionScope,
   type MigrationPlan,
   type RenameHints,
@@ -19,6 +20,7 @@ import {
   typeConversion,
 } from "./conversions";
 import type { MigrationColumn, MigrationTable } from "./snapshot";
+import { distinctDefault, VOLATILE_FUNCTION } from "./sql-lint";
 
 /**
  * destructive: data is lost or becomes unrepresentable (generation requires
@@ -46,7 +48,8 @@ export const lintMigration = (
   renames: RenameHints = {},
 ): LintFinding[] => {
   const findings: LintFinding[] = [];
-  const renamedTables = renames.tables ?? {};
+  const { tables: renamedTables, columns: renamedColumnsByTable } =
+    renameMaps(renames);
   const afterTables = new Map(
     plan.after.tables.map((table) => [table.name, table]),
   );
@@ -66,6 +69,33 @@ export const lintMigration = (
       advice,
     });
   };
+
+  /**
+   * A constraint the plan adds NOT VALID and validates in its own statement
+   * (--online): the validation still fails on a violating row, but under a
+   * lock that lets reads and writes go on, as SQL lint rates it.
+   */
+  const validatedLater = (table: string, constraint: string): boolean =>
+    plan.up.includes(
+      `ALTER TABLE ${quoteIdentifier(table)} VALIDATE CONSTRAINT ${quoteIdentifier(constraint)}`,
+    );
+  const validation = (
+    table: string,
+    constraint: string,
+    level: LintLevel,
+    message: string,
+    advice: string,
+    column?: string,
+  ): void =>
+    validatedLater(table, constraint)
+      ? report(
+          "caution",
+          table,
+          `${message.replace(/; the statement fails when .*$/, "")}; it is added NOT VALID and validated in a separate statement, which fails when an existing row violates it.`,
+          "Fix violating rows before the migration runs.",
+          column,
+        )
+      : report(level, table, message, advice, column);
 
   // A type that keeps its labels under a new name is renamed in place (ALTER TYPE … RENAME TO).
   const renamedEnumeration = (from?: string, to?: string): boolean => {
@@ -117,7 +147,8 @@ export const lintMigration = (
     before: MigrationTable,
     after: MigrationTable,
   ): void => {
-    const renamedColumns = renames.columns?.[after.name] ?? {};
+    const renamedColumns =
+      renamedColumnsByTable.get(after.name) ?? new Map<string, string>();
     const afterColumns = new Map(
       after.columns.map((column) => [column.name, column]),
     );
@@ -126,7 +157,7 @@ export const lintMigration = (
     );
 
     for (const column of before.columns) {
-      const renamedTo = renamedColumns[column.name];
+      const renamedTo = renamedColumns.get(column.name);
       const next = afterColumns.get(renamedTo ?? column.name);
 
       // A generated column holds nothing of its own: PostgreSQL computes it
@@ -163,23 +194,46 @@ export const lintMigration = (
       // the same target column cannot fail, as the old key held.
       const target = column.references && {
         table:
-          renamedTables[column.references.table] ?? column.references.table,
+          renamedTables.get(column.references.table) ?? column.references.table,
         column: column.references.column,
       };
       const targetColumn =
         target &&
-        (renames.columns?.[target.table]?.[target.column] ?? target.column);
+        (renamedColumnsByTable.get(target.table)?.get(target.column) ??
+          target.column);
 
       if (
         next.references &&
         (target?.table !== next.references.table ||
           targetColumn !== next.references.column)
       ) {
-        report(
-          "blocking",
+        validation(
           after.name,
+          objectName(after.name, next.name, "fkey"),
+          "blocking",
           `Column "${next.name}" gains a foreign key to ${next.references.table}.${next.references.column}; the statement fails when an existing value has no match.`,
           "Fix or clear unmatched values first, or generate with --online, which adds the key NOT VALID and validates it separately.",
+          next.name,
+        );
+      } else if (column.references && !next.references) {
+        report(
+          "caution",
+          after.name,
+          `Column "${next.name}" loses its foreign key to ${column.references.table}.${column.references.column}; the database stops checking it.`,
+          "Dropping the key loses no data; make sure nothing relies on it.",
+          next.name,
+        );
+      } else if (
+        column.references &&
+        next.references &&
+        (column.references.onDelete !== next.references.onDelete ||
+          column.references.onUpdate !== next.references.onUpdate)
+      ) {
+        report(
+          "caution",
+          after.name,
+          `The foreign key of column "${next.name}" is rebuilt to change its actions; PostgreSQL checks every existing row again while it holds a lock.`,
+          "It cannot fail, as the key held; on a large table run the migration in a quiet hour, or generate with --online.",
           next.name,
         );
       }
@@ -192,7 +246,7 @@ export const lintMigration = (
       affected: [],
       renamed: renamedDefinitions(
         new Map(
-          Object.entries(renamedColumns).map(([previous, next]) => [
+          [...renamedColumns].map(([previous, next]) => [
             quoteIdentifier(previous),
             quoteIdentifier(next),
           ]),
@@ -202,31 +256,61 @@ export const lintMigration = (
         after.columns.map((column) => [column.name, column.sqlType]),
       ),
     };
+    /** The next definitions that continue a previous one unchanged, and the previous ones none continues. */
     const kept = <Definition extends { sqlName: string }>(
       previous: readonly Definition[],
       next: readonly Definition[],
-    ): Set<string> => {
+    ): { kept: Set<string>; removed: Definition[] } => {
       const matches = counterparts(scope, previous, next);
 
-      return new Set(
-        previous.flatMap((definition) => {
-          const match = matches.get(definition.sqlName);
+      return {
+        kept: new Set(
+          previous.flatMap((definition) => {
+            const match = matches.get(definition.sqlName);
 
-          return match && !changedDefinition(scope, definition, match)
-            ? [match.sqlName]
-            : [];
-        }),
-      );
+            return match && !changedDefinition(scope, definition, match)
+              ? [match.sqlName]
+              : [];
+          }),
+        ),
+        removed: previous.filter(
+          (definition) => !matches.has(definition.sqlName),
+        ),
+      };
     };
-    const keptChecks = kept(before.checks ?? [], after.checks ?? []);
-    const keptIndexes = kept(before.indexes, after.indexes);
+    const checks = kept(before.checks ?? [], after.checks ?? []);
+    const keptChecks = checks.kept;
+    const indexes = kept(before.indexes, after.indexes);
+    const keptIndexes = indexes.kept;
+
+    // Removing a check or an index loses no data.
+    for (const definition of checks.removed) {
+      report(
+        "caution",
+        after.name,
+        `CHECK constraint "${definition.sqlName}" is dropped; the database stops checking it.`,
+        "Dropping the constraint loses no data; make sure nothing relies on it.",
+      );
+    }
+
+    for (const definition of indexes.removed) {
+      report(
+        "caution",
+        after.name,
+        definition.unique
+          ? `Unique index "${definition.sqlName}" is dropped; the database stops refusing duplicates.`
+          : `Index "${definition.sqlName}" is dropped; queries that used it can get slower.`,
+        "Dropping the index loses no data; make sure nothing relies on it.",
+      );
+    }
 
     // CHECK constraints validate every existing row, like NOT NULL.
     for (const definition of after.checks ?? []) {
       if (!keptChecks.has(definition.sqlName)) {
-        report(
-          "blocking",
+        validation(
           after.name,
+          definition.sqlName,
+          "blocking",
           `CHECK constraint "${definition.sqlName}" is added; the statement fails when an existing row violates it.`,
           "Fix violating rows first, or generate with --online, which adds the check NOT VALID and validates it separately.",
         );
@@ -236,7 +320,7 @@ export const lintMigration = (
     for (const column of after.columns) {
       if (
         beforeColumns.has(column.name) ||
-        Object.values(renamedColumns).includes(column.name)
+        [...renamedColumns.values()].includes(column.name)
       ) {
         continue;
       }
@@ -246,7 +330,18 @@ export const lintMigration = (
         continue;
       }
 
-      if (column.notNull && column.default === undefined && !column.identity) {
+      const unfilled =
+        column.notNull && column.default === undefined && !column.identity;
+      // A volatile default is computed for every existing row; an identity, a
+      // sequence or a uuid generator gives each its own value, while
+      // clock_timestamp() or random() can repeat.
+      const volatile =
+        column.default !== undefined && VOLATILE_FUNCTION.test(column.default);
+      const distinct =
+        column.identity ||
+        (column.default !== undefined && distinctDefault(column.default));
+
+      if (unfilled) {
         report(
           "blocking",
           after.name,
@@ -256,12 +351,52 @@ export const lintMigration = (
         );
       }
 
-      if (column.unique) {
+      if (column.identity || volatile) {
         report(
           "caution",
           after.name,
-          `Column "${column.name}" is added with a UNIQUE constraint.`,
-          "Existing rows all receive the same default; make sure the default is unique or add the constraint after backfilling.",
+          column.identity
+            ? `Column "${column.name}" is added as an identity column; PostgreSQL numbers every existing row and rewrites the table while it holds a lock that blocks reads and writes.`
+            : `Column "${column.name}" gets its default computed for every existing row; PostgreSQL rewrites the table while it holds a lock that blocks reads and writes.`,
+          "On a large table run the migration in a quiet hour.",
+          column.name,
+        );
+      }
+
+      if (column.unique && !unfilled) {
+        if (column.default !== undefined && !distinct) {
+          report(
+            "blocking",
+            after.name,
+            volatile
+              ? `Column "${column.name}" is added with a UNIQUE constraint and the default ${column.default}, whose values can repeat across existing rows; the statement fails when two rows get the same one.`
+              : `Column "${column.name}" is added with a UNIQUE constraint and the default ${column.default}; every existing row receives that value, so the statement fails when the table has two or more rows.`,
+            "Add the column without UNIQUE, give existing rows distinct values, then add the constraint in a later migration.",
+            column.name,
+          );
+        } else {
+          report(
+            "caution",
+            after.name,
+            `Column "${column.name}" is added with a UNIQUE constraint; existing rows hold distinct values or NULL, and the index is built while writes wait.`,
+            "On a large table run the migration in a quiet hour.",
+            column.name,
+          );
+        }
+      }
+
+      // Existing rows that get a value are checked against the key.
+      if (
+        column.references &&
+        !unfilled &&
+        (column.identity || column.default !== undefined)
+      ) {
+        validation(
+          after.name,
+          objectName(after.name, column.name, "fkey"),
+          "blocking",
+          `Column "${column.name}" is added with a foreign key to ${column.references.table}.${column.references.column} and a value for every existing row; the statement fails when one has no match.`,
+          "Add the column without a default, or generate with --online, which adds the key NOT VALID and validates it separately.",
           column.name,
         );
       }
@@ -284,15 +419,64 @@ export const lintMigration = (
       );
     }
 
-    if (
-      JSON.stringify(before.primaryKey) !== JSON.stringify(after.primaryKey)
-    ) {
-      report(
-        "caution",
-        after.name,
-        `Primary key changes from (${before.primaryKey.join(", ")}) to (${after.primaryKey.join(", ")}).`,
-        "The table is rewritten and foreign keys are rebuilt; plan the deploy for low traffic.",
-      );
+    const previousKey = before.primaryKey.map(
+      (name) => renamedColumns.get(name) ?? name,
+    );
+
+    if (JSON.stringify(previousKey) !== JSON.stringify(after.primaryKey)) {
+      // A key over columns that contain the previous one, none retyped,
+      // keeps existing rows unique.
+      const contained =
+        previousKey.length > 0 &&
+        previousKey.every((name) => after.primaryKey.includes(name)) &&
+        before.primaryKey.every((name) => {
+          const previous = beforeColumns.get(name)!;
+          const next = afterColumns.get(renamedColumns.get(name) ?? name);
+
+          return (
+            next !== undefined &&
+            normalizeSqlType(previous.sqlType) ===
+              normalizeSqlType(next.sqlType) &&
+            previous.enumeration === next.enumeration
+          );
+        });
+      // A column added with an identity, a sequence or a uuid generator gives
+      // every existing row its own non-null value, so a key over it cannot fail.
+      const fresh = after.primaryKey.some((name) => {
+        const column = afterColumns.get(name);
+
+        return (
+          column !== undefined &&
+          !beforeColumns.has(name) &&
+          ![...renamedColumns.values()].includes(name) &&
+          column.generated === undefined &&
+          (column.identity ||
+            (column.default !== undefined && distinctDefault(column.default)))
+        );
+      });
+
+      if (!after.primaryKey.length) {
+        report(
+          "caution",
+          after.name,
+          `Primary key (${before.primaryKey.join(", ")}) is dropped; the database stops refusing duplicate keys.`,
+          "Dropping the key loses no data; foreign keys that reference it must go first.",
+        );
+      } else if (contained || fresh) {
+        report(
+          "caution",
+          after.name,
+          `Primary key changes from (${before.primaryKey.join(", ")}) to (${after.primaryKey.join(", ")}).`,
+          "The table is rewritten and foreign keys are rebuilt; plan the deploy for low traffic.",
+        );
+      } else {
+        report(
+          "blocking",
+          after.name,
+          `Primary key changes from (${before.primaryKey.join(", ")}) to (${after.primaryKey.join(", ")}); the statement fails when existing rows share a key or hold NULL in it.`,
+          "Make the new key's values unique first; the table is rewritten and foreign keys are rebuilt, so plan the deploy for low traffic.",
+        );
+      }
     }
   };
 
@@ -300,7 +484,7 @@ export const lintMigration = (
     table: MigrationTable,
     before: MigrationColumn,
     after: MigrationColumn,
-    renamedColumns: Readonly<Record<string, string>> = {},
+    renamedColumns: ReadonlyMap<string, string> = new Map(),
   ): void => {
     const retyped =
       normalizeSqlType(before.sqlType) !== normalizeSqlType(after.sqlType) ||
@@ -369,11 +553,19 @@ export const lintMigration = (
         "Deduplicate the data first, then add the constraint.",
         after.name,
       );
+    } else if (before.unique && !after.unique) {
+      report(
+        "caution",
+        table.name,
+        `Column "${after.name}" is no longer UNIQUE; the database stops refusing duplicates.`,
+        "Dropping the constraint loses no data; make sure nothing relies on it.",
+        after.name,
+      );
     }
   };
 
   for (const table of plan.before.tables) {
-    const renamedTo = renamedTables[table.name];
+    const renamedTo = renamedTables.get(table.name);
     const next = afterTables.get(renamedTo ?? table.name);
 
     if (!next) {

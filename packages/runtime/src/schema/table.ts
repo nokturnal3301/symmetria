@@ -901,7 +901,7 @@ export const createTable = (init: TableInit): object => {
         return referenceChain(state, { [key]: true });
       }
 
-      if (key in state.columns) {
+      if (Object.hasOwn(state.columns, key)) {
         return {
           kind: "columnReference",
           table: state,
@@ -930,7 +930,8 @@ export const createTable = (init: TableInit): object => {
         key === "relations" ||
         key === "named" ||
         (typeof key === "string" &&
-          (key in state.columns || Object.hasOwn(state.slots, key))) ||
+          (Object.hasOwn(state.columns, key) ||
+            Object.hasOwn(state.slots, key))) ||
         Reflect.has(proxyTarget, key)
       );
     },

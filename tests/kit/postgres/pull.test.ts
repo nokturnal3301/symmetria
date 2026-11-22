@@ -27,7 +27,10 @@ import {
   timestamptz,
   uuid,
   varchar,
+  time,
+  inet,
 } from "../../../packages/runtime/src";
+import { fullText } from "../../../packages/runtime/src/entries/search";
 import {
   normalizeResult,
   objectName,
@@ -1316,5 +1319,168 @@ describe.skipIf(!url)("pull round trip", () => {
       expect(pulled.warnings).toEqual([]);
       expect(pulled.source).toContain(`casing: "preserve"`);
       expect(diffSchemas(declared.$snapshot(), tables).up).toEqual([]);
+    }));
+
+  /** Builds the database from `declared`, pulls it and loads the module. */
+  const roundTrip = async (
+    context: {
+      driver: Driver;
+      directory: string;
+      run: (sql: string) => Promise<unknown>;
+    },
+    declared: {
+      $snapshot: () => ReturnType<ReturnType<typeof schema>["$snapshot"]>;
+    },
+    name: string,
+  ) => {
+    for (const statement of createSchemaSQL(declared.$snapshot())) {
+      await context.run(statement.sql);
+    }
+
+    const pulled = await pullSchema({
+      execute: context.driver.execute,
+      module: runtime,
+      searchModule: resolve("packages/runtime/src/entries/search.ts"),
+    });
+    const path = join(context.directory, `${name}.ts`);
+
+    await writeFile(path, pulled.source);
+
+    const { appSchema } = await import(pathToFileURL(path).href);
+    const { extensions: _extensions, ...tables } = appSchema.$snapshot();
+
+    return { pulled, tables, snapshot: appSchema.$snapshot() };
+  };
+
+  test("a full-text search pulls back as its .search() declaration", () =>
+    sandbox(async (context) => {
+      const declared = schema({
+        notes: table({
+          id: int.auto,
+          title: varchar(80),
+          body: text.nullable,
+        }).search((note) => ({
+          about: {
+            words: fullText(
+              { A: note.title, B: note.body },
+              { language: "english" },
+            ),
+          },
+          quick: { words: fullText(note.title) },
+        })),
+      });
+      const { pulled, tables, snapshot } = await roundTrip(
+        context,
+        declared,
+        "search",
+      );
+
+      expect(pulled.source).toContain(
+        `about: { words: fullText({ A: notes.title, B: notes.body }, { language: "english" }) },`,
+      );
+      expect(pulled.source).toContain(
+        "quick: { words: fullText(notes.title) },",
+      );
+      expect(pulled.warnings).toEqual([]);
+      expect(diffSchemas(declared.$snapshot(), tables).up).toEqual([]);
+      expect(
+        await detectDrift({ execute: context.driver.execute, snapshot }),
+      ).toEqual([]);
+    }));
+
+  test("tables, columns and CHECK literals PostgreSQL spells its own way pull back to no migration", () =>
+    sandbox(async (context) => {
+      const declared = schema({
+        cars: table({
+          id: int.auto,
+          maker: text.nullable.named("constructor"),
+          label: text.nullable.named("__proto__"),
+          tm: time,
+          iv: interval,
+          key: uuid,
+          ip: inet,
+        })
+          .checks((t) => ({
+            late: t.tm.below("23:00"),
+            long: t.iv.below("24 hours"),
+            ancient: t.iv.above("-1000 years"),
+            key: t.key.isNot("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"),
+            host: t.ip.isNot("10.0.0.1/32"),
+          }))
+          .indexes((t) => ({ week: index(t.id).where(t.iv.below("7 days")) })),
+        labels: table({ id: int.auto, label: text }).named("toString"),
+      });
+      const { pulled, tables, snapshot } = await roundTrip(
+        context,
+        declared,
+        "spelled",
+      );
+
+      expect(diffSchemas(declared.$snapshot(), tables).up).toEqual([]);
+      // Pull writes the literals PostgreSQL stored, which it reads again.
+      expect(pulled.source).toContain('above("-1000 years")');
+      expect(pulled.source).toContain('below("7 days")');
+      expect(pulled.source).toContain('below("24:00:00")');
+      expect(
+        await detectDrift({ execute: context.driver.execute, snapshot }),
+      ).toEqual([]);
+    }));
+
+  test("a search-shaped tsvector that is NOT NULL or used by another index stays a column with its warning", () =>
+    sandbox(async ({ driver, run }) => {
+      // `.search()` creates the column nullable and only its own GIN index on it.
+      await run(
+        `CREATE TABLE posts (id int PRIMARY KEY, title text NOT NULL, doc_words tsvector NOT NULL GENERATED ALWAYS AS (setweight(to_tsvector('simple', coalesce(title, '')), 'A')) STORED)`,
+      );
+      await run(
+        "CREATE INDEX posts_doc_words_idx ON posts USING gin (doc_words)",
+      );
+      await run(
+        `CREATE TABLE notes (id int PRIMARY KEY, title text NOT NULL, about_words tsvector GENERATED ALWAYS AS (setweight(to_tsvector('simple', coalesce(title, '')), 'A')) STORED)`,
+      );
+      await run(
+        "CREATE INDEX notes_about_words_idx ON notes USING gin (about_words)",
+      );
+      await run("CREATE INDEX notes_extra ON notes USING gist (about_words)");
+
+      const pulled = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+
+      expect(pulled.source).not.toContain("fullText");
+      expect(pulled.source).toContain("notes_extra");
+      expect(
+        pulled.warnings
+          .filter((warning) => warning.code === "generated-column")
+          .map((warning) => warning.table)
+          .sort(),
+      ).toEqual(["notes", "posts"]);
+    }));
+
+  test("UNLOGGED tables and identity sequence options are reported", () =>
+    sandbox(async ({ driver, run }) => {
+      await run(
+        "CREATE TABLE numbered (id int GENERATED ALWAYS AS IDENTITY (START WITH 1000 INCREMENT BY 10) PRIMARY KEY)",
+      );
+      await run("CREATE UNLOGGED TABLE scratch (id int PRIMARY KEY)");
+      await run(
+        "CREATE TABLE plain (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY)",
+      );
+
+      const { warnings } = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+
+      expect(
+        warnings.map(({ code, table, column }) => ({ code, table, column })),
+      ).toEqual([
+        { code: "sequence", table: "numbered", column: "id" },
+        { code: "unlogged", table: "scratch", column: undefined },
+      ]);
+      expect(
+        warnings.find((warning) => warning.code === "sequence")!.message,
+      ).toContain("(START 1000 INCREMENT 10)");
     }));
 });

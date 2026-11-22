@@ -548,8 +548,110 @@ describe.skipIf(!databaseUrl)("indexes and transactions on PostgreSQL", () => {
         await rows.next();
       }),
     ).rejects.toThrow(/finish or break out of every stream\(\)/);
-    await expect(rows!.next()).rejects.toThrow(/context is closed/);
+    await expect(rows!.next()).rejects.toThrow(
+      /ended while the stream was open and was rolled back/,
+    );
     expect(await balances()).toEqual([{ balance: 100n }, { balance: 50n }]);
+  });
+
+  test("a stream left open stops at its transaction's rollback, also with rows fetched before it", async () => {
+    let rows: AsyncIterator<{ id: number; balance: bigint }> | undefined;
+    await expect(
+      model.$transaction(async (transaction) => {
+        await transaction.accounts
+          .update({ balance: 0n })
+          .where((accounts) => accounts.id.is(2))
+          .execute();
+        // Both rows arrive with the first fetch.
+        rows = transaction
+          .accounts(
+            (accounts) => ({ id: accounts.id, balance: accounts.balance }),
+            { orderBy: (accounts) => accounts.id.ascending },
+          )
+          .stream({ size: 10 })
+          [Symbol.asyncIterator]();
+        await rows.next();
+      }),
+    ).rejects.toThrow(/finish or break out of every stream\(\)/);
+    // The second row, balance 0, was rolled back.
+    await expect(rows!.next()).rejects.toThrow(
+      /ended while the stream was open and was rolled back/,
+    );
+    expect(await rows!.next()).toEqual({ done: true, value: undefined });
+    expect(await balances()).toEqual([{ balance: 100n }, { balance: 50n }]);
+  });
+
+  test("a stream of the transaction stops inside one of its savepoints without holding it up", async () => {
+    const result = await model.$transaction(async (transaction) => {
+      const rows = transaction
+        .accounts((accounts) => ({ id: accounts.id }), {
+          orderBy: (accounts) => accounts.id.ascending,
+        })
+        .stream({ size: 1 })
+        [Symbol.asyncIterator]();
+      const first = await rows.next();
+      // A fetch on the parent there is refused like a plain parent query,
+      // and the cursor closes once the savepoint ends.
+      const refused = await transaction.$transaction(async () =>
+        rows.next().then(
+          () => "fetched",
+          (error: Error) => error.message,
+        ),
+      );
+      const broken = transaction
+        .accounts((accounts) => ({ id: accounts.id }))
+        .stream({ size: 1 })
+        [Symbol.asyncIterator]();
+      await broken.next();
+      // `break` there just ends the loop.
+      await transaction.$transaction(async (savepoint) => {
+        await savepoint.accounts.count();
+        await broken.return!();
+      });
+
+      return {
+        first: first.value,
+        refused,
+        count: await transaction.accounts.count(),
+      };
+    });
+
+    expect(result).toEqual({
+      first: { id: 1 },
+      refused:
+        "symmetria: await the nested transaction before using its parent context",
+      count: 2,
+    });
+  });
+
+  test("a stream inside a transaction leaves the planner's cursor setting as it was", async () => {
+    const settings = await model.$transaction(async (transaction) => {
+      const setting = (value?: string) =>
+        transaction
+          .accounts(
+            () => ({
+              value:
+                value === undefined
+                  ? sql<string>`current_setting('cursor_tuple_fraction')`
+                  : sql<string>`set_config('cursor_tuple_fraction', ${value}, true)`,
+            }),
+            { limit: 1 },
+          )
+          .first();
+
+      await setting("0.3");
+      const ids: number[] = [];
+
+      for await (const row of transaction
+        .accounts((accounts) => ({ id: accounts.id }))
+        .stream({ size: 1 })) {
+        ids.push(row.id);
+      }
+
+      return { ids: ids.length, after: (await setting())!.value };
+    });
+
+    expect(settings).toEqual({ ids: 2, after: "0.3" });
   });
 
   test("a savepoint queues concurrent parent queries and sibling savepoints until it ends", async () => {
@@ -651,5 +753,72 @@ describe.skipIf(!databaseUrl)("indexes and transactions on PostgreSQL", () => {
         orderBy: (entries) => entries.externalId.ascending,
       }),
     ).toEqual([{ externalId: "e1" }, { externalId: "e2" }]);
+  });
+
+  test("reads in Promise.all start in the array's order, after the writes before them", async () => {
+    const [, counted, renamed, page, batch, exists] = await model.$transaction(
+      (transaction) =>
+        Promise.all([
+          transaction.accounts.insert({
+            owner: "Linus",
+            email: "linus@example.test",
+          }),
+          transaction.accounts.count(),
+          transaction.accounts.byId(1).update({ owner: "Ada L." }),
+          transaction.accounts.get(1),
+          transaction.accounts
+            .update({ active: false })
+            .where((accounts) => accounts.id.is(2)),
+          transaction
+            .accounts((accounts) => ({ id: accounts.id }), {
+              where: (accounts) => accounts.active.is(true),
+              orderBy: (accounts) => accounts.id.ascending,
+            })
+            .page({ size: 5 }),
+          transaction.$batch((batch) => [
+            batch.accounts.find(3),
+            batch.accounts.aggregate((accounts, { count }) => ({
+              n: count(),
+            })),
+          ]),
+          transaction.accounts.delete().where((accounts) => accounts.id.is(3)),
+          transaction.accounts({ where: { id: 3 } }).exists(),
+        ]).then((all) => [all[0], all[1], all[3], all[5], all[6], all[8]]),
+    );
+
+    expect(counted).toBe(3);
+    expect(renamed).toMatchObject({ id: 1, owner: "Ada L." });
+    expect((page as { items: unknown[] }).items).toEqual([
+      { id: 1 },
+      { id: 3 },
+    ]);
+    expect(batch).toMatchObject([{ owner: "Linus" }, { n: 3 }]);
+    expect(exists).toBe(false);
+  });
+
+  test("a read starts when it is awaited, once, and is a promise", async () => {
+    const count = model.accounts.count();
+
+    expect(count).toBeInstanceOf(Promise);
+    await model.accounts.insert({
+      owner: "Linus",
+      email: "linus@example.test",
+    });
+    // Started by the first await, after the insert; later ones share it.
+    expect(await count).toBe(3);
+    await model.accounts.byId(3).delete();
+    expect(await count).toBe(3);
+    await expect(model.accounts.get(99)).rejects.toMatchObject({
+      code: "SYMMETRIA_RECORD_NOT_FOUND",
+    });
+    // One that is never awaited never runs, so it holds up nothing.
+    expect(
+      await model.$transaction(async (transaction) => {
+        void transaction.accounts.count();
+        void transaction.accounts.get(1);
+
+        return "committed";
+      }),
+    ).toBe("committed");
   });
 });

@@ -3,6 +3,7 @@
  * must be confirmed with all(). A scoped database's writes check every written row against the scope.
  */
 import { freeze } from "../plan/freeze";
+import { childNodes } from "../plan/traverse";
 import { embeddingColumns } from "../../schema/search-columns";
 import { scopeViolation, sqlState } from "../../driver/errors";
 import { collectDataErrors, dataError } from "../codecs/deferred";
@@ -73,62 +74,400 @@ const jsonNullValue = (
   }
 };
 
+/** TRUE, FALSE or NULL for every row whatever the data; undefined when it depends on the data. */
+type Truth = boolean | null | undefined;
+
+/** Kleene AND: FALSE wins, then an unknown, then NULL. */
+const allOf = (values: readonly Truth[]): Truth =>
+  values.includes(false)
+    ? false
+    : values.includes(undefined)
+      ? undefined
+      : values.includes(null)
+        ? null
+        : true;
+
+/** Kleene OR: TRUE wins, then an unknown, then NULL. */
+const anyOf = (values: readonly Truth[]): Truth =>
+  values.includes(true)
+    ? true
+    : values.includes(undefined)
+      ? undefined
+      : values.includes(null)
+        ? null
+        : false;
+
+const negated = (value: Truth): Truth =>
+  value === undefined || value === null ? value : !value;
+
+/** No row passes: FALSE and NULL both filter every row out. */
+const never = (
+  description: PredicateDescription,
+  root: TableBinding,
+): boolean => {
+  const value = truth(description, root);
+
+  return value === false || value === null;
+};
+
+/** An aggregate that collapses the rows into one, not one under a window. */
+const aggregates = (node: ValueNode): boolean =>
+  node.kind === "aggregate" ||
+  (node.kind !== "window" && childNodes(node).some(aggregates));
+
+/** Aggregates without grouping: one row even over no rows. */
+const collapsed = (query: SelectPlan): boolean =>
+  !query.grouping.length &&
+  query.selection.some((expression) => aggregates(expression.node));
+
 /**
- * A condition every row passes whatever the data: a list that filtered down to
- * nothing (`[userId && …]` without a user), `and()`, `not(or())`, `notIn([])`,
- * and a relation quantifier over such a condition (`every(() => [skipped])`,
- * `none((post) => post.id.in([]))`), which holds for every row the same way.
+ * A subquery that returns no row whatever the data: `EXISTS` of it is false
+ * and `IN` it is false. A filter no row passes still leaves the one row of an
+ * aggregate without grouping (`count()` is 0).
  */
-const unconditional = (description: PredicateDescription): boolean => {
-  switch (description.kind) {
-    case "group":
-      return description.operator === "AND"
-        ? description.predicates.every(unconditional)
-        : description.predicates.some(unconditional);
-    case "not":
-      return impossible(description.predicate);
-    case "notTrue":
-      return impossible(description.predicate);
-    case "membership":
-      return (
-        description.negated &&
-        Array.isArray(description.values) &&
-        !description.values.length
-      );
-    case "exists":
-      return description.negated && empty(description.query);
+const empty = (query: SelectPlan, root: TableBinding): boolean =>
+  query.limit === 0 ||
+  query.having.some((description) => never(description, root)) ||
+  (query.predicates.some((description) => never(description, root)) &&
+    !collapsed(query));
+
+/** A subquery that returns exactly one row whatever the data: an aggregate without grouping. */
+const single = (query: SelectPlan): boolean =>
+  collapsed(query) &&
+  !query.having.length &&
+  (query.limit === undefined ||
+    (typeof query.limit === "number" && query.limit > 0)) &&
+  (query.offset === undefined || query.offset === 0);
+
+/**
+ * What a node is for every row: a known value; a count, an integer of at
+ * least 0 that is never NULL; or present, never NULL.
+ */
+type Known =
+  | { readonly value: unknown }
+  | { readonly count: true }
+  | { readonly present: true };
+
+const known = (node: ValueNode, root: TableBinding): Known | undefined => {
+  switch (node.kind) {
+    case "parameter":
+      return { value: node.value };
+    case "column":
+      // A NOT NULL column of the written table: its rows are never outer-joined.
+      return node.description.binding === root &&
+        !node.description.binding.projection &&
+        node.description.column.notNull
+        ? { present: true }
+        : undefined;
+    case "rowCount":
+      return empty(node.query, root) ? { value: 0 } : { count: true };
+    case "subquery": {
+      const { query } = node;
+
+      // A scalar subquery without a row is NULL.
+      if (empty(query, root)) {
+        return { value: null };
+      }
+
+      const selected = query.selection[0]?.node;
+
+      if (
+        query.selection.length !== 1 ||
+        selected?.kind !== "aggregate" ||
+        query.grouping.length
+      ) {
+        return undefined;
+      }
+
+      // One row over no rows: COUNT is 0, every other aggregate NULL.
+      if (query.predicates.some((description) => never(description, root))) {
+        return { value: selected.name === "COUNT" ? 0 : null };
+      }
+
+      return selected.name === "COUNT" && single(query)
+        ? { count: true }
+        : undefined;
+    }
+    case "raw": {
+      // A relation's exists(): `EXISTS (subquery)`.
+      const [text, subquery] = node.parts;
+
+      if (
+        !node.composed ||
+        node.parts.length !== 2 ||
+        text !== "EXISTS " ||
+        typeof subquery !== "object" ||
+        subquery.kind !== "subquery"
+      ) {
+        return undefined;
+      }
+
+      return empty(subquery.query, root)
+        ? { value: false }
+        : single(subquery.query)
+          ? { value: true }
+          : undefined;
+    }
+    case "coalesce": {
+      for (const value of node.values) {
+        const entry = known(value, root);
+
+        if (!entry || !("value" in entry) || entry.value !== null) {
+          return entry;
+        }
+      }
+
+      return { value: null };
+    }
     default:
-      return false;
+      return undefined;
   }
 };
 
-/** A condition no row passes: `or()`, `in([])`, `some()` over one of them. */
-const impossible = (description: PredicateDescription): boolean => {
-  switch (description.kind) {
-    case "group":
-      return description.operator === "OR"
-        ? description.predicates.every(impossible)
-        : description.predicates.some(impossible);
-    case "not":
-      return unconditional(description.predicate);
-    case "notTrue":
-      return unconditional(description.predicate);
-    case "membership":
-      return (
-        !description.negated &&
-        Array.isArray(description.values) &&
-        !description.values.length
-      );
-    case "exists":
-      return !description.negated && empty(description.query);
+const NUMBER_TEXT = /^-?\d+(?:\.\d+)?$/;
+
+const numberOf = (value: unknown): number | undefined =>
+  typeof value === "number" && !Number.isNaN(value)
+    ? value
+    : typeof value === "bigint"
+      ? Number(value)
+      : typeof value === "string" && NUMBER_TEXT.test(value)
+        ? Number(value)
+        : undefined;
+
+/** The operator with its sides swapped: `a < b` is `b > a`. */
+const MIRRORED: Readonly<Record<string, string>> = {
+  "<": ">",
+  "<=": ">=",
+  ">": "<",
+  ">=": "<=",
+};
+
+/** A comparison of two known values; only numbers and booleans are compared. */
+const comparedValues = (
+  left: unknown,
+  operator: string,
+  right: unknown,
+): Truth => {
+  if (left === null || right === null) {
+    return operator === "IS DISTINCT FROM"
+      ? left !== right
+      : operator === "IS NOT DISTINCT FROM"
+        ? left === right
+        : null;
+  }
+
+  if (typeof left === "boolean" || typeof right === "boolean") {
+    if (typeof left !== typeof right) {
+      return undefined;
+    }
+
+    return operator === "=" || operator === "IS NOT DISTINCT FROM"
+      ? left === right
+      : operator === "<>" || operator === "IS DISTINCT FROM"
+        ? left !== right
+        : undefined;
+  }
+
+  const first = numberOf(left);
+  const second = numberOf(right);
+
+  if (first === undefined || second === undefined) {
+    return undefined;
+  }
+
+  switch (operator) {
+    case "=":
+    case "IS NOT DISTINCT FROM":
+      return first === second;
+    case "<>":
+    case "IS DISTINCT FROM":
+      return first !== second;
+    case "<":
+      return first < second;
+    case "<=":
+      return first <= second;
+    case ">":
+      return first > second;
+    case ">=":
+      return first >= second;
     default:
-      return false;
+      return undefined;
   }
 };
 
-/** A subquery that returns no row whatever the data: `EXISTS` of it is false. */
-const empty = (query: SelectPlan): boolean =>
-  query.limit === 0 || query.predicates.some(impossible);
+/** `left operator right`, where the left side is never NULL and may be a count. */
+const comparedPresent = (
+  left: Known,
+  operator: string,
+  right: unknown,
+): Truth => {
+  if (right === null) {
+    return operator === "IS DISTINCT FROM"
+      ? true
+      : operator === "IS NOT DISTINCT FROM"
+        ? false
+        : null;
+  }
+
+  const bound = numberOf(right);
+
+  if (!("count" in left) || bound === undefined) {
+    return undefined;
+  }
+
+  // A count is a whole number of at least 0.
+  const outside = bound < 0 || !Number.isInteger(bound);
+
+  switch (operator) {
+    case "=":
+    case "IS NOT DISTINCT FROM":
+      return outside ? false : undefined;
+    case "<>":
+    case "IS DISTINCT FROM":
+      return outside ? true : undefined;
+    case ">=":
+      return bound <= 0 ? true : undefined;
+    case ">":
+      return bound < 0 ? true : undefined;
+    case "<=":
+      return bound < 0 ? false : undefined;
+    case "<":
+      return bound <= 0 ? false : undefined;
+    default:
+      return undefined;
+  }
+};
+
+const compared = (
+  left: Known | undefined,
+  operator: string,
+  right: Known | undefined,
+): Truth => {
+  if (!left || !right) {
+    return undefined;
+  }
+
+  if ("value" in left && "value" in right) {
+    return comparedValues(left.value, operator, right.value);
+  }
+
+  if ("value" in right) {
+    return comparedPresent(left, operator, right.value);
+  }
+
+  return "value" in left
+    ? comparedPresent(right, MIRRORED[operator] ?? operator, left.value)
+    : undefined;
+};
+
+/**
+ * What a condition answers whatever the data, for the rows of the written
+ * table `root`. A list that filtered down to nothing (`[userId && …]`
+ * without a user), `and()`, `not(or())`, `notIn([])`, `notIn()` or
+ * `notExists()` of a query that finds nothing (an emptied `in([])`,
+ * `limit: 0`), `exists()` of an aggregate without grouping, a relation
+ * quantifier over such a condition (`every(() => [skipped])`,
+ * `none((post) => post.id.in([]))`), an aggregate of such a relation
+ * (`count().is(0)`), a count compared with what every count passes
+ * (`count().atLeast(0)`) and `isNot(null)` of a NOT NULL column hold for
+ * every row.
+ */
+const truth = (
+  description: PredicateDescription,
+  root: TableBinding,
+): Truth => {
+  switch (description.kind) {
+    case "group": {
+      const values = description.predicates.map((child) => truth(child, root));
+
+      return description.operator === "AND" ? allOf(values) : anyOf(values);
+    }
+    case "not":
+      return negated(truth(description.predicate, root));
+    case "notTrue": {
+      const value = truth(description.predicate, root);
+
+      return value === undefined ? undefined : value !== true;
+    }
+    case "membership": {
+      if (!Array.isArray(description.values)) {
+        // `x IN (no rows)` is FALSE even for a NULL x, `NOT IN` TRUE.
+        return empty(description.values as SelectPlan, root)
+          ? description.negated
+          : undefined;
+      }
+
+      if (!description.values.length) {
+        return description.negated;
+      }
+
+      const value = known(description.value, root);
+      const found = anyOf(
+        description.values.map((node: ValueNode) =>
+          compared(value, "=", known(node, root)),
+        ),
+      );
+
+      return description.negated ? negated(found) : found;
+    }
+    case "exists":
+      return empty(description.query, root)
+        ? description.negated
+        : single(description.query)
+          ? !description.negated
+          : undefined;
+    case "comparison":
+      return compared(
+        known(description.left, root),
+        description.operator,
+        known(description.right, root),
+      );
+    case "nullCheck": {
+      const value = known(description.value, root);
+
+      return !value
+        ? undefined
+        : "value" in value
+          ? (value.value === null) !== description.negated
+          : description.negated;
+    }
+    case "between": {
+      const value = known(description.value, root);
+
+      return allOf([
+        compared(value, ">=", known(description.lower, root)),
+        compared(value, "<=", known(description.upper, root)),
+      ]);
+    }
+    default:
+      return undefined;
+  }
+};
+
+/**
+ * PostgreSQL's "ON CONFLICT DO UPDATE command cannot affect row a second
+ * time". Its SQLSTATE 21000 also reports a subquery that returned more than
+ * one row; the routine that raised it (or, without one, the untranslated
+ * command name in the message) tells them apart.
+ */
+const conflictedTwice = (error: unknown): boolean => {
+  if (sqlState(error) !== "21000") {
+    return false;
+  }
+
+  const { routine, message } = error as {
+    routine?: unknown;
+    message?: unknown;
+  };
+
+  return typeof routine === "string"
+    ? routine === "ExecOnConflictUpdate"
+    : typeof message === "string" && message.includes("ON CONFLICT DO UPDATE");
+};
+
+/** Refusals of a filter that holds for every row; a later where() that adds a condition lifts them. */
+const everyRowErrors = new WeakSet<object>();
 
 export const createMutation = (
   kind: MutationPlan["kind"],
@@ -152,11 +491,12 @@ export const createMutation = (
 
   /**
    * Predicates may follow relation paths; the resulting JOINs cannot live in an
-   * UPDATE or DELETE, so they move into a primary-key subquery.
+   * UPDATE or DELETE, so they move into a primary-key subquery. `everyRow`
+   * says whether the filter holds for every row whatever the data.
    */
   const wherePredicate = (
     callback: (row: RuntimeScope[string]) => Predicate | PredicateList,
-  ): PredicateDescription => {
+  ): { description: PredicateDescription; everyRow: boolean } => {
     // An array combines with AND, like the where option of a query.
     const evaluate = (row: RuntimeScope[string]): Predicate => {
       const result = callback(row);
@@ -164,35 +504,18 @@ export const createMutation = (
       return Array.isArray(result) ? and(...result) : (result as Predicate);
     };
 
-    // A filter that holds for every row is a missing filter: the write would
-    // reach the whole table without saying so. Request values often empty it
-    // (`[userId && …]`), so it is refused when the write runs, like a missing
-    // where(), and reaches the write's catch().
-    const conditional = (
-      description: PredicateDescription,
-    ): PredicateDescription => {
-      if (unconditional(description)) {
-        dataError(
-          new Error(
-            `symmetria: ${kind}() where() leaves no condition (an empty list, and() or notIn([]) holds for every row); call .all() to ${kind} every row`,
-          ),
-        );
-      }
-
-      return description;
-    };
-
     if (!options.context) {
-      return conditional(readPredicate(evaluate(scope[root.alias]!)));
+      const description = readPredicate(evaluate(scope[root.alias]!));
+
+      return { description, everyRow: truth(description, root) === true };
     }
 
     const context = options.context(initialPlan(root));
-    const description = conditional(
-      readPredicate(evaluate(context.scope()[root.alias]!)),
-    );
+    const description = readPredicate(evaluate(context.scope()[root.alias]!));
+    const everyRow = truth(description, root) === true;
 
     if (!context.plan.joins.length) {
-      return description;
+      return { description, everyRow };
     }
 
     const keys = primaryKeyColumns(root.table);
@@ -220,13 +543,32 @@ export const createMutation = (
             values: freeze(keys.map(columnNode)),
           });
 
-    return freeze({
-      kind: "membership",
-      value,
-      values: subquery,
-      negated: false,
-    });
+    return {
+      description: freeze({
+        kind: "membership",
+        value,
+        values: subquery,
+        negated: false,
+      }),
+      everyRow,
+    };
   };
+
+  /** where() filters that hold for every row, also once moved into a primary-key subquery. */
+  const everyRowFilters = new WeakSet<PredicateDescription>();
+
+  /**
+   * Whether the plan's filter has a condition that depends on the data: a
+   * lookup's key or a where() that does not hold for every row. A $scope()
+   * bounds the write but is no filter.
+   */
+  const conditioned = (plan: MutationPlan): boolean =>
+    plan.predicates.some(
+      (description) =>
+        description.kind !== "scope" &&
+        !everyRowFilters.has(description) &&
+        truth(description, root) !== true,
+    );
 
   // Captured by the initial immutable plan; conflict assignments are walked separately.
   let atomicValues = true;
@@ -335,7 +677,11 @@ export const createMutation = (
 
     if (insert) {
       for (const column of requiredColumns) {
-        if (values[column.name] === undefined) {
+        // Own keys only: a column named "constructor" is not Object's.
+        if (
+          !Object.hasOwn(values, column.name) ||
+          values[column.name] === undefined
+        ) {
           dataError(
             new Error(
               `symmetria: missing required column "${root.alias}.${column.name}"`,
@@ -437,7 +783,7 @@ export const createMutation = (
         ? result.catch((error: unknown) => {
             // PostgreSQL found two rows with one key ("cannot affect row a
             // second time"): the documented refusal, whatever the spelling.
-            if (upsert && sqlState(error) === "21000") {
+            if (upsert && conflictedTwice(error)) {
               throw duplicateKeyError(root, upsert.columns, error);
             }
 
@@ -568,24 +914,59 @@ export const createMutation = (
           throw new Error("symmetria: INSERT has no WHERE clause");
         }
 
-        return build(
-          derive(() =>
-            freeze({
-              ...state,
-              predicates: freeze([
-                ...state.predicates,
-                wherePredicate(callback),
-              ]),
-            }),
-          ),
-        );
+        const next = derive(() => {
+          const { description, everyRow } = wherePredicate(callback);
+          const filtered =
+            !everyRow || !!state.unrestricted || conditioned(state);
+
+          if (everyRow) {
+            everyRowFilters.add(description);
+          }
+
+          // A filter that holds for every row is a missing filter: the write
+          // would reach the whole table without saying so. Request values
+          // often empty it (`[userId && …]`), so it is refused when the write
+          // runs, like a missing where(), and reaches the write's catch(). A
+          // condition from another where() or the lookup makes it a filter;
+          // all(), before or after, confirms every row.
+          if (!filtered) {
+            const refusal = new Error(
+              `symmetria: ${kind}() where() leaves no condition (an empty list, and() or notIn([]) holds for every row); call .all() to ${kind} every row`,
+            );
+            everyRowErrors.add(refusal);
+            dataError(refusal);
+          }
+
+          const { failure: earlier, ...rest } = state;
+
+          return freeze({
+            ...(earlier &&
+            !(filtered && everyRowErrors.has(earlier.error as object))
+              ? state
+              : rest),
+            predicates: freeze([...state.predicates, description]),
+          });
+        });
+
+        return build(next);
       },
       all: () => {
         if (kind === "insert") {
           throw new Error("symmetria: all() applies to UPDATE and DELETE");
         }
 
-        return build(freeze({ ...state, unrestricted: true as const }));
+        // Every row is what all() asks for: a where() that holds for every
+        // row is no longer refused.
+        const { failure, ...rest } = state;
+
+        return build(
+          freeze({
+            ...(failure && everyRowErrors.has(failure.error as object)
+              ? rest
+              : state),
+            unrestricted: true as const,
+          }),
+        );
       },
       onConflict: (...names: string[]) => {
         if (kind !== "insert") {

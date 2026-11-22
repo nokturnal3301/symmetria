@@ -26,7 +26,7 @@ import type {
   PulledTable,
   PulledSchema,
 } from "./pulled";
-import { columnMember } from "./columns";
+import { columnMember, fullTextSearch } from "./columns";
 import {
   primaryKeyName,
   primaryKey,
@@ -358,6 +358,34 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       });
     }
 
+    if (details?.persistence === "u") {
+      warn({
+        code: "unlogged",
+        table: table.name,
+        message: `"${table.name}" is UNLOGGED; the declaration describes a logged table, so a database built from it writes the table to the WAL and keeps it after a crash`,
+        fix: `ALTER TABLE ${quoteSql(table.name)} SET LOGGED;`,
+      });
+    }
+
+    // An identity's sequence options are not declared: `.auto` numbers from 1 by 1.
+    for (const sequence of catalog.sequences ?? []) {
+      if (
+        sequence.identity &&
+        sequence.options &&
+        sequence.owner_table === table.name
+      ) {
+        warn({
+          code: "sequence",
+          table: table.name,
+          ...(sequence.owner_column === null
+            ? {}
+            : { column: sequence.owner_column }),
+          object: sequence.name,
+          message: `"${table.name}.${sequence.owner_column}" is an identity column whose sequence has options the schema cannot declare (${sequence.options}); a database built from this schema numbers it from 1 by 1`,
+        });
+      }
+    }
+
     const allocateColumnKey = keyAllocator();
 
     facts.set(table.name, {
@@ -630,6 +658,28 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
     );
     const primaryKeyColumns = table.primaryKey?.columns ?? [];
     const consumedIndexes = new Set<string>();
+    // A full-text search's column and index are declared by `.search()`.
+    const searches = table.columns.flatMap((column) => {
+      const search = fullTextSearch(
+        column,
+        table.columnKeys.get(column.column_name)!,
+        table,
+      );
+
+      return search ? [{ column: column.column_name, ...search }] : [];
+    });
+
+    for (const search of searches) {
+      consumedIndexes.add(search.index);
+    }
+
+    if (searches.length) {
+      declared.searches = searches.map(({ key, language, parts }) => ({
+        key,
+        language,
+        parts,
+      }));
+    }
 
     const uniqueFor = (
       columnName: string,
@@ -755,6 +805,10 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
     };
 
     for (const column of table.columns) {
+      if (searches.some((search) => search.column === column.column_name)) {
+        continue;
+      }
+
       const reference = table.references.get(column.column_name);
 
       if (reference) {

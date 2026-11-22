@@ -5,11 +5,13 @@ import {
   int,
   text,
   bool,
+  doublePrecision,
   index,
   sum,
   count,
   maximum,
   over,
+  sql,
   type CompiledQuery,
 } from "../../../packages/runtime/src";
 
@@ -567,8 +569,9 @@ test("$batch sends its reads as one statement and settles each read", async () =
       executor: async (query) => {
         calls.push(query);
 
-        // One row, one JSON array per read, in the order the reads started:
-        // get() and count() run when they are called, a query when it is awaited.
+        // One row, one JSON array per read, in the order the reads joined:
+        // get() and count() join the batch when they are made, a query when
+        // the batch awaits it.
         return [
           {
             q0: [{ id: 1, name: "Ada", active: true }],
@@ -613,6 +616,104 @@ WHERE "posts"."version" = $2) AS "__symmetria_row") AS "q2"`,
       executor: async () => [],
     }),
   ).toThrow('reserved table name "$batch"');
+});
+
+test("$batch keeps reads its callback wraps, and CTEs of one name apart by their exact values and from table names", async () => {
+  const calls: CompiledQuery[] = [];
+  const database = schema(
+    {
+      readings: table({ id: int, value: doublePrecision }),
+      ranked_2: table({ id: int }),
+    },
+    {
+      executor: async (query) => {
+        calls.push(query);
+
+        return [
+          Object.fromEntries(
+            Array.from({ length: 8 }, (_, position) => [
+              `q${position}`,
+              [{ count: String(position) }],
+            ]),
+          ),
+        ];
+      },
+    },
+  );
+
+  // Reads made inside the callback join the batch wherever they are awaited.
+  const helper = async (db: typeof database) => db.readings.count();
+
+  expect(
+    await database.$batch((db) => ({
+      total: db.readings.count(),
+      each: Promise.all([db.readings.count(), db.ranked_2.count()]),
+      resolved: Promise.resolve(db.readings.exists()),
+      helper: helper(db),
+    })),
+  ).toEqual({ total: 0, each: [1, 2], resolved: true, helper: 4 });
+  expect(calls).toHaveLength(1);
+
+  // NaN, Infinity and -Infinity are different values: three CTEs, and the
+  // second name avoids the table ranked_2 that the same batch reads.
+  const matching = (db: typeof database, value: number) =>
+    db
+      .readings((reading) => ({ id: reading.id }), {
+        where: (reading) => reading.value.is(value),
+      })
+      .cte("ranked")((row) => ({ id: row.id }))
+      .count();
+
+  calls.length = 0;
+  await database.$batch((db) => [
+    matching(db, Number.NaN),
+    matching(db, Number.POSITIVE_INFINITY),
+    matching(db, Number.NEGATIVE_INFINITY),
+    matching(db, Number.NaN),
+    db.ranked_2.count(),
+  ]);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.sql.match(/"ranked(_\d)?" AS \(/g)).toEqual([
+    '"ranked" AS (',
+    '"ranked_3" AS (',
+    '"ranked_4" AS (',
+  ]);
+
+  // A new name skips every table of the schema, read or not, and any name
+  // the reads' raw SQL contains, such as a table outside the schema.
+  const named = (db: typeof database, name: string, value: number) =>
+    db
+      .readings((reading) => ({ id: reading.id }), {
+        where: (reading) => reading.value.is(value),
+      })
+      .cte(name)((row) => ({ id: row.id }))
+      .count();
+
+  calls.length = 0;
+  await database.$batch((db) => [
+    named(db, "ranked", 1),
+    named(db, "ranked", 2),
+    named(db, "legacy", 1),
+    named(db, "legacy", 2),
+    db
+      .readings({ where: () => sql<boolean>`EXISTS (SELECT 1 FROM Legacy_2)` })
+      .count(),
+  ]);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.sql.match(/"(ranked|legacy)(_\d)?" AS \(/g)).toEqual([
+    '"ranked" AS (',
+    '"ranked_3" AS (',
+    '"legacy" AS (',
+    '"legacy_3" AS (',
+  ]);
+
+  // A long name is shortened so that the new one fits in 63 bytes.
+  const long = "é".repeat(31) + "x";
+
+  calls.length = 0;
+  await database.$batch((db) => [named(db, long, 1), named(db, long, 2)]);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.sql).toContain(`"${"é".repeat(30)}_2" AS (`);
 });
 
 test("get() and find() read one row by a unique key given as an object", async () => {

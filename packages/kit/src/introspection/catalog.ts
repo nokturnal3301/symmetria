@@ -24,6 +24,8 @@ export type TableDetailRow = {
   /** relkind: 'r' ordinary table, 'p' partitioned parent. */
   kind: string;
   partition: boolean;
+  /** relpersistence: 'p' logged, 'u' UNLOGGED. */
+  persistence?: string;
 };
 
 export type IndexDetailRow = {
@@ -81,7 +83,8 @@ export const readColumnLayout = (options: CatalogOptions) =>
 export const readTableDetails = (options: CatalogOptions) =>
   query<TableDetailRow>(
     options,
-    `SELECT relation.relname AS name, relation.relkind::text AS kind, relation.relispartition AS partition
+    `SELECT relation.relname AS name, relation.relkind::text AS kind, relation.relispartition AS partition,
+      relation.relpersistence::text AS persistence
     FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
     WHERE ${filter} AND relation.relkind IN ('r', 'p')
     ORDER BY relation.relname COLLATE "C"`,
@@ -204,6 +207,8 @@ export type SequenceRow = {
   /** True for the internal sequence of an identity column. */
   identity: boolean;
   defaults: number;
+  /** Options other than an identity's defaults (START 1, INCREMENT 1, …), as SQL; empty when none. */
+  options?: string;
 };
 
 export const readSequences = (options: CatalogOptions) =>
@@ -214,8 +219,17 @@ export const readSequences = (options: CatalogOptions) =>
       COALESCE(ownership.deptype = 'i', false) AS identity,
       (SELECT count(*)::integer FROM pg_depend usage
         WHERE usage.classid = 'pg_attrdef'::regclass AND usage.refclassid = 'pg_class'::regclass
-          AND usage.refobjid = relation.oid) AS defaults
+          AND usage.refobjid = relation.oid) AS defaults,
+      concat_ws(' ',
+        CASE WHEN sequence.seqstart <> 1 THEN 'START ' || sequence.seqstart END,
+        CASE WHEN sequence.seqincrement <> 1 THEN 'INCREMENT ' || sequence.seqincrement END,
+        CASE WHEN sequence.seqmin <> 1 THEN 'MINVALUE ' || sequence.seqmin END,
+        CASE WHEN sequence.seqmax <> CASE sequence.seqtypid WHEN 'smallint'::regtype THEN 32767
+          WHEN 'integer'::regtype THEN 2147483647 ELSE 9223372036854775807 END
+          THEN 'MAXVALUE ' || sequence.seqmax END,
+        CASE WHEN sequence.seqcycle THEN 'CYCLE' END) AS options
     FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    JOIN pg_sequence sequence ON sequence.seqrelid = relation.oid
     LEFT JOIN pg_depend ownership ON ownership.classid = 'pg_class'::regclass AND ownership.objid = relation.oid
       AND ownership.refclassid = 'pg_class'::regclass AND ownership.refobjsubid > 0 AND ownership.deptype IN ('a', 'i')
       AND (SELECT owner.relnamespace FROM pg_class owner WHERE owner.oid = ownership.refobjid) = relation.relnamespace

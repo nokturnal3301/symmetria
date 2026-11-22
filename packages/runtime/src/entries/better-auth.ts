@@ -49,8 +49,18 @@ type Field = {
 const escapeLike = (value: unknown): string =>
   String(value).replace(/[\\%_]/g, (character) => `\\${character}`);
 
-const predicate = (row: Loose, clause: CleanedWhere) => {
-  const column = row[clause.field];
+/** A where clause whose field is already the table's key. */
+type KeyedWhere = CleanedWhere & { readonly key: string };
+
+/** `target[key]`, unless it is only what every object inherits (`constructor`). */
+const member = (target: Loose, key: string): Loose => {
+  const value = target[key];
+
+  return value === (Object.prototype as Loose)[key] ? undefined : value;
+};
+
+const predicate = (row: Loose, clause: KeyedWhere) => {
+  const column = member(row, clause.key);
 
   if (!column) {
     throw new Error(
@@ -60,6 +70,12 @@ const predicate = (row: Loose, clause: CleanedWhere) => {
 
   const insensitive =
     clause.mode === "insensitive" && typeof clause.value === "string";
+  // A list compared without case: one ILIKE per value, as a single value is.
+  const insensitiveList =
+    clause.mode === "insensitive" &&
+    Array.isArray(clause.value) &&
+    clause.value.length > 0 &&
+    clause.value.every((value) => typeof value === "string");
   const pattern = (text: string) =>
     insensitive ? column.ilike(text) : column.like(text);
 
@@ -69,9 +85,21 @@ const predicate = (row: Loose, clause: CleanedWhere) => {
         ? not(column.ilike(escapeLike(clause.value)))
         : column.isNot(clause.value);
     case "in":
-      return column.in(clause.value);
+      return insensitiveList
+        ? or(
+            ...(clause.value as string[]).map((value) =>
+              column.ilike(escapeLike(value)),
+            ),
+          )
+        : column.in(clause.value);
     case "not_in":
-      return column.notIn(clause.value);
+      return insensitiveList
+        ? and(
+            ...(clause.value as string[]).map((value) =>
+              not(column.ilike(escapeLike(value))),
+            ),
+          )
+        : column.notIn(clause.value);
     case "gt":
       return column.above(clause.value);
     case "gte":
@@ -94,7 +122,7 @@ const predicate = (row: Loose, clause: CleanedWhere) => {
 };
 
 /** better-auth's flat clause list: every AND clause, and at least one of the OR clauses. */
-const filter = (where: readonly CleanedWhere[] | undefined) => (row: Loose) => {
+const filter = (where: readonly KeyedWhere[] | undefined) => (row: Loose) => {
   const clauses = where ?? [];
   const all = clauses
     .filter((clause) => clause.connector !== "OR")
@@ -121,9 +149,22 @@ const snakeCase = (name: string): string =>
 /**
  * The auth tables as a Symmetria schema module, for `npx auth generate`.
  * Tables come out in an order where each one follows the tables it
- * references; spread `authTables` into `schema({ ... })`.
+ * references; spread `authTables` into `schema({ ... })`. With `usePlural`
+ * the tables are keyed in the plural (`users`), as the adapter then asks for
+ * them.
  */
-export const authSchemaSource = (tables: Tables): string => {
+export const authSchemaSource = (
+  input: Tables,
+  options: { readonly usePlural?: boolean } = {},
+): string => {
+  const tables: Tables = options.usePlural
+    ? Object.fromEntries(
+        Object.entries(input).map(([model, entry]) => [
+          model,
+          { ...entry, modelName: `${entry.modelName}s` },
+        ]),
+      )
+    : input;
   const builders = new Set<string>(["table", "text"]);
   const models = Object.values(tables);
   const nameOf = (model: string): string =>
@@ -166,6 +207,10 @@ export const authSchemaSource = (tables: Tables): string => {
 
       if (reference && reference.field === "id" && key.endsWith("Id")) {
         const target = nameOf(reference.model);
+        // A key column better-auth names its own way keeps that SQL name.
+        const keyColumn = named
+          ? `.column(${JSON.stringify(field.fieldName)})`
+          : "";
         // better-auth's own migrations cascade when a reference names no action.
         const action =
           reference.onDelete === undefined || reference.onDelete === "cascade"
@@ -182,7 +227,7 @@ export const authSchemaSource = (tables: Tables): string => {
             builders.add("self");
           }
 
-          return `  ${relation}: ${self ? "self" : target}${field.required === false || action === "setNull" ? ".nullable" : ""}${field.unique ? ".unique" : ".index"}${action ? `.onDelete.${action}` : ""}.inverse(${JSON.stringify(`${entry.modelName}By${relation[0]!.toUpperCase()}${relation.slice(1)}`)}),`;
+          return `  ${relation}: ${self ? "self" : target}${keyColumn}${field.required === false || action === "setNull" ? ".nullable" : ""}${field.unique ? ".unique" : ".index"}${action ? `.onDelete.${action}` : ""}.inverse(${JSON.stringify(`${entry.modelName}By${relation[0]!.toUpperCase()}${relation.slice(1)}`)}),`;
         }
 
         const claim =
@@ -190,7 +235,7 @@ export const authSchemaSource = (tables: Tables): string => {
 
         builders.add(claim);
 
-        return `  ${relation}: ${claim}(${target})${action ? `.${action}` : ""}${field.unique ? ".unique" : ""},`;
+        return `  ${relation}: ${claim}(${target})${action ? `.${action}` : ""}${field.unique ? ".unique" : ""}${keyColumn},`;
       }
 
       let type: string;
@@ -274,14 +319,22 @@ export const symmetriaAdapter = (
         supportsBooleans: true,
         supportsJSON: true,
         supportsArrays: true,
+        // Ids are text columns better-auth fills; `generateId: "serial"` is
+        // refused when better-auth starts rather than at the first insert.
+        supportsNumericIds: false,
         transaction: (callback) =>
           connection.$transaction((transaction: Loose) =>
             callback(build(transaction)(authOptions ?? {}) as never),
           ),
       },
-      adapter: () => {
+      adapter: ({
+        getDefaultFieldName,
+        getDefaultModelName,
+        getFieldName,
+        schema,
+      }) => {
         const table = (model: string) => {
-          const handle = connection[model];
+          const handle = member(connection, model);
 
           if (!handle) {
             throw new Error(
@@ -291,56 +344,144 @@ export const symmetriaAdapter = (
 
           return handle;
         };
+        // better-auth hands over rows and clauses by each field's database
+        // name (`fields: { emailVerified: "email_verified" }`); the tables are
+        // keyed by its field names (`emailVerified`) with that SQL name.
+        const keyOf = (model: string, field: string): string => {
+          try {
+            return getDefaultFieldName({ model, field });
+          } catch {
+            return field;
+          }
+        };
+        const keyed = (model: string, data: Record<string, unknown>) =>
+          Object.fromEntries(
+            Object.entries(data).map(([field, value]) => [
+              keyOf(model, field),
+              value,
+            ]),
+          );
+        // A key of the table that is one of better-auth's fields (`name`, `userId`).
+        const isField = (model: string, key: string): boolean => {
+          if (key === "id") {
+            return true;
+          }
+
+          try {
+            const fields = schema[getDefaultModelName(model)]?.fields;
+
+            return fields !== undefined && Object.hasOwn(fields, key);
+          } catch {
+            return false;
+          }
+        };
+        // Rows go back under better-auth's database names. A column of the
+        // application's own (`plan`) is not a better-auth field: it keeps its
+        // key, and a field's value wins over it when the two names meet
+        // (`fields: { name: "nickname" }` next to an app column `nickname`).
+        const fielded = (
+          model: string,
+          row: Record<string, unknown> | null,
+        ) => {
+          if (!row) {
+            return null;
+          }
+
+          const entries = Object.entries(row);
+          const own = entries.filter(([key]) => !isField(model, key));
+          const fields = entries
+            .filter(([key]) => isField(model, key))
+            .map(([key, value]) => [
+              getFieldName({ model, field: key }),
+              value,
+            ]);
+
+          return Object.fromEntries([...own, ...fields]);
+        };
+        const where = (
+          model: string,
+          clauses: readonly CleanedWhere[] | undefined,
+        ): KeyedWhere[] =>
+          (clauses ?? []).map((clause) => ({
+            ...clause,
+            key: keyOf(model, clause.field),
+          }));
         // An UPDATE or DELETE without a filter is refused unless spelled
         // out; better-auth means every row when it sends none.
         const filtered = (
+          model: string,
           mutation: Loose,
-          where: readonly CleanedWhere[] | undefined,
-        ) => (where?.length ? mutation.where(filter(where)) : mutation.all());
+          clauses: readonly CleanedWhere[] | undefined,
+        ) =>
+          clauses?.length
+            ? mutation.where(filter(where(model, clauses)))
+            : mutation.all();
 
         return {
-          create: ({ model, data }) => table(model).insert(data).returning(),
+          create: async ({ model, data }) =>
+            fielded(
+              model,
+              await table(model).insert(keyed(model, data)).returning(),
+            ) as never,
 
-          findOne: ({ model, where }) =>
-            table(model)({ where: filter(where), limit: 1 }).first(),
+          findOne: async ({ model, where: clauses }) =>
+            fielded(
+              model,
+              await table(model)({
+                where: filter(where(model, clauses)),
+                limit: 1,
+              }).first(),
+            ) as never,
 
-          findMany: ({ model, where, limit, offset, sortBy }) =>
-            table(model)({
-              where: filter(where),
-              limit,
-              offset,
-              orderBy: sortBy
-                ? { [sortBy.field]: sortBy.direction }
-                : undefined,
-            }),
+          findMany: async ({ model, where: clauses, limit, offset, sortBy }) =>
+            (
+              await table(model)({
+                where: filter(where(model, clauses)),
+                limit,
+                offset,
+                orderBy: sortBy
+                  ? { [keyOf(model, sortBy.field)]: sortBy.direction }
+                  : undefined,
+              })
+            ).map((row: Record<string, unknown>) => fielded(model, row)),
 
-          count: ({ model, where }) =>
-            table(model)({ where: filter(where) }).count(),
+          count: ({ model, where: clauses }) =>
+            table(model)({ where: filter(where(model, clauses)) }).count(),
 
-          update: async ({ model, where, update }) => {
+          update: async ({ model, where: clauses, update }) => {
             const [row] = await filtered(
-              table(model).update(update),
-              where,
+              model,
+              table(model).update(
+                keyed(model, update as Record<string, unknown>),
+              ),
+              clauses,
             ).returning();
 
-            return row ?? null;
+            return fielded(model, row ?? null) as never;
           },
 
-          updateMany: async ({ model, where, update }) =>
-            (await filtered(table(model).update(update), where)).affectedRows,
+          updateMany: async ({ model, where: clauses, update }) =>
+            (
+              await filtered(
+                model,
+                table(model).update(keyed(model, update)),
+                clauses,
+              )
+            ).affectedRows,
 
-          delete: async ({ model, where }) => {
-            await filtered(table(model).delete(), where);
+          delete: async ({ model, where: clauses }) => {
+            await filtered(model, table(model).delete(), clauses);
           },
 
-          deleteMany: async ({ model, where }) =>
-            (await filtered(table(model).delete(), where)).affectedRows,
+          deleteMany: async ({ model, where: clauses }) =>
+            (await filtered(model, table(model).delete(), clauses))
+              .affectedRows,
 
           // One row at most: the DELETE by key decides which of two
           // concurrent callers gets it.
-          consumeOne: async ({ model, where }) => {
+          consumeOne: async ({ model, where: clauses }) => {
             const found = await table(model)({
-              where: filter(where),
+              where: filter(where(model, clauses)),
               limit: 1,
             }).first();
 
@@ -353,28 +494,32 @@ export const symmetriaAdapter = (
               .delete()
               .returning();
 
-            return row ?? null;
+            return fielded(model, row ?? null) as never;
           },
 
-          incrementOne: async ({ model, where, increment, set }) => {
+          incrementOne: async ({ model, where: clauses, increment, set }) => {
             const [row] = await filtered(
+              model,
               table(model).update((current: Loose) => ({
-                ...set,
+                ...keyed(model, set ?? {}),
                 ...Object.fromEntries(
-                  Object.entries(increment).map(([field, delta]) => [
-                    field,
-                    current[field].plus(delta),
-                  ]),
+                  Object.entries(increment).map(([field, delta]) => {
+                    const key = keyOf(model, field);
+
+                    return [key, current[key].plus(delta)];
+                  }),
                 ),
               })),
-              where,
+              clauses,
             ).returning();
 
-            return row ?? null;
+            return fielded(model, row ?? null) as never;
           },
 
           createSchema: async ({ tables, file }) => ({
-            code: authSchemaSource(tables as Tables),
+            code: authSchemaSource(tables as Tables, {
+              usePlural: options.usePlural ?? false,
+            }),
             path: file ?? "./auth-schema.ts",
             overwrite: true,
           }),

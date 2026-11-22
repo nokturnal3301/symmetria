@@ -38,7 +38,7 @@ export type TypeConversion = {
 export const embeddingChange = (
   before: MigrationColumn,
   after: MigrationColumn,
-  renamed: Readonly<Record<string, string>> = {},
+  renamed: ReadonlyMap<string, string> = new Map(),
 ): string | undefined => {
   if (!before.embedding || !after.embedding) {
     return undefined;
@@ -48,7 +48,9 @@ export const embeddingChange = (
     return `the model changes from ${before.embedding.model} to ${after.embedding.model}`;
   }
 
-  const sources = before.embedding.sources.map((name) => renamed[name] ?? name);
+  const sources = before.embedding.sources.map(
+    (name) => renamed.get(name) ?? name,
+  );
 
   return sources.join("\u0000") === after.embedding.sources.join("\u0000")
     ? undefined
@@ -71,11 +73,11 @@ const STRINGS = new Set([
   "bpchar",
 ]);
 const BITS = new Set(["bit", "bit varying", "varbit"]);
-const INTEGER_DIGITS: Record<string, number> = {
-  smallint: 5,
-  integer: 10,
-  bigint: 19,
-};
+const INTEGER_DIGITS: ReadonlyMap<string, number> = new Map([
+  ["smallint", 5],
+  ["integer", 10],
+  ["bigint", 19],
+]);
 const FLOATS = new Set(["real", "double precision", "float"]);
 /** pgvector's types; `vector` and `halfvec` of one length cast into each other. */
 const VECTORS = new Set(["vector", "halfvec"]);
@@ -85,6 +87,108 @@ const TIMESTAMPS = new Set([
   "timestamp without time zone",
 ]);
 const TIMES = new Set(["time with time zone", "time without time zone"]);
+
+/**
+ * The built-in types castless() knows, each with the types PostgreSQL casts
+ * it into (pg_cast, in any context). A string type converts into and from
+ * every type through its text form, and a type not listed here (an
+ * extension's, a domain, a customType) is left to PostgreSQL. PostgreSQL 18
+ * adds casts between the integer types and `bytea`; they are left out, so a
+ * generated migration runs on every supported version (`using` gives them).
+ */
+const CASTS: ReadonlyMap<string, ReadonlySet<string>> = new Map(
+  (
+    [
+      [
+        "smallint",
+        ["integer", "bigint", "real", "double precision", "numeric"],
+      ],
+      [
+        "integer",
+        [
+          "smallint",
+          "bigint",
+          "real",
+          "double precision",
+          "numeric",
+          "money",
+          "boolean",
+          "bit",
+        ],
+      ],
+      [
+        "bigint",
+        [
+          "smallint",
+          "integer",
+          "real",
+          "double precision",
+          "numeric",
+          "money",
+          "bit",
+        ],
+      ],
+      [
+        "real",
+        ["smallint", "integer", "bigint", "double precision", "numeric"],
+      ],
+      [
+        "double precision",
+        ["smallint", "integer", "bigint", "real", "numeric"],
+      ],
+      [
+        "numeric",
+        ["smallint", "integer", "bigint", "real", "double precision", "money"],
+      ],
+      ["money", ["numeric"]],
+      ["boolean", ["integer"]],
+      ["date", ["timestamp without time zone", "timestamp with time zone"]],
+      ["time without time zone", ["time with time zone", "interval"]],
+      ["time with time zone", ["time without time zone"]],
+      [
+        "timestamp without time zone",
+        ["date", "time without time zone", "timestamp with time zone"],
+      ],
+      [
+        "timestamp with time zone",
+        [
+          "date",
+          "time without time zone",
+          "time with time zone",
+          "timestamp without time zone",
+        ],
+      ],
+      ["interval", ["time without time zone"]],
+      ["bytea", []],
+      ["uuid", []],
+      ["inet", ["cidr"]],
+      ["cidr", ["inet"]],
+      ["json", ["jsonb"]],
+      [
+        "jsonb",
+        [
+          "json",
+          "boolean",
+          "smallint",
+          "integer",
+          "bigint",
+          "real",
+          "double precision",
+          "numeric",
+        ],
+      ],
+      ["tsvector", []],
+      ["xml", []],
+      ["bit", ["bit varying", "integer", "bigint"]],
+      ["bit varying", ["bit"]],
+    ] as const
+  ).map(([source, targets]) => [source, new Set<string>(targets)]),
+);
+/** Other spellings of the types above. */
+const CAST_NAMES: ReadonlyMap<string, string> = new Map([
+  ["varbit", "bit varying"],
+  ["float", "double precision"],
+]);
 
 const parse = (sqlType: string): ParsedType => {
   const normalized = normalizeSqlType(sqlType);
@@ -108,7 +212,7 @@ const lengthLimit = (type: ParsedType): number =>
 
 /** Decimal places a number of this type can carry. */
 const scaleOf = (type: ParsedType): number | undefined => {
-  if (type.base in INTEGER_DIGITS) {
+  if (INTEGER_DIGITS.has(type.base)) {
     return 0;
   }
 
@@ -127,8 +231,8 @@ const scaleOf = (type: ParsedType): number | undefined => {
 
 /** Significant digits a type keeps exactly, for conversions into floating point. */
 const exactDigits = (type: ParsedType): number => {
-  if (type.base in INTEGER_DIGITS) {
-    return INTEGER_DIGITS[type.base]!;
+  if (INTEGER_DIGITS.has(type.base)) {
+    return INTEGER_DIGITS.get(type.base)!;
   }
 
   if (DECIMALS.has(type.base)) {
@@ -139,6 +243,23 @@ const exactDigits = (type: ParsedType): number => {
 };
 
 const fractionalDigits = (type: ParsedType): number => type.first ?? 6;
+
+/** Digits before the decimal point a value of an integer or `numeric` type can have. */
+const integerDigits = (type: ParsedType): number =>
+  INTEGER_DIGITS.get(type.base) ??
+  (type.first === undefined
+    ? Number.POSITIVE_INFINITY
+    : type.first - (type.second ?? 0));
+
+/**
+ * Digits before the decimal point every value with that many digits fits
+ * into: 9 for `integer`, whose largest value has 10 digits but not every
+ * 10-digit number fits.
+ */
+const fittingDigits = (type: ParsedType): number =>
+  INTEGER_DIGITS.has(type.base)
+    ? INTEGER_DIGITS.get(type.base)! - 1
+    : integerDigits(type);
 
 const lossy = (effect: string): TypeConversion => ({
   assignmentCast: false,
@@ -192,8 +313,11 @@ export const widens = (
 
 /**
  * A type change PostgreSQL has no cast for, so `USING "column"::type` fails
- * even on an empty table: a `uuid` from or to anything but text, and a value
- * from or to an array of it unless one side is text.
+ * even on an empty table: between two built-in types without a cast
+ * (`integer` to `date`, `boolean` to `numeric`, `integer` to `jsonb`), a
+ * `uuid` from or to anything but text, and a value from or to an array of it
+ * unless one side is text. Arrays convert element by element. A string type
+ * converts into and from every type through its text form.
  */
 export const castless = (
   before: MigrationColumn,
@@ -211,11 +335,27 @@ export const castless = (
     return false;
   }
 
-  return (
-    source.array !== target.array ||
-    (source.base !== target.base &&
-      (source.base === "uuid" || target.base === "uuid"))
-  );
+  if (source.array !== target.array) {
+    return true;
+  }
+
+  if (
+    source.base === target.base ||
+    STRINGS.has(source.base) ||
+    STRINGS.has(target.base)
+  ) {
+    return false;
+  }
+
+  if (source.base === "uuid" || target.base === "uuid") {
+    return true;
+  }
+
+  const from = CAST_NAMES.get(source.base) ?? source.base;
+  const to = CAST_NAMES.get(target.base) ?? target.base;
+  const casts = CASTS.get(from);
+
+  return casts !== undefined && CASTS.has(to) && from !== to && !casts.has(to);
 };
 
 /**
@@ -291,7 +431,7 @@ export const typeConversion = (
       : undefined;
   }
 
-  if (source.base in INTEGER_DIGITS) {
+  if (INTEGER_DIGITS.has(source.base)) {
     // Any number but 0 reads as true, and the numbers cannot be told apart again.
     if (target.base === "boolean") {
       return lossy("every value other than 0 becomes true");
@@ -299,7 +439,10 @@ export const typeConversion = (
 
     // A smaller integer type holds fewer values and PostgreSQL does not wrap
     // around, the way a shorter bit(n) refuses longer values.
-    if (INTEGER_DIGITS[target.base]! < INTEGER_DIGITS[source.base]!) {
+    if (
+      INTEGER_DIGITS.has(target.base) &&
+      INTEGER_DIGITS.get(target.base)! < INTEGER_DIGITS.get(source.base)!
+    ) {
       return {
         ...lossy(
           `values outside the ${target.base} range make the migration fail`,
@@ -321,13 +464,29 @@ export const typeConversion = (
         : undefined;
     }
 
-    return sourceScale > targetScale
-      ? lossy(
-          targetScale === 0
-            ? "values are rounded to whole numbers"
-            : `values are rounded to ${targetScale} decimal places`,
-        )
-      : undefined;
+    const rounding =
+      sourceScale > targetScale
+        ? targetScale === 0
+          ? "values are rounded to whole numbers"
+          : `values are rounded to ${targetScale} decimal places`
+        : undefined;
+    // numeric(20, 0) holds whole numbers no integer type can, and
+    // numeric(10, 2) ones numeric(8, 2) cannot: PostgreSQL refuses them.
+    const fitting = fittingDigits(target);
+    const range =
+      !FLOATS.has(source.base) && integerDigits(source) > fitting
+        ? INTEGER_DIGITS.has(target.base)
+          ? `values outside the ${target.base} range make the migration fail`
+          : `values with more than ${fitting} digits before the decimal point make the migration fail`
+        : undefined;
+
+    if (rounding === undefined) {
+      return range === undefined
+        ? undefined
+        : { ...lossy(range), refused: true };
+    }
+
+    return lossy(range === undefined ? rounding : `${rounding}, and ${range}`);
   }
 
   if (
@@ -380,17 +539,21 @@ export const halfPrecision = (
 };
 
 /**
- * A change between `timestamptz` and `timestamp`, for a value or for an
- * array of them. A plain cast converts through the time zone of the session
- * that runs the migration, so the stored values would depend on who
- * migrates; Symmetria reads and writes `timestamp` as UTC, and the generated
- * SQL converts at UTC: `AT TIME ZONE 'UTC'` for a value, and for an array,
- * which has no such operator, the cast with the session's zone set to UTC.
+ * A type change whose cast goes through the time zone of the session that
+ * runs the migration: `timestamp` or `date` to `timestamptz` (read as local
+ * time), `timestamptz` to `timestamp`, `date` or `time` (the local date and
+ * time), a value to `timetz` (the session's offset), and a string to or from
+ * `timestamptz` or `timetz`. The stored values would depend on who migrates;
+ * Symmetria reads and writes `timestamp` as UTC, and the generated SQL
+ * converts at UTC: through `AT TIME ZONE 'UTC'` where a value allows it (a
+ * function of the quoted column and the target type), and otherwise
+ * (`"session"`: an array, which has no such operator, a `timetz` target, a
+ * string) with the session's zone set to UTC around the statement.
  */
 export const utcConversion = (
   before: MigrationColumn,
   after: MigrationColumn,
-): "value" | "array" | undefined => {
+): ((column: string, type: string) => string) | "session" | undefined => {
   if (before.enumeration || after.enumeration) {
     return undefined;
   }
@@ -398,13 +561,43 @@ export const utcConversion = (
   const source = parse(before.sqlType);
   const target = parse(after.sqlType);
 
-  return source.array === target.array &&
-    TIMESTAMPS.has(source.base) &&
-    TIMESTAMPS.has(target.base) &&
-    source.base !== target.base
-    ? source.array
-      ? "array"
-      : "value"
+  if (source.array !== target.array || source.base === target.base) {
+    return undefined;
+  }
+
+  const TIMESTAMPTZ = "timestamp with time zone";
+  const TIMETZ = "time with time zone";
+  const pair = (from: string, to: string) =>
+    source.base === from && target.base === to;
+  const value = (
+    conversion: (column: string, type: string) => string,
+  ): ((column: string, type: string) => string) | "session" =>
+    source.array ? "session" : conversion;
+
+  if (
+    pair("timestamp without time zone", TIMESTAMPTZ) ||
+    pair(TIMESTAMPTZ, "timestamp without time zone")
+  ) {
+    return value((column) => `${column} AT TIME ZONE 'UTC'`);
+  }
+
+  if (pair("date", TIMESTAMPTZ)) {
+    return value((column) => `${column}::timestamp AT TIME ZONE 'UTC'`);
+  }
+
+  if (
+    pair(TIMESTAMPTZ, "date") ||
+    pair(TIMESTAMPTZ, "time without time zone")
+  ) {
+    return value((column, type) => `(${column} AT TIME ZONE 'UTC')::${type}`);
+  }
+
+  return pair(TIMESTAMPTZ, TIMETZ) ||
+    pair("time without time zone", TIMETZ) ||
+    (STRINGS.has(source.base) &&
+      (target.base === TIMESTAMPTZ || target.base === TIMETZ)) ||
+    (source.base === TIMESTAMPTZ && STRINGS.has(target.base))
+    ? "session"
     : undefined;
 };
 

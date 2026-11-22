@@ -76,8 +76,9 @@ test("checks compile to DDL and diff reversibly with renamed and changed columns
   expect(plan.up).toContain(
     'ALTER TABLE "products" ADD CONSTRAINT "products_nonnegative_stock_check" CHECK ("stock" >= 0)',
   );
+  // The saved SQL says that dropping a check no longer declared loses no data.
   expect(plan.down).toContain(
-    'ALTER TABLE "products" DROP CONSTRAINT "products_positive_price_check"',
+    '-- symmetria: caution: CHECK constraint "products_positive_price_check" is no longer declared; dropping it loses no data.\nALTER TABLE "products" DROP CONSTRAINT "products_positive_price_check"',
   );
   expect(createSchemaSQL(checked.$snapshot())[0]?.sql).toContain(
     'CONSTRAINT "products_positive_price_check" CHECK ("price" > E\'0\')',

@@ -1,7 +1,6 @@
 /**
  * Shared pool contract for the Bun and pg adapters plus the driver factory that wires sessions and transactions.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import {
   CONNECTION_CLAIM,
   type CompiledQuery,
@@ -14,6 +13,7 @@ import {
 import { transactionOptionsSQL, runTransaction } from "./transactions";
 import { runPostgresSession } from "./session";
 import { createPendingTasks } from "./pending";
+import { holders, type Holder } from "./serial";
 import type { QueryProfiler } from "../observability/profiling";
 import { queryError } from "./errors";
 
@@ -91,23 +91,22 @@ export const createPostgresDriver = (
   // request to the pool from inside would wait for a connection its own caller
   // is holding. Code started inside one and still running after it ended
   // (a timer, a background loop) inherits the list, so only open ones count.
-  type Holder = { open: boolean; stream?: true };
-  const held = new AsyncLocalStorage<readonly Holder[]>();
+  // The list is shared by every pool; each counts its own holders.
   const holding = async <Argument, Result>(
     run: (callback: (driver: Argument) => Promise<Result>) => Promise<Result>,
     callback: (driver: Argument) => Promise<Result>,
   ): Promise<Result> => {
-    const holder: Holder = { open: true };
+    const holder: Holder = { pool, open: true };
     // Only open holders are carried on: a job loop whose rounds each start
     // inside the last one's transaction would otherwise grow the list forever.
-    const holders = [
-      ...(held.getStore() ?? []).filter((outer) => outer.open),
+    const inside = [
+      ...(holders.getStore() ?? []).filter((outer) => outer.open),
       holder,
     ];
 
     try {
       return await run((driver) =>
-        held.run(holders, async () => {
+        holders.run(inside, async () => {
           try {
             return await callback(driver);
           } finally {
@@ -121,14 +120,14 @@ export const createPostgresDriver = (
       holder.open = false;
     }
   };
-  const refusal = (holders: readonly Holder[]): Error => {
-    const streams = holders.filter((holder) => holder.stream).length;
+  const refusal = (own: readonly Holder[]): Error => {
+    const streams = own.filter((holder) => holder.stream).length;
     const within =
       streams === 0
         ? pool.max === 1
           ? "a transaction that holds the only one"
           : `transactions that hold all ${pool.max} of them`
-        : streams === holders.length
+        : streams === own.length
           ? pool.max === 1
             ? "a stream() loop that holds the only one"
             : `stream() loops that hold all ${pool.max} of them`
@@ -136,7 +135,7 @@ export const createPostgresDriver = (
     const instead =
       streams === 0
         ? "run it on the transaction's own database (the callback's argument)"
-        : streams === holders.length
+        : streams === own.length
           ? "run it after the loop"
           : "run it on the transaction's own database (the callback's argument) or after the loop";
 
@@ -145,20 +144,22 @@ export const createPostgresDriver = (
     );
   };
   const free = <Value>(operation: () => Promise<Value>): Promise<Value> => {
-    const holders = (held.getStore() ?? []).filter((holder) => holder.open);
+    const own = (holders.getStore() ?? []).filter(
+      (holder) => holder.open && holder.pool === pool,
+    );
 
-    return holders.length >= pool.max
-      ? Promise.reject(refusal(holders))
+    return own.length >= pool.max
+      ? Promise.reject(refusal(own))
       : track(operation);
   };
 
   const driver: PostgresDriver = {
     // The holder enters the caller's context, which the loop body continues.
     [CONNECTION_CLAIM]: () => {
-      const holder: Holder = { open: false, stream: true };
+      const holder: Holder = { pool, open: false, stream: true };
 
-      held.enterWith([
-        ...(held.getStore() ?? []).filter((outer) => outer.open),
+      holders.enterWith([
+        ...(holders.getStore() ?? []).filter((outer) => outer.open),
         holder,
       ]);
 

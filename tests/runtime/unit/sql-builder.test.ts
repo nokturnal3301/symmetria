@@ -209,6 +209,13 @@ test("write validation catches missing values, unknown columns and generated ide
     () => model.users.insert({ id: 1, name: "Ada" }),
     /generated always/,
   );
+  // A column named like an Object.prototype member is missing all the same.
+  const named = schema({ things: { id: int.auto, constructor: int } });
+  await expectDataError(
+    // @ts-expect-error constructor is required
+    () => named.things.insert({}),
+    /missing required column "things.constructor"/,
+  );
   // Unknown columns are about the query's shape and throw where it is built,
   // even after a data error.
   // @ts-expect-error unknown column
@@ -998,6 +1005,177 @@ test("a relation quantifier that holds for every row is no filter for UPDATE or 
   }
 });
 
+test("UPDATE and DELETE refuse membership in a query that finds nothing and aggregates of an emptied relation", () => {
+  const selected: number[] = [];
+  const chosen = () =>
+    model.posts((posts) => ({ authorId: posts.authorId }), {
+      where: (posts) => posts.id.in(selected),
+    });
+
+  for (const everyRow of [
+    () => model.users.delete({ where: (users) => users.id.notIn(chosen()) }),
+    () => model.users.delete({ where: (users) => not(users.id.in(chosen())) }),
+    () =>
+      model.users.delete({
+        where: (users) =>
+          users.id.notIn(
+            model.posts((posts) => ({ authorId: posts.authorId }), {
+              limit: 0,
+            }),
+          ),
+      }),
+    () =>
+      model.users.update(
+        { active: false },
+        {
+          where: (users) =>
+            users
+              .posts({ where: (posts) => posts.id.in(selected) })
+              .count()
+              .is(0),
+        },
+      ),
+    () =>
+      model.users.delete({
+        where: (users) =>
+          not(
+            users
+              .posts({ where: (posts) => posts.id.in(selected) })
+              .count()
+              .above(0),
+          ),
+      }),
+    // Two where() calls that both hold for every row.
+    () =>
+      model.users
+        .delete()
+        .where(() => [])
+        .where(() => and()),
+    // One row whatever the data: an aggregate without grouping.
+    () =>
+      model.users.delete({
+        where: (users) =>
+          exists(
+            model.posts(() => ({ total: count() }), {
+              where: (posts) => posts.authorId.is(users.id),
+            }),
+          ),
+      }),
+    // A count is a whole number of at least 0, never NULL.
+    () =>
+      model.users.delete({
+        where: (users) => users.posts.count().atLeast(0),
+      }),
+    () =>
+      model.users.delete({ where: (users) => users.posts.count().isNot(-1) }),
+    // A NOT NULL column of the written table is never NULL.
+    () => model.users.delete({ where: (users) => users.name.isNot(null) }),
+  ]) {
+    expect(() => everyRow().toSQL()).toThrow("where() leaves no condition");
+  }
+
+  for (const filtered of [
+    // No row passes: the write writes nothing.
+    () =>
+      model.users.delete({
+        where: (users) =>
+          users
+            .posts({ where: (posts) => posts.id.in(selected) })
+            .count()
+            .above(0),
+      }),
+    // COUNT of no rows is still one row: NOT EXISTS of it holds for none.
+    () =>
+      model.users.delete({
+        where: () =>
+          notExists(
+            model.posts(() => ({ total: count() }), {
+              where: (posts) => posts.id.in(selected),
+            }),
+          ),
+      }),
+    () =>
+      model.users.delete({
+        where: (users) =>
+          users.id.notIn(
+            model.posts(() => ({ total: count() }), {
+              where: (posts) => posts.id.in(selected),
+            }),
+          ),
+      }),
+    () => model.users.delete({ where: (users) => users.posts.count().is(0) }),
+    // Another where() gives the filter its condition, in either order.
+    () =>
+      model.users
+        .delete()
+        .where((users) => users.id.is(1))
+        .where((users) => users.posts.every(() => [])),
+    () =>
+      model.users
+        .delete()
+        .where(() => [])
+        .where((users) => users.id.is(1)),
+    // Data decides these.
+    () =>
+      model.users.delete({
+        where: (users) => users.posts.count().atLeast(1),
+      }),
+    () => model.posts.delete({ where: (posts) => posts.editorId.isNot(null) }),
+    () =>
+      model.posts.delete({
+        where: (posts) => posts.editor.name.isNot(null),
+      }),
+    // all(), before or after, asks for every row.
+    () =>
+      model.users
+        .delete()
+        .where(() => [])
+        .all(),
+    () =>
+      model.users
+        .delete()
+        .all()
+        .where(() => []),
+  ]) {
+    expect(() => filtered().toSQL()).not.toThrow();
+  }
+});
+
+test("not() over JSON leaves JSON null out of a query, and DDL keeps the condition as written", () => {
+  const documents = table({
+    id: int.auto,
+    tag: int,
+    meta: jsonb<{ state: string }>(),
+  });
+  const declared = schema({
+    documents: documents
+      .checks((document) => ({
+        live: not(document.meta.path("state").is("archived")),
+      }))
+      .indexes((document) => ({
+        live: index(document.tag).where(
+          not(document.meta.path("state").is("archived")),
+        ),
+      })),
+  });
+  const [snapshot] = declared.$snapshot().tables;
+  const plain = `NOT (("meta" #> ARRAY[E'state'::text]) = E'"archived"'::text::jsonb)`;
+
+  expect(snapshot!.checks![0]!.expression).toBe(plain);
+  expect(snapshot!.indexes![0]!.where).toBe(plain);
+  // The plain negation stays a conjunct, which a partial index declared with
+  // it matches; the second leaves JSON null out.
+  expect(
+    declared
+      .documents((document) => ({ id: document.id }), {
+        where: (document) => not(document.meta.path("state").is("archived")),
+      })
+      .toSQL().sql,
+  ).toEndWith(
+    `WHERE (NOT (("documents"."meta" #> ARRAY[$1::text]) = $2::text::jsonb) AND NOT ((NULLIF(("documents"."meta" #> ARRAY[$3::text]), 'null'::jsonb)) = $4::text::jsonb))`,
+  );
+});
+
 test("pages() iterates keyset pages until the cursor runs out", async () => {
   let calls = 0;
   const local = schema(
@@ -1252,6 +1430,37 @@ test("long literal IN lists bind one array parameter on PostgreSQL", () => {
       })
       .toSQL().sql,
   ).toEndWith('WHERE "users"."id" IN ($1, $2)');
+
+  // An enum (whose type name the runtime need not know) and a typed column
+  // with a precision leave the array untyped: PostgreSQL types it from the
+  // column as it types each $n of a short list, and rounds nothing.
+  const events = schema({
+    events: {
+      id: int.auto,
+      kind: oneOf("a", "b"),
+      at: customType<string>("timestamp(3)", {
+        encode: (value: string) => value,
+        decode: (value: unknown) => String(value),
+      }),
+      meta: jsonb<{ n: number }>(),
+    },
+  });
+  const kinds = Array.from({ length: 1001 }, () => "a" as const);
+  const moments = ids.map((id) => `2024-01-01 00:00:${id % 60}`);
+  expect(
+    events
+      .events((event) => ({ id: event.id }), {
+        where: (event) => [
+          event.kind.in(kinds),
+          event.at.notIn(moments),
+          event.meta.path("n").in(ids),
+        ],
+      })
+      .toSQL(),
+  ).toEqual({
+    sql: 'SELECT "events"."id" AS "id"\nFROM "events" AS "events"\nWHERE "events"."kind" = ANY($1) AND "events"."at" <> ALL($2) AND ("events"."meta" #> ARRAY[$3::text]) = ANY($4::text[]::jsonb[])',
+    parameters: [kinds, moments, "n", ids.map(String)],
+  });
 });
 
 test("coalesce accepts a non-null expression fallback", () => {

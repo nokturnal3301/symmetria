@@ -422,6 +422,9 @@ export const arrayCodec = (
   element?: RuntimeCodec,
 ): RuntimeCodec => {
   const nullable = elementType === "jsonb" || elementType === "json";
+  // PostgreSQL separates the elements of a box array with ";": its own
+  // elements hold commas.
+  const delimiter = /^box$/i.test(elementType) ? ";" : ",";
 
   const nullElement = (direction: "store" | "read"): Error =>
     new Error(
@@ -436,13 +439,23 @@ export const arrayCodec = (
         throw new Error("symmetria: array columns accept arrays");
       }
 
-      return values.map((value) => {
+      const encoded = values.map((value) => {
         if (value == null && !nullable) {
           throw nullElement("store");
         }
 
         return encodeValue(value, element);
       });
+
+      // The drivers write an array with commas; this one goes as its text.
+      return delimiter === ","
+        ? encoded
+        : `{${encoded
+            .map(
+              (value) =>
+                `"${String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`,
+            )
+            .join(delimiter)}}`;
     },
     decode: (value) => {
       const values =
@@ -451,7 +464,7 @@ export const arrayCodec = (
           : // A type the driver has no parser for (an enum, tsvector or range
             // array on node-postgres, an enum array on Bun) arrives as text.
             typeof value === "string" && value.startsWith("{")
-            ? arrayLiteral(value)
+            ? arrayLiteral(value, delimiter)
             : // Bun reads integer[] and real[] parameters and RETURNING values as typed arrays.
               ArrayBuffer.isView(value) && !(value instanceof DataView)
               ? Array.from(value as unknown as ArrayLike<unknown>)
@@ -476,9 +489,10 @@ export const arrayCodec = (
 
 /**
  * A one-dimensional array in PostgreSQL's text form, `{a,"b c",NULL}`, as
- * its element texts; `NULL` unquoted is a NULL element.
+ * its element texts; `NULL` unquoted is a NULL element. A box array
+ * separates its elements with ";".
  */
-const arrayLiteral = (text: string): (string | null)[] => {
+const arrayLiteral = (text: string, delimiter = ","): (string | null)[] => {
   const values: (string | null)[] = [];
 
   if (!text.endsWith("}")) {
@@ -515,7 +529,7 @@ const arrayLiteral = (text: string): (string | null)[] => {
       position += 1;
       values.push(element);
     } else {
-      while (text[position] !== "," && text[position] !== "}") {
+      while (text[position] !== delimiter && text[position] !== "}") {
         if (text[position] === "{") {
           throw new Error(
             "symmetria: multidimensional arrays are not supported",

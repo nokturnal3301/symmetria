@@ -19,6 +19,11 @@ import {
   numeric,
   interval,
   date,
+  time,
+  inet,
+  bytea,
+  smallint,
+  type Column,
 } from "../../../packages/runtime/src";
 import { vector, halfvec } from "../../../packages/runtime/src/entries/vector";
 import {
@@ -29,11 +34,15 @@ import {
   diffSchemas,
   createSchemaSQL,
   lintMigration,
+  lintMigrationSQL,
   formatLintFindings,
   normalizeSqlType,
 } from "../../../packages/kit/src";
 import { splitMigrationSQL } from "../../../packages/kit/src/migrations/sql";
-import { expressionKey } from "../../../packages/kit/src/migrations/expressions";
+import {
+  expressionKey,
+  readExpression,
+} from "../../../packages/kit/src/migrations/expressions";
 import { objectName } from "../../../packages/kit/src/migrations/snapshot";
 
 test("migration snapshots normalize physical names, defaults and ordering without losing bigint or Date", () => {
@@ -191,8 +200,9 @@ test("DDL creates enum types and tables before foreign keys, including cyclic re
   ).toBeGreaterThan(
     statements.findIndex((sql) => sql.startsWith('CREATE TABLE "users"')),
   );
+  // Dropping a type no column uses loses no data, and the saved SQL says so.
   expect(diffSchemas(model.$snapshot(), emptySnapshot()).up.at(-1)).toBe(
-    'DROP TYPE "users_status_enum"',
+    '-- symmetria: caution: type "users_status_enum" is no longer used; dropping it loses no data.\nDROP TYPE "users_status_enum"',
   );
 });
 
@@ -338,9 +348,15 @@ test("enum changes rebuild the type and dependent indexes instead of ADD VALUE i
   expect(plan.up).toContain(
     'ALTER TABLE "records" ALTER COLUMN "status" SET DEFAULT E\'archived\'',
   );
-  expect(plan.up.at(-1)).toStartWith(
-    'DROP TYPE "records_status_enum_previous_',
+  expect(plan.up.at(-1)).toMatch(
+    /^-- symmetria: caution: type "records_status_enum_previous_\w+" held the previous labels of "records_status_enum" and is no longer used; dropping it loses no data\.\nDROP TYPE "records_status_enum_previous_/,
   );
+  // lint of the saved file rates the drop of the old type as generate does.
+  expect(
+    lintMigrationSQL(plan.up.map((sql) => `${sql};`).join("\n")).filter(
+      (finding) => finding.level !== "caution",
+    ),
+  ).toEqual([]);
 });
 
 test("an enum value nothing in the migration uses is appended with ADD VALUE, even transactionally", () => {
@@ -434,8 +450,9 @@ test("lintMigration flags destructive, blocking and cautionary changes with advi
     "blocking users.email",
     "blocking users.nickname",
     "blocking users.score",
+    // Every existing row gets the same default, so the UNIQUE key fails.
+    "blocking users.slug",
     "caution users.age",
-    "caution users.slug",
     "caution users",
   ]);
   expect(
@@ -688,9 +705,20 @@ test("changing ON UPDATE recreates the foreign key; keeping it changes nothing",
   };
 
   expect(diffSchemas(build(true), build(true)).up).toEqual([]);
-  expect(diffSchemas(build(false), build(true)).up).toEqual([
+  const changed = diffSchemas(build(false), build(true));
+  // The key held with the same column and target, so adding it again cannot
+  // fail; the saved SQL says so, and lint rates it as generate does.
+  expect(changed.up).toEqual([
     'ALTER TABLE "posts" DROP CONSTRAINT "posts_author_id_fkey"',
-    'ALTER TABLE "posts" ADD CONSTRAINT "posts_author_id_fkey" FOREIGN KEY ("author_id") REFERENCES "users" ("id") ON DELETE RESTRICT ON UPDATE CASCADE',
+    '-- symmetria: caution: the foreign key held with the same column and target; only its actions change, so existing rows still match.\nALTER TABLE "posts" ADD CONSTRAINT "posts_author_id_fkey" FOREIGN KEY ("author_id") REFERENCES "users" ("id") ON DELETE RESTRICT ON UPDATE CASCADE',
+  ]);
+  expect(
+    lintMigrationSQL(changed.up.map((sql) => `${sql};`).join("\n")).map(
+      (finding) => finding.level,
+    ),
+  ).toEqual(["caution", "caution"]);
+  expect(lintMigration(changed).map((finding) => finding.level)).toEqual([
+    "caution",
   ]);
   // NO ACTION stays out of snapshots, so earlier snapshots compare unchanged.
   expect(
@@ -1289,4 +1317,370 @@ test("an extension name may have a hyphen, as uuid-ossp does", () => {
   expect(() =>
     schema({ items: { id: int.auto } }, { extensions: ["Bad Name"] }),
   ).toThrow('extension names are lowercase identifiers such as "pg_trgm"');
+});
+
+test("tables and columns named like Object.prototype members are no change and follow rename hints", () => {
+  const names = [
+    "constructor",
+    "toString",
+    "valueOf",
+    "hasOwnProperty",
+    "__proto__",
+    "isPrototypeOf",
+  ];
+  const version = (extra: boolean) =>
+    schema({
+      a: table(
+        Object.fromEntries([
+          ["id", int.auto],
+          ...names.map((name, position) => [
+            `c${position}`,
+            text.nullable.named(name),
+          ]),
+          ...(extra ? [["extra", text.nullable]] : []),
+        ]),
+      ).named("constructor"),
+      b: table({ id: int.auto, n: int.nullable.named("valueOf") }).named(
+        "__proto__",
+      ),
+    }).$snapshot();
+
+  // Before: `{}["constructor"]` was a function, so every such table and
+  // column looked renamed to nothing and was dropped and added again.
+  expect(diffSchemas(version(false), version(false))).toMatchObject({
+    up: [],
+    down: [],
+  });
+  expect(diffSchemas(version(false), version(true)).up).toEqual([
+    'ALTER TABLE "constructor" ADD COLUMN "extra" text',
+  ]);
+  expect(
+    lintMigration(diffSchemas(version(false), version(true))).filter(
+      (finding) => finding.level === "destructive",
+    ),
+  ).toEqual([]);
+
+  // Hints keyed by such names, as a --diff file gives them (JSON keeps
+  // `__proto__` as an own key).
+  const renamed = schema({
+    a: table({ id: int.auto, toString: text.nullable }).named("constructor"),
+    b: table({ id: int.auto, n: bigint.nullable.named("toString") }).named(
+      "valueOf",
+    ),
+  }).$snapshot();
+  const original = schema({
+    a: table({ id: int.auto, toString: text.nullable }).named("constructor"),
+    b: table({ id: int.auto, n: int.nullable.named("__proto__") }).named(
+      "__proto__",
+    ),
+  }).$snapshot();
+  const options = JSON.parse(`{
+    "renames": { "tables": { "__proto__": "valueOf" }, "columns": { "valueOf": { "__proto__": "toString" } } },
+    "using": { "valueOf": { "toString": { "up": "\\"toString\\"::bigint", "down": "\\"toString\\"::integer" } } }
+  }`);
+  const plan = diffSchemas(original, renamed, options);
+
+  expect(plan.up).toEqual([
+    'ALTER TABLE "__proto__" RENAME TO "valueOf"',
+    'ALTER TABLE "valueOf" RENAME COLUMN "__proto__" TO "toString"',
+    'ALTER TABLE "valueOf" RENAME CONSTRAINT "__proto___pkey" TO "valueOf_pkey"',
+    'ALTER TABLE "valueOf" ALTER COLUMN "toString" TYPE bigint USING "toString"::bigint',
+  ]);
+  expect(plan.down).toContain('ALTER TABLE "valueOf" RENAME TO "__proto__"');
+  expect(
+    plan.down.some((sql) =>
+      sql.endsWith(
+        'ALTER TABLE "__proto__" ALTER COLUMN "toString" TYPE integer USING "toString"::integer',
+      ),
+    ),
+  ).toBe(true);
+  expect(plan.down.at(-1)).toBe(
+    'ALTER TABLE "__proto__" RENAME COLUMN "toString" TO "__proto__"',
+  );
+  expect(
+    lintMigration(plan, options.renames).map((finding) => finding.level),
+  ).toEqual(["caution"]);
+});
+
+test("date and time conversions where a time zone enters convert at UTC, up and down", () => {
+  const timetz = customType<string>("timetz", {
+    encode: (value) => value,
+    decode: (value) => String(value),
+  });
+  const change = (from: Column, to: Column) =>
+    diffSchemas(
+      schema({ items: table({ id: int.auto, at: from }) }).$snapshot(),
+      schema({ items: table({ id: int.auto, at: to }) }).$snapshot(),
+    );
+  const statement = (sql: readonly string[]) =>
+    sql.map((entry) => entry.replace(/^-- symmetria: .*\n/, ""));
+
+  // A plain cast reads the session's zone: the stored values would depend on
+  // who runs the migration.
+  const day = change(date, timestamptz);
+  expect(statement(day.up)).toEqual([
+    `ALTER TABLE "items" ALTER COLUMN "at" TYPE timestamptz USING "at"::timestamp AT TIME ZONE 'UTC'`,
+  ]);
+  expect(statement(day.down)).toEqual([
+    `ALTER TABLE "items" ALTER COLUMN "at" TYPE date USING ("at" AT TIME ZONE 'UTC')::date`,
+  ]);
+  // A value to timetz takes the session's offset, and a string has no zone
+  // of its own: the statement runs with the zone set to UTC.
+  expect(change(time, timetz).up).toEqual([
+    "SET TIME ZONE 'UTC'",
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE timetz USING "at"::timetz',
+    "RESET TIME ZONE",
+  ]);
+  const words = change(text, timestamptz);
+  expect(words.up).toEqual([
+    "SET TIME ZONE 'UTC'",
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE timestamptz USING "at"::timestamptz',
+    "RESET TIME ZONE",
+  ]);
+  expect(words.down).toEqual([
+    "SET TIME ZONE 'UTC'",
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE text USING "at"::text',
+    "RESET TIME ZONE",
+  ]);
+  // Lint passes the zone statements.
+  expect(
+    lintMigrationSQL(words.up.map((sql) => `${sql};`).join("\n")).map(
+      (finding) => finding.level,
+    ),
+  ).toEqual(["caution"]);
+  // timestamp to date reads no zone.
+  expect(statement(change(timestamp, date).up)).toEqual([
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE date USING "at"::date',
+  ]);
+});
+
+test("type changes between built-in types without a cast are refused, in either direction", () => {
+  const change = (from: Column, to: Column) => () =>
+    diffSchemas(
+      schema({ items: table({ id: int.auto, value: from }) }).$snapshot(),
+      schema({ items: table({ id: int.auto, value: to }) }).$snapshot(),
+    );
+
+  for (const [from, to, message] of [
+    [int, date, "PostgreSQL has no cast from integer to date"],
+    [bool, numeric(10, 2), "PostgreSQL has no cast from boolean to numeric"],
+    [date, int, "PostgreSQL has no cast from date to integer"],
+    [int, timestamptz, "PostgreSQL has no cast from integer to timestamptz"],
+    [interval, int, "PostgreSQL has no cast from interval to integer"],
+    // integer and bytea cast into each other from PostgreSQL 18 only.
+    [int, bytea, "PostgreSQL has no cast from integer to bytea"],
+  ] as const) {
+    expect(change(from, to)).toThrow(message);
+  }
+
+  // up.sql runs, down.sql never could: the migration could not be rolled back.
+  expect(change(jsonb(), int)).toThrow(
+    'PostgreSQL has no cast from integer back to jsonb for "items"."value", so the migration could not be rolled back',
+  );
+  expect(change(timestamptz, time)).toThrow(
+    "PostgreSQL has no cast from time back to timestamptz",
+  );
+
+  // Casts PostgreSQL has, element by element for arrays, and text both ways.
+  for (const [from, to] of [
+    [int, bool],
+    [jsonb(), text],
+    [text, date],
+    [date, timestamp],
+    [time, interval],
+    [int.array, bigint.array],
+    [text.array, uuid.array],
+  ] as const) {
+    expect(change(from, to)).not.toThrow();
+  }
+
+  // A conversion given for both directions is used.
+  expect(
+    diffSchemas(
+      schema({ items: table({ id: int.auto, value: int }) }).$snapshot(),
+      schema({ items: table({ id: int.auto, value: date }) }).$snapshot(),
+      {
+        using: {
+          items: {
+            value: {
+              up: "date '2000-01-01' + \"value\"",
+              down: "\"value\" - date '2000-01-01'",
+            },
+          },
+        },
+      },
+    ).up,
+  ).toEqual([
+    `ALTER TABLE "items" ALTER COLUMN "value" TYPE date USING date '2000-01-01' + "value"`,
+  ]);
+});
+
+test("numeric to an integer type narrows when its digits before the point can exceed the target", () => {
+  const destructive = (from: Column, to: Column) =>
+    lintMigration(
+      diffSchemas(
+        schema({ t: table({ id: int.auto, n: from }) }).$snapshot(),
+        schema({ t: table({ id: int.auto, n: to }) }).$snapshot(),
+      ),
+    )
+      .filter((finding) => finding.level === "destructive")
+      .map((finding) => finding.message);
+
+  expect(destructive(numeric(20, 0), int)).toEqual([
+    'Column "n" narrows from numeric(20,0) to integer: values outside the integer range make the migration fail.',
+  ]);
+  expect(destructive(numeric(12, 2), int)).toEqual([
+    'Column "n" narrows from numeric(12,2) to integer: values are rounded to whole numbers, and values outside the integer range make the migration fail.',
+  ]);
+  expect(destructive(numeric(10, 2), numeric(8, 2))).toEqual([
+    'Column "n" narrows from numeric(10,2) to numeric(8,2): values with more than 6 digits before the decimal point make the migration fail.',
+  ]);
+  expect(destructive(int, numeric(9, 0))).toHaveLength(1);
+  // Every value fits.
+  expect(destructive(numeric(9, 0), int)).toEqual([]);
+  expect(destructive(numeric(4, 0), smallint)).toEqual([]);
+  expect(destructive(int, numeric(10, 0))).toEqual([]);
+  expect(destructive(numeric(18, 0), bigint)).toEqual([]);
+});
+
+test("CHECK literals PostgreSQL stores in another spelling compare as the same", () => {
+  const timetz = customType<string>("timetz", {
+    encode: (value) => value,
+    decode: (value) => String(value),
+  });
+  const version = (spelling: "dsl" | "stored") =>
+    schema({
+      t: table({
+        id: int.auto,
+        tm: time,
+        tz: timetz,
+        iv: interval,
+        key: uuid,
+        ip: inet,
+      }).checks((t) =>
+        spelling === "dsl"
+          ? {
+              late: t.tm.below("23:00"),
+              zoned: t.tz.isNot("7:00+02"),
+              long: t.iv.below("24 hours"),
+              key: t.key.isNot("{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}"),
+              host: t.ip.isNot("10.0.0.1/32"),
+            }
+          : {
+              late: sql<boolean>`${t.tm} < '23:00:00'::time without time zone`,
+              zoned: sql<boolean>`${t.tz} <> '07:00:00+02'::time with time zone`,
+              long: sql<boolean>`${t.iv} < '24:00:00'::interval`,
+              key: sql<boolean>`${t.key} <> 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid`,
+              host: sql<boolean>`${t.ip} <> '10.0.0.1'::inet`,
+            },
+      ),
+    }).$snapshot();
+
+  expect(diffSchemas(version("dsl"), version("stored")).up).toEqual([]);
+  // Another value is still a change.
+  expect(
+    diffSchemas(
+      version("dsl"),
+      schema({
+        t: table({
+          id: int.auto,
+          tm: time,
+          tz: timetz,
+          iv: interval,
+          key: uuid,
+          ip: inet,
+        }).checks((t) => ({
+          late: t.tm.below("22:00"),
+          zoned: t.tz.isNot("7:00+02"),
+          long: t.iv.below("24 hours"),
+          key: t.key.isNot("{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}"),
+          host: t.ip.isNot("10.0.0.0/32"),
+        })),
+      }).$snapshot(),
+    ).up,
+  ).toHaveLength(4);
+});
+
+test("interval literals compare as PostgreSQL keeps them: months, days and time apart", () => {
+  const check = (bound: string) =>
+    schema({
+      t: table({ id: int.auto, iv: interval }).checks((t) => ({
+        short: t.iv.below(bound),
+      })),
+    }).$snapshot();
+  const changes = (from: string, to: string) =>
+    diffSchemas(check(from), check(to)).up.length;
+
+  // One value, other spellings.
+  expect(changes("24 hours", "24:00:00")).toBe(0);
+  expect(changes("1440 minutes", "24:00:00")).toBe(0);
+  expect(changes("1.5 days", "1 day 12:00:00")).toBe(0);
+  expect(changes("1 year 2 mons", "14 mons")).toBe(0);
+  // Another value: a day is not always 24 hours, a month not always 30 days.
+  expect(changes("1 day", "24 hours")).toBe(2);
+  expect(changes("1.5 days", "36 hours")).toBe(2);
+  expect(changes("1 mon", "30 days")).toBe(2);
+});
+
+test("typed literals and IN lists compare the way PostgreSQL stores them", () => {
+  const version = (spelling: "dsl" | "stored") =>
+    schema({
+      t: table({ id: int.auto, iv: interval, tm: time, ip: inet }).checks(
+        (t) =>
+          spelling === "dsl"
+            ? {
+                list: t.iv.in(["1440 minutes", "1 day"]),
+                times: t.tm.in(["7:05"]),
+                host: sql<boolean>`${t.ip} <> inet '10.0.0.01/32'`,
+              }
+            : {
+                list: sql<boolean>`${t.iv} = ANY (ARRAY['24:00:00'::interval, '1 day'::interval])`,
+                times: sql<boolean>`${t.tm} = '07:05:00'::time without time zone`,
+                host: sql<boolean>`${t.ip} <> '10.0.0.1'::inet`,
+              },
+      ),
+    }).$snapshot();
+
+  expect(diffSchemas(version("dsl"), version("stored")).up).toEqual([]);
+  // A different value in a list is still a change.
+  expect(
+    diffSchemas(
+      version("dsl"),
+      schema({
+        t: table({ id: int.auto, iv: interval, tm: time, ip: inet }).checks(
+          (t) => ({
+            list: t.iv.in(["1440 minutes", "24 hours"]),
+            times: t.tm.in(["7:05"]),
+            host: sql<boolean>`${t.ip} <> inet '10.0.0.01/32'`,
+          }),
+        ),
+      }).$snapshot(),
+    ).up,
+  ).toHaveLength(2);
+});
+
+test("pull renders a condition's literals as PostgreSQL stored them, not as their comparison key", () => {
+  const node = readExpression(
+    `(iv > '-1000 years'::interval) AND (at < '23:00:00'::time without time zone)`,
+    new Map([
+      ["iv", "interval"],
+      ["at", "time"],
+    ]),
+  );
+
+  expect(JSON.stringify(node)).toContain('"value":"-1000 years"');
+  expect(JSON.stringify(node)).toContain('"value":"23:00:00"');
+});
+
+test("a USING conversion without one of its directions is refused with its name", () => {
+  const before = schema({ items: table({ id: int.auto, v: int }) }).$snapshot();
+  const after = schema({ items: table({ id: int.auto, v: date }) }).$snapshot();
+
+  expect(() =>
+    diffSchemas(before, after, {
+      using: { items: { v: { up: "date '2000-01-01' + v" } as never } },
+    }),
+  ).toThrow(
+    'symmetria: the USING conversion for "items.v" needs both directions, and "down" is missing',
+  );
 });

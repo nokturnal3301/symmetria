@@ -361,6 +361,26 @@ export const queryJsonSemanticsTests = (): void => {
         ),
         // Row 8's JSON null is null, as for is(null): no value to compare.
       ).toEqual([3, 4, 5, 6, 7].map((id) => ({ id })));
+      // not() leaves out what the negated operator leaves out.
+      expect(
+        await database.records((records) => ({ id: records.id }), {
+          where: (records) => not(records.document.is(reordered)),
+          orderBy: (records) => records.id.ascending,
+        }),
+      ).toEqual([3, 4, 5, 6, 7].map((id) => ({ id })));
+      expect(
+        await database.records((records) => ({ id: records.id }), {
+          where: (records) =>
+            not(records.document.in([reordered, true]).or(records.id.is(9))),
+          orderBy: (records) => records.id.ascending,
+        }),
+      ).toEqual([4, 5, 6, 7].map((id) => ({ id })));
+      expect(
+        await database.records((records) => ({ id: records.id }), {
+          where: (records) => not(records.document.contains(reordered)),
+          orderBy: (records) => records.id.ascending,
+        }),
+      ).toEqual([3, 4, 5, 6, 7].map((id) => ({ id })));
       expect(
         await database.records(
           (records) => ({

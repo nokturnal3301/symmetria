@@ -6,6 +6,7 @@ import {
   bigint,
   bool,
   timestamptz,
+  customType,
 } from "../../../packages/runtime/src";
 import { testDatabase } from "../../support/postgres";
 
@@ -17,6 +18,11 @@ const model = schema({
     scores: bigint.array.nullable,
     flags: bool.array,
     seen: timestamptz.array,
+    // PostgreSQL separates box elements with ";".
+    boxes: customType<string>("box", {
+      encode: (value: string) => value,
+      decode: (value: unknown) => String(value),
+    }).array.nullable,
   },
 });
 
@@ -118,6 +124,25 @@ describe.skipIf(!databaseUrl)(
           .where((items) => items.id.is(2))
           .returning((items) => [items.tags]),
       ).toEqual([{ tags: ["replaced"] }]);
+    });
+
+    test("a box array round-trips", async () => {
+      const boxes = ["(1,1),(0,0)", "(3,4),(2,2)"];
+
+      expect(
+        await database.items
+          .update({ boxes })
+          .where((items) => items.id.is(2))
+          .returning("boxes"),
+      ).toEqual([{ boxes }]);
+      expect(
+        await database.items((items) => ({ boxes: items.boxes }), {
+          where: (items) => items.id.is(2),
+        }),
+      ).toEqual([{ boxes }]);
+      await database.items
+        .update({ boxes: null })
+        .where((items) => items.id.is(2));
     });
 
     test("search() matches stemmed words and searchRank() orders results", async () => {

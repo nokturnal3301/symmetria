@@ -53,7 +53,7 @@ import {
   type QueryHandle,
   shapeFrame,
 } from "./scope";
-import { rowCountError } from "./terminal";
+import { deferredRead, rowCountError } from "./terminal";
 import type { RuntimeScope } from "./types";
 
 export {
@@ -230,18 +230,21 @@ export const createQueryTables = (
         readonly values: readonly unknown[];
       }
     >();
+    // Starts when awaited, as the query's own one() does.
     const lookupRow = (handle: QueryHandle, required: boolean) => {
       const key = lookupKeys.get(handle[QUERY_STATE].plan);
 
-      return (
-        (key && compiledRow(key, required)) ??
-        (
-          Reflect.get(
-            queryPrototype,
-            required ? "one" : "maybeOne",
-            handle,
-          ) as () => Promise<Record<string, unknown> | null>
-        )()
+      return deferredRead(
+        () =>
+          (key && compiledRow(key, required)) ??
+          (
+            Reflect.get(
+              queryPrototype,
+              required ? "one" : "maybeOne",
+              handle,
+            ) as () => Promise<Record<string, unknown> | null>
+          )(),
+        executor,
       );
     };
     const lookupPrototype = Object.freeze(
@@ -772,6 +775,36 @@ export const createQueryTables = (
       return shape === undefined ? lookup : lookup(shape);
     };
 
+    /**
+     * `get()` and `find()`: a read that starts when it is awaited, as a
+     * query does. A shape is applied now, as a query's is; a malformed key
+     * or a shape that throws rejects like any other failure of the read.
+     */
+    const keyedRow = (
+      value: unknown,
+      shape: ShapeCallback | undefined,
+      required: boolean,
+    ): Promise<Record<string, unknown> | null> => {
+      if (shape === undefined) {
+        return deferredRead(
+          () =>
+            wholeRow(value, required) ??
+            (required ? keyed(value).one() : keyed(value).maybeOne()),
+          executor,
+        );
+      }
+
+      let lookup: LookupQuery;
+
+      try {
+        lookup = keyed(value, shape) as LookupQuery;
+      } catch (error) {
+        return deferredRead(() => Promise.reject(error), executor);
+      }
+
+      return required ? lookup.one() : lookup.maybeOne();
+    };
+
     return extendBuilder(createQuery(rootPlan, true, true), {
       shape: (callback: ShapeCallback) => {
         if (typeof callback !== "function") {
@@ -795,13 +828,10 @@ export const createQueryTables = (
         ),
       ),
       byId,
-      // async: a malformed key rejects like any other failure of the read.
-      get: async (value: unknown, shape?: ShapeCallback) =>
-        (shape === undefined ? wholeRow(value, true) : undefined) ??
-        keyed(value, shape).one(),
-      find: async (value: unknown, shape?: ShapeCallback) =>
-        (shape === undefined ? wholeRow(value, false) : undefined) ??
-        keyed(value, shape).maybeOne(),
+      get: (value: unknown, shape?: ShapeCallback) =>
+        keyedRow(value, shape, true),
+      find: (value: unknown, shape?: ShapeCallback) =>
+        keyedRow(value, shape, false),
       insert: (
         values: Record<string, unknown> | readonly Record<string, unknown>[],
       ) => createMutation("insert", root, values, executor, mutationOptions),

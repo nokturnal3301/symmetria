@@ -11,6 +11,8 @@ import {
   QueryError,
   operatorClass,
   timestamptz,
+  timestamp,
+  oneOf,
   type CompiledQuery,
 } from "../../../packages/runtime/src";
 import { vector } from "../../../packages/runtime/src/entries/vector";
@@ -92,6 +94,38 @@ test("a page cursor does not depend on how the statement is optimized", async ()
   // relation became one LATERAL join.
   expect(String(page.nextCursor)).toBe(
     "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6ImVmNzhiOWQxYjFmYTZkMTIwOTY4YzE4NjRiZWZhMGQ2ZTYxMGIyMjQ2MDZiNzJhZmRmMTRlOGYxOTRhMDExNjUiLCJ2YWx1ZXMiOltudWxsXX0",
+  );
+});
+
+test("a page cursor survives long lists becoming one array parameter", async () => {
+  const database = schema(
+    {
+      events: table({
+        id: int.auto,
+        kind: oneOf("a", "b"),
+        at: timestamp,
+        n: int,
+      }),
+    },
+    { executor: async () => [{ id: 1 }, { id: 2 }, { id: 3 }] },
+  );
+  const query = database.events((event) => ({ id: event.id }), {
+    where: (event) => [
+      event.kind.in(Array.from({ length: 1001 }, () => "a" as const)),
+      event.at.notIn(
+        Array.from(
+          { length: 1001 },
+          (_, i) => new Date(Date.UTC(2000, 0, 1, 0, 0, i)),
+        ),
+      ),
+    ],
+    orderBy: (event) => event.id.asc,
+  });
+
+  expect(query.toSQL().parameters).toHaveLength(2);
+  // The cursor 3.4.0 issued, when these lists bound one value each.
+  expect(String((await query.page({ size: 2 })).nextCursor)).toBe(
+    "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6IjE4Y2RlNjBjZWRmOWQ1NjU1ZGJkNzBjNmMxMmE3ZTM5MzkyZTUxOWI2OWJmNmFmMWEzMDAwNWRlM2Q3MjU0ZDkiLCJ2YWx1ZXMiOltudWxsXX0",
   );
 });
 

@@ -11,13 +11,18 @@ const remap = <Value>(
   visit: (value: Value) => Value,
 ): readonly Value[] => (values.length ? freeze(values.map(visit)) : values);
 
-/** Rewrites plans and expressions onto other bindings; anything not listed stays as it is. */
-const rebinder = (replacements: ReadonlyMap<TableBinding, TableBinding>) => {
+/**
+ * Rewrites plans and expressions onto other bindings; a binding `replace`
+ * does not map (undefined) stays as it is. Derived tables are walked.
+ */
+const rebinder = (
+  replace: (binding: TableBinding) => TableBinding | undefined,
+) => {
   const derivedBindings = new Map<TableBinding, TableBinding>();
 
   const binding = (original: TableBinding): TableBinding => {
     if (!original.derived) {
-      return replacements.get(original) ?? original;
+      return replace(original) ?? original;
     }
 
     const existing = derivedBindings.get(original);
@@ -260,17 +265,29 @@ const rebinder = (replacements: ReadonlyMap<TableBinding, TableBinding>) => {
 };
 
 /** Give a reusable query new local sources, retaining its correlated ancestors. */
-export const queryOccurrence = (source: SelectPlan): SelectPlan =>
-  rebinder(
-    new Map<TableBinding, TableBinding>(
-      [source.root, ...source.joins.map((join) => join.binding)].map(
-        (binding) => [binding, freeze({ ...binding })],
-      ),
+export const queryOccurrence = (source: SelectPlan): SelectPlan => {
+  const replacements = new Map<TableBinding, TableBinding>(
+    [source.root, ...source.joins.map((join) => join.binding)].map(
+      (binding) => [binding, freeze({ ...binding })],
     ),
-  ).query(source);
+  );
+
+  return rebinder((binding) => replacements.get(binding)).query(source);
+};
 
 /** An expression read from other bindings, such as one query's root in place of another's. */
 export const reboundExpression = (
   expression: ExpressionDescription,
   replacements: ReadonlyMap<TableBinding, TableBinding>,
-): ExpressionDescription => rebinder(replacements).expression(expression);
+): ExpressionDescription =>
+  rebinder((binding) => replacements.get(binding)).expression(expression);
+
+/**
+ * The plan with every table binding `replace` maps swapped, in subqueries
+ * and derived tables too. CTE bodies are not walked: `replace` sees the
+ * binding that carries one.
+ */
+export const rebindPlan = (
+  plan: SelectPlan,
+  replace: (binding: TableBinding) => TableBinding | undefined,
+): SelectPlan => rebinder(replace).query(plan);

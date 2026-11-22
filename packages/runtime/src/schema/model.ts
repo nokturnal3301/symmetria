@@ -594,20 +594,23 @@ const bindDatabase = (
       // Reads only: what needs a connection of its own (a nested insert, a
       // stream, a transaction) is refused by the handle's driver.
       $batch: (callback: (database: object) => unknown) =>
-        runBatch(executor, (collecting) =>
-          callback(
-            bindDatabase(
-              runtime,
-              collecting,
-              undefined,
-              {
-                execute: collecting,
-                close: async () => {},
-                transaction: () => Promise.reject(readsOnly()),
-              },
-              scopes,
+        runBatch(
+          executor,
+          (collecting) =>
+            callback(
+              bindDatabase(
+                runtime,
+                collecting,
+                undefined,
+                {
+                  execute: collecting,
+                  close: async () => {},
+                  transaction: () => Promise.reject(readsOnly()),
+                },
+                scopes,
+              ),
             ),
-          ),
+          snapshot.tables,
         ),
       $snapshot: () => structuredClone(snapshot),
       $createIndexes: (settings?: CreateIndexesOptions) =>

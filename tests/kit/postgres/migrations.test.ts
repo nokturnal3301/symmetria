@@ -19,6 +19,7 @@ import {
   bool,
   jsonb,
   timestamptz,
+  date,
   oneOf,
   index,
   sql,
@@ -1358,6 +1359,120 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       expect((await runCli(config, "status")).stdout).toContain("pending");
     } finally {
       await execute(`DROP SCHEMA IF EXISTS "${metadataSchema}" CASCADE`);
+    }
+  });
+
+  test("tables and columns named like Object.prototype members keep their data through migrations and drift", async () => {
+    const version = (extra: boolean) =>
+      schema({
+        cars: table({
+          id: int.auto,
+          maker: text.nullable.named("constructor"),
+          label: text.nullable.named("__proto__"),
+          ...(extra ? { extra: text.nullable } : {}),
+        }),
+        labels: table({ id: int.auto, label: text }).named("toString"),
+      }).$snapshot();
+
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: version(false),
+    });
+    await runner().migrate();
+    await execute(
+      `INSERT INTO cars ("constructor", "__proto__") VALUES ('Ferrari', 'F40')`,
+    );
+    await execute(`INSERT INTO "toString" (label) VALUES ('kept')`);
+
+    // Before, every later migration dropped and added them again.
+    const next = await generateMigration({
+      directory,
+      name: "extra",
+      snapshot: version(true),
+    });
+    expect(next!.up.trim()).toBe('ALTER TABLE "cars" ADD COLUMN "extra" text;');
+    await runner().migrate();
+    expect(
+      await detectDrift({
+        execute: driver.execute,
+        snapshot: version(true),
+        metadataSchema: namespace,
+      }),
+    ).toEqual([]);
+    await runner().rollback({ steps: 1 });
+    expect(
+      await execute(`SELECT "constructor", "__proto__" FROM cars`),
+    ).toEqual([{ constructor: "Ferrari", ["__proto__"]: "F40" }]);
+    expect(await execute(`SELECT label FROM "toString"`)).toEqual([
+      { label: "kept" },
+    ]);
+  });
+
+  test("date and time conversions convert at UTC whatever the migrating session's zone", async () => {
+    const zoned = new URL(address);
+    zoned.searchParams.set(
+      "options",
+      `-c search_path=${namespace} -c TimeZone=America/New_York`,
+    );
+    const newYork = postgres({ url: zoned.toString(), max: 2 });
+    const utc = new URL(address);
+    utc.searchParams.set(
+      "options",
+      `-c search_path=${namespace} -c TimeZone=UTC`,
+    );
+    const reader = postgres({ url: utc.toString(), max: 1 });
+    const read = async () => {
+      const result = await reader.execute({
+        sql: "SELECT day::text AS day, at::text AS at, plain::text AS plain FROM events",
+        parameters: [],
+      });
+
+      return (Array.isArray(result) ? result : result.rows)[0];
+    };
+    const version = (after: boolean) =>
+      schema({
+        events: {
+          id: int.auto,
+          day: after ? timestamptz : date,
+          at: after ? date : timestamptz,
+          plain: after ? timestamptz : text,
+        },
+      }).$snapshot();
+    const migrations = () =>
+      migrator({ driver: newYork, directory, metadataSchema: namespace });
+
+    try {
+      await generateMigration({
+        directory,
+        name: "initial",
+        snapshot: version(false),
+      });
+      await migrations().migrate();
+      await execute(
+        `INSERT INTO events (day, at, plain) VALUES ('2024-01-02', '2024-01-02 03:04:05+00', '2024-01-02 03:04:05')`,
+      );
+      await generateMigration({
+        directory,
+        name: "retype",
+        snapshot: version(true),
+        allowDestructive: true,
+      });
+      await migrations().migrate();
+      // A plain cast in New York gave 05:00 UTC, the date 2024-01-01 and 08:04:05.
+      expect(await read()).toEqual({
+        day: "2024-01-02 00:00:00+00",
+        at: "2024-01-02",
+        plain: "2024-01-02 03:04:05+00",
+      });
+      await migrations().rollback({ steps: 1 });
+      expect(await read()).toEqual({
+        day: "2024-01-02",
+        at: "2024-01-02 00:00:00+00",
+        plain: "2024-01-02 03:04:05+00",
+      });
+    } finally {
+      await Promise.all([newYork.close(), reader.close()]);
     }
   });
 

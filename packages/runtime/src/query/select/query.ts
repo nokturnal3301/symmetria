@@ -1,5 +1,6 @@
 /** Query handles: the shared prototype of every query and the callable that extends it. */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { whenCursorEnds } from "../../driver/transactions";
 import { freeze } from "../plan/freeze";
 import { collectDataErrors } from "../codecs/deferred";
 import { createExpression } from "../expressions";
@@ -35,6 +36,7 @@ import type { ShapeCallback } from "./joins";
 import type { TableRegistry } from "./registry";
 import { applyShape } from "./shape";
 import {
+  EMPTY,
   QUERY_STATE,
   limitedPlan,
   initialPlan,
@@ -46,6 +48,7 @@ import {
 } from "./scope";
 import {
   countPlan,
+  deferredRead,
   existsPlan,
   readCount,
   readExists,
@@ -69,6 +72,11 @@ export const endStreams = async (owner: object): Promise<void> => {
 
 const closedStream = () =>
   new Error("symmetria: the database was closed while this stream was open");
+
+const endedStream = () =>
+  new Error(
+    "symmetria: the transaction of this stream ended while the stream was open and was rolled back; finish or break out of a stream() before its transaction callback returns",
+  );
 
 /** How a dropped stream gives its connection back: see `dropped`. */
 type StreamLink = { release?: () => void };
@@ -99,12 +107,25 @@ async function* streamRows(
   const cursor = quoteIdentifier(`__symmetria_stream_${++streamOrdinal}`);
   const ready = Promise.withResolvers<QueryExecutor>();
   const finished = Promise.withResolvers<void>();
+  // A stream of the pool holds a transaction of its own; one of a
+  // transaction or savepoint runs on that transaction's connection.
+  const owner = (hold as { owner?: object }).owner;
   const held = hold(async (execute) => {
-    // The loop runs in its caller's context; its statements run in the
-    // transaction's, as its other statements do (a tracer's span, a profile).
-    const inside = AsyncLocalStorage.snapshot();
+    if (!owner) {
+      // Like the transaction's other statements, its statements are checked
+      // where they are called: a fetch from inside one of its savepoints is
+      // refused as a plain query there is, instead of waiting for the
+      // savepoint that waits for it.
+      ready.resolve(execute);
+    } else {
+      // The loop runs in its caller's context; its statements run in its
+      // own transaction's, as that transaction's statements do (a tracer's
+      // span, a profile).
+      const inside = AsyncLocalStorage.snapshot();
 
-    ready.resolve((query) => inside(() => execute(query)));
+      ready.resolve((query) => inside(() => execute(query)));
+    }
+
     await finished.promise;
   });
   held.catch(() => {});
@@ -117,7 +138,12 @@ async function* streamRows(
   let waiting = false;
   let closing = false;
   let ended: Promise<void> | undefined;
-  const owner = (hold as { owner?: object }).owner;
+  // The transaction or savepoint ended under the open stream and rolled back
+  // with its cursor: rows fetched before must not be handed out.
+  let rolledBack = false;
+  const stopListening = whenCursorEnds(cursor, () => {
+    rolledBack = true;
+  });
   const end = async () => {
     closing = true;
 
@@ -172,15 +198,37 @@ async function* streamRows(
     // A stream reads to the end, so its cursor is planned like the plain
     // query. PostgreSQL otherwise plans a cursor to start fast, and may pick
     // an approximate index (pgvector's) that returns only some of the rows.
-    await execute({
-      sql: "SET LOCAL cursor_tuple_fraction = 1",
-      parameters: [],
-    });
+    // The setting is read when the cursor is declared; inside the caller's
+    // transaction it goes back to its value afterwards, so the rest of that
+    // transaction plans its cursors as before.
+    const previous = owner
+      ? undefined
+      : normalizeResult(
+          await execute({
+            sql: "SELECT current.setting, set_config('cursor_tuple_fraction', '1', true) FROM (SELECT current_setting('cursor_tuple_fraction') AS setting OFFSET 0) AS current",
+            parameters: [],
+          }),
+        ).rows[0]?.setting;
+
+    if (owner) {
+      await execute({
+        sql: "SET LOCAL cursor_tuple_fraction = 1",
+        parameters: [],
+      });
+    }
+
     await execute({
       sql: `DECLARE ${cursor} NO SCROLL CURSOR FOR ${compiled.sql}`,
       parameters: compiled.parameters,
     });
     declared = true;
+
+    if (typeof previous === "string") {
+      await execute({
+        sql: "SELECT set_config('cursor_tuple_fraction', $1, true)",
+        parameters: [previous],
+      });
+    }
 
     while (true) {
       const { rows } = normalizeResult(
@@ -194,6 +242,10 @@ async function* streamRows(
         throw closedStream();
       }
 
+      if (rolledBack) {
+        throw endedStream();
+      }
+
       for (const row of rows) {
         waiting = true;
         yield decode(row);
@@ -201,6 +253,10 @@ async function* streamRows(
 
         if (closing) {
           throw closedStream();
+        }
+
+        if (rolledBack) {
+          throw endedStream();
         }
       }
 
@@ -218,6 +274,7 @@ async function* streamRows(
     }
 
     dropped.unregister(link);
+    stopListening();
 
     if (owner) {
       streams.get(owner)?.delete(end);
@@ -238,8 +295,9 @@ async function* streamRows(
     // Runs on completion, on an early `break` and on errors, also on a row
     // that failed to decode: inside $transaction an open cursor would roll
     // the whole transaction back. After a failed statement CLOSE fails too;
-    // the first error is the one reported.
-    if (declared && execute) {
+    // the first error is the one reported. A rollback closed it already, and
+    // a reader that stops there (`break`, `return`) just ends.
+    if (declared && execute && !rolledBack) {
       try {
         await execute({ sql: `CLOSE ${cursor}`, parameters: [] });
       } catch (error) {
@@ -361,6 +419,72 @@ export const createQueryFactory = (
     state.sharedRoot
       ? (state.embedded ??= queryOccurrence(state.plan))
       : state.plan;
+
+  /**
+   * The plan of `aggregate()`: its shape over the rows the source selects.
+   * A grouped source keeps its groups (and its LIMIT, OFFSET and ordering of
+   * them), so a shape over several groups yields several rows. Otherwise
+   * LIMIT, OFFSET, DISTINCT and row locks pick the rows, which therefore stay
+   * in a derived table with the source's columns under their own names and
+   * the table's relations, so relation paths and relation aggregates still
+   * work; an ordering only matters there with a LIMIT or OFFSET.
+   */
+  const aggregatePlan = (
+    handle: QueryHandle,
+    shape: ShapeCallback,
+  ): SelectPlan => {
+    type Shaped = (shape: ShapeCallback) => QueryHandle;
+    const { plan } = handle[QUERY_STATE];
+
+    if (plan.grouping.length || plan.having.length) {
+      return (handle as unknown as Shaped)(shape)[QUERY_STATE].plan;
+    }
+
+    if (typeof plan.limit === "object" || typeof plan.offset === "object") {
+      throw new Error("symmetria: bind a parameterized LIMIT with prepare()");
+    }
+
+    if (plan.distinct && plan.selection.length) {
+      throw new Error(
+        `symmetria: aggregate() reads rows of "${plan.root.table.name}", and a DISTINCT query returns distinct values of its fields instead; count them with count(), or aggregate the fields through a derived table: query.as("name").aggregate(…)`,
+      );
+    }
+
+    const limited = plan.limit !== undefined || plan.offset !== undefined;
+
+    if (!limited && !plan.distinct && !plan.locking) {
+      const shaped = (handle as unknown as Shaped)(shape)[QUERY_STATE].plan;
+
+      return shaped.ordering.length
+        ? freeze({ ...shaped, ordering: EMPTY })
+        : shaped;
+    }
+
+    const { root } = plan;
+    const { cte: _cte, cteReference: _reference, ...binding } = root;
+    const rows = freeze({
+      ...plan,
+      selection: freeze(
+        root.table.columns.map((column) =>
+          freeze({
+            outputName: column.sqlName,
+            node: freeze({
+              kind: "column" as const,
+              description: freeze({ binding: root, column }),
+            }),
+          }),
+        ),
+      ),
+      ordering: limited ? plan.ordering : EMPTY,
+    });
+    const source = createQuery(
+      initialPlan(freeze({ ...binding, derived: rows })),
+      false,
+      true,
+    ) as unknown as Shaped;
+
+    return source(shape)[QUERY_STATE].plan;
+  };
 
   /** Every query is a callable whose methods live on one shared prototype. */
   const queryPrototype: object = Object.freeze(
@@ -598,11 +722,17 @@ export const createQueryFactory = (
             options,
           );
         },
+        // Reads start when they are awaited, as the query itself does; see
+        // deferredRead. execute() and inspect() start when called.
         one(this: QueryHandle) {
-          return single(runnable(this[QUERY_STATE]), true);
+          const plan = runnable(this[QUERY_STATE]);
+
+          return deferredRead(() => single(plan, true), executor);
         },
         maybeOne(this: QueryHandle) {
-          return single(runnable(this[QUERY_STATE]), false);
+          const plan = runnable(this[QUERY_STATE]);
+
+          return deferredRead(() => single(plan, false), executor);
         },
         page(
           this: QueryHandle,
@@ -612,7 +742,12 @@ export const createQueryFactory = (
             before?: string | null | undefined;
           },
         ) {
-          return executePage(runnable(this[QUERY_STATE]), options, executor);
+          const plan = runnable(this[QUERY_STATE]);
+
+          return deferredRead(
+            () => executePage(plan, options, executor),
+            executor,
+          );
         },
         pages(
           this: QueryHandle,
@@ -676,52 +811,54 @@ export const createQueryFactory = (
           };
         },
         /** The shape's single row: aggregates over the source, as one object. */
-        async aggregate(this: QueryHandle, shape: ShapeCallback) {
-          type Source = ((
-            shape: ShapeCallback,
-          ) => Source & { one: () => Promise<Record<string, unknown>> }) & {
-            as: (name: string) => Source;
-          };
-          const plan = this[QUERY_STATE].plan;
-          // LIMIT, OFFSET and their ordering pick the rows the aggregates
-          // read, so they stay with those rows in a derived table instead of
-          // applying to the one result row.
-          const source =
-            plan.limit !== undefined || plan.offset !== undefined
-              ? (this as unknown as Source)((_row, tools) => ({
-                  ...(tools as unknown as { row: Record<string, unknown> }).row,
-                })).as("__symmetria_aggregated")
-              : (this as unknown as Source);
+        aggregate(this: QueryHandle, shape: ShapeCallback) {
+          let plan: SelectPlan;
 
-          return source(shape).one();
-        },
-        async first(this: QueryHandle) {
-          const state = runnable(this[QUERY_STATE]);
-
-          if (typeof state.limit === "object") {
-            throw new Error(
-              "symmetria: bind a parameterized LIMIT with prepare()",
-            );
+          // Built now, as a query is; a callback that throws rejects.
+          try {
+            plan = aggregatePlan(this, shape);
+          } catch (error) {
+            return deferredRead(() => Promise.reject(error), executor);
           }
 
-          return (
-            (await executePlan(limitedPlan(state, 1), executor)).rows[0] ?? null
+          return deferredRead(() => single(plan, true), executor);
+        },
+        first(this: QueryHandle) {
+          const state = this[QUERY_STATE];
+
+          return deferredRead(async () => {
+            const plan = runnable(state);
+
+            if (typeof plan.limit === "object") {
+              throw new Error(
+                "symmetria: bind a parameterized LIMIT with prepare()",
+              );
+            }
+
+            return (
+              (await executePlan(limitedPlan(plan, 1), executor)).rows[0] ??
+              null
+            );
+          }, executor);
+        },
+        count(this: QueryHandle) {
+          const { plan } = this[QUERY_STATE];
+
+          return deferredRead(
+            async () =>
+              readCount((await executePlan(countPlan(plan), executor)).rows),
+            executor,
           );
         },
-        async count(this: QueryHandle) {
-          return readCount(
-            (await executePlan(countPlan(this[QUERY_STATE].plan), executor))
-              .rows,
-          );
-        },
-        async exists(this: QueryHandle) {
-          return readExists(
-            (
-              await executePlan(
-                existsPlan(this[QUERY_STATE].plan, false),
-                executor,
-              )
-            ).rows,
+        exists(this: QueryHandle) {
+          const { plan } = this[QUERY_STATE];
+
+          return deferredRead(
+            async () =>
+              readExists(
+                (await executePlan(existsPlan(plan, false), executor)).rows,
+              ),
+            executor,
           );
         },
       }),

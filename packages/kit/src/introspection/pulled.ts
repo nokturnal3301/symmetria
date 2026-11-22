@@ -26,6 +26,7 @@ export type PullWarningCode =
   | "primary-key"
   | "name"
   | "partition"
+  | "unlogged"
   | "exclusion"
   | "extension"
   | "inheritance"
@@ -166,6 +167,20 @@ export type PulledCheck = {
   comments: string[];
 };
 
+/**
+ * A full-text search Symmetria declared with `.search()`: its stored
+ * document column (`<key>Words`, generated) and GIN index, read back as the
+ * declaration that creates them.
+ */
+export type PulledSearch = {
+  /** The search's key in `.search()`. */
+  key: string;
+  /** Text search configuration; "simple" is the default. */
+  language: string;
+  /** Member keys of the text columns in document order, with their weights. */
+  parts: { weight: "A" | "B" | "C" | "D"; member: string }[];
+};
+
 export type PulledTable = {
   key: string;
   /**
@@ -180,6 +195,8 @@ export type PulledTable = {
   primaryKey?: string[];
   indexes: PulledIndex[];
   checks: PulledCheck[];
+  /** Full-text searches whose column and index the declaration creates. */
+  searches?: PulledSearch[];
   comments: string[];
   skipped: { sqlName: string; dataType: string; reason: string }[];
 };

@@ -151,6 +151,28 @@ type TransactionStatements<Connection> = {
 /** The cursor of a `stream()` (see streamRows in query/select/query.ts). */
 const STREAM_CURSOR = /^(DECLARE|CLOSE) ("__symmetria_stream_\d+")/;
 
+/** What each open stream does when its transaction ends under it, by cursor name. */
+const cursorEndings = new Map<string, () => void>();
+
+/**
+ * Called when the transaction or savepoint that declared this cursor ends
+ * while the cursor is still open: it rolled back, and so did the cursor. A
+ * stream then stops instead of handing out rows it fetched before. Returns
+ * the function that stops listening.
+ */
+export const whenCursorEnds = (
+  cursor: string,
+  ended: () => void,
+): (() => void) => {
+  cursorEndings.set(cursor, ended);
+
+  return () => {
+    cursorEndings.delete(cursor);
+  };
+};
+
+const NO_ROWS: ExecutionResult = Object.freeze({ rows: [], affectedRows: 0 });
+
 /** What an operation still waiting to start returns once the scope has closed. */
 const ABANDONED = Symbol("symmetria.abandoned");
 
@@ -170,11 +192,27 @@ const transactionScope = async <Connection, Result>(
   const queue = createSerialQueue();
   // Cursors of streams that have not finished: open work like a pending query.
   const cursors = new Set<string>();
+  // Streams of this scope that ended inside its savepoint: closed after it.
+  const closeAfterNested: CompiledQuery[] = [];
 
   let closed = false;
   let unsettled = 0;
   let nested: NestedFrame | undefined;
   let failure: { error: unknown } | undefined;
+
+  const close = (): void => {
+    if (closed) {
+      return;
+    }
+
+    closed = true;
+
+    for (const cursor of cursors) {
+      cursorEndings.get(cursor)?.();
+      // Also for an iterator dropped halfway, which never stops listening.
+      cursorEndings.delete(cursor);
+    }
+  };
 
   const assertAvailable = (): void => {
     if (closed) {
@@ -245,8 +283,29 @@ const transactionScope = async <Connection, Result>(
 
   const driver: TransactionDriver = Object.freeze({
     execute: (query) => {
-      assertAvailable();
       const cursor = STREAM_CURSOR.exec(query.sql);
+
+      // A stream of this scope left inside one of its savepoints (`break`,
+      // or a fetch refused there): the savepoint holds the connection, and
+      // the code waiting for this CLOSE would hold up the savepoint, so the
+      // cursor is closed as soon as the savepoint ends.
+      if (
+        cursor?.[1] === "CLOSE" &&
+        !closed &&
+        nested &&
+        callerInside(nested) &&
+        cursors.delete(cursor[2]!)
+      ) {
+        closeAfterNested.push(query);
+
+        return Promise.resolve(NO_ROWS);
+      }
+
+      try {
+        assertAvailable();
+      } catch (error) {
+        return Promise.reject(error);
+      }
 
       return schedule(async () => {
         if (cursor?.[1] === "CLOSE") {
@@ -279,6 +338,14 @@ const transactionScope = async <Connection, Result>(
           );
         } finally {
           nested = undefined;
+
+          for (const query of closeAfterNested.splice(0)) {
+            try {
+              await statements.execute(connection, query);
+            } catch (error) {
+              failure ??= { error };
+            }
+          }
         }
       }, false);
     },
@@ -286,7 +353,7 @@ const transactionScope = async <Connection, Result>(
 
   try {
     const result = await callback(driver);
-    closed = true;
+    close();
     const unfinished = unsettled > 0;
     const streaming = cursors.size > 0;
 
@@ -310,7 +377,7 @@ const transactionScope = async <Connection, Result>(
 
     return result;
   } finally {
-    closed = true;
+    close();
     await pending.settle();
   }
 };

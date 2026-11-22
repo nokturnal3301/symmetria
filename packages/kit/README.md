@@ -172,9 +172,10 @@ names (`oneOf(...).typeName("Role")`, shared by several columns too), foreign
 keys as relations (including `ON UPDATE CASCADE`, keys to unique columns and
 columns not named `*_id`, through `.by()` and `.column()`), junction tables,
 primary keys, unique columns, indexes (including expression, partial, ordered,
-`INCLUDE`, collated, `WITH (…)` and non-btree indexes) and CHECK constraints.
-Conditions are predicates where the DSL can write them as PostgreSQL stored them
-(`users.score.between(1, 10)`,
+`INCLUDE`, collated, `WITH (…)` and non-btree indexes), CHECK constraints and
+full-text searches (`.search()` with `fullText()`, for the column and index it
+creates). Conditions are predicates where the DSL can write them as PostgreSQL
+stored them (`users.score.between(1, 10)`,
 `and(users.status.is("active"), users.deletedAt.is(null))`), and `sql` text
 otherwise. A schema written with the DSL, migrated and pulled back needs no
 migration: `diff` and `generate` compare conditions in a normalized form, so
@@ -200,10 +201,11 @@ manage. Things that exist only in the database are listed too, so nothing
 disappears without a word: table inheritance (`inheritance`), row-level security
 and policies (`row-security`), functions and procedures (`function`), sequences
 no column owns or several columns share (`sequence`, without the identity fix,
-which would drop the shared sequence) and the number of tables in other schemas,
-which `pull` does not read (`other-schema`). The same list is in `--json` output
-under `warnings`, each with a `code` and, when one exists, a `fix`. The file is
-never overwritten without `--force`.
+which would drop the shared sequence), identity columns whose sequence starts or
+steps differently (`sequence`), `UNLOGGED` tables (`unlogged`) and the number of
+tables in other schemas, which `pull` does not read (`other-schema`). The same
+list is in `--json` output under `warnings`, each with a `code` and, when one
+exists, a `fix`. The file is never overwritten without `--force`.
 
 Then point `symmetria.config.ts` at the module, run `drift` until the remaining
 findings are intended, generate the first migration with `generate initial` and
@@ -223,10 +225,13 @@ can stay until Prisma no longer deploys.
 
 - `generate` requires explicit rename hints or `--allow-destructive` for dropped
   tables/columns and for type changes that narrow existing values (a shorter
-  `varchar`, fewer decimal places, a smaller integer type, an integer to
-  `boolean`). A shorter string type is altered without a truncating cast, so
-  PostgreSQL refuses values that do not fit instead of cutting them. Declared
-  column order is preserved; snapshot hashes are order-independent.
+  `varchar`, fewer decimal places, a smaller integer type or fewer digits before
+  the decimal point, an integer to `boolean`). A type change PostgreSQL has no
+  cast for in either direction is refused until `using` gives both conversions,
+  and conversions that would read the migrating session's time zone convert at
+  UTC. A shorter string type is altered without a truncating cast, so PostgreSQL
+  refuses values that do not fit instead of cutting them. Declared column order
+  is preserved; snapshot hashes are order-independent.
 - `lint` checks actual `up.sql` even after generation and fails for destructive
   or blocking findings, reviewing every action of an `ALTER TABLE` and ignoring
   comments and strings. `CHECK` and foreign keys added without `NOT VALID` are

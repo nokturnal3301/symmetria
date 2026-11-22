@@ -105,8 +105,9 @@ test("table-local indexes use resolved columns and table-prefixed names", () => 
     table.indexes = [];
   }
 
+  // The saved SQL says that dropping an index no longer declared loses no data.
   expect(diffSchemas(model.$snapshot(), withoutIndexes).up).toContain(
-    'DROP INDEX "posts_by_author_date_idx"',
+    '-- symmetria: caution: index "posts_by_author_date_idx" is no longer declared; dropping it loses no data, but queries that used it can get slower.\nDROP INDEX "posts_by_author_date_idx"',
   );
 });
 

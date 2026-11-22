@@ -1,5 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import {
+  arrayCodec,
   createRowDecoder,
   type RuntimeCodec,
 } from "../../../packages/runtime/src/query/codecs";
@@ -92,4 +93,28 @@ test("nested objects come back in the selected key order, built as json or as js
       ).who,
     ),
   ).toEqual(["firstName", "city"]);
+});
+
+test("a box array reads and writes with PostgreSQL's ';' between elements", () => {
+  const box: RuntimeCodec = {
+    encode: (value) => value,
+    decode: (value) => String(value),
+  };
+  const boxes = arrayCodec("box", box);
+
+  // node-postgres hands over box[] as its text.
+  expect(boxes.decode("{(1,1),(0,0);(3,4),(2,2)}")).toEqual([
+    "(1,1),(0,0)",
+    "(3,4),(2,2)",
+  ]);
+  expect(boxes.decode("{}")).toEqual([]);
+  // The drivers would write it with commas, which PostgreSQL refuses.
+  expect(boxes.encode(["(1,1),(0,0)", "(3,4),(2,2)"] as never)).toBe(
+    '{"(1,1),(0,0)";"(3,4),(2,2)"}',
+  );
+  // Every other array keeps commas.
+  expect(arrayCodec("point", box).decode('{"(1,1)","(2,2)"}')).toEqual([
+    "(1,1)",
+    "(2,2)",
+  ]);
 });

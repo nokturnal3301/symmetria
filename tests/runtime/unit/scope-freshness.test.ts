@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { expect, test } from "bun:test";
 import {
   schema,
@@ -5,6 +6,7 @@ import {
   int,
   text,
   prepare,
+  type CompiledQuery,
 } from "../../../packages/runtime/src";
 
 const posts = table({ id: int.auto, tenantId: int, title: text.unique });
@@ -354,4 +356,39 @@ test("a scoped query built earlier and used inside another $scope() reads the cu
 
   await reused;
   expect(statements.at(-1)!.parameters).toEqual([2]);
+});
+
+test("a read made in one async context binds that context's $scope() values wherever it is awaited", async () => {
+  const tenant = new AsyncLocalStorage<number>();
+  const statements: CompiledQuery[] = [];
+  const database = schema(
+    { posts },
+    {
+      executor: async (query) => {
+        statements.push(query);
+
+        return [{ count: 0, id: 1, tenantId: 1, title: "x" }];
+      },
+    },
+  );
+  const scoped = database.$scope({
+    posts: (post) => post.tenantId.is(tenant.getStore() ?? 0),
+  });
+
+  // Made inside run(), awaited outside it: the read starts when awaited,
+  // in the context it was made in, as it did when it started at once.
+  await tenant.run(1, () => scoped.posts.count());
+  await tenant.run(1, () => scoped.posts.find(1));
+  await tenant.run(1, () =>
+    scoped.posts.aggregate((_post, { count }) => ({ n: count() })),
+  );
+  const later = tenant.run(2, () => scoped.posts.exists());
+
+  await tenant.run(3, () => later);
+  expect(statements.map((statement) => statement.parameters)).toEqual([
+    [1],
+    [1, 1],
+    [1],
+    [2],
+  ]);
 });

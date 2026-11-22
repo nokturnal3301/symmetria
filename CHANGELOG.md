@@ -1,5 +1,185 @@
 # Changelog
 
+## 3.5.0 — 2026-11-22
+
+Fixes from a bug hunt on 3.4.1: whole-table writes and lost data that slipped
+past the 3.4.0 checks, regressions brought in by the 3.4.0 and 3.4.1 fixes, and
+places the last hunt did not reach (migrations, transactions, better-auth).
+
+### Runtime (`symmetria`)
+
+- **Changed:** `UPDATE` and `DELETE` also refuse a filter that holds for every
+  row whatever the data ("where() leaves no condition"): `notIn()` or
+  `not(in())` of a query that finds nothing (an emptied `in([])`, `limit: 0`),
+  an aggregate of an emptied relation compared so that it holds for every row
+  (`user.posts({ where: (post) => post.id.in([]) }).count().is(0)`,
+  `.exists().is(false)`), `exists()` of an aggregate without `groupBy`, a count
+  compared with what every count passes (`count().atLeast(0)`, `isNot(-1)`), and
+  `isNot(null)` of a NOT NULL column. Before, such a write reached every row of
+  the table.
+- Several `where()` calls on one write make one filter:
+  `.where((u) => u.id.is(1)).where(() => [])` writes the one row instead of
+  being refused, and `.all()`, before or after, accepts a filter that holds for
+  every row as the whole-table write it asks for. `notExists()` of an aggregate
+  query (one row even over no rows) is no longer refused.
+- 3.4.0 regression: a prepared `.nullable` parameter on an enum column bound to
+  `null` made `not(is(p))` and `not(isNot(p))` find nothing, and a prepared
+  delete with them delete nothing. They now match like `not(is(null))`.
+- **Changed:** on a JSON path and a nullable `jsonb` column, `not(is(x))`,
+  `not(in([…]))`, `not(between(…))` and `not(contains(…))` in a query leave out
+  a stored JSON `null`, as `isNot(x)` and `notIn([…])` do; also in writes. CHECK
+  constraints and partial indexes declared with such a `not()` keep their SQL,
+  so upgrading needs no migration, and a query with the same `not()` still uses
+  such a partial index.
+- 3.4.1 regression: `page()` cursors issued by 3.4.0 for queries ordered by,
+  filtered by or selecting a vector distance were refused. They work again;
+  cursors issued by 3.4.1 itself for those queries are refused once.
+- `in()` / `notIn()` lists longer than 1,000 values bind one array parameter for
+  every column type, as documented: enum, timestamp, double precision, real,
+  interval, inet, time, bytea, JSON paths and the rest. Above 65,535 values they
+  failed (pg: a misleading `ConnectionError`; Bun: a raw driver error). A
+  statement that still binds more than 65,535 values (a list of expressions) is
+  refused with a `QueryError` before it is sent.
+- An upsert whose value is a subquery returning more than one row reports
+  PostgreSQL's error ("more than one row returned by a subquery") instead of
+  `DuplicateConflictKeyError`.
+- `box` arrays (`customType("box", …).array`) are read correctly on symmetria/pg
+  and can be written on both drivers (PostgreSQL separates their elements with
+  `;`).
+- **Changed:** `get()`, `find()`, `one()`, `maybeOne()`, `first()`, `count()`,
+  `exists()`, `aggregate()`, `page()` and `$batch()` start when they are
+  awaited, as queries and writes do, instead of when they are called; they are
+  still real promises and still run in the async context where they were made
+  (`$scope()` callbacks, profiler requests and tracer spans see that context).
+  In a transaction, `Promise.all([tx.logs.insert(row), tx.logs.count()])`
+  counted before the insert and `Promise.all([byId(1).update(…), get(1)])`
+  returned the old row, against the documented order; an array now runs in its
+  order. Inside a `$batch()` callback such reads still join the batch when they
+  are made. A read that is never awaited no longer runs. A read made through a
+  transaction before one of its savepoints and first awaited inside that
+  savepoint's callback is refused ("await the nested transaction before using
+  its parent context"); before, it had already run. With a pool of one
+  connection, a read made outside a transaction and first awaited inside it is
+  refused ("…holds the only one"), as a query is. `execute()`, `inspect()` and
+  prepared queries still start when called.
+- A stream of a transaction that was read on inside one of its savepoints hung
+  the transaction and `$close()` for good. Its fetch is now refused there like
+  any query through the parent ("await the nested transaction before using its
+  parent context"); a `break` there ends the loop, and its cursor is closed when
+  the savepoint ends.
+- A stream left open when its transaction or savepoint rolled back kept handing
+  out the rows it had fetched, data that was rolled back. Reading on now fails
+  ("the transaction of this stream ended while the stream was open and was
+  rolled back"); a `break` there just ends the loop.
+- `stream()` inside `$transaction` no longer leaves `cursor_tuple_fraction = 1`
+  set for the rest of the transaction. A session's `execute()` and `cancel()`
+  and a transaction driver's `execute()`, called after their callback ended,
+  reject instead of throwing.
+- `aggregate()` on a source with `limit` or `offset` failed on relation paths
+  and relation aggregates, with an error naming an internal table; with
+  `orderBy` alone, or on a grouped source with a limit, it failed with
+  PostgreSQL's GROUP BY error, and on a DISTINCT source with a limit it counted
+  other rows (3.4.0 fix incomplete). It now aggregates the rows the source
+  selects, keeping the table's relations: an ordering alone changes nothing, a
+  grouped source keeps its groups (several reject with `TooManyRowsError`), and
+  DISTINCT whole rows and `forUpdate` sources work too.
+- **Changed:** `aggregate()` on a query with `distinct` and selected fields is
+  refused; `count()` counts its rows, and `query.as(name).aggregate(…)`
+  aggregates its fields.
+- A `$batch()` whose reads each define a CTE of one name (a helper called once
+  per read) is one statement again, so its reads see one snapshot: an identical
+  CTE is defined once, a different one gets its own name in the statement. Since
+  3.4.0 such a batch was split into several statements, and a list and its total
+  could disagree. CTEs count as identical only when their SQL and every bound
+  value match exactly (NaN, Infinity and -0 included). A different one gets a
+  new name in the statement, at most 63 bytes, that no table of the schema, no
+  name the reads use and nothing in their raw SQL already has; when no such name
+  can be formed, the batch is sent as separate statements, as before.
+- Docs: what a `$batch` split by its size keeps of the snapshot, and why a query
+  a `stream()` loop starts is refused when the loop holds every connection,
+  whether or not the loop awaits it.
+- A slot, column or required column named like an `Object` member
+  (`constructor`, `toString`, `valueOf`, `hasOwnProperty`) is that slot or
+  column: `one(owners.valueOf)` no longer reads it as a column, and an insert
+  that leaves out a required `constructor` column is refused as "missing
+  required column".
+- `symmetria/better-auth`: field names given to better-auth
+  (`user: { fields: { name: "full_name" } }`) work. `npx auth generate` keeps
+  better-auth's field names as keys with those SQL names (`.named()`, and
+  `.column()` for references), and the adapter translates rows and filters.
+  Before, every write failed with "unknown column". Columns of the application's
+  own on an auth table go back beside better-auth's fields, and a field wins
+  where its stored name meets such a column's key.
+- `symmetria/better-auth`: with `usePlural: true`, `npx auth generate` writes
+  plural table keys (`users`, `sessions`), as the adapter asks for them; `in` /
+  `not_in` with `mode: "insensitive"` compare without case;
+  `generateId: "serial"` is refused when better-auth starts instead of failing
+  at the first sign-up with "missing required column".
+
+### Kit (`symmetria-kit`)
+
+- A table or column whose SQL name is an `Object.prototype` member
+  (`constructor`, `toString`, `valueOf`, `__proto__`, …) is no longer dropped
+  and added again, with its data, by every later migration. `diff`, `generate`,
+  `lint` and the rename prompt read rename hints and `using` keyed by such
+  names.
+- **Changed:** a type change whose plain cast reads the time zone of the session
+  running the migration converts at UTC, in `up.sql` and `down.sql`: `date` →
+  `timestamptz` and `timestamptz` → `date` / `time` use `AT TIME ZONE 'UTC'`; a
+  value → `timetz`, text ↔ `timestamptz` / `timetz` and arrays run with the zone
+  set to UTC around the statement. Before, under `America/New_York`,
+  `2024-01-02` became 05:00 UTC and `2024-01-02 03:04:05+00` became the date
+  `2024-01-01`.
+- **Changed:** `generate` refuses a type change between built-in types that
+  PostgreSQL has no cast for, in either direction, unless `using` gives both
+  conversions: `integer` → `date`, `boolean` → `numeric`, `date` → `integer`,
+  `bigint` → `boolean`, and `jsonb` → `integer`, whose `down.sql` needs
+  `integer` → `jsonb`. `integer` ↔ `bytea` counts as castless, as before
+  PostgreSQL 18.
+- **Changed:** `numeric` to an integer type, or to a `numeric` with fewer digits
+  before the decimal point, is narrowing and needs `--allow-destructive` when
+  values can exceed the target (`numeric(20,0)` → `integer`, `numeric(10,2)` →
+  `numeric(8,2)`).
+- **Changed:** `generate`'s review and `lint` of the saved file fail on the same
+  changes. Adding an identity column is a rewrite caution; dropping an index,
+  constraint or enum type that is no longer declared is a caution, written in
+  the SQL as `-- symmetria: caution: …`; a composite key reordered or widened
+  and a foreign key rebuilt only for its actions are cautions; a new unique
+  column with a constant default and a primary key moved to other columns are
+  blocking in `generate` too; removed enum labels carry a destructive note; a
+  primary key over a newly added identity, sequence or uuid-generator column is
+  a caution in both; a `-- symmetria: caution:` note counts only on the
+  statements generate writes it on. Hand-written SQL is rated as before.
+- **Changed:** SQL lint: `ADD COLUMN` with `REFERENCES`, `CHECK`, `UNIQUE` or
+  `PRIMARY KEY` is blocking when existing rows get a value, and a `PRIMARY KEY`
+  column without one is blocking; a key on a column added in the same migration
+  is a caution when its rows hold only NULLs, or each got their own value from
+  an identity, a sequence or a uuid generator (`gen_random_uuid()`, `uuidv7()`;
+  not `clock_timestamp()` or `random()`, whose values can repeat), unless a
+  statement in between (an `UPDATE` backfill, a `USING`, a `DO` block) may have
+  written it; a `USING` cast to `varchar(n)` is destructive however the type is
+  spelled, and so is a `USING` whose whole expression is `NULL` or another
+  constant.
+- **Changed:** `pull` reads a full-text search back as
+  `.search(…{ words: fullText(…) })`, so a declared schema pulled back needs no
+  migration, has no drift and `adopt` takes it. `pullSchema()` takes
+  `searchModule`. Only a nullable column that no other index or constraint uses
+  is taken as a search; any other stays a column with its warning.
+- A CHECK or index-condition literal that PostgreSQL stores in another spelling
+  is no change: `time '23:00'`, `interval '24 hours'` (`24:00:00`), an
+  upper-case or braced `uuid`, `inet '10.0.0.1/32'`, also as a typed literal or
+  in an `in()` list (`t.iv.in(["1440 minutes"])` and `'24:00:00'`). Intervals
+  compare as PostgreSQL keeps them, months, days and time apart, so `'1 day'` →
+  `'24 hours'` is still a change; `pull` writes the literals as stored.
+- A `using` conversion missing `up` or `down` is refused with a message that
+  names the missing direction (it crashed).
+- `testDatabase()` checks its options before creating anything and cleans up
+  after any failure. Before, a refused `searchPath` left the schema behind and,
+  with node-postgres, a pool that kept the process alive.
+- `drift` accepts `DEFAULT CURRENT_TIMESTAMP` for `.now`; `pull` warns about
+  `UNLOGGED` tables (`unlogged`) and identity sequences with options
+  (`sequence`).
+
 ## 3.4.1 — 2026-11-22
 
 ### Runtime (`symmetria`)

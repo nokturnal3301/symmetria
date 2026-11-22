@@ -102,3 +102,68 @@ test.skipIf(!available)(
     }
   },
 );
+
+test.skipIf(!databaseUrl)(
+  "testDatabase refuses bad options before it creates anything, and cleans up after any later failure",
+  async () => {
+    const prefix = `symmetria_leak_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+    const opened: { closed: boolean }[] = [];
+    // Every pool testDatabase opens, and whether it was closed.
+    const driver = (options: { url: string; max: number }) => {
+      const pool = postgres(options);
+      const entry = { closed: false };
+
+      opened.push(entry);
+
+      return {
+        ...pool,
+        close: async () => {
+          entry.closed = true;
+          await pool.close();
+        },
+      };
+    };
+    const leftovers = async () =>
+      rows(
+        await admin!.execute({
+          sql: "SELECT nspname FROM pg_namespace WHERE nspname LIKE $1",
+          parameters: [`${prefix}%`],
+        }),
+      );
+
+    await expect(
+      testDatabase({
+        url: databaseUrl!,
+        schema: schema({ t: table({ id: int.auto }) }),
+        prefix,
+        searchPath: ["Public"],
+        driver,
+      }),
+    ).rejects.toThrow("search_path entries must be identifiers");
+    expect(opened).toEqual([]);
+
+    // A statement that fails after the schema exists drops it and closes both pools.
+    await expect(
+      testDatabase({
+        url: databaseUrl!,
+        schema: schema({ t: table({ id: int.auto }) }),
+        prefix,
+        searchPath: ["missing_schema_for_types"],
+        driver: (options) => {
+          const pool = driver(options);
+
+          return opened.length === 2
+            ? {
+                ...pool,
+                execute: async () => {
+                  throw new Error("refused by the test");
+                },
+              }
+            : pool;
+        },
+      }),
+    ).rejects.toThrow("refused by the test");
+    expect(opened).toEqual([{ closed: true }, { closed: true }]);
+    expect(await leftovers()).toEqual([]);
+  },
+);

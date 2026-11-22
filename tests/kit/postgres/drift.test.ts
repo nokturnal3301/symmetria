@@ -367,4 +367,39 @@ describe.skipIf(!databaseUrl)("PostgreSQL drift definitions", () => {
       await fixture.close();
     }
   });
+
+  test("DEFAULT CURRENT_TIMESTAMP is .now, and another default is still drift", async () => {
+    const model = schema({
+      events: { id: int.auto, at: timestamptz.now, later: timestamptz.now },
+    });
+    const fixture = await testDatabase({ url: databaseUrl!, schema: model });
+    const run = (statement: string) =>
+      fixture.driver.execute({ sql: statement, parameters: [] });
+
+    try {
+      await run(
+        "ALTER TABLE events ALTER COLUMN at SET DEFAULT CURRENT_TIMESTAMP",
+      );
+      await run(
+        "ALTER TABLE events ALTER COLUMN later SET DEFAULT clock_timestamp()",
+      );
+      expect(
+        await detectDrift({
+          execute: fixture.driver.execute,
+          snapshot: model.$snapshot(),
+          schemaName: fixture.namespace,
+        }),
+      ).toEqual([
+        {
+          kind: "default-mismatch",
+          table: "events",
+          column: "later",
+          expected: "now()",
+          actual: "clock_timestamp()",
+        },
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  });
 });

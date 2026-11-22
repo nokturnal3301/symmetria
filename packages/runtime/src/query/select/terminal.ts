@@ -3,12 +3,15 @@
  * `exists()` over any SELECT plan, selected or not. Derived plans are cached per
  * source plan so compiled SQL and row decoders stay cached too.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
+import { currentFrame, currentHolders, runHolding } from "../../driver/serial";
 import { NotFoundError, TooManyRowsError } from "../../errors";
 import { freeze } from "../plan/freeze";
 import { count, readColumn } from "../expressions";
 import { derivedBinding } from "../plan/derived";
+import { batchCollectors } from "../plan/batching";
 import { containsNode } from "../plan/traverse";
-import type { SelectPlan } from "../plan/types";
+import type { QueryExecutor, SelectPlan } from "../plan/types";
 import {
   EMPTY,
   createScope,
@@ -161,6 +164,103 @@ export const rowCountError = (
     `symmetria: expected ${required ? "exactly one" : "at most one"} row from "${plan.root.table.name}", received ${received}`,
     plan.root.table.name,
   );
+
+/**
+ * A read that starts when it is awaited, as queries and writes do: the first
+ * `then()` (also through `catch()`, `finally()`, `await`, `Promise.all()`)
+ * runs it, and later calls share its result. Reads in an array therefore
+ * start in the array's order, so in a transaction, whose statements run in
+ * the order they start, `Promise.all([insert, count()])` counts the inserted
+ * row. It is a real `Promise`, so test runners and `instanceof` treat it as
+ * one; nothing reads its result without calling `then()`.
+ *
+ * It runs in the async context where it was made, as it did when reads
+ * started when called: `$scope()` callbacks, a profiler's request and a
+ * tracer's span see that context. What the code that starts it holds (the
+ * savepoint it runs in, pool connections) comes from where it starts, so a
+ * read awaited where it would wait for itself is refused, never left waiting.
+ * A read made while a `$batch()` collects starts at once and joins it.
+ */
+class DeferredRead<Value> extends Promise<Value> {
+  // Promises derived from it (then, catch, finally) are plain ones.
+  static override get [Symbol.species](): PromiseConstructor {
+    return Promise;
+  }
+
+  #start: (() => PromiseLike<Value>) | undefined;
+  #context: ((run: () => void) => void) | undefined;
+  #frame: ReturnType<typeof currentFrame>;
+  #held: ReturnType<typeof currentHolders>;
+  readonly #resolve: (value: Value | PromiseLike<Value>) => void;
+  readonly #reject: (reason: unknown) => void;
+
+  constructor(start: () => PromiseLike<Value>, executor?: QueryExecutor) {
+    let resolve!: (value: Value | PromiseLike<Value>) => void;
+    let reject!: (reason: unknown) => void;
+
+    super((settle, fail) => {
+      resolve = settle;
+      reject = fail;
+    });
+    this.#resolve = resolve;
+    this.#reject = reject;
+
+    if (executor && batchCollectors.has(executor)) {
+      this.#begin(start);
+    } else {
+      this.#start = start;
+      this.#context = AsyncLocalStorage.snapshot();
+      this.#frame = currentFrame();
+      this.#held = currentHolders();
+    }
+  }
+
+  #begin(start: () => PromiseLike<Value>): void {
+    try {
+      const started = start();
+
+      // A read built on another deferred read starts that one here and now
+      // (resolving with it would wait a tick), in this read's context.
+      if (started instanceof DeferredRead || !(started instanceof Promise)) {
+        started.then(this.#resolve, this.#reject);
+      } else {
+        this.#resolve(started);
+      }
+    } catch (error) {
+      this.#reject(error);
+    }
+  }
+
+  override then<Fulfilled = Value, Rejected = never>(
+    onFulfilled?: ((value: Value) => Fulfilled | PromiseLike<Fulfilled>) | null,
+    onRejected?: ((reason: unknown) => Rejected | PromiseLike<Rejected>) | null,
+  ): Promise<Fulfilled | Rejected> {
+    const start = this.#start;
+
+    if (start) {
+      const frame = currentFrame();
+      const held = currentHolders();
+      const context = this.#context!;
+
+      this.#start = undefined;
+      this.#context = undefined;
+      context(() => {
+        if (frame === this.#frame && held === this.#held) {
+          this.#begin(start);
+        } else {
+          runHolding(frame, held, () => this.#begin(start));
+        }
+      });
+    }
+
+    return super.then(onFulfilled, onRejected);
+  }
+}
+
+export const deferredRead = <Value>(
+  start: () => PromiseLike<Value>,
+  executor?: QueryExecutor,
+): Promise<Value> => new DeferredRead(start, executor);
 
 export const readCount = (rows: readonly Record<string, unknown>[]): number =>
   rows[0]!.count as number;

@@ -354,6 +354,64 @@ const jsonNullAsNull = (description: ExpressionDescription): ValueNode =>
       })
     : description.node;
 
+/**
+ * The predicate as a query's `not()` negates it. `=`, `in()`, `between` and
+ * `contains()` keep the plain JSON operand an index can serve: for JSON null
+ * they answer FALSE where a missing path answers NULL, and a filter drops both
+ * alike. NOT turns only the FALSE into TRUE, so below a not() those operands
+ * read JSON null as SQL NULL, as isNot() and notIn() do, and not(is(x)) leaves
+ * out what isNot(x) leaves out. The same predicate is returned when nothing
+ * changes; nested not() and subqueries are compiled on their own. Schema DDL
+ * (checks, partial indexes) renders the predicate as written.
+ */
+export const negatable = (
+  description: PredicateDescription,
+): PredicateDescription => {
+  const operand = (node: ValueNode): ValueNode =>
+    jsonNullAsNull({ node, outputName: "value" });
+
+  switch (description.kind) {
+    case "group": {
+      const predicates = description.predicates.map(negatable);
+
+      return predicates.some(
+        (child, position) => child !== description.predicates[position],
+      )
+        ? freeze({ ...description, predicates: freeze(predicates) })
+        : description;
+    }
+    case "comparison": {
+      if (description.operator !== "=" && description.operator !== "@>") {
+        return description;
+      }
+
+      const left = operand(description.left);
+
+      return left === description.left
+        ? description
+        : freeze({ ...description, left });
+    }
+    case "membership": {
+      const value = description.negated
+        ? description.value
+        : operand(description.value);
+
+      return value === description.value
+        ? description
+        : freeze({ ...description, value });
+    }
+    case "between": {
+      const value = operand(description.value);
+
+      return value === description.value
+        ? description
+        : freeze({ ...description, value });
+    }
+    default:
+      return description;
+  }
+};
+
 /** Comparisons that tell a NULL operand from a value. */
 const NULL_LIKE = new Set<ComparisonOperator>([
   "<>",
@@ -771,6 +829,7 @@ export class ColumnHandle {
                 sqlType: expressionSqlType(description),
                 composed: true,
                 delimited: true,
+                readOnce: true,
               })
             : right,
         sqlType: "double precision",

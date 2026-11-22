@@ -256,6 +256,12 @@ const renderValue = (
         : bound;
     }
     case "raw":
+      // Page cursors fingerprint the shape: issued before 3.4.1 bound the
+      // value bare, and they stay valid.
+      if (node.readOnce && compilation.shapeOnly) {
+        return operandSql(compilation, node.parts[1] as ValueNode, bindings);
+      }
+
       return node.parts
         .map((part) =>
           typeof part === "string"

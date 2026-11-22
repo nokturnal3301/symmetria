@@ -1,10 +1,13 @@
+import { sqlKey } from "symmetria";
 import { normalizeSqlType } from "../migrations/drift";
-import { isReservedColumnKey } from "./names";
+import { expressionKey } from "../migrations/expressions";
+import { conventionalNames, isReservedColumnKey, sqlString } from "./names";
 import type {
   PullWarning,
   ColumnType,
   ColumnDefault,
   PulledColumn,
+  PulledSearch,
 } from "./pulled";
 import {
   type CatalogColumn,
@@ -23,6 +26,145 @@ export type ColumnTools = {
   warn: (warning: PullWarning) => void;
   uniqueFor: (columnName: string) => { unique: boolean; comments: string[] };
   indexFor: (columnName: string, unique: boolean) => boolean;
+};
+
+/** One `setweight(to_tsvector(…, COALESCE(column, '')), 'W')` of a stored document, as PostgreSQL prints it. */
+const DOCUMENT_PART =
+  /setweight\(to_tsvector\('((?:[^']|'')*)'(?:::regconfig)?, \(?COALESCE\(("(?:[^"]|"")+"|[a-z_][a-z0-9_$]*), ''::[a-z ]+\)(?:\)::text)?\), '([ABCD])'::"char"\)/g;
+
+const unquote = (identifier: string): string =>
+  identifier.startsWith('"')
+    ? identifier.slice(1, -1).replaceAll('""', '"')
+    : identifier;
+
+/**
+ * The full-text search whose document `column` stores: a generated tsvector
+ * column keyed `<search>Words`, computed exactly as `fullText()` computes it
+ * from the table's own text columns, with the GIN index `.search()` creates
+ * under its conventional name. Undefined for any other generated column,
+ * which stays a plain column with a warning.
+ */
+export const fullTextSearch = (
+  column: CatalogColumn,
+  key: string,
+  table: TableFacts,
+): (PulledSearch & { index: string }) | undefined => {
+  if (
+    !table.generated.has(column.column_name) ||
+    // `.search()` creates the column nullable; a NOT NULL one stays a column.
+    column.not_null ||
+    normalizeSqlType(column.data_type) !== "tsvector" ||
+    !column.default ||
+    !/^[a-z][A-Za-z0-9]*Words$/.test(key) ||
+    // `.search()` names the column after the key, without `.named()`.
+    sqlKey(key, table.casing) !== column.column_name
+  ) {
+    return undefined;
+  }
+
+  const found = [...column.default.matchAll(DOCUMENT_PART)].map((match) => ({
+    language: match[1]!.replaceAll("''", "'"),
+    column: unquote(match[2]!),
+    weight: match[3] as PulledSearch["parts"][number]["weight"],
+  }));
+  const language = found[0]?.language;
+  const sources = found.map((part) =>
+    table.columns.find((entry) => entry.column_name === part.column),
+  );
+
+  if (
+    language === undefined ||
+    found.some((part) => part.language !== language) ||
+    sources.some(
+      (source) =>
+        !source ||
+        table.generated.has(source.column_name) ||
+        table.references.has(source.column_name) ||
+        source.enum_name !== null ||
+        !/^(?:text|character varying(?:\(\d+\))?)$/.test(
+          normalizeSqlType(source.data_type),
+        ),
+    )
+  ) {
+    return undefined;
+  }
+
+  // fullText() writes the parts by weight, A first; PostgreSQL adds the cast
+  // to text a varchar column needs.
+  const parts = (["A", "B", "C", "D"] as const).flatMap((weight) =>
+    found.flatMap((part, position) =>
+      part.weight === weight ? [{ part, source: sources[position]! }] : [],
+    ),
+  );
+  const expected = parts
+    .map(({ part, source }) => {
+      const value = `coalesce("${part.column.replaceAll('"', '""')}", '')`;
+
+      return `setweight(to_tsvector(${sqlString(language)}, ${normalizeSqlType(source.data_type) === "text" ? value : `(${value})::text`}), '${part.weight}')`;
+    })
+    .join(" || ");
+  const types = new Map(
+    table.columns.map((entry) => [entry.column_name, entry.data_type]),
+  );
+  const same = (() => {
+    try {
+      return (
+        expressionKey(column.default, types) === expressionKey(expected, types)
+      );
+    } catch {
+      return false;
+    }
+  })();
+  // `.search()` declares the index under the column's key.
+  const index = conventionalNames.index(table.sqlName, key, table.casing);
+  const indexed = table.indexes.some(
+    (entry) =>
+      entry.index_name === index &&
+      entry.method === "gin" &&
+      !entry.is_unique &&
+      entry.keys.length === 1 &&
+      unquote(entry.keys[0]!) === column.column_name &&
+      entry.predicate === null &&
+      entry.included.length === 0 &&
+      entry.options.every((option) => option === 0) &&
+      entry.opclasses.every((opclass) => opclass === null) &&
+      !entry.reloptions?.length,
+  );
+
+  // Another index or a constraint on the column would lose its column: the
+  // search declares it hidden, so the column stays (with its warning).
+  const named = new RegExp(
+    `(?:^|[^\\w$"])(?:${column.column_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|"${column.column_name.replaceAll('"', '""').replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}")(?![\\w$"])`,
+  );
+  const used =
+    table.indexes.some(
+      (entry) =>
+        entry.index_name !== index &&
+        [...entry.keys, ...entry.included, entry.predicate ?? ""].some((part) =>
+          named.test(part),
+        ),
+    ) ||
+    table.constraints.some((entry) =>
+      entry.columns.includes(column.column_name),
+    );
+
+  if (!same || !indexed || used) {
+    return undefined;
+  }
+
+  const members = new Map(
+    [...table.columnKeys].map(([sqlName, member]) => [sqlName, member]),
+  );
+
+  return {
+    key: key.slice(0, -"Words".length),
+    language,
+    parts: parts.map(({ part }) => ({
+      weight: part.weight,
+      member: members.get(part.column)!,
+    })),
+    index,
+  };
 };
 
 export const columnMember = (

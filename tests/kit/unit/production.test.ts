@@ -231,11 +231,13 @@ test("SQL lint sees anonymous table constraints, including those added next to a
     ALTER TABLE "posts" ADD COLUMN "author_id" integer, ADD FOREIGN KEY ("author_id") REFERENCES "users" ("id");
     ALTER TABLE "posts" ADD CONSTRAINT "posts_pkey" PRIMARY KEY USING INDEX "posts_id_idx";
   `);
+  // A column added without a default holds only NULL, which a UNIQUE key
+  // and a foreign key accept (statements 3 and 5).
   expect(findings.map((finding) => [finding.statement, finding.level])).toEqual(
     [
       [1, "blocking"],
       [2, "blocking"],
-      [3, "blocking"],
+      [3, "caution"],
       [4, "blocking"],
       [5, "caution"],
       [6, "caution"],

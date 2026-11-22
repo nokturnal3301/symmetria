@@ -7,6 +7,7 @@
  */
 import { normalizeSqlType } from "./drift";
 import { expressionKey } from "./expressions";
+import { intervalKey } from "./expression-simplify";
 
 const LITERAL = /^(E?)'((?:[^'\\]|''|\\.)*)'(?:::([\s\S]+))?$/;
 
@@ -105,57 +106,6 @@ const sortedJson = (value: unknown): unknown =>
             ]),
         )
       : value;
-
-const INTERVAL_UNITS: Record<string, [months: number, micros: number]> = {
-  year: [12, 0],
-  month: [1, 0],
-  mon: [1, 0],
-  week: [0, 7 * 86_400e6],
-  day: [0, 86_400e6],
-  hour: [0, 3_600e6],
-  minute: [0, 60e6],
-  min: [0, 60e6],
-  second: [0, 1e6],
-  sec: [0, 1e6],
-};
-
-/**
- * An interval as months and microseconds: `90 minutes` and `01:30:00` are
- * one interval. Days count as 24 hours here, which only matters across a
- * daylight-saving change, never for comparing two spellings of a default.
- */
-const intervalKey = (text: string): string | undefined => {
-  let months = 0;
-  let micros = 0;
-  let rest = text.trim().toLowerCase();
-  const time = /(-?)(\d+):(\d{2})(?::(\d{2}(?:\.\d+)?))?\s*$/.exec(rest);
-
-  if (time) {
-    const sign = time[1] ? -1 : 1;
-
-    micros +=
-      sign *
-      (Number(time[2]) * 3_600e6 +
-        Number(time[3]) * 60e6 +
-        Number(time[4] ?? 0) * 1e6);
-    rest = rest.slice(0, time.index).trim();
-  }
-
-  for (const part of rest.matchAll(/(-?\d+(?:\.\d+)?)\s*([a-z]+)/g)) {
-    const unit = INTERVAL_UNITS[part[2]!.replace(/s$/, "")];
-
-    if (!unit) {
-      return undefined;
-    }
-
-    months += Number(part[1]) * unit[0];
-    micros += Number(part[1]) * unit[1];
-  }
-
-  return rest.replace(/(-?\d+(?:\.\d+)?)\s*([a-z]+)/g, "").trim()
-    ? undefined
-    : `${months} ${Math.round(micros)}`;
-};
 
 /** A timestamp as epoch milliseconds; one without a zone reads as UTC. */
 const timestampKey = (text: string, zoned: boolean): string | undefined => {

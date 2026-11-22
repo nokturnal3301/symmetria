@@ -350,6 +350,8 @@ describe.skipIf(!databaseUrl)("$batch on PostgreSQL", () => {
     };
 
     expect(alone.views[0]).toEqual({ views: 9007199254740993n });
+    sent.length = 0;
+    // One statement, so one snapshot: the identical CTE is defined once.
     expect(
       await database.$batch((db) => ({
         best: ranked(db)({
@@ -362,5 +364,30 @@ describe.skipIf(!databaseUrl)("$batch on PostgreSQL", () => {
         prices: prices(db),
       })),
     ).toEqual(alone);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.sql.match(/"ranked" AS \(/g)).toHaveLength(1);
+
+    // Different CTEs under one name: the second gets its own name.
+    const viewed = (db: typeof database, minimum: bigint) =>
+      db
+        .posts((post) => ({ id: post.id }), {
+          where: (post) => post.views.atLeast(minimum),
+        })
+        .cte("viewed");
+
+    sent.length = 0;
+    expect(
+      await database.$batch((db) => [
+        viewed(db, 0n)((row) => ({ id: row.id })).count(),
+        viewed(db, 1n)((row) => ({ id: row.id })).count(),
+        viewed(db, 0n)((row) => ({ id: row.id })).count(),
+        viewed(db, 1n)((row) => ({ id: row.id })).count(),
+      ]),
+    ).toEqual([3, 1, 3, 1]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.sql.match(/"viewed(_2)?" AS \(/g)).toEqual([
+      '"viewed" AS (',
+      '"viewed_2" AS (',
+    ]);
   });
 });

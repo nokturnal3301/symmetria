@@ -2,6 +2,7 @@
  * SQL compiler entry: turns a query plan into a compiled query (SQL, parameters, decoder) and executes it on a driver.
  */
 import { createRowDecoder, cloneParameter } from "../codecs";
+import { QueryError } from "../../errors";
 import { throwDataErrors } from "../codecs/deferred";
 import { executorProfiling } from "../../observability/profiling";
 import { postgresRenderer } from "./postgres/render";
@@ -263,6 +264,9 @@ export const executePlan = (
   );
 };
 
+/** PostgreSQL's wire protocol counts a statement's bound values in 16 bits. */
+const PARAMETER_LIMIT = 65535;
+
 export const executeCompiled = async (
   plan: SelectPlan | MutationPlan,
   compiled: CompiledQuery,
@@ -272,6 +276,16 @@ export const executeCompiled = async (
   if (!executor) {
     throw new Error(
       "symmetria: configure a query executor or driver before calling execute()",
+    );
+  }
+
+  // The drivers would send a count that wrapped around, which PostgreSQL
+  // answers with a misleading protocol error (a ConnectionError on pg).
+  if (compiled.parameters.length > PARAMETER_LIMIT) {
+    throw new QueryError(
+      `symmetria: the statement binds ${compiled.parameters.length} values; PostgreSQL takes at most 65,535 in one statement. An in() list of plain values binds as one array, a list of expressions one value each`,
+      { kind: "other", sqlState: "54000" },
+      undefined,
     );
   }
 

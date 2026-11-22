@@ -421,3 +421,20 @@ test("declarations with slots stay reusable across schemas", () => {
       .tables.find((entry) => entry.name === "users")!.sqlName,
   ).toBe("people");
 });
+
+test("a slot or column named like an Object member is that slot or column", () => {
+  for (const name of ["valueOf", "toString", "constructor", "hasOwnProperty"]) {
+    const owners = table({ id: int.auto, label: text, [name]: many }) as any;
+    const pets = table({ id: int.auto, owner: one(owners[name]) });
+    const pets2 = table({ id: int.auto, [name]: text }) as any;
+
+    expect(
+      schema({ owners, pets }, { executor })
+        .$snapshot()
+        .tables.find((entry) => entry.name === "pets")!
+        .columns.map((column) => column.name),
+    ).toEqual(["id", "ownerId"]);
+    // A column of that name is a column reference, not the inherited member.
+    expect(pets2[name]).toMatchObject({ kind: "columnReference", key: name });
+  }
+});

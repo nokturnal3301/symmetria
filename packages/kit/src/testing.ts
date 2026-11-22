@@ -124,79 +124,79 @@ export const testDatabase = async <
     throw new Error("symmetria: test schema prefix must be a short identifier");
   }
 
-  const connect = options.driver ?? postgres;
-  const admin = connect({ url: options.url, max: 1 });
-
-  const adminSQL = (sql: string, parameters: unknown[] = []) =>
-    admin.execute({ sql, parameters });
-
-  try {
-    await adminSQL(`CREATE SCHEMA "${namespace}"`);
-  } catch (error) {
-    await admin.close();
-    throw error;
-  }
-
+  // Everything that can be refused is checked before anything is created.
   for (const schemaName of options.searchPath ?? []) {
     if (!/^[a-z_][a-z0-9_]*$/.test(schemaName)) {
       throw new Error("symmetria: search_path entries must be identifiers");
     }
   }
 
-  let extensionSchemas: readonly string[];
+  const snapshot = options.schema.$snapshot();
+  const statements = createSchemaSQL(snapshot);
+  const connect = options.driver ?? postgres;
+  const admin = connect({ url: options.url, max: 1 });
 
-  try {
-    extensionSchemas = await installExtensions(
-      adminSQL,
-      options.schema.$snapshot().extensions ?? [],
-    );
-  } catch (error) {
-    await adminSQL(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`);
-    await admin.close();
-    throw error;
-  }
+  const adminSQL = (sql: string, parameters: unknown[] = []) =>
+    admin.execute({ sql, parameters });
 
-  const connection = new URL(options.url);
-  connection.searchParams.set(
-    "options",
-    `-c search_path=${[
-      ...new Set([
-        namespace,
-        ...(options.searchPath ?? []),
-        ...extensionSchemas,
-      ]),
-    ].join(",")}`,
-  );
-  const driver = connect({
-    url: connection.toString(),
-    max: options.max ?? 4,
-  });
-
+  let created = false;
+  let driver: PostgresDriver | undefined;
   let database: TestDatabase<Model>["database"];
 
   try {
-    for (const statement of createSchemaSQL(options.schema.$snapshot())) {
+    await adminSQL(`CREATE SCHEMA "${namespace}"`);
+    created = true;
+    const extensionSchemas = await installExtensions(
+      adminSQL,
+      snapshot.extensions ?? [],
+    );
+    const connection = new URL(options.url);
+    connection.searchParams.set(
+      "options",
+      `-c search_path=${[
+        ...new Set([
+          namespace,
+          ...(options.searchPath ?? []),
+          ...extensionSchemas,
+        ]),
+      ].join(",")}`,
+    );
+    driver = connect({
+      url: connection.toString(),
+      max: options.max ?? 4,
+    });
+
+    for (const statement of statements) {
       await driver.execute(statement);
     }
 
     database = createDatabase({ schema: options.schema, driver });
   } catch (error) {
-    await driver.close();
-    await adminSQL(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`);
-    await admin.close();
+    // Nothing is left behind, and no open pool keeps the process alive; a
+    // failing cleanup step does not hide the error or skip the next step.
+    await driver?.close().catch(() => {});
+
+    if (created) {
+      await adminSQL(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`).catch(
+        () => {},
+      );
+    }
+
+    await admin.close().catch(() => {});
     throw error;
   }
 
+  const pool = driver;
   let closing: Promise<void> | undefined;
 
   return Object.freeze({
     database,
-    driver,
+    driver: pool,
     namespace,
     close: () =>
       (closing ??= (async () => {
         try {
-          await driver.close();
+          await pool.close();
         } finally {
           try {
             await adminSQL(`DROP SCHEMA IF EXISTS "${namespace}" CASCADE`);

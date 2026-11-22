@@ -162,6 +162,7 @@ export const MODULE_IDENTIFIERS: readonly string[] = [
   "customType",
   "date",
   "doublePrecision",
+  "fullText",
   "index",
   "inet",
   "int",

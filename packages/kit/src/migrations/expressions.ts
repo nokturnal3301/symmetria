@@ -1,6 +1,6 @@
 import { type SqlExpression, UnsupportedExpression } from "./expression-tree";
 import { parseExpression } from "./expression-parser";
-import { simplifyExpression } from "./expression-simplify";
+import { canonicalLiteral, simplifyExpression } from "./expression-simplify";
 
 export type { SqlExpression } from "./expression-tree";
 
@@ -22,7 +22,9 @@ const printKey = (node: SqlExpression): string => {
       // either (`doc -> 0` is an array element, `doc -> '0'` an object key),
       // so a number prints without quotes. A real literal compares in single
       // precision, unlike the same digits elsewhere.
-      return `${node.numeric ? node.value : quoted(node.value, "'")}${
+      // Spellings of one value PostgreSQL stores in its own form compare
+      // the same; the tree pull renders keeps the stored text.
+      return `${node.numeric ? node.value : quoted(node.type ? canonicalLiteral(node.value, node.type) : node.value, "'")}${
         node.type === "real"
           ? "::real"
           : !node.numeric && node.type && VALUE_TYPES.test(node.type)

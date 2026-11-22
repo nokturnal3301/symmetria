@@ -219,6 +219,32 @@ describe.skipIf(!databaseUrl)("better-auth on a Symmetria database", () => {
     expect(
       await names([{ field: "name", value: "BOB", mode: "insensitive" }]),
     ).toEqual(["Bob"]);
+    // A list compared without case, as a single value is.
+    expect(
+      await names([
+        {
+          field: "name",
+          value: ["BOB", "DAVE"],
+          operator: "in",
+          mode: "insensitive",
+        },
+      ]),
+    ).toEqual(["Bob", "dave"]);
+    expect(
+      await names([
+        {
+          field: "name",
+          value: ["BOB", "DAVE"],
+          operator: "not_in",
+          mode: "insensitive",
+        },
+      ]),
+    ).toEqual(["Ada Lovelace", "Carol"]);
+    expect(
+      await names([
+        { field: "name", value: [], operator: "in", mode: "insensitive" },
+      ]),
+    ).toEqual([]);
     // A pattern character in the value is matched as itself.
     expect(
       await names([{ field: "name", value: "%", operator: "contains" }]),
@@ -344,3 +370,116 @@ describe.skipIf(!databaseUrl)("better-auth on a Symmetria database", () => {
     await expect(adapter.findMany({ model: "passkey" })).rejects.toThrow();
   });
 });
+
+test("numeric ids are refused when better-auth starts", async () => {
+  const auth = betterAuth({
+    ...options,
+    advanced: { database: { generateId: "serial" } },
+    database: symmetriaAdapter({}),
+  });
+
+  await expect(auth.$context).rejects.toThrow("does not support numeric ids");
+});
+
+describe.skipIf(!databaseUrl)(
+  "better-auth with its own field names and plural tables",
+  () => {
+    // What `npx auth generate` writes for this configuration, through the adapter.
+    const renamed = {
+      ...options,
+      user: { fields: { name: "full_name", emailVerified: "email_verified" } },
+      session: { fields: { userId: "owner", token: "session_token" } },
+    } as const;
+    const file = join(import.meta.dir, ".better-auth-renamed.generated.ts");
+    let isolated: Awaited<ReturnType<typeof testDatabase>> | undefined;
+    let written = "";
+    let auth: any;
+
+    beforeAll(async () => {
+      const probe: any = betterAuth({
+        ...renamed,
+        database: symmetriaAdapter({}, { usePlural: true }),
+      });
+      const context = await probe.$context;
+
+      written = (await context.adapter.createSchema(context.options)).code;
+      // Application columns of its own, as one adds to the generated module;
+      // one is keyed like better-auth's stored name of a field (`full_name`).
+      await Bun.write(
+        file,
+        written
+          .replace('"symmetria"', '"../../../packages/runtime/src"')
+          .replace(
+            "export const users = table({\n  id: text,",
+            'export const users = table({\n  id: text,\n  plan: text.default("free"),\n  full_name: text.named("app_full_name").nullable,',
+          ),
+      );
+
+      const { authTables: loaded } = (await import(file)) as {
+        authTables: Parameters<typeof schema>[0];
+      };
+
+      isolated = await testDatabase({
+        url: databaseUrl!,
+        schema: schema({ ...loaded }),
+        prefix: "symmetria_better_auth_renamed",
+        max: 4,
+      });
+      auth = betterAuth({
+        ...renamed,
+        database: symmetriaAdapter(isolated.database as object, {
+          usePlural: true,
+        }),
+      });
+    });
+
+    afterAll(async () => {
+      await isolated?.close();
+      await rm(file, { force: true });
+    });
+
+    test("the module keys plural tables and keeps the SQL names", () => {
+      expect(written).toContain("export const users = table({");
+      expect(written).toContain('  name: text.named("full_name"),');
+      expect(written).toContain('  user: one(users).cascade.column("owner"),');
+      expect(written).toContain(
+        "export const authTables = { users, sessions, accounts, verifications };",
+      );
+    });
+
+    test("sign up, sign in and read the session", async () => {
+      const created = await auth.api.signUpEmail({
+        body: {
+          name: "Ada",
+          email: "ada@example.test",
+          password: "correct-horse-battery",
+        },
+      });
+
+      expect(created.user).toMatchObject({ name: "Ada", emailVerified: false });
+
+      const signedIn = await auth.api.signInEmail({
+        body: { email: "ada@example.test", password: "correct-horse-battery" },
+        asResponse: true,
+      });
+      const cookie = signedIn.headers.get("set-cookie")!.split(";")[0]!;
+      const session = await auth.api.getSession({
+        headers: new Headers({ cookie }),
+      });
+
+      expect(session.user).toMatchObject({ name: "Ada", emailVerified: false });
+
+      const rows = (await isolated!.driver.execute({
+        sql: "SELECT u.full_name, u.email_verified, u.plan, s.owner = u.id AS owned FROM users u JOIN sessions s ON s.owner = u.id",
+        parameters: [],
+      })) as { rows: Record<string, unknown>[] };
+
+      expect(rows.rows[0]).toMatchObject({
+        full_name: "Ada",
+        email_verified: false,
+        plan: "free",
+        owned: true,
+      });
+    });
+  },
+);

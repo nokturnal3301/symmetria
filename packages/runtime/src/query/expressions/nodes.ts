@@ -122,6 +122,12 @@ export type ValueNode =
       readonly composed?: true;
       /** Its SQL is one parenthesized term, which an operand needs no more of. */
       readonly delimited?: true;
+      /**
+       * `(SELECT value)`: the bound value in `parts[1]`, read once per
+       * statement. A shape (a page cursor's fingerprint) renders the value
+       * alone, as releases before 3.4.1 did.
+       */
+      readonly readOnce?: true;
     }
   | {
       readonly kind: "binary";

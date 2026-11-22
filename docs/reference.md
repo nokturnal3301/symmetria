@@ -469,13 +469,16 @@ db.posts((post, { innerJoin, join }) => {
 Also supported: `crossJoin`, `distinct`, `groupBy`, `having`, `offset`,
 `ascending.nullsLast`, `is` / `isNot` (equality; `is(null)` compiles to
 `IS NULL`), ordering comparisons, `in` / `notIn` (lists longer than 1,000 values
-bind one array parameter on PostgreSQL: `= ANY($1::type[])`; a `null` in the
-list is rejected where the query is built, because SQL's `NOT IN (…, NULL)`
-matches no row: combine the list with `is(null)` or `isNot(null)`), `between`,
-`like` / `ilike`, `isDistinctFrom`, and `and` / `or` / `not`. On an enum, uuid,
-date, time, interval or inet column, `like`, `ilike` and full-text search read
-the value as text, as PostgreSQL prints it (`day.like("2024-%")`), and a
-comparison with a text column compares it as text.
+bind one array parameter on PostgreSQL: `= ANY($1::type[])`, or an untyped
+`= ANY($1)` that PostgreSQL types from the column, as an enum needs; a list of
+expressions binds one value each, and a statement over 65,535 values is refused
+with a `QueryError` before it is sent; a `null` in the list is rejected where
+the query is built, because SQL's `NOT IN (…, NULL)` matches no row: combine the
+list with `is(null)` or `isNot(null)`), `between`, `like` / `ilike`,
+`isDistinctFrom`, and `and` / `or` / `not`. On an enum, uuid, date, time,
+interval or inet column, `like`, `ilike` and full-text search read the value as
+text, as PostgreSQL prints it (`day.like("2024-%")`), and a comparison with a
+text column compares it as text.
 
 ### Shape-first queries
 
@@ -1079,11 +1082,20 @@ under `$scope()`. Every read keeps its own type and result: queries, `get()`,
 `find()`, `one()`, `first()`, `count()`, `exists()`, `aggregate()` and `page()`.
 
 The callback is synchronous and returns the reads at once, as an array or an
-object; other values pass through. A read that cannot run by itself (a malformed
-key, no row for `get()`) fails alone. A statement PostgreSQL rejects fails every
-read in it. Writes, row locks, streams and transactions are not reads and are
-refused on the batch's handle. Beyond 1,000 reads or 65,535 bound values the
-batch becomes several statements, sent in order.
+object; other values pass through. Like the reads, the batch starts when it is
+awaited, and the callback runs then; the reads the callback makes join it when
+they are made, also when the callback wraps them in `Promise.all()` or an async
+helper. A read that cannot run by itself (a malformed key, no row for `get()`)
+fails alone. A statement PostgreSQL rejects fails every read in it. Writes, row
+locks, streams and transactions are not reads and are refused on the batch's
+handle. Reads that each define a CTE of the same name, as a helper called once
+per read does, stay in the one statement: an identical CTE is defined once and
+shared, a different one gets its own name in the statement (`ranked_2`), while
+each read still names it as it did. Beyond 1,000 reads or 65,535 bound values
+the batch becomes several statements, sent in order. Each of them then reads its
+own snapshot outside a transaction, and in one at read committed, so a list and
+its total can disagree; when they must agree, run such a batch in
+`$transaction(…, { isolationLevel: IsolationLevel.RepeatableRead })`.
 
 Outside a transaction the gain over `Promise.all` is the single connection and
 the single snapshot rather than time: both drivers already run independent
@@ -1143,12 +1155,29 @@ a connection, declares a `NO SCROLL` cursor, fetches `size` rows at a time
 `break` or an error. Memory stays flat regardless of the result size. Inside
 `$transaction` the stream uses the transaction's connection and sees its
 uncommitted writes; the transaction stays usable between rows, and a stream
-still open when the callback returns rolls the transaction back. `$close()` does
-not wait for a stream: it ends the stream's transaction, and a loop that reads
-on fails with "the database was closed while this stream was open". Unlike
-`pages()`, no ordering key is required, but the reserved connection is held
-until the loop finishes, so do not keep a stream open while waiting on unrelated
-work.
+still open when the callback returns rolls the transaction back. Such a stream
+then stops: reading on fails with "the transaction of this stream ended while
+the stream was open and was rolled back", also for rows it had fetched before,
+and a `break` there just ends the loop. Inside one of the transaction's
+savepoints, reading on a stream of the transaction itself is refused like any
+query through the parent ("await the nested transaction before using its parent
+context"); breaking out of it there ends the loop, and its cursor is closed when
+the savepoint ends. `$close()` does not wait for a stream: it ends the stream's
+transaction, and a loop that reads on fails with "the database was closed while
+this stream was open". Unlike `pages()`, no ordering key is required, but the
+reserved connection is held until the loop finishes, so do not keep a stream
+open while waiting on unrelated work.
+
+Outside a transaction the loop holds one of the pool's connections. A query the
+loop body sends through the database asks the pool for another, and when the
+loop and the transactions or loops around it hold all of them (with `max: 1`,
+the loop alone), it is refused at once ("…from inside a stream() loop that holds
+the only one, and would wait forever"). That holds whether the loop awaits the
+query or only starts it, to await after the loop: when the query is called, the
+library cannot tell the two apart, and one the loop waits for would never get a
+connection. Start such queries after the loop, raise `max`, or stream inside a
+`$transaction` and query through the transaction, whose statements run on the
+stream's connection between fetches.
 
 ## Query inspector
 
@@ -1464,10 +1493,18 @@ still takes `.all()`. `where()` may return an array of predicates combined with
 `AND`, like the `where` option. A filter that holds for every row is refused
 like a missing one, with "where() leaves no condition": an empty array, a list
 whose entries were all skipped (`[userId && post.authorId.is(userId)]` without a
-user), `and()`, `not(or())` and `notIn([])`. A filter no row passes, such as
-`in([])` or `or()`, is a filter and writes nothing. `onConflict().doNothing()`
-handles conflicts. `doUpdate("name", "active")` assigns those fields from
-`excluded`; object and callback forms support custom assignments.
+user), `and()`, `not(or())`, `notIn([])`, `notIn()`, `not(in())` or
+`notExists()` of a query that finds nothing (an emptied `in([])`, `limit: 0`),
+an aggregate of such a relation compared so that it holds for every row
+(`user.posts({ where: (post) => post.id.in([]) }).count().is(0)`), `exists()` of
+an aggregate without `groupBy` (one row even over no rows), a count compared
+with what every count passes (`count().atLeast(0)`) and `isNot(null)` of a NOT
+NULL column. Several `where()` calls make one filter: it is refused only when
+every part holds for every row, and `.all()`, before or after them, accepts it
+as a write to every row. A filter no row passes, such as `in([])` or `or()`, is
+a filter and writes nothing. `onConflict().doNothing()` handles conflicts.
+`doUpdate("name", "active")` assigns those fields from `excluded`; object and
+callback forms support custom assignments.
 `doUpdate(values, { where: (current, incoming) => … })` updates the conflicting
 row only when the condition holds, for example
 `incoming.version.above(current.version)`; otherwise nothing is written,
@@ -1738,7 +1775,17 @@ const { orders, total } = await db
   }));
 ```
 
-A shape that yields several rows (a `groupBy`) rejects with `TooManyRowsError`.
+The aggregates read the rows the source selects: with `limit` or `offset`, the
+rows its ordering puts first (`db.orders({ orderBy, limit: 10 })` aggregates
+those ten); with `distinct`, its distinct rows; with `forUpdate`/`forShare`, the
+rows it locks. An ordering alone changes nothing. Relation paths
+(`order.customer.name`) and relation aggregates (`sum(customer.orders.count())`)
+work on all of them. A grouped source keeps its groups, with its `limit` and
+`offset` applying to them, so a shape that yields several rows (a `groupBy`)
+rejects with `TooManyRowsError`. A query with `distinct` and selected fields
+returns distinct values of those fields rather than rows of its table, so
+`aggregate()` on it is refused: `count()` counts its rows, and
+`query.as("name").aggregate(…)` aggregates its fields.
 
 `count()` returns `number`. `sum()` and `average()` take numbers, bigints and
 decimals (not text) and return lossless decimal strings or `null`. `minimum()`
@@ -2101,6 +2148,22 @@ not `Promise` objects: `instanceof Promise` is false,
 `Object.prototype.toString` names them `SymmetriaQuery` or `SymmetriaWrite`, and
 they run each time one of `then()`, `catch()` and `finally()` is called.
 
+The reads that resolve to one value, `get()`, `find()`, `one()`, `maybeOne()`,
+`first()`, `count()`, `exists()`, `aggregate()`, `page()` and `$batch()`, return
+real promises that also start when they are awaited: the first `then()` (through
+`await`, `catch()`, `finally()` or `Promise.all()`) runs the read, and later
+calls share its result. So in `Promise.all([…])` every query, write and read
+starts in the array's order. `execute()`, `inspect()` and prepared queries start
+when they are called; a read that is never awaited never runs. A read runs in
+the async context where it was made, so a `$scope()` callback that reads an
+`AsyncLocalStorage`, a profiler's request and a tracer's span see that context
+wherever the read is awaited. What the awaiting code holds counts where it
+awaits: a read of a transaction awaited inside one of its savepoints is refused
+like any query through the parent, and one through the database awaited where
+transactions hold every connection is refused as well, instead of waiting
+forever. Inside a `$batch()` callback a read joins the batch when it is made,
+also when the callback wraps it (`Promise.all`, an async helper).
+
 ### Error classes
 
 ```ts
@@ -2181,7 +2244,7 @@ the defaults to the Bun adapter yourself:
 (a connection pooler must allow these start-up parameters).
 
 Transactions and nested savepoints reserve a single connection, and its
-operations run one at a time in call order on both drivers. Use
+operations run one at a time in the order they start on both drivers. Use
 `driver.session(async session => { ... })` for connection-local settings,
 temporary tables and advisory locks across statements. A session provides
 `execute`, `transaction` and `cancel`; cancellation uses a separate connection
@@ -2440,7 +2503,9 @@ order, so the statement sorts the rows it got once more, exactly. How many lists
 it starts with is still `ivfflat.probes`, yours to set. `page()` ordered by a
 distance compares rows exactly, without the vector index, since pages must cover
 every row once; `stream()` plans its cursor to read every row
-(`cursor_tuple_fraction = 1`), so it returns what `await` returns.
+(`cursor_tuple_fraction = 1`), so it returns what `await` returns. Inside
+`$transaction()` the setting is back to its earlier value once the cursor is
+declared.
 
 `schema(defs, { extensions: ["vector"] })` records the extension in the
 snapshot: generated migrations start with `CREATE EXTENSION IF NOT EXISTS`,
@@ -2516,8 +2581,9 @@ The extensions are recorded by the declaration itself: migrations start with
 `CREATE EXTENSION IF NOT EXISTS` for `vector` and `pg_search` as needed, without
 `extensions: [...]` in the schema options. Everything else is an ordinary column
 and ordinary indexes in the snapshot, so `generate`, `drift` and `rollback`
-treat a search like any other change; `pull` reads it back as the column and the
-indexes.
+treat a search like any other change; `pull` reads a full-text search back as
+its declaration (`words: fullText(…)`, without the column and index it creates)
+and a meaning search as its vector column and index.
 
 **Models.** Each service has a module of its own; all of them call the service's
 HTTP API directly and add no dependency.
@@ -2683,17 +2749,23 @@ const posts = table({ id: int.auto, title: text, author: one(user).cascade });
 export const appSchema = schema({ ...authTables, posts });
 ```
 
-Dates are `timestamptz`, ids are `text` (better-auth generates them), a
-reference is `one(target)` or `maybe(target)` with better-auth's delete action
-(cascade unless it names another), and plugin tables come with the rest. Run it
-again after adding a plugin and generate a migration from the difference.
+Dates are `timestamptz`, ids are `text` (better-auth generates them, also as
+`generateId: "uuid"`; `generateId: "serial"` is refused when better-auth
+starts), a reference is `one(target)` or `maybe(target)` with better-auth's
+delete action (cascade unless it names another), and plugin tables come with the
+rest. Field names you give better-auth
+(`user: { fields: { name: "full_name" } }`) become the SQL names
+(`name: text.named("full_name")`, `user: one(user).column("owner")`) while the
+keys stay better-auth's field names; the adapter translates between the two. Run
+it again after adding a plugin and generate a migration from the difference.
 
 `symmetriaAdapter(db, { usePlural, debugLogs })`: `usePlural` when the tables
-are keyed `users`, `sessions`. `db` may be a `$scope()` of the database.
-better-auth's transactions run inside `db.$transaction`, a single-use row (a
-verification token) is taken by a `DELETE … RETURNING` that only one of two
-concurrent callers wins, and a table the schema lacks is named in the error.
-Joins are left to better-auth, which reads related rows with separate queries.
+are keyed `users`, `sessions`; `npx auth generate` then writes them so. `db` may
+be a `$scope()` of the database. better-auth's transactions run inside
+`db.$transaction`, a single-use row (a verification token) is taken by a
+`DELETE … RETURNING` that only one of two concurrent callers wins, and a table
+the schema lacks is named in the error. Joins are left to better-auth, which
+reads related rows with separate queries.
 
 ## Scoped databases
 
@@ -2855,11 +2927,12 @@ since that is what the database holds. Missing paths and JSON null decode to
 null, and `is(null)`, `isNot(null)`, `coalesce()` and `whereNotNull()` agree
 with that: a missing path and a present JSON null both count as null. So do the
 other comparisons: `isNot(3)`, `notIn([3])`, `above()` and `below()` leave both
-out, and `isDistinctFrom(null)` holds for neither. Ordering is PostgreSQL's
-`jsonb` order, where JSON null is a value that sorts before every other value
-and SQL NULL follows `nullsFirst`/`nullsLast`. To tell the two apart, compare in
-SQL (``sql<boolean>`${doc.meta} ? 'size'` ``). `contains()` uses `@>` and
-accepts partial objects/subarrays.
+out, as do `not(is(3))`, `not(in([3]))`, `not(between(…))` and
+`not(contains(…))`, and `isDistinctFrom(null)` holds for neither. Ordering is
+PostgreSQL's `jsonb` order, where JSON null is a value that sorts before every
+other value and SQL NULL follows `nullsFirst`/`nullsLast`. To tell the two
+apart, compare in SQL (``sql<boolean>`${doc.meta} ? 'size'` ``). `contains()`
+uses `@>` and accepts partial objects/subarrays.
 
 `set(key, value)` changes one key of a jsonb value and keeps the rest, where
 assigning the column would replace the whole document:
@@ -3135,13 +3208,19 @@ to a transaction-only helper is a compile-time error.
   nested writes still roll back if the outer transaction fails.
 - `forUpdate` / `forShare` acquire row locks. Options: `of: [alias]`,
   `noWait: true`, or `skipLocked: true`. Locks last until the transaction ends.
-- Operations on one transaction run one at a time, in the order they are called:
-  `Promise.all([...])` of queries, chunked bulk inserts and nested inserts
-  works, and each waits for the previous one. A savepoint holds the connection
-  until it ends, so parent operations issued meanwhile wait for it. Inside a
-  savepoint's callback use its own context: calling the parent there would wait
-  for the savepoint that is waiting for it, so it is rejected ("await the nested
-  transaction before using its parent context").
+- Operations on one transaction run one at a time, in the order they start:
+  `Promise.all([...])` of queries, writes, reads such as `count()` or `get()`,
+  chunked bulk inserts and nested inserts works, and each waits for the previous
+  one. All of these start when they are awaited, so
+  `Promise.all([transaction.logs.insert(row), transaction.logs.count()])` counts
+  the new row; `execute()` starts when it is called, so put it where it should
+  run. A savepoint holds the connection until it ends, so parent operations
+  issued meanwhile wait for it. Inside a savepoint's callback use its own
+  context: calling the parent there would wait for the savepoint that is waiting
+  for it, so it is rejected ("await the nested transaction before using its
+  parent context"). That includes a read made through the parent before the
+  savepoint and first awaited inside its callback: await it before the
+  savepoint, or make it through the savepoint's context.
 - Await all operations. An operation still running or queued when the callback
   returns makes the transaction roll back, and that operation then rejects ("the
   transaction ended before this operation was awaited; it was rolled back")
@@ -3150,8 +3229,9 @@ to a transaction-only helper is a compile-time error.
   unhandled rejection (Node.js ends the process by default); the transaction's
   own rejection already names the mistake. A `stream()` that is still open when
   the callback returns counts as unfinished too: finish the loop or `break` out
-  of it first. Query handles from a finished transaction/savepoint reject
-  execution.
+  of it first; reading on after that fails, also for rows it had fetched. Query
+  handles from a finished transaction/savepoint reject execution. A read that is
+  never awaited never starts, so it holds up nothing.
 - A caught SQL error still aborts its transaction scope. Use a savepoint for
   recoverable SQL failures. `retries` (a whole number from 0 to 20; other values
   are rejected) re-runs the whole callback after a serialization failure or
@@ -3280,17 +3360,25 @@ Generation rejects dropped tables or columns, removed enum labels, cleared
 search embeddings and type changes that narrow existing values unless
 `--allow-destructive` is explicitly supplied; the refusal lists each destructive
 operation. A generated migration is printed with the same review `lint` gives
-it, so cautions such as a rewritten table are seen before it runs. A narrowing
-type change and cleared embeddings are written with a comment above them
-(`-- symmetria: destructive: …`), since the SQL alone does not show what they
-lose; `lint` of the saved file reads it and rates them as destructive, as
-`generate` did. `discard` takes the latest migration back while no database has
-applied it (see the Kit README). Narrowing means a value can change or stop
-fitting: a shorter `varchar`/`char` or `bit` length, fewer `numeric` decimal
-places (values are rounded), `numeric` or floating point to an integer type, a
-smaller integer type (`bigint` to `integer`, either to `smallint`: the migration
-fails while a value is out of range), an integer type to `boolean` (every value
-other than 0 becomes true), fewer fractional-second digits on
+it, so cautions such as a rewritten table are seen before it runs, and what
+`lint` of the saved file fails on (destructive or blocking) `generate` reports
+too. A narrowing type change, cleared embeddings and removed enum labels are
+written with a comment above them (`-- symmetria: destructive: …`), since the
+SQL alone does not show what they lose; `lint` of the saved file reads it and
+rates them as destructive, as `generate` did. The other way round, a drop of an
+index, constraint or enum type that is no longer declared, a primary key rebuilt
+over columns that contain the previous key and a foreign key rebuilt to change
+only its actions are written with `-- symmetria: caution: …`: they lose no data
+and cannot fail, and `lint` rates them as cautions, where the same SQL written
+by hand stays destructive or blocking. `discard` takes the latest migration back
+while no database has applied it (see the Kit README). Narrowing means a value
+can change or stop fitting: a shorter `varchar`/`char` or `bit` length, fewer
+`numeric` decimal places (values are rounded), `numeric` or floating point to an
+integer type, a smaller integer type (`bigint` to `integer`, either to
+`smallint`: the migration fails while a value is out of range), fewer digits
+before the decimal point (`numeric(20)` to `integer`, `numeric(10,2)` to
+`numeric(8,2)`: likewise), an integer type to `boolean` (every value other than
+0 becomes true), fewer fractional-second digits on
 `timestamp`/`time`/`interval`, a timestamp to `date` or `time`, or a number into
 a floating-point type that keeps fewer digits. A change to a length-limited
 string type is generated without a `USING` cast: an explicit `::varchar(5)`
@@ -3298,13 +3386,21 @@ would silently cut `Alexandria` to `Alexa`, while PostgreSQL's own assignment
 cast refuses the long value, so the migration fails and rolls back with the data
 intact. The same holds for the `down.sql` of a widening change: a rollback to
 the shorter type fails on values that no longer fit instead of cutting them. A
-type change PostgreSQL has no cast for (a number to `uuid`, a value to an array
-of it) is refused when the migration is generated, since its SQL could not run
-even on an empty table; give the conversion for both directions under `using` in
-the `--diff` file. A rename needs a `--diff` hint; it is never guessed from
-similar names. The API uses `allowDestructive: true` for intentional removals.
-Column declarations keep their order in `CREATE TABLE`; snapshot hashes ignore
-column order so reordering source declarations does not create a migration.
+type change PostgreSQL has no cast for, in either direction (a number to `uuid`,
+a value to an array of it, `integer` to `date`, `boolean` to `numeric`, `jsonb`
+to `integer`, whose `down.sql` would need `integer` to `jsonb`), is refused when
+the migration is generated, since its SQL could not run even on an empty table;
+give the conversion for both directions under `using` in the `--diff` file.
+`integer` to `bytea` counts as castless, as it is before PostgreSQL 18. A change
+whose plain cast would read the time zone of the session that runs the migration
+(`timestamp`, `date` or text to `timestamptz`, `timestamptz` to `timestamp`,
+`date` or text, a value to `timetz`) converts at UTC instead, in `up.sql` and
+`down.sql`: with `AT TIME ZONE 'UTC'`, or with the session's zone set to UTC
+around the statement, so the stored values do not depend on who migrates. A
+rename needs a `--diff` hint; it is never guessed from similar names. The API
+uses `allowDestructive: true` for intentional removals. Column declarations keep
+their order in `CREATE TABLE`; snapshot hashes ignore column order so reordering
+source declarations does not create a migration.
 
 `diff` compares the current declaration to the latest local snapshot, not to the
 live database. CHECK expressions, partial-index predicates and index key
@@ -3439,15 +3535,26 @@ appends a journal entry without changing the snapshot.
   pending schema diff, because they check every existing row: `SET NOT NULL`,
   new `UNIQUE`/`PRIMARY KEY` constraints and unique indexes, and `CHECK` or
   `FOREIGN KEY` constraints added without `NOT VALID` (add them `NOT VALID`,
-  then `VALIDATE CONSTRAINT` separately). A foreign key on a column added
-  earlier in the same migration without a default holds only NULLs and is not
-  blocking, and a key or check dropped and added again after its columns change
-  type (an `integer` to `bigint` primary key) is a rebuild caution. Volatile
-  column defaults (`gen_random_uuid()`, `uuidv4()`, `uuidv7()`,
+  then `VALIDATE CONSTRAINT` separately), and the same written into `ADD COLUMN`
+  (`REFERENCES`, `CHECK`, `UNIQUE` or `PRIMARY KEY` on a column whose existing
+  rows get a value; a `PRIMARY KEY` column without one fails on NULL). A column
+  added earlier in the same migration without a default holds only NULLs, which
+  a foreign key and a `UNIQUE` key accept, and one added with an identity, a
+  sequence or a uuid generator (`gen_random_uuid()`, `uuidv7()`) as its default
+  gives every row its own value, so a key on it is not blocking (a
+  `clock_timestamp()` or `random()` default can repeat, so a key on it is),
+  unless a statement in between may have written the column (an `UPDATE`
+  backfill, a `USING`, a `DO` block); a key or check dropped and added again
+  after its columns change type (an `integer` to `bigint` primary key) is a
+  rebuild caution. Adding an identity column is a caution: it rewrites the
+  table. Volatile column defaults (`gen_random_uuid()`, `uuidv4()`, `uuidv7()`,
   `uuid_generate_v1()`, `uuid_generate_v1mc()`, `uuid_generate_v4()`,
   `random()`, `clock_timestamp()`, `nextval()`) are cautions because they
   rewrite the table. A `USING` clause that casts to `varchar(n)` or `char(n)` is
-  destructive: the explicit cast cuts long values.
+  destructive, however the type is spelled (`pg_catalog.varchar(2)`,
+  `"varchar"(2)`): the explicit cast cuts long values; so is a `USING` whose
+  whole expression is `NULL` or another constant (`USING 0`,
+  `USING '{}'::jsonb`), which gives every row the same value.
 - `drift` compares the live database with the latest snapshot: missing or extra
   tables, columns and indexes; types, collations, nullability, defaults and
   identity (`ALWAYS` or `BY DEFAULT`); primary, unique, foreign-key and check
@@ -3643,7 +3750,11 @@ each with a `code` and often a `fix`):
   constraint stay plain columns.
 - Multi-column unique constraints are declared as unique indexes of the same
   name; exclusion constraints, `NULLS NOT DISTINCT` indexes, generated-column
-  expressions and partitions are reported but not declared.
+  expressions and partitions are reported but not declared. A full-text search's
+  stored column (`aboutWords`, nullable, computed as `fullText()` computes it,
+  with its GIN index and no other index or constraint on it) is declared as the
+  search, `.search((t) => ({ about: { words: fullText(…) } }))`; any other
+  generated column stays a column with its warning.
 - Views, materialized views and triggers are listed: the schema neither declares
   nor manages them, so migrations leave them alone.
 - More that exists only in the database is listed, each under its own code, so
@@ -3656,8 +3767,12 @@ each with a `code` and often a `fix`):
     every row visible and writable.
   - `function`: functions and procedures of the schema that no extension owns,
     in one entry that names them (the first ten when there are more).
-  - `sequence`: sequences no column owns, in one entry, and each column whose
-    default draws from a shared or free-standing sequence.
+  - `sequence`: sequences no column owns, in one entry, each column whose
+    default draws from a shared or free-standing sequence, and each identity
+    column whose sequence has options (`START WITH 1000`, `INCREMENT BY 10`):
+    `.auto` numbers from 1 by 1.
+  - `unlogged`: an `UNLOGGED` table, which the schema declares as an ordinary
+    one; the fix is `ALTER TABLE … SET LOGGED`.
   - `other-schema`: how many tables live in other schemas, per schema. `pull`
     reads one schema (the connection's current one), so those tables are not in
     the generated module. System schemas and tables owned by extensions are not

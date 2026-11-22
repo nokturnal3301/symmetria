@@ -667,6 +667,96 @@ test("aggregate() reads only the rows a limit or offset leaves", async () => {
   }
 });
 
+test("aggregate() over a limited, ordered, distinct or grouped source keeps relations and counts the source's rows", async () => {
+  const database = await articles();
+
+  try {
+    // Relation paths and relation aggregates over the rows a limit leaves.
+    expect(
+      await database
+        .articles({ orderBy: (article) => article.id.desc, limit: 2 })
+        .aggregate((article, { count, maximum, minimum }) => ({
+          n: count(),
+          last: maximum(article.author.name),
+          first: minimum(article.author.name),
+          edited: count(article.editor.name),
+        })),
+    ).toEqual({ n: 2, last: "Bob", first: "Ada", edited: 0 });
+    expect(
+      await database
+        .writers({ orderBy: (writer) => writer.id.asc, offset: 1 })
+        .aggregate((writer, { sum }) => ({ posts: sum(writer.posts.count()) })),
+    ).toEqual({ posts: "1" });
+    // An ordering alone picks no rows.
+    expect(
+      await database
+        .articles({ orderBy: (article) => article.id.asc })
+        .aggregate((article, { count, maximum }) => ({
+          n: count(),
+          last: maximum(article.title),
+        })),
+    ).toEqual({ n: 3, last: "b1" });
+    // Distinct whole rows of a table, also with a limit.
+    expect(
+      await database
+        .articles({ distinct: true, limit: 5 })
+        .aggregate((_article, { count }) => ({ n: count() })),
+    ).toEqual({ n: 3 });
+    // Distinct fields are not rows of the table: refused, with the way out.
+    const authors = database.articles(
+      (article) => ({ authorId: article.authorId }),
+      { distinct: true, limit: 10 },
+    );
+    expect(await authors.count()).toBe(2);
+    await expect(
+      authors.aggregate((_article, { count }) => ({ n: count() })),
+    ).rejects.toThrow(/a DISTINCT query returns distinct values/);
+    expect(
+      await authors.as("authors").aggregate((author, { count, maximum }) => ({
+        n: count(),
+        top: maximum(author.authorId),
+      })),
+    ).toEqual({ n: 2, top: 2 });
+    // A grouped source with a limit: one row per group, so several reject.
+    const grouped = (limit: number) =>
+      database.articles(
+        (article, { count }) => ({ authorId: article.authorId, n: count() }),
+        {
+          groupBy: (article) => [article.authorId],
+          orderBy: (article) => article.authorId.asc,
+          limit,
+        },
+      );
+    await expect(
+      grouped(5).aggregate((_article, { count }) => ({ n: count() })),
+    ).rejects.toMatchObject({ code: "SYMMETRIA_TOO_MANY_ROWS" });
+    expect(
+      await grouped(1).aggregate((_article, { count }) => ({ n: count() })),
+    ).toEqual({ n: 2 });
+    // Locked rows inside a transaction.
+    expect(
+      await database.$transaction((transaction) =>
+        transaction
+          .articles({ where: { authorId: 1 }, forUpdate: true })
+          .aggregate((article, { sum }) => ({ total: sum(article.price) })),
+      ),
+    ).toEqual({ total: "2.20" });
+    // One statement in a batch.
+    expect(
+      await database.$batch((batch) => [
+        batch
+          .articles({ orderBy: (article) => article.id.asc, limit: 1 })
+          .aggregate((article, { maximum }) => ({
+            name: maximum(article.author.name),
+          })),
+        batch.articles.count(),
+      ]),
+    ).toEqual([{ name: "Ada" }, 3]);
+  } finally {
+    await database.$close();
+  }
+});
+
 test("a path to an enum field of a nested object in a CTE", async () => {
   const database = await articles();
 

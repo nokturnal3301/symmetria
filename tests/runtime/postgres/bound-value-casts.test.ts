@@ -18,6 +18,7 @@ import {
   interval,
   jsonb,
   not,
+  sql,
 } from "../../../packages/runtime/src";
 import { postgres as pg } from "../../../packages/runtime/src/entries/pg";
 import { testDatabase as isolatedDatabase } from "../../../packages/kit/src/testing";
@@ -111,6 +112,31 @@ describe.skipIf(!databaseUrl)(
 
       expect(removal.toSQL().sql).toContain("::varchar[]");
       expect(await removal).toEqual({ affectedRows: 0 });
+    });
+
+    test("a list above 65,535 values of any typed column is one array parameter", async () => {
+      const many = Array.from({ length: 70_000 }, () => "published" as const);
+
+      // An enum, whose type name the statement need not name.
+      for (const query of [
+        ids({ where: (thing) => thing.state.in([...many, "draft"]) }),
+        ids({ where: (thing) => thing.state.notIn(many) }),
+      ]) {
+        expect(query.toSQL().parameters).toHaveLength(1);
+        expect(await query).toEqual([{ id: 1 }]);
+      }
+
+      // What cannot be one array fails before it is sent, and says why.
+      await expect(
+        Promise.resolve(
+          ids({
+            where: (thing, { sql }) =>
+              thing.id.in(
+                Array.from({ length: 70_000 }, (_, i) => sql<number>`${i}`),
+              ),
+          }),
+        ),
+      ).rejects.toThrow("PostgreSQL takes at most 65,535");
     });
 
     test("match() returns its literal branches whole", async () => {
@@ -249,6 +275,20 @@ describe.skipIf(!databaseUrl)(
       ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
     });
 
+    test("an upsert value that is a subquery of two rows is PostgreSQL's error, not a duplicate key", async () => {
+      // Both are SQLSTATE 21000.
+      const twoRows = sql.of(
+        text,
+      )`(SELECT v FROM (VALUES ('a'), ('b')) AS t(v))`;
+      const failure = await database.hosts
+        .upsert({ address: "10.9.9.9", label: twoRows }, { by: "address" })
+        .execute()
+        .catch((error: unknown) => error);
+
+      expect(failure).not.toBeInstanceOf(DuplicateConflictKeyError);
+      expect(String(failure)).toContain("more than one row");
+    });
+
     test("upsert keys of inet and interval equal in another spelling are one key, also when split", async () => {
       await expect(
         database.hosts
@@ -314,6 +354,16 @@ describe.skipIf(!databaseUrl)(
       expect(await ids(other({ stage: "draft" }))).toEqual([2]);
       expect(await ids(negated({ stage: "draft" }))).toEqual([2]);
       expect(await ids(other({ stage: null }))).toEqual([1, 2]);
+      // Bound to null, not() turns the null check around: TRUE or FALSE for
+      // every row, never NULL.
+      const kept = prepare({ stage: stage.nullable }, (p) =>
+        database.entries((entry) => ({ id: entry.id }), {
+          where: (entry) => not(entry.stage.isNot(p.stage)),
+        }),
+      );
+      expect(await ids(negated({ stage: null }))).toEqual([1, 2]);
+      expect(await ids(kept({ stage: null }))).toEqual([3]);
+      expect(await ids(kept({ stage: "draft" }))).toEqual([1]);
       expect(
         await ids(
           database.entries((entry) => ({ id: entry.id }), {

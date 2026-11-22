@@ -215,3 +215,40 @@ test("a distance reads as a number inside JSON, and a plain array is a vector fa
       .toSQL().parameters,
   ).toContain("[9,9,9]");
 });
+
+test("page cursors issued before 3.4.1 for a distance stay valid", async () => {
+  const rows = [
+    { id: 1, __symmetria_cursor_0: "0.5", __symmetria_cursor_1: "1" },
+    { id: 2, __symmetria_cursor_0: "0.6", __symmetria_cursor_1: "2" },
+    { id: 3, __symmetria_cursor_0: "0.7", __symmetria_cursor_1: "3" },
+  ];
+  const database = schema(
+    {
+      documents: table({ id: int.auto, content: text, embedding: vector(3) }),
+    },
+    { extensions: ["vector"], executor: async () => rows },
+  );
+  const ordered = await database
+    .documents((document) => ({ id: document.id }), {
+      orderBy: (document) => [
+        document.embedding.cosineDistance([1, 0, 0]).asc,
+        document.id.asc,
+      ],
+    })
+    .page({ size: 2 });
+  const filtered = await database
+    .documents((document) => ({ id: document.id }), {
+      where: (document) => document.embedding.l2Distance([1, 0, 0]).below(0.5),
+      orderBy: (document) => document.id.asc,
+    })
+    .page({ size: 2 });
+
+  // The cursors 3.4.0 issued, before a bound vector was read once per
+  // statement as `(SELECT $1::text::vector)`.
+  expect(String(ordered.nextCursor)).toBe(
+    "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6IjRkMGFiMzNiOWRjNWU1MjAxN2RiN2U0MGZjNzdiNDI4ZDg4MzE2MWE4YTQwM2IxNTdhN2QwNDQzZGIzMmVkZDAiLCJ2YWx1ZXMiOlsiMC42IiwiMiJdfQ",
+  );
+  expect(String(filtered.nextCursor)).toBe(
+    "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6ImM1NmFjNzJmZWM0ZjBjMzE5MzkxYzY5MGRkYzhlYTE3Mjc2MzgzNzc1OGMyMDNmYzYxMzdjMjdkMTIxY2IwNmEiLCJ2YWx1ZXMiOlsiMC42Il19",
+  );
+});

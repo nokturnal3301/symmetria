@@ -292,9 +292,10 @@ describe.skipIf(!url)("production migrations", () => {
           }),
         ).toEqual(pid);
       });
-      expect(() =>
+      await expect(
         escaped!.execute({ sql: "SELECT 1", parameters: [] }),
-      ).toThrow(/context is closed/);
+      ).rejects.toThrow(/context is closed/);
+      await expect(escaped!.cancel!()).rejects.toThrow(/context is closed/);
       await expect(
         driver.session!(async (session) => {
           void session.execute({

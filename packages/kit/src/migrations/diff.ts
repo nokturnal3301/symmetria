@@ -17,7 +17,7 @@ import {
   utcConversion,
   widens,
 } from "./conversions";
-import { DESTRUCTIVE_NOTE } from "./sql-lint";
+import { CAUTION_NOTE, DESTRUCTIVE_NOTE } from "./sql-lint";
 import { defaultKey } from "./default-values";
 import type { CompiledQuery, SchemaSnapshot } from "symmetria";
 import {
@@ -51,6 +51,28 @@ export type RenameHints = {
   readonly tables?: Readonly<Record<string, string>>;
   readonly columns?: Readonly<Record<string, Readonly<Record<string, string>>>>;
 };
+
+/**
+ * Rename hints as maps. Table and column names are chosen by the user, and a
+ * plain object answers `constructor`, `toString` or `__proto__` from its
+ * prototype, which made such a table or column look renamed to nothing.
+ */
+export type RenameMaps = {
+  readonly tables: ReadonlyMap<string, string>;
+  readonly columns: ReadonlyMap<string, ReadonlyMap<string, string>>;
+};
+
+export const renameMaps = (hints: RenameHints = {}): RenameMaps => ({
+  tables: new Map(Object.entries(hints.tables ?? {})),
+  columns: new Map(
+    Object.entries(hints.columns ?? {}).map(
+      ([table, columns]) =>
+        [table, new Map(Object.entries(columns ?? {}))] as const,
+    ),
+  ),
+});
+
+const NO_RENAMES: ReadonlyMap<string, string> = new Map();
 
 export type MigrationDiffOptions = {
   readonly online?: boolean;
@@ -87,7 +109,8 @@ type TablePair = {
   types: ReadonlyMap<string, string>;
 };
 
-type Casts = Readonly<Record<string, Readonly<Record<string, string>>>>;
+/** USING expressions by table and column. */
+type Casts = ReadonlyMap<string, ReadonlyMap<string, string>>;
 
 const equal = (left: unknown, right: unknown): boolean =>
   canonicalJSON(left ?? null) === canonicalJSON(right ?? null);
@@ -235,7 +258,7 @@ export const counterparts = <Definition extends { sqlName: string }>(
 const direction = (
   before: MigrationSnapshot,
   after: MigrationSnapshot,
-  renames: RenameHints,
+  renames: RenameMaps,
   casts: Casts,
   online = false,
   /** Down SQL: USING expressions name columns as the up migration left them. */
@@ -245,7 +268,7 @@ const direction = (
     before.tables.map((table) => [table.name, table]),
   );
   const afterTables = new Map(after.tables.map((table) => [table.name, table]));
-  const tableNames = renames.tables ?? {};
+  const tableNames = renames.tables;
 
   /** A reference as it reads after this diff's table and column renames. */
   const renamedReference = (reference: {
@@ -259,11 +282,12 @@ const direction = (
     onDelete: string;
     onUpdate?: string;
   } => {
-    const table = tableNames[reference.table] ?? reference.table;
+    const table = tableNames.get(reference.table) ?? reference.table;
 
     return {
       table,
-      column: renames.columns?.[table]?.[reference.column] ?? reference.column,
+      column:
+        renames.columns.get(table)?.get(reference.column) ?? reference.column,
       onDelete: reference.onDelete,
       ...(reference.onUpdate === undefined
         ? {}
@@ -271,7 +295,7 @@ const direction = (
     };
   };
 
-  for (const [previous, next] of Object.entries(tableNames)) {
+  for (const [previous, next] of tableNames) {
     if (!beforeTables.has(previous) || !afterTables.has(next)) {
       throw new Error(
         `symmetria: invalid table rename "${previous}" -> "${next}"`,
@@ -285,9 +309,7 @@ const direction = (
     }
   }
 
-  if (
-    new Set(Object.values(tableNames)).size !== Object.values(tableNames).length
-  ) {
+  if (new Set(tableNames.values()).size !== tableNames.size) {
     throw new Error("symmetria: duplicate table rename target");
   }
 
@@ -326,8 +348,9 @@ const direction = (
 
       const continued = enumerationColumns(before, previous.name).map(
         ([table, column]) => {
-          const tableName = tableNames[table] ?? table;
-          const columnName = renames.columns?.[tableName]?.[column] ?? column;
+          const tableName = tableNames.get(table) ?? table;
+          const columnName =
+            renames.columns.get(tableName)?.get(column) ?? column;
 
           return afterTables
             .get(tableName)
@@ -429,15 +452,17 @@ const direction = (
   const pairs: TablePair[] = [];
 
   for (const previous of before.tables) {
-    const next = afterTables.get(tableNames[previous.name] ?? previous.name);
+    const next = afterTables.get(
+      tableNames.get(previous.name) ?? previous.name,
+    );
 
     if (!next) {
       continue;
     }
 
-    const columnNames = renames.columns?.[next.name] ?? {};
+    const columnNames = renames.columns.get(next.name) ?? NO_RENAMES;
 
-    for (const [previousName, nextName] of Object.entries(columnNames)) {
+    for (const [previousName, nextName] of columnNames) {
       if (
         !previous.columns.some((column) => column.name === previousName) ||
         !next.columns.some((column) => column.name === nextName)
@@ -457,17 +482,14 @@ const direction = (
       }
     }
 
-    if (
-      new Set(Object.values(columnNames)).size !==
-      Object.values(columnNames).length
-    ) {
+    if (new Set(columnNames.values()).size !== columnNames.size) {
       throw new Error("symmetria: duplicate column rename target");
     }
 
     const matched = previous.columns.flatMap((column): ColumnPair[] => {
       const target = next.columns.find(
         (candidate) =>
-          candidate.name === (columnNames[column.name] ?? column.name),
+          candidate.name === (columnNames.get(column.name) ?? column.name),
       );
 
       return target
@@ -484,7 +506,7 @@ const direction = (
       .filter((pair) => pair.typeChanged)
       .map((pair) => quoteIdentifier(pair.before.name));
     const renamedColumns = new Map(
-      Object.entries(columnNames).map(
+      [...columnNames].map(
         ([from, to]) => [quoteIdentifier(from), quoteIdentifier(to)] as const,
       ),
     );
@@ -504,7 +526,7 @@ const direction = (
     );
     const primaryChanged =
       !equal(
-        previous.primaryKey.map((name) => columnNames[name] ?? name),
+        previous.primaryKey.map((name) => columnNames.get(name) ?? name),
         next.primaryKey,
       ) ||
       columns.some(
@@ -553,14 +575,14 @@ const direction = (
     });
   }
 
-  for (const name of Object.keys(renames.columns ?? {})) {
+  for (const name of renames.columns.keys()) {
     if (!pairs.some((pair) => pair.after.name === name)) {
       throw new Error(`symmetria: unknown column-rename table "${name}"`);
     }
   }
 
-  for (const [table, columns] of Object.entries(casts)) {
-    for (const [column, expression] of Object.entries(columns)) {
+  for (const [table, columns] of casts) {
+    for (const [column, expression] of columns) {
       if (
         !expression.trim() ||
         !pairs
@@ -680,6 +702,24 @@ const direction = (
 
   const statements: string[] = [];
   const droppedReferences = new Set<string>();
+  // Foreign keys dropped only to change their actions: the same column and
+  // target held, so adding them again cannot fail.
+  const heldReferences = new Set<string>();
+  // Indexes, constraints and types this migration drops, and the names it
+  // creates: a drop whose name is not created again removes something no
+  // longer declared, which loses no data, and the saved SQL says so (SQL lint
+  // alone would rate it destructive).
+  const drops: { position: number; note: string; name?: string }[] = [];
+  const created = new Set<string>();
+
+  const pushDrop = (statement: string, note: string, name?: string): void => {
+    statements.push(statement);
+    drops.push({
+      position: statements.length - 1,
+      note,
+      ...(name === undefined ? {} : { name }),
+    });
+  };
 
   // Remove dependencies before changing or removing keys, types, columns or tables.
   for (const table of before.tables) {
@@ -690,20 +730,45 @@ const direction = (
           (candidate) => candidate.before.name === column.name,
         );
 
+        const renamed = renamedReference(column.references);
+        const keyKept =
+          !removedTableNames.has(column.references.table) &&
+          !changedKeys.has(
+            referenceKey(column.references.table, column.references.column),
+          );
+
         if (
           !pair ||
           !match ||
           match.typeChanged ||
-          !equal(renamedReference(column.references), match.after.references) ||
-          removedTableNames.has(column.references.table) ||
-          changedKeys.has(
-            referenceKey(column.references.table, column.references.column),
-          )
+          !equal(renamed, match.after.references) ||
+          !keyKept
         ) {
-          statements.push(
-            `ALTER TABLE ${quoteIdentifier(table.name)} DROP CONSTRAINT ${quoteIdentifier(objectName(table.name, column.name, "fkey"))}`,
-          );
+          const name = objectName(table.name, column.name, "fkey");
+          const statement = `ALTER TABLE ${quoteIdentifier(table.name)} DROP CONSTRAINT ${quoteIdentifier(name)}`;
+
+          // With its column or table gone, the drop goes with a destructive one.
+          if (pair && match) {
+            pushDrop(
+              statement,
+              `foreign key "${name}" is no longer declared; dropping it loses no data.`,
+              name,
+            );
+          } else {
+            statements.push(statement);
+          }
+
           droppedReferences.add(referenceKey(table.name, column.name));
+
+          if (
+            match &&
+            !match.typeChanged &&
+            keyKept &&
+            match.after.references?.table === renamed.table &&
+            match.after.references.column === renamed.column
+          ) {
+            heldReferences.add(referenceKey(table.name, column.name));
+          }
         }
       }
     }
@@ -712,30 +777,44 @@ const direction = (
   for (const pair of pairs) {
     for (const definition of pair.before.indexes) {
       if (droppedIndexes.has(definition.sqlName)) {
-        statements.push(
+        pushDrop(
           `DROP INDEX ${online ? "CONCURRENTLY " : ""}${quoteIdentifier(definition.sqlName)}`,
+          definition.unique
+            ? `unique index "${definition.sqlName}" is no longer declared; dropping it loses no data, and the database stops refusing duplicates.`
+            : `index "${definition.sqlName}" is no longer declared; dropping it loses no data, but queries that used it can get slower.`,
+          definition.sqlName,
         );
       }
     }
 
     for (const definition of pair.before.checks ?? []) {
       if (changedCheck(pair, definition)) {
-        statements.push(
+        pushDrop(
           `ALTER TABLE ${quoteIdentifier(pair.before.name)} DROP CONSTRAINT ${quoteIdentifier(definition.sqlName)}`,
+          `CHECK constraint "${definition.sqlName}" is no longer declared; dropping it loses no data.`,
+          definition.sqlName,
         );
       }
     }
 
     if (pair.primaryChanged && pair.before.primaryKey.length) {
-      statements.push(
-        `ALTER TABLE ${quoteIdentifier(pair.before.name)} DROP CONSTRAINT ${quoteIdentifier(objectName(pair.before.name, "pkey"))}`,
+      const name = objectName(pair.before.name, "pkey");
+
+      pushDrop(
+        `ALTER TABLE ${quoteIdentifier(pair.before.name)} DROP CONSTRAINT ${quoteIdentifier(name)}`,
+        `primary key "${name}" is no longer declared; dropping it loses no data.`,
+        name,
       );
     }
 
     for (const column of pair.columns) {
       if (column.before.unique && uniqueChanged(column)) {
-        statements.push(
-          `ALTER TABLE ${quoteIdentifier(pair.before.name)} DROP CONSTRAINT ${quoteIdentifier(objectName(pair.before.name, column.before.name, "key"))}`,
+        const name = objectName(pair.before.name, column.before.name, "key");
+
+        pushDrop(
+          `ALTER TABLE ${quoteIdentifier(pair.before.name)} DROP CONSTRAINT ${quoteIdentifier(name)}`,
+          `unique constraint "${name}" is no longer declared; dropping it loses no data.`,
+          name,
         );
       }
     }
@@ -896,6 +975,12 @@ const direction = (
       continue;
     }
 
+    // Rows using a removed label make the rebuild fail; generate needed
+    // --allow-destructive for it, and the saved SQL says so.
+    const removed = previous
+      ? previous.values.filter((value) => !enumeration.values.includes(value))
+      : [];
+
     if (previous) {
       let counter = 0;
       let temporary: string;
@@ -914,7 +999,9 @@ const direction = (
       );
     }
 
-    statements.push(enumerationSQL(enumeration.name, enumeration.values));
+    statements.push(
+      `${removed.length ? `${DESTRUCTIVE_NOTE} Enum "${enumeration.name}" drops ${removed.map((value) => `'${value}'`).join(", ")}; rows using those labels make the rebuild fail.\n` : ""}${enumerationSQL(enumeration.name, enumeration.values)}`,
+    );
   }
 
   for (const table of addedTables) {
@@ -969,13 +1056,20 @@ const direction = (
       if (column.typeChanged) {
         // An explicit ::varchar(n) cuts long values; without USING, PostgreSQL's
         // assignment cast rejects them instead.
-        const supplied = casts[pair.after.name]?.[next.name];
+        const supplied = casts.get(pair.after.name)?.get(next.name);
         // A cast would use the migrating session's time zone.
         const atUtc =
           supplied === undefined ? utcConversion(previous, next) : undefined;
         if (supplied === undefined && castless(previous, next)) {
+          // `using` is keyed by the names the up migration gives.
+          const [table, name] = reverse
+            ? [pair.before.name, previous.name]
+            : [pair.after.name, next.name];
+
           throw new Error(
-            `symmetria: PostgreSQL has no cast from ${previous.sqlType} to ${next.sqlType} for "${pair.after.name}"."${next.name}", so the migration could not run; give the conversion for both directions in the --diff file: { "using": { "${pair.after.name}": { "${next.name}": { "up": "…", "down": "…" } } } }`,
+            reverse
+              ? `symmetria: PostgreSQL has no cast from ${previous.sqlType} back to ${next.sqlType} for "${table}"."${name}", so the migration could not be rolled back; give the conversion for both directions in the --diff file: { "using": { "${table}": { "${name}": { "up": "…", "down": "…" } } } }`
+              : `symmetria: PostgreSQL has no cast from ${previous.sqlType} to ${next.sqlType} for "${table}"."${name}", so the migration could not run; give the conversion for both directions in the --diff file: { "using": { "${table}": { "${name}": { "up": "…", "down": "…" } } } }`,
           );
         }
 
@@ -986,13 +1080,14 @@ const direction = (
             ? undefined
             : change?.cleared
               ? "NULL"
-              : atUtc === "value"
-                ? `${quoteIdentifier(current)} AT TIME ZONE 'UTC'`
+              : typeof atUtc === "function"
+                ? atUtc(quoteIdentifier(current), columnTypeSQL(next))
                 : `${quoteIdentifier(current)}${previous.enumeration || next.enumeration ? "::text" : ""}::${columnTypeSQL(next)}`);
 
-        // An array has no AT TIME ZONE and USING takes no subquery, so the
-        // cast itself runs with the zone set to UTC.
-        if (atUtc === "array") {
+        // An array has no AT TIME ZONE, a timetz takes the session's offset
+        // and USING takes no subquery, so the cast itself runs with the zone
+        // set to UTC.
+        if (atUtc === "session") {
           statements.push("SET TIME ZONE 'UTC'");
         }
 
@@ -1002,7 +1097,7 @@ const direction = (
           `${change?.lossy ? `${DESTRUCTIVE_NOTE} ${supplied === undefined ? conversionMessage(previous, next, change) : `Column "${next.name}" narrows from ${previous.enumeration ?? previous.sqlType} to ${next.enumeration ?? next.sqlType} with the USING conversion given for it.`}\n` : ""}${prefix} TYPE ${columnTypeSQL(next)}${conversion === undefined ? "" : ` USING ${conversion}`}`,
         );
 
-        if (atUtc === "array") {
+        if (atUtc === "session") {
           statements.push("RESET TIME ZONE");
         }
 
@@ -1017,6 +1112,14 @@ const direction = (
       if (previous.notNull !== next.notNull) {
         if (online && next.notNull) {
           const name = quoteIdentifier(
+            objectName(
+              pair.after.name,
+              next.name,
+              "not_null",
+              checksum(canonicalJSON(before)).slice(0, 8),
+            ),
+          );
+          created.add(
             objectName(
               pair.after.name,
               next.name,
@@ -1071,7 +1174,7 @@ const direction = (
       const stale = embeddingChange(
         previous,
         next,
-        Object.fromEntries(
+        new Map(
           pair.columns.map((match) => [match.before.name, match.after.name]),
         ),
       );
@@ -1096,7 +1199,25 @@ const direction = (
     }
 
     if (pair.primaryChanged && pair.after.primaryKey.length) {
-      statements.push(`${alter} ADD ${primaryKeySQL(pair.after)}`);
+      created.add(objectName(pair.after.name, "pkey"));
+      // A key over columns that contain the previous one, none of them
+      // retyped, keeps existing rows unique.
+      const previousKey = pair.before.primaryKey.map(
+        (name) =>
+          pair.columns.find((column) => column.before.name === name)?.after
+            .name ?? name,
+      );
+      const contained =
+        previousKey.length > 0 &&
+        previousKey.every((name) => pair.after.primaryKey.includes(name)) &&
+        !pair.columns.some(
+          (column) =>
+            column.typeChanged &&
+            pair.before.primaryKey.includes(column.before.name),
+        );
+      statements.push(
+        `${contained ? `${CAUTION_NOTE} the primary key (${pair.after.primaryKey.join(", ")}) contains the previous key (${previousKey.join(", ")}), so existing rows stay unique.\n` : ""}${alter} ADD ${primaryKeySQL(pair.after)}`,
+      );
     }
 
     for (const definition of pair.after.checks ?? []) {
@@ -1106,6 +1227,7 @@ const direction = (
       );
 
       if (!previous || changedCheck(pair, previous)) {
+        created.add(definition.sqlName);
         statements.push(
           `${alter} ADD ${checkSQL(definition)}${online ? " NOT VALID" : ""}`,
         );
@@ -1124,6 +1246,8 @@ const direction = (
       );
 
       if (column.unique && (!match || uniqueChanged(match))) {
+        created.add(objectName(pair.after.name, column.name, "key"));
+
         if (online) {
           const name = quoteIdentifier(
             objectName(pair.after.name, column.name, "key"),
@@ -1148,6 +1272,7 @@ const direction = (
         : undefined;
 
       if (!pair || previous === undefined || droppedIndexes.has(previous)) {
+        created.add(definition.sqlName);
         statements.push(
           online
             ? indexSQL(table, definition).replace(
@@ -1173,8 +1298,14 @@ const direction = (
           !previous?.references ||
           droppedReferences.has(referenceKey(pair.before.name, previous.name))
         ) {
+          const held =
+            !online &&
+            !!pair &&
+            !!previous &&
+            heldReferences.has(referenceKey(pair.before.name, previous.name));
+          created.add(objectName(table.name, column.name, "fkey"));
           statements.push(
-            `${foreignKeySQL(table, column)}${online ? " NOT VALID" : ""}`,
+            `${held ? `${CAUTION_NOTE} the foreign key held with the same column and target; only its actions change, so existing rows still match.\n` : ""}${foreignKeySQL(table, column)}${online ? " NOT VALID" : ""}`,
           );
 
           if (online) {
@@ -1195,8 +1326,12 @@ const direction = (
       (!afterEnumerations.has(enumeration.name) &&
         !enumerationRenames.has(enumeration.name))
     ) {
-      statements.push(
+      // DROP TYPE without CASCADE fails while a column uses the type.
+      pushDrop(
         `DROP TYPE ${quoteIdentifier(temporary ?? enumeration.name)}`,
+        temporary
+          ? `type "${temporary}" held the previous labels of "${enumeration.name}" and is no longer used; dropping it loses no data.`
+          : `type "${enumeration.name}" is no longer used; dropping it loses no data.`,
       );
     }
   }
@@ -1204,6 +1339,13 @@ const direction = (
   for (const name of before.extensions ?? []) {
     if (!(after.extensions ?? []).includes(name)) {
       statements.push(keptExtensionSQL(name));
+    }
+  }
+
+  for (const drop of drops) {
+    if (drop.name === undefined || !created.has(drop.name)) {
+      statements[drop.position] =
+        `${CAUTION_NOTE} ${drop.note}\n${statements[drop.position]}`;
     }
   }
 
@@ -1221,49 +1363,66 @@ export const diffSchemas = (
       : migrationSnapshot(previous);
   const after =
     "version" in next ? parseMigrationSnapshot(next) : migrationSnapshot(next);
-  const reverseTables = Object.fromEntries(
-    Object.entries(options.renames?.tables ?? {}).map(([previous, next]) => [
-      next,
-      previous,
-    ]),
+  const renames = renameMaps(options.renames);
+  const reverseTables = new Map(
+    [...renames.tables].map(([previous, next]) => [next, previous] as const),
   );
-  const reverseColumns = Object.fromEntries(
-    Object.entries(options.renames?.columns ?? {}).map(([table, columns]) => [
-      reverseTables[table] ?? table,
-      Object.fromEntries(
-        Object.entries(columns).map(([previous, next]) => [next, previous]),
-      ),
-    ]),
+  const reverseColumns = new Map(
+    [...renames.columns].map(
+      ([table, columns]) =>
+        [
+          reverseTables.get(table) ?? table,
+          new Map(
+            [...columns].map(([previous, next]) => [next, previous] as const),
+          ),
+        ] as const,
+    ),
   );
-  const forwardCasts: Record<string, Record<string, string>> = {};
-  const reverseCasts: Record<string, Record<string, string>> = {};
+  const forwardCasts = new Map<string, Map<string, string>>();
+  const reverseCasts = new Map<string, Map<string, string>>();
 
   for (const [table, columns] of Object.entries(options.using ?? {})) {
-    forwardCasts[table] = Object.fromEntries(
-      Object.entries(columns).map(([column, conversion]) => [
-        column,
-        conversion.up,
-      ]),
+    for (const [column, conversion] of Object.entries(columns ?? {})) {
+      const missing = (["up", "down"] as const).filter((direction) => {
+        const expression = (
+          conversion as Partial<Record<string, unknown>> | undefined
+        )?.[direction];
+
+        return typeof expression !== "string" || !expression.trim();
+      });
+
+      if (missing.length) {
+        throw new Error(
+          `symmetria: the USING conversion for "${table}.${column}" needs both directions, and ${missing.map((direction) => `"${direction}"`).join(" and ")} ${missing.length === 1 ? "is" : "are"} missing or empty: { "using": { "${table}": { "${column}": { "up": "…", "down": "…" } } } }`,
+        );
+      }
+    }
+
+    forwardCasts.set(
+      table,
+      new Map(
+        Object.entries(columns).map(([column, conversion]) => [
+          column,
+          conversion.up,
+        ]),
+      ),
     );
-    const originalTable = reverseTables[table] ?? table;
-    reverseCasts[originalTable] = Object.fromEntries(
-      Object.entries(columns).map(([column, conversion]) => [
-        reverseColumns[originalTable]?.[column] ?? column,
-        conversion.down,
-      ]),
+    const originalTable = reverseTables.get(table) ?? table;
+    reverseCasts.set(
+      originalTable,
+      new Map(
+        Object.entries(columns).map(([column, conversion]) => [
+          reverseColumns.get(originalTable)?.get(column) ?? column,
+          conversion.down,
+        ]),
+      ),
     );
   }
 
   return {
     before,
     after,
-    up: direction(
-      before,
-      after,
-      options.renames ?? {},
-      forwardCasts,
-      options.online,
-    ),
+    up: direction(before, after, renames, forwardCasts, options.online),
     down: direction(
       after,
       before,

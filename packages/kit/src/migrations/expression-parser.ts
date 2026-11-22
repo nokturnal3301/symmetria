@@ -71,6 +71,9 @@ export const TYPED_LITERALS = new Set([
   "uuid",
   "json",
   "jsonb",
+  "timetz",
+  "inet",
+  "cidr",
 ]);
 
 /**

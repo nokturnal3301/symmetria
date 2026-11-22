@@ -124,25 +124,26 @@ const indexKey = (key: string) => {
   };
 };
 
-const typeAliases: Record<string, string> = {
-  int: "integer",
-  int4: "integer",
-  serial: "integer",
-  int8: "bigint",
-  bigserial: "bigint",
-  int2: "smallint",
-  bool: "boolean",
-  timestamptz: "timestamp with time zone",
-  timestamp: "timestamp without time zone",
-  varchar: "character varying",
-  char: "character",
-  decimal: "numeric",
-  dec: "numeric",
-  float8: "double precision",
-  float4: "real",
-  time: "time without time zone",
-  timetz: "time with time zone",
-};
+// A Map: a user type may be called `constructor`.
+const typeAliases: ReadonlyMap<string, string> = new Map([
+  ["int", "integer"],
+  ["int4", "integer"],
+  ["serial", "integer"],
+  ["int8", "bigint"],
+  ["bigserial", "bigint"],
+  ["int2", "smallint"],
+  ["bool", "boolean"],
+  ["timestamptz", "timestamp with time zone"],
+  ["timestamp", "timestamp without time zone"],
+  ["varchar", "character varying"],
+  ["char", "character"],
+  ["decimal", "numeric"],
+  ["dec", "numeric"],
+  ["float8", "double precision"],
+  ["float4", "real"],
+  ["time", "time without time zone"],
+  ["timetz", "time with time zone"],
+]);
 
 /** Compare declared and catalog types after resolving aliases such as timestamptz. */
 export const normalizeSqlType = (sqlType: string): string => {
@@ -165,7 +166,7 @@ export const normalizeSqlType = (sqlType: string): string => {
     ? base.slice(base.indexOf(".") + 1)
     : base;
 
-  const name = typeAliases[qualified] ?? qualified;
+  const name = typeAliases.get(qualified) ?? qualified;
   // format_type() prints modifiers without spaces: `numeric(12, 2)` is `numeric(12,2)`.
   const modifiers = match[2]?.replace(/\s+/g, "") ?? "";
 
@@ -397,6 +398,14 @@ export const detectDrift = async (
 
       // A generated column keeps its expression where a default would be.
       const expected = column.generated ?? column.default;
+      // `DEFAULT CURRENT_TIMESTAMP` is `.now`: both are the transaction's
+      // start, which PostgreSQL prints in the spelling it was written in.
+      const transactionStart = (text: string | null | undefined): boolean =>
+        text !== null &&
+        text !== undefined &&
+        /^\s*(?:now\(\)|CURRENT_TIMESTAMP|transaction_timestamp\(\))\s*$/i.test(
+          text,
+        );
       const stored = (generated: boolean, expression: string): string =>
         generated ? `GENERATED ALWAYS AS (${expression}) STORED` : expression;
 
@@ -405,6 +414,11 @@ export const detectDrift = async (
         (column.generated !== undefined) !== details.generated ||
         (expected !== undefined &&
           details.default !== null &&
+          !(
+            column.generated === undefined &&
+            transactionStart(expected) &&
+            transactionStart(details.default)
+          ) &&
           !(await expressionsMatch(
             [
               `(${expected})::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,

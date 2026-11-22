@@ -43,6 +43,36 @@ export const runInFrame = <Value>(
 ): Promise<Value> => frames.run(frame, operation);
 
 /**
+ * A pool connection the running code holds through a transaction, session or
+ * stream loop of that pool; see `free()` in pool.ts.
+ */
+export type Holder = {
+  readonly pool: object;
+  open: boolean;
+  readonly stream?: true;
+};
+
+/** The holders of the running code, of every pool, carried as its async context. */
+export const holders = new AsyncLocalStorage<readonly Holder[]>();
+
+/**
+ * What the running code holds: the nested callback it runs in and the pool
+ * connections. A read that starts later than it was made runs in the context
+ * where it was made, but with these from where it starts, so that it is
+ * refused where it would wait for itself instead of waiting forever.
+ */
+export const currentFrame = (): NestedFrame | undefined => frames.getStore();
+
+export const currentHolders = (): readonly Holder[] | undefined =>
+  holders.getStore();
+
+export const runHolding = <Value>(
+  frame: NestedFrame | undefined,
+  held: readonly Holder[] | undefined,
+  run: () => Value,
+): Value => frames.run(frame!, () => holders.run(held!, run));
+
+/**
  * Whether the caller runs inside the frame. A parent operation queued behind
  * its nested callback while that callback waits for it would never run.
  */

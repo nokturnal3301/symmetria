@@ -3,6 +3,8 @@
  */
 import { expressionSqlType } from "../plan/metadata";
 import { tsquerySql } from "./postgres/search";
+import { unconstrained } from "./postgres/render";
+import { negatable } from "../expressions/core";
 import type {
   PredicateDescription,
   ScopePredicate,
@@ -23,26 +25,51 @@ const sqlTypeOf = (node: ValueNode): string =>
 /** Lists longer than this bind as a single PostgreSQL array parameter. */
 const LARGE_LIST_THRESHOLD = 1000;
 
+/** Types whose values bind as they are, written out as the array's type. */
+const PLAIN_LIST_TYPE =
+  /^(?:smallint|integer|bigint|text|uuid|boolean|timestamptz|date|(?:numeric|varchar|character varying)(?:\(\d+(?:,\s*\d+)?\))?)$/;
+
+/**
+ * How a list longer than 1,000 values binds as one array parameter, or
+ * undefined to keep `IN ($1, …)`: the plain types above cast the array to
+ * their type (without a length or scale, which would cut or round the
+ * values); values bound with a cast (`$n::text::jsonb`, real, a vector) cast
+ * the array the same way (`$1::text[]::jsonb[]`); any other type, such as an
+ * enum, a timestamp or inet, leaves the array untyped, so PostgreSQL takes
+ * its type from the compared value as it does for each `$n` of an IN list.
+ */
 const largeListType = (
   description: Extract<PredicateDescription, { kind: "membership" }>,
-): string | undefined => {
+): { readonly cast?: string; readonly type?: string } | undefined => {
   if (
     !Array.isArray(description.values) ||
-    description.values.length <= LARGE_LIST_THRESHOLD ||
+    description.values.length <= LARGE_LIST_THRESHOLD
+  ) {
+    return undefined;
+  }
+
+  const first = description.values[0] as ValueNode;
+  const cast = first.kind === "parameter" ? first.cast : undefined;
+
+  if (
+    cast?.endsWith("]") ||
     !description.values.every(
-      (value: ValueNode) => value.kind === "parameter" && !value.cast,
+      (value: ValueNode) =>
+        value.kind === "parameter" &&
+        value.cast === cast &&
+        !Array.isArray(value.value),
     )
   ) {
     return undefined;
   }
 
+  if (cast) {
+    return { cast };
+  }
+
   const type = sqlTypeOf(description.value);
 
-  return /^(?:smallint|integer|bigint|text|uuid|boolean|timestamptz|date|(?:numeric|varchar|character varying)(?:\(\d+(?:,\s*\d+)?\))?)$/.test(
-    type,
-  )
-    ? type
-    : undefined;
+  return PLAIN_LIST_TYPE.test(type) ? { type } : {};
 };
 
 /** Stands for a $scope() filter in a shape-only compilation; never executed. */
@@ -103,8 +130,23 @@ export const predicateSql = (
       return `(${description.predicates.map((child) => predicateSql(compilation, child, bindings)).join(` ${description.operator} `)})`;
     case "scope":
       return scopeSql(compilation, description, bindings);
-    case "not":
-      return `NOT (${predicateSql(compilation, description.predicate, bindings)})`;
+    case "not": {
+      const negated = `NOT (${predicateSql(compilation, description.predicate, bindings)})`;
+      // `=`, `in()`, `between` and `contains()` answer FALSE for JSON null,
+      // which NOT turns into TRUE. The negation of the same predicate with
+      // JSON null read as SQL NULL (as isNot() and notIn() read it) only
+      // narrows the plain one, so both together are exactly that negation,
+      // and the plain one stays as written, as a CHECK or a partial index
+      // declares it, for the planner to match. A cursor's shape keeps the
+      // plain form alone.
+      const strict = compilation.shapeOnly
+        ? description.predicate
+        : negatable(description.predicate);
+
+      return strict === description.predicate
+        ? negated
+        : `(${negated} AND NOT (${predicateSql(compilation, strict, bindings)}))`;
+    }
     case "notTrue":
       return `(${predicateSql(compilation, description.predicate, bindings)}) IS NOT TRUE`;
     case "nullCheck":
@@ -130,9 +172,11 @@ export const predicateSql = (
 
       // An enum type's name is not known here to cast the parameter; the
       // comparison comes first, so PostgreSQL takes the type from it. As in
-      // the CASE form, a NULL row never matches a value under = or <>.
+      // the CASE form, each branch is TRUE or FALSE when the other one holds,
+      // so not() of it stays exact: bound to null it is the null check alone,
+      // and a NULL row never matches a value under = or <>.
       if (type === "enum") {
-        return `(${comparison} OR (${right} IS NULL AND ${whenNull}))`;
+        return `((${comparison} AND ${right} IS NOT NULL) OR (${right} IS NULL AND ${whenNull}))`;
       }
 
       const checked = renderer.cast(right, {
@@ -196,14 +240,29 @@ export const predicateSql = (
       }
 
       const left = operandSql(compilation, description.value, bindings);
-      const arrayType = largeListType(description);
+      const listType = largeListType(description);
+      // A page cursor's fingerprint keeps the list as 3.4.1 and earlier
+      // bound it: one parameter per value unless the type is a plain one.
+      const arrayType =
+        listType && (listType.type || !compilation.shapeOnly)
+          ? listType
+          : undefined;
 
       if (arrayType) {
         const values = (description.values as readonly ValueNode[]).map(
           (value) => (value as Extract<ValueNode, { kind: "parameter" }>).value,
         );
+        const bound = parameter(compilation, values);
+        const array = arrayType.cast
+          ? `${bound}::text[]::${unconstrained(arrayType.cast)}[]`
+          : arrayType.type
+            ? renderer.cast(bound, {
+                kind: "typed",
+                type: `${arrayType.type}[]`,
+              })
+            : bound;
 
-        return `${left} ${description.negated ? "<> ALL" : "= ANY"}(${renderer.cast(parameter(compilation, values), { kind: "typed", type: `${arrayType}[]` })})`;
+        return `${left} ${description.negated ? "<> ALL" : "= ANY"}(${array})`;
       }
 
       const operand = Array.isArray(description.values)

@@ -13,6 +13,10 @@ import {
   oneOf,
   customType,
   index,
+  uuid,
+  sql,
+  type Column,
+  type SchemaSnapshot,
 } from "../../../packages/runtime/src";
 import {
   diffSchemas,
@@ -20,6 +24,7 @@ import {
   lintMigration,
   lintMigrationSQL,
   type Migration,
+  type RenameHints,
 } from "../../../packages/kit/src";
 import { executionPlan } from "../../../packages/kit/src/migrations/execution";
 import {
@@ -483,13 +488,25 @@ CREATE INDEX "users_email_idx" ON users (email);`).map(([, level]) => level),
 test("SQL lint reviews every action of a multi-action ALTER TABLE", () => {
   expect(
     lint(
-      "ALTER TABLE users ADD COLUMN note text, ALTER COLUMN score TYPE text USING NULL;",
+      "ALTER TABLE users ADD COLUMN note text, ALTER COLUMN score TYPE text USING score::text;",
     ),
   ).toEqual([
     [
       1,
       "caution",
       "Changing a column type rewrites the table under an ACCESS EXCLUSIVE lock unless the cast is binary-coercible.",
+    ],
+  ]);
+  // USING NULL empties the column.
+  expect(
+    lint(
+      "ALTER TABLE users ADD COLUMN note text, ALTER COLUMN score TYPE text USING NULL;",
+    ),
+  ).toEqual([
+    [
+      1,
+      "destructive",
+      "USING gives every row the same value (NULL or a constant): every existing value is lost.",
     ],
   ]);
   expect(
@@ -729,4 +746,442 @@ test("lint of a saved migration rates a narrowing change as generate did", () =>
       'ALTER TABLE "users" ALTER COLUMN "name" TYPE varchar(5);',
     ).map((finding) => finding.level),
   ).not.toContain("destructive");
+});
+
+test("generate's review and lint of the saved SQL fail on the same generated changes", () => {
+  const one = (columns: Record<string, Column>) =>
+    schema({ t: table(columns) });
+  const users = () => table({ id: int.auto, name: text });
+  type Declared = { readonly $snapshot: () => SchemaSnapshot };
+  const scenarios: [string, Declared, Declared, RenameHints?][] = [
+    [
+      "identity column",
+      one({ code: text.primaryKey }),
+      one({ code: text.primaryKey, n: int.auto }),
+    ],
+    [
+      "unique column, constant default",
+      one({ id: int.auto }),
+      one({ id: int.auto, k: text.unique.default("x") }),
+    ],
+    [
+      "unique column, nullable",
+      one({ id: int.auto }),
+      one({ id: int.auto, k: text.unique.nullable }),
+    ],
+    [
+      "unique column, identity",
+      one({ code: text.primaryKey }),
+      one({ code: text.primaryKey, n: int.auto.unique }),
+    ],
+    [
+      "enum reorder",
+      one({ id: int.auto, s: oneOf("a", "b") }),
+      one({ id: int.auto, s: oneOf("b", "a") }),
+    ],
+    [
+      "enum reorder, unique",
+      one({ id: int.auto, s: oneOf("a", "b").unique }),
+      one({ id: int.auto, s: oneOf("b", "a").unique }),
+    ],
+    [
+      "enum to text",
+      one({ id: int.auto, s: oneOf("a", "b") }),
+      one({ id: int.auto, s: text }),
+    ],
+    [
+      "enum drops a label",
+      one({ id: int.auto, s: oneOf("a", "b") }),
+      one({ id: int.auto, s: oneOf("a") }),
+    ],
+    [
+      "composite key reordered",
+      schema({ t: table({ a: int, b: int }).primaryKey((t) => [t.a, t.b]) }),
+      schema({ t: table({ a: int, b: int }).primaryKey((t) => [t.b, t.a]) }),
+    ],
+    [
+      "key widened",
+      schema({ t: table({ a: int, b: int }).primaryKey((t) => [t.a]) }),
+      schema({ t: table({ a: int, b: int }).primaryKey((t) => [t.a, t.b]) }),
+    ],
+    [
+      "key moves",
+      one({ id: int.auto, code: text }),
+      one({ id: int, code: text.primaryKey }),
+    ],
+    [
+      "key moves to a new identity column",
+      one({ code: text.primaryKey }),
+      one({ id: int.auto, code: text }),
+    ],
+    [
+      "key on a new uuid column",
+      schema({ t: table({ a: int, b: int }).primaryKey((t) => [t.a, t.b]) }),
+      one({ id: uuid.v4, a: int, b: int }),
+    ],
+    [
+      "key on a new clock_timestamp() column",
+      schema({ t: table({ a: int, b: int }).primaryKey((t) => [t.a, t.b]) }),
+      one({
+        at: timestamptz.default(sql`clock_timestamp()`).primaryKey,
+        a: int,
+        b: int,
+      }),
+    ],
+    [
+      "unique column, clock_timestamp() default",
+      one({ id: int.auto }),
+      one({
+        id: int.auto,
+        at: timestamptz.default(sql`clock_timestamp()`).unique,
+      }),
+    ],
+    [
+      "unique column, gen_random_uuid() default",
+      one({ id: int.auto }),
+      one({ id: int.auto, k: uuid.default(sql`gen_random_uuid()`).unique }),
+    ],
+    [
+      "foreign key action",
+      schema({ u: users(), t: ({ u }) => table({ id: int.auto, owner: u }) }),
+      schema({
+        u: users(),
+        t: ({ u }) => table({ id: int.auto, owner: u.onDelete.cascade }),
+      }),
+    ],
+    [
+      "foreign key action, column renamed",
+      schema({ u: users(), t: ({ u }) => table({ id: int.auto, owner: u }) }),
+      schema({
+        u: users(),
+        t: ({ u }) => table({ id: int.auto, boss: u.onDelete.cascade }),
+      }),
+      { columns: { t: { owner_id: "boss_id" } } },
+    ],
+    [
+      "foreign key dropped",
+      schema({
+        u: users(),
+        t: ({ u }) => table({ id: int.auto, owner: u.noIndex }),
+      }),
+      schema({ u: users(), t: table({ id: int.auto, ownerId: int }) }),
+    ],
+    [
+      "foreign key on a column",
+      schema({ u: users(), t: table({ id: int.auto, uid: int }) }),
+      schema({
+        u: users(),
+        t: ({ u }) => table({ id: int.auto, uid: u.column("uid").noIndex }),
+      }),
+    ],
+    [
+      "index dropped",
+      one({ id: int.auto, a: text.index }),
+      one({ id: int.auto, a: text }),
+    ],
+    [
+      "unique dropped",
+      one({ id: int.auto, a: text.unique }),
+      one({ id: int.auto, a: text }),
+    ],
+    [
+      "check dropped",
+      schema({
+        t: table({ id: int.auto, a: int }).checks((t) => ({
+          pos: t.a.above(0),
+        })),
+      }),
+      one({ id: int.auto, a: int }),
+    ],
+    [
+      "check added",
+      one({ id: int.auto, a: int }),
+      schema({
+        t: table({ id: int.auto, a: int }).checks((t) => ({
+          pos: t.a.above(0),
+        })),
+      }),
+    ],
+    [
+      "unique index dropped",
+      schema({
+        t: table({ id: int.auto, a: text }).indexes((t) => ({
+          u: index(t.a).unique,
+        })),
+      }),
+      one({ id: int.auto, a: text }),
+    ],
+    ["column dropped", one({ id: int.auto, a: text }), one({ id: int.auto })],
+    [
+      "becomes unique",
+      one({ id: int.auto, a: text }),
+      one({ id: int.auto, a: text.unique }),
+    ],
+    [
+      "becomes not null",
+      one({ id: int.auto, a: text.nullable }),
+      one({ id: int.auto, a: text }),
+    ],
+  ];
+  const fails = (levels: readonly string[]) =>
+    levels.some((level) => level !== "caution");
+  const rating = new Map<string, boolean>();
+
+  for (const online of [false, true]) {
+    for (const [label, before, after, renames] of scenarios) {
+      const plan = diffSchemas(before.$snapshot(), after.$snapshot(), {
+        online,
+        ...(renames ? { renames } : {}),
+      });
+      const review = lintMigration(plan, renames).map(
+        (finding) => finding.level,
+      );
+      const saved = lintMigrationSQL(
+        plan.up.map((sql) => `${sql};`).join("\n"),
+      ).map((finding) => finding.level);
+
+      expect([label, online, fails(saved)]).toEqual([
+        label,
+        online,
+        fails(review),
+      ]);
+
+      if (!online) {
+        rating.set(label, fails(review));
+      }
+    }
+  }
+
+  // And both are right: what can fail or lose data fails, what cannot passes.
+  expect(Object.fromEntries(rating)).toEqual({
+    "identity column": false,
+    "unique column, constant default": true,
+    "unique column, nullable": false,
+    "unique column, identity": false,
+    "enum reorder": false,
+    "enum reorder, unique": false,
+    "enum to text": false,
+    "enum drops a label": true,
+    "composite key reordered": false,
+    "key widened": false,
+    "key moves": true,
+    // Every existing row gets its own value.
+    "key moves to a new identity column": false,
+    "key on a new uuid column": false,
+    // clock_timestamp() repeats across rows written in one microsecond.
+    "key on a new clock_timestamp() column": true,
+    "unique column, clock_timestamp() default": true,
+    "unique column, gen_random_uuid() default": false,
+    "foreign key action": false,
+    "foreign key action, column renamed": false,
+    "foreign key dropped": false,
+    "foreign key on a column": true,
+    "index dropped": false,
+    "unique dropped": false,
+    "check dropped": false,
+    "check added": true,
+    "unique index dropped": false,
+    "column dropped": true,
+    "becomes unique": true,
+    "becomes not null": true,
+  });
+});
+
+test("SQL lint rates column constraints in ADD COLUMN, spelled-out truncating casts and USING NULL", () => {
+  expect(
+    lint(`ALTER TABLE t ADD COLUMN x int NOT NULL DEFAULT 99 REFERENCES u(id);
+ALTER TABLE t ADD COLUMN y int DEFAULT 5 CHECK (y > 10);
+ALTER TABLE t ADD COLUMN z int PRIMARY KEY;
+ALTER TABLE t ADD COLUMN k text DEFAULT 'x' UNIQUE;
+ALTER TABLE t ALTER COLUMN name TYPE varchar(2) USING name::pg_catalog.varchar(2);
+ALTER TABLE t ALTER COLUMN name TYPE varchar(2) USING CAST(name AS "varchar"(2));
+ALTER TABLE t ALTER COLUMN name TYPE text USING NULL::text;`).map(
+      ([statement, level]) => [statement, level],
+    ),
+  ).toEqual([
+    [1, "blocking"],
+    [2, "blocking"],
+    [3, "blocking"],
+    [4, "blocking"],
+    [5, "destructive"],
+    [6, "destructive"],
+    [7, "destructive"],
+  ]);
+  // Without a value for existing rows, REFERENCES, CHECK and UNIQUE see only
+  // NULL and pass; an identity gives each row its own value.
+  expect(
+    lint(`ALTER TABLE t ADD COLUMN x int REFERENCES u(id);
+ALTER TABLE t ADD COLUMN y int CHECK (y > 10);
+ALTER TABLE t ADD COLUMN k text UNIQUE;
+ALTER TABLE t ADD COLUMN n int GENERATED ALWAYS AS IDENTITY NOT NULL;
+ALTER TABLE t ADD CONSTRAINT t_n_key UNIQUE (n);
+CREATE UNIQUE INDEX t_k_idx ON t (k);
+SET TIME ZONE 'UTC';
+RESET TIME ZONE;`).map(([statement, level]) => [statement, level]),
+  ).toEqual([
+    [4, "caution"],
+    [5, "caution"],
+    [6, "caution"],
+  ]);
+});
+
+test("a caution note counts only on the statements generate writes it on", () => {
+  const NOTE = "-- symmetria: caution: generate knew better.\n";
+  const levels = (sql: string) => lint(sql).map(([, level]) => level);
+  const noted = (statement: string) => levels(`${NOTE}${statement};`);
+
+  expect(noted('DROP INDEX "t_a_idx"')).toEqual(["caution"]);
+  expect(noted('DROP INDEX CONCURRENTLY "t_a_idx"')).toEqual(["caution"]);
+  expect(noted('ALTER TABLE "t" DROP CONSTRAINT "t_a_key"')).toEqual([
+    "caution",
+  ]);
+  expect(noted('DROP TYPE "t_s_enum"')).toEqual(["caution"]);
+  // A key added back after its drop in the same migration (a primary key,
+  // also on a renamed table; a foreign key of the same name).
+  expect(
+    levels(`ALTER TABLE "t" DROP CONSTRAINT "t_pkey";
+ALTER TABLE "t" RENAME TO "v";
+${NOTE}ALTER TABLE "v" ADD CONSTRAINT "v_pkey" PRIMARY KEY ("b", "a");`).at(-1),
+  ).toBe("caution");
+  expect(
+    levels(`ALTER TABLE "t" DROP CONSTRAINT "t_u_fkey";
+${NOTE}ALTER TABLE "t" ADD CONSTRAINT "t_u_fkey" FOREIGN KEY ("u") REFERENCES "u" ("id") ON DELETE CASCADE;`),
+  ).toEqual(["caution", "caution"]);
+  // Anywhere else the note is a comment: a key with no drop on its table
+  // before it, CHECK, UNIQUE, or what loses data.
+  expect(
+    noted('ALTER TABLE "t" ADD CONSTRAINT "t_pkey" PRIMARY KEY ("a")'),
+  ).toEqual(["blocking"]);
+  expect(
+    levels(`ALTER TABLE "other" DROP CONSTRAINT "other_u_fkey";
+${NOTE}ALTER TABLE "t" ADD CONSTRAINT "t_u_fkey" FOREIGN KEY ("u") REFERENCES "u" ("id");`).at(
+      -1,
+    ),
+  ).toBe("blocking");
+  expect(
+    noted('ALTER TABLE "t" ADD CONSTRAINT "t_c_check" CHECK ("a" > 0)'),
+  ).toEqual(["blocking"]);
+  expect(
+    noted('ALTER TABLE "t" ADD CONSTRAINT "t_a_key" UNIQUE ("a")'),
+  ).toEqual(["blocking"]);
+  expect(noted('DROP TABLE "t"')).toEqual(["destructive"]);
+  expect(noted('ALTER TABLE "t" DROP COLUMN "a"')).toEqual(["destructive"]);
+  expect(noted('DROP INDEX "t_a_idx" CASCADE')).toEqual(["destructive"]);
+  expect(
+    noted('ALTER TABLE "t" DROP CONSTRAINT "t_a_key", DROP COLUMN "a"'),
+  ).toEqual(["destructive"]);
+  expect(
+    noted('ALTER TABLE "t" ALTER COLUMN "a" TYPE text USING NULL'),
+  ).toEqual(["destructive"]);
+});
+
+test("SQL lint takes only a whole constant in USING as emptying the column", () => {
+  const retyped = (using: string) =>
+    lint(`ALTER TABLE t ALTER COLUMN c TYPE text USING ${using};`).map(
+      ([, level]) => level,
+    );
+
+  for (const constant of [
+    "NULL",
+    "(NULL)::text",
+    "0",
+    "'{}'::jsonb",
+    "jsonb '{}'",
+    "CAST(NULL AS text)",
+    "timestamp with time zone '2024-01-01'",
+  ]) {
+    expect([constant, retyped(constant)]).toEqual([constant, ["destructive"]]);
+  }
+
+  // A column compared or converted with a literal keeps its values.
+  for (const conversion of [
+    "c AT TIME ZONE 'Europe/Paris'",
+    "c LIKE 'y%'",
+    "c IS DISTINCT FROM 'n'",
+    "c SIMILAR TO 'x%'",
+    "date AT TIME ZONE 'UTC'",
+    "NULLIF(c, '')",
+    "c || ''",
+  ]) {
+    expect([conversion, retyped(conversion)]).toEqual([
+      conversion,
+      ["caution"],
+    ]);
+  }
+});
+
+test("SQL lint forgets what it knew of an added column once a statement may write it", () => {
+  const last = (sql: string) => lint(sql).at(-1)?.slice(1, 2)[0];
+
+  // The backfill between ADD COLUMN and the key can make duplicates.
+  expect(
+    last(`ALTER TABLE t ADD COLUMN s text;
+UPDATE t SET s = 'x';
+ALTER TABLE t ADD CONSTRAINT t_s_key UNIQUE (s);`),
+  ).toBe("blocking");
+  expect(
+    last(`ALTER TABLE t ADD COLUMN s text;
+UPDATE t SET s = 'x';
+CREATE UNIQUE INDEX t_s_idx ON t (s);`),
+  ).toBe("blocking");
+  expect(
+    last(`ALTER TABLE t ADD COLUMN n serial;
+UPDATE t SET n = 1;
+ALTER TABLE t ADD PRIMARY KEY (n);`),
+  ).toBe("blocking");
+  // So can a type change with USING, and a DO block anywhere.
+  expect(
+    last(`ALTER TABLE t ADD COLUMN s text;
+ALTER TABLE t ALTER COLUMN s TYPE varchar(10) USING 'x';
+ALTER TABLE t ADD CONSTRAINT t_s_key UNIQUE (s);`),
+  ).toBe("blocking");
+  expect(
+    last(`ALTER TABLE t ADD COLUMN s text;
+DO $$ BEGIN UPDATE t SET s = 'x'; END $$;
+ALTER TABLE t ADD CONSTRAINT t_s_key UNIQUE (s);`),
+  ).toBe("blocking");
+  // A foreign key on a column backfilled first checks the values it got.
+  expect(
+    last(`ALTER TABLE t ADD COLUMN u int;
+UPDATE t SET u = 5;
+ALTER TABLE t ADD CONSTRAINT t_u_fkey FOREIGN KEY (u) REFERENCES v (id);`),
+  ).toBe("blocking");
+  // An index, a default or another table's DDL write nothing.
+  expect(
+    last(`ALTER TABLE t ADD COLUMN s text;
+CREATE INDEX t_id_idx ON t (id);
+ALTER TABLE t ALTER COLUMN s SET DEFAULT 'x';
+ALTER TABLE t ADD CONSTRAINT t_s_key UNIQUE (s);`),
+  ).toBe("caution");
+});
+
+test("SQL lint counts only sequences and uuid generators as giving each existing row its own value", () => {
+  const key = (definition: string) =>
+    lint(`ALTER TABLE t ADD COLUMN k ${definition};
+ALTER TABLE t ADD CONSTRAINT t_pkey PRIMARY KEY (k);`)
+      .filter(([statement]) => statement === 2)
+      .map(([, level]) => level);
+
+  for (const distinct of [
+    "uuid DEFAULT gen_random_uuid() NOT NULL",
+    "uuid DEFAULT uuidv7() NOT NULL",
+    "uuid DEFAULT public.uuid_generate_v4() NOT NULL",
+    "bigint DEFAULT nextval('t_k_seq'::regclass) NOT NULL",
+    "bigserial",
+    "integer GENERATED ALWAYS AS IDENTITY NOT NULL",
+  ]) {
+    expect([distinct, key(distinct)]).toEqual([distinct, ["caution"]]);
+  }
+
+  // Evaluated per row, but the values repeat: rows written within one
+  // microsecond share a clock_timestamp(), and a key over them fails.
+  for (const repeating of [
+    "timestamptz DEFAULT clock_timestamp() NOT NULL",
+    "text DEFAULT timeofday() NOT NULL",
+    "double precision DEFAULT random() NOT NULL",
+    "text DEFAULT left(gen_random_uuid()::text, 2) NOT NULL",
+    "bigint DEFAULT nextval('t_k_seq') % 2 NOT NULL",
+  ]) {
+    expect([repeating, key(repeating)]).toEqual([repeating, ["blocking"]]);
+  }
 });

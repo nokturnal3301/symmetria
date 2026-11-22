@@ -57,16 +57,23 @@ export const runPostgresSession = async <Result>(
     }
   };
 
+  // Like every operation, a refused one rejects rather than throwing.
   const session: SessionDriver = Object.freeze({
     cancel: () => {
       if (!active) {
-        throw new Error("symmetria: session context is closed");
+        return Promise.reject(
+          new Error("symmetria: session context is closed"),
+        );
       }
 
       return cancellations.track(pool.cancel(pid));
     },
     execute: (query) => {
-      available();
+      try {
+        available();
+      } catch (error) {
+        return Promise.reject(error);
+      }
 
       return pending.track(queue.run(() => connection.execute(query)));
     },

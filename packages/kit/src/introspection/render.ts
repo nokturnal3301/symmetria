@@ -15,6 +15,7 @@ import type {
   PulledMember,
   PulledReference,
   PulledSchema,
+  PulledSearch,
   PulledTable,
 } from "./model";
 
@@ -27,6 +28,8 @@ export type RenderOptions = {
   readonly header?: readonly string[];
   /** Module specifier for the pgvector entry (default: `${module}/vector`). */
   readonly vectorModule?: string;
+  /** Module specifier for the search entry (default: `${module}/search`). */
+  readonly searchModule?: string;
 };
 
 const PASSTHROUGH = `/** Driver-native values for types without a builder; replace with real codecs when convenient. */
@@ -475,6 +478,28 @@ const indexSource = (
   return source;
 };
 
+/** `t.title`, `[t.title, t.body]` or `{ A: t.title, B: [t.body, t.tags] }`. */
+const searchParts = (search: PulledSearch, binding: string): string => {
+  const columns = (members: readonly string[]) =>
+    members.length === 1
+      ? `${binding}.${members[0]}`
+      : `[${members.map((member) => `${binding}.${member}`).join(", ")}]`;
+
+  if (search.parts.every((part) => part.weight === "A")) {
+    return columns(search.parts.map((part) => part.member));
+  }
+
+  return `{ ${(["A", "B", "C", "D"] as const)
+    .flatMap((weight) => {
+      const members = search.parts
+        .filter((part) => part.weight === weight)
+        .map((part) => part.member);
+
+      return members.length ? [`${weight}: ${columns(members)}`] : [];
+    })
+    .join(", ")} }`;
+};
+
 const tableSource = (
   table: PulledTable,
   imports: Set<string>,
@@ -552,6 +577,18 @@ const tableSource = (
       ...table.checks.map(
         (check) =>
           `  ${check.key}: ${conditionSource(check.condition, imports)},${comment(check.comments)}`,
+      ),
+      "}))",
+    ]);
+  }
+
+  if (table.searches?.length) {
+    imports.add("fullText");
+    chain.push([
+      `.search((${table.binding}) => ({`,
+      ...table.searches.map(
+        (search) =>
+          `  ${search.key}: { words: fullText(${searchParts(search, table.binding)}${search.language === "simple" ? "" : `, { language: ${quoteString(search.language)} }`}) },`,
       ),
       "}))",
     ]);
@@ -645,6 +682,11 @@ export const renderSchema = (
         `import { ${vectorBuilders.join(", ")} } from ${quoteString(options.vectorModule ?? `${module}/vector`)};`,
       ]
     : [];
+  const searchImport = imports.has("fullText")
+    ? [
+        `import { fullText } from ${quoteString(options.searchModule ?? `${module}/search`)};`,
+      ]
+    : [];
   const sections = [
     header.map((line) => `// ${line}`).join("\n"),
     [
@@ -653,6 +695,7 @@ export const renderSchema = (
         module,
       ),
       ...vectorImport,
+      ...searchImport,
     ].join("\n"),
     ...(passthrough ? [PASSTHROUGH] : []),
     ...(numbers ? [AS_NUMBER] : []),
