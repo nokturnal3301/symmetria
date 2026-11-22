@@ -58,6 +58,41 @@ export type DriftOptions = {
   readonly ignoreTables?: readonly string[];
 };
 
+/** The text without parentheses around all of it: `((a))` is `a`. */
+const unwrapped = (text: string): string => {
+  let current = text;
+
+  while (current.startsWith("(") && current.endsWith(")")) {
+    let depth = 0;
+    let closes = -1;
+
+    for (let index = 0; index < current.length; index += 1) {
+      const char = current[index];
+
+      if (char === '"' || char === "'") {
+        index = current.indexOf(char, index + 1);
+
+        if (index < 0) {
+          return current;
+        }
+      } else if (char === "(") {
+        depth += 1;
+      } else if (char === ")" && (depth -= 1) === 0) {
+        closes = index;
+        break;
+      }
+    }
+
+    if (closes !== current.length - 1) {
+      return current;
+    }
+
+    current = current.slice(1, -1).trim();
+  }
+
+  return current;
+};
+
 /**
  * A declared key's ordering and collation. PostgreSQL stores a key's top-level
  * `COLLATE` as the key's collation, not in its expression, and EXPLAIN does not
@@ -69,9 +104,10 @@ const indexKey = (key: string) => {
   )!;
   const descending = ordering[1]?.toUpperCase() === "DESC";
   const expression = key.slice(0, ordering.index);
+  // `((name COLLATE "C"))` is the same key: parentheses around it say nothing.
   const collated =
     /^\((.*)\s+COLLATE\s+("(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_]*)\)$/is.exec(
-      expression.trim(),
+      `(${unwrapped(expression.trim())})`,
     );
 
   return {
@@ -129,8 +165,14 @@ export const normalizeSqlType = (sqlType: string): string => {
     ? base.slice(base.indexOf(".") + 1)
     : base;
 
+  const name = typeAliases[qualified] ?? qualified;
   // format_type() prints modifiers without spaces: `numeric(12, 2)` is `numeric(12,2)`.
-  return `${typeAliases[qualified] ?? qualified}${match[2]?.replace(/\s+/g, "") ?? ""}`;
+  const modifiers = match[2]?.replace(/\s+/g, "") ?? "";
+
+  // A precision without a scale has scale 0, as PostgreSQL stores it.
+  return name === "numeric" && /^\(\d+\)$/.test(modifiers)
+    ? `${name}${modifiers.slice(0, -1)},0)`
+    : `${name}${modifiers}`;
 };
 
 /** A type name to_regtype() can always parse: one word, optionally in a schema, optionally an array. */
@@ -439,11 +481,15 @@ export const detectDrift = async (
         definition.method !== live.method ||
         declaredKeys.length !== live.keys.length ||
         definition.include.length !== live.included.length ||
-        declaredKeys.some(
-          (_key, position) =>
-            (definition.opclasses?.[position] ?? null) !==
-            (live.opclasses[position] ?? null),
-        ) ||
+        // A declared class matches by name, also the type's default one
+        // (`text_ops`), which the catalog otherwise reports as no class.
+        declaredKeys.some((_key, position) => {
+          const declared = definition.opclasses?.[position] ?? null;
+
+          return declared === null
+            ? (live.opclasses[position] ?? null) !== null
+            : declared !== live.opclass_names[position];
+        }) ||
         !sameStorage(definition.with, live.reloptions) ||
         declaredKeys.some(
           (key, position) =>

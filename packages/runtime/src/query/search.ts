@@ -43,10 +43,19 @@ const template = (strings: string[], ...values: unknown[]) =>
 /**
  * A question as a full-text query that matches any of its words: `websearch`
  * would demand all of them, and a question shares few words with its answer.
- * Only letters and digits survive, so the raw query syntax cannot break.
+ * A word keeps its combining marks (Hindi, Thai, Arabic vowels, decomposed
+ * accents) and the `@ . - _ /` inside it, so an address or a host name stays
+ * the one word PostgreSQL's parser makes of it. Nothing else survives, so the
+ * raw query syntax cannot break.
  */
 const anyWord = (text: string): string =>
-  [...new Set(text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])]
+  [
+    ...new Set(
+      text
+        .toLowerCase()
+        .match(/[\p{L}\p{N}\p{M}]+(?:[@._\-/][\p{L}\p{N}\p{M}]+)*/gu) ?? [],
+    ),
+  ]
     .slice(0, 64)
     .join(" | ");
 
@@ -521,19 +530,35 @@ export const createSearch = (
   };
 };
 
+/** A model's answer as a vector it can store: its length, finite numbers only. */
+const modelVector = (
+  model: EmbeddingModel,
+  vector: readonly number[] | undefined,
+  what: string,
+): readonly number[] => {
+  if (!vector || vector.length !== model.size) {
+    throw new Error(
+      `symmetria: ${model.name} returned ${vector ? `${vector.length} numbers` : "nothing"} for ${what}; ${model.size} expected`,
+    );
+  }
+
+  // pgvector stores no NaN or infinity; a model that answers one failed.
+  if (!vector.every(Number.isFinite)) {
+    throw new Error(
+      `symmetria: ${model.name} returned a number that is not finite for ${what}`,
+    );
+  }
+
+  return vector;
+};
+
 const embedQuery = async (
   model: EmbeddingModel,
   text: string,
 ): Promise<readonly number[]> => {
   const [vector] = await model.embed([text], "query");
 
-  if (!vector || vector.length !== model.size) {
-    throw new Error(
-      `symmetria: ${model.name} returned ${vector ? `${vector.length} numbers` : "nothing"} for a question; ${model.size} expected`,
-    );
-  }
-
-  return vector;
+  return modelVector(model, vector, "a question");
 };
 
 /** The text a model embeds for a row: its source columns, one per paragraph. */
@@ -553,40 +578,106 @@ type Embedded = {
   readonly column: string;
   readonly model: EmbeddingModel;
   readonly sources: readonly string[];
+  /**
+   * Source columns whose value a row that leaves them out does not tell:
+   * PostgreSQL fills in their default.
+   */
+  readonly defaults?: ReadonlySet<string>;
 };
 
 export const embeddedSearches = (
   declared: readonly Search[],
   sourceNames: (search: NonNullable<Search["meaning"]>) => readonly string[],
+  table?: TableSnapshot,
 ): readonly Embedded[] =>
-  declared.flatMap((search) =>
-    search.meaning
-      ? [
-          {
-            column: search.name,
-            model: search.meaning.model,
-            sources: sourceNames(search.meaning),
-          },
-        ]
-      : [],
-  );
+  declared.flatMap((search) => {
+    if (!search.meaning) {
+      return [];
+    }
+
+    const sources = sourceNames(search.meaning);
+
+    return [
+      {
+        column: search.name,
+        model: search.meaning.model,
+        sources,
+        defaults: new Set(
+          sources.filter(
+            (name) =>
+              table?.columns.find((column) => column.name === name)?.default !==
+              undefined,
+          ),
+        ),
+      },
+    ];
+  });
+
+/** A row as a write takes it, also one built without a prototype (nested inserts). */
+const writtenRow = (value: unknown): value is Record<string, unknown> =>
+  !!value &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  (Object.getPrototypeOf(value) === Object.prototype ||
+    Object.getPrototypeOf(value) === null);
+
+/**
+ * The text a row's embedding is made of, or undefined when the row does not
+ * tell it: a source column holds an SQL expression, or is left out where
+ * PostgreSQL decides its value (a default, or the existing row of an upsert).
+ */
+const knownText = (
+  search: Embedded,
+  row: Record<string, unknown>,
+  conflict: boolean,
+): string | undefined => {
+  for (const name of search.sources) {
+    const value = row[name];
+
+    if (value === undefined) {
+      if (conflict || search.defaults?.has(name)) {
+        return undefined;
+      }
+    } else if (value !== null && typeof value !== "string") {
+      return undefined;
+    }
+  }
+
+  return documentText(search.sources, row);
+};
 
 /**
  * Rows about to be written, with the embeddings their searches keep. A row
- * that brings its own embedding, or whose text is not plain strings, is left
- * as it is; every model is asked once for all the rows that need it.
+ * that brings its own embedding keeps it; every model is asked once for all
+ * the rows that need it. A row whose text is empty, or not known before
+ * PostgreSQL writes it (an SQL expression, a left-out column with a default,
+ * a left-out column an upsert keeps), gets no embedding (`null`), which
+ * `reindex()` computes later; so every row carries the column, as a bulk
+ * write requires. `conflict`: the write may update an existing row.
  */
 export const embedRows = async (
   embedded: readonly Embedded[],
   rows: readonly Record<string, unknown>[],
+  conflict = false,
 ): Promise<Record<string, unknown>[]> => {
   const result = rows.map((row) => ({ ...row }));
 
-  for (const { column, model, sources } of embedded) {
+  for (const search of embedded) {
+    const { column, model } = search;
     const missing = result.flatMap((row, position) => {
-      const text = row[column] === undefined ? documentText(sources, row) : "";
+      if (row[column] !== undefined) {
+        return [];
+      }
 
-      return text ? [{ position, text }] : [];
+      const text = knownText(search, row, conflict);
+
+      if (!text) {
+        row[column] = null;
+
+        return [];
+      }
+
+      return [{ position, text }];
     });
 
     if (!missing.length) {
@@ -605,15 +696,7 @@ export const embedRows = async (
     }
 
     missing.forEach(({ position }, at) => {
-      const vector = vectors[at]!;
-
-      if (vector.length !== model.size) {
-        throw new Error(
-          `symmetria: ${model.name} returned ${vector.length} numbers; ${model.size} expected`,
-        );
-      }
-
-      result[position]![column] = vector;
+      result[position]![column] = modelVector(model, vectors[at], "a text");
     });
   }
 
@@ -627,10 +710,10 @@ export const needsEmbedding = (
 ): boolean =>
   rows.some(
     (row) =>
-      plainRecord(row) &&
+      writtenRow(row) &&
       embedded.some(
-        ({ column, sources }) =>
-          row[column] === undefined && documentText(sources, row) !== "",
+        (search) =>
+          row[search.column] === undefined && !!knownText(search, row, false),
       ),
   );
 
@@ -645,7 +728,13 @@ const TERMINALS = new Set(["then", "catch", "finally", "execute"]);
 export const deferredWrite = (
   start: (
     chained: (builder: object) => object,
-  ) => Promise<{ readonly builder: object }>,
+    /** The chained calls, such as `onConflict("slug")`, with their arguments. */
+    calls: readonly (readonly [string, readonly unknown[]])[],
+  ) => Promise<{
+    readonly builder: object;
+    /** The chained calls were already made on `builder`. */
+    readonly chained?: true;
+  }>,
   chain: readonly (readonly [string, readonly unknown[]])[] = [],
 ): object => {
   let running: Promise<unknown> | undefined;
@@ -658,8 +747,12 @@ export const deferredWrite = (
       builder,
     );
   const run = () =>
-    (running ??= start(chained).then(({ builder }) =>
-      (chained(builder) as { execute: () => Promise<unknown> }).execute(),
+    (running ??= start(chained, chain).then((started) =>
+      (
+        (started.chained ? started.builder : chained(started.builder)) as {
+          execute: () => Promise<unknown>;
+        }
+      ).execute(),
     ));
 
   return new Proxy(Object.create(null) as object, {
@@ -845,8 +938,8 @@ export const createReindex =
         last = rows.at(-1)![key];
 
         const filled = await embedRows([search], rows);
-        const written = filled.filter(
-          (row) => row[search.column] !== undefined,
+        const written = filled.filter((row) =>
+          Array.isArray(row[search.column]),
         );
 
         if (!written.length) {

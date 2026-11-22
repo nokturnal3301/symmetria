@@ -88,8 +88,8 @@ const HEADLINE_KEYS: Record<keyof SearchHeadlineRendering, string> = {
   fragmentDelimiter: "FragmentDelimiter",
 };
 
-/** The ts_headline() options literal, or undefined when every option is default. */
-export const headlineOptionsSql = (
+/** The ts_headline() options text, or undefined when every option is default. */
+export const headlineOptionsText = (
   options: SearchHeadlineRendering,
 ): string | undefined => {
   const entries = (
@@ -109,16 +109,14 @@ export const headlineOptionsSql = (
     return [`${HEADLINE_KEYS[key]}=${text}`];
   });
 
-  return entries.length ? sqlString(entries.join(", ")) : undefined;
+  return entries.length ? entries.join(", ") : undefined;
 };
 
+/** `options` is the bound options text: its values stay out of the SQL text. */
 export const searchHeadlineSql = (
   language: string,
   text: string,
   query: string,
-  options: SearchHeadlineRendering,
-): string => {
-  const literal = headlineOptionsSql(options);
-
-  return `ts_headline(${sqlString(language)}, ${text}, ${query}${literal ? `, ${literal}` : ""})`;
-};
+  options: string | undefined,
+): string =>
+  `ts_headline(${sqlString(language)}, ${text}, ${query}${options ? `, ${options}::text` : ""})`;

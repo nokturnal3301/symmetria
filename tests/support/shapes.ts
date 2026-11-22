@@ -545,7 +545,9 @@ export const shapeTests = (): void => {
           },
           {
             distinct: true,
-            orderBy: (posts) => posts.author.name.ascending,
+            // A path is the post's own author; the cross-joined row is the
+            // selected field.
+            orderBy: (_posts, { selected }) => selected.name.ascending,
           },
         ),
       ).toEqual([{ name: "Ada" }, { name: "Grace" }, { name: "Lin" }]);

@@ -1,5 +1,193 @@
 # Changelog
 
+## 3.4.0 — 2026-11-22
+
+Fixes from a bug hunt on 3.3.0: wrong results, lost or wrong stored data,
+crashes and hangs.
+
+### Runtime (`symmetria`)
+
+- **Changed:** `UPDATE` and `DELETE` refuse a relation quantifier that holds for
+  every row, as they refuse an empty filter ("where() leaves no condition"):
+  `every()` over a list whose entries were all skipped, `none()` or
+  `not(some())` over an empty `in([])`, `notExists()` of a query that finds
+  nothing. Before, such a write reached every row of the table.
+- **Changed:** a prepared lookup by key (`by.<key>(p.x)`, `byId(p.id)`, `get`,
+  `find`) refuses a parameter declared `.nullable`: bound to `null` it would
+  compare as `IS NULL` and reach every row whose key is NULL.
+- **Changed:** on a nullable `jsonb` column, `is(null)` and `isNot(null)` count
+  a stored JSON `null` as null, as reading it back and a JSON path do; a
+  prepared `path.is(p)` bound to `null` does the same.
+- **Changed:** in option callbacks (`where`, `orderBy`, …), `join`, `innerJoin`
+  and `leftJoin` of a relation without `.as()` return the JOIN of that relation
+  and kind the projection made, as documented. Before, each call joined the
+  relation again and rows multiplied (3 posts became 18 rows). With two such
+  JOINs in the query, a call without a name is refused. In the projection each
+  call is still a JOIN of its own.
+- **Changed:** a path through a relation after `crossJoin()` of that relation
+  (`post.editor.name` after `crossJoin(post.editor)`) reads the row's own
+  related row; it read the cross-joined row, which gave wrong values and
+  filters. The cross-joined row is the value `crossJoin()` returns, a selected
+  field, or a path that names the JOIN's alias
+  (`crossJoin(post.editor.as("any"))`, then `post.editor.as("any").name`).
+- **Changed:** an upsert row that leaves out one of the embedded columns is
+  written without an embedding (`NULL`, for `reindex()`); so is a row with a SQL
+  expression in one of them. Before, the embedding was made of the columns the
+  row carried and described text the stored row did not have.
+- **Changed:** a `traced()` span of a failed statement names the error by class,
+  SQLSTATE and constraint (`QueryError (23505) on constraint "…"`) instead of
+  recording PostgreSQL's message and stack, which can quote a value.
+- **Changed:** on a JSON path and a nullable `jsonb` column, `isNot()`,
+  `notIn()`, `above()`, `below()` and `isDistinctFrom(null)` treat a stored JSON
+  `null` as null, as `is(null)` does: `isNot(3)` no longer returns rows whose
+  value is JSON null.
+- **Changed:** an `update()` or `delete()` whose filter leaves no condition (a
+  list emptied by request values, `where: { authorId: undefined }`) is refused
+  when it runs or compiles, like a missing `where()`, so the write's `catch()`
+  sees it; it threw while the write was built.
+- **Changed:** a session PostgreSQL ends because a transaction was idle or open
+  too long (SQLSTATE 25P03, 25P04) is a `ConnectionError` of kind `connection`
+  on both drivers; it was a plain `QueryError` on Bun. On `symmetria/pg` a lost
+  connection reports the server's reason (`57P01`) instead of the generic
+  `08006`.
+- Upsert keys PostgreSQL holds equal in another spelling (`10.0.0.1` and
+  `10.0.0.1/32`, `1 day` and `24:00:00`) are refused with
+  `DuplicateConflictKeyError` instead of PostgreSQL's "cannot affect row a
+  second time"; an upsert split into several statements checks its keys with
+  PostgreSQL first, where the later row used to overwrite the earlier one.
+  Timestamp keys before 2000 are rounded as PostgreSQL rounds them.
+- A prepared `.nullable` parameter on an enum column compares like the literal
+  (`isNot(p.state)` left out NULL rows only for the literal).
+- `aggregate()` of a source with `limit` or `offset` aggregates the rows they
+  leave; before, they applied to the one result row.
+- `count()` and `exists()` of a query whose projection aggregates every row (no
+  `groupBy`) count its one row.
+- `$batch` runs reads that cannot share one statement (two CTEs of one name)
+  separately instead of failing all of them.
+- A relation's aggregate or quantifier inside the first shape of the same
+  relation (`user.posts((post) => ({ total: user.posts.count() }))`) works again
+  (it failed since 3.1.0).
+- DISTINCT ordered by a `bigint` or `numeric` column works inside `$batch`, a
+  nested query and a relation collection.
+- A path to an enum field of a nested object in a CTE or derived table reads as
+  text instead of failing ("type enum does not exist").
+- Arrays the driver leaves as PostgreSQL's text (`{happy,sad}`: enum arrays on
+  both drivers, range and `tsvector` arrays on node-postgres) read as arrays,
+  also from `RETURNING`.
+- `minimum()` and `maximum()` of a `halfvec` work, as for `vector`.
+- `join()` of a many-to-many relation under a scope on its target no longer adds
+  an all-NULL row for each hidden target row.
+- Rows created by a nested insert get their embeddings; the model is asked once
+  per `INSERT` the nested write sends.
+- An embedded table's `upsert(row, { by, update: [...] })` and
+  `onConflict().doUpdate(...)` store the embedding they paid for; a bulk upsert
+  with one empty-text row is no longer refused as "rows carry different
+  columns".
+- A nearest-neighbour read with a filter no longer returns too few rows (or
+  none) when the matching rows lie far away: pgvector's iterative scan stopped
+  at `work_mem × hnsw.scan_mem_multiplier`, which is now raised for the
+  statement. The same applied to `table.search()` by meaning above its exact
+  threshold.
+- An IVFFlat nearest read with `forUpdate` reads on past its lists and is sorted
+  again, like one without a lock.
+- Full-text search finds words with combining marks (Hindi, Thai, decomposed
+  accents) and e-mail addresses.
+- A query inside a `for await` loop over `stream()` that would wait for the
+  connection the loop holds is refused at once ("from inside a stream() loop
+  that holds the only one"), as inside a transaction. A `stream()` iterator read
+  partly and dropped without `return()` gives its connection back (the
+  transaction rolls back) once it is garbage-collected; before, the connection
+  stayed idle in a transaction for good.
+- Inside `$transaction`, a stream that fails to decode a row closes its cursor,
+  so a callback that catches the error can still commit.
+- The pool guard against waiting forever drops transactions that have ended:
+  work a transaction scheduled may use the pool while its `COMMIT` runs, a job
+  loop no longer slows down round after round, and `$close()` from such work is
+  no longer refused as "called inside a $transaction()".
+- `postgres({ prepare: true })` from `symmetria/pg`: after a migration changes
+  the type of a column a prepared statement reads, the statement is prepared
+  again under a new name; outside a transaction the call succeeds, inside one
+  that transaction fails once. Before, every later call failed on every
+  connection that had prepared it.
+
+- `like`, `ilike`, full-text search and `searchHeadline()` on an enum, uuid,
+  date, time, interval or inet column read the value as text, and a text column
+  compared with one of them (`is`, `in` a subquery, `coalesce`) compares as
+  text; PostgreSQL refused all of these.
+- A vector distance reads as a number inside nested results and `$batch`, also
+  when it is NaN (it was the string `"NaN"`).
+- Nested objects keep their selected key order when PostgreSQL builds them as
+  `jsonb` (`distinct`, `groupBy`, derived tables, more than 50 fields).
+- `exists()` in the projection of a paginated query keeps the "page the root
+  rows first" rewrite, so the subqueries run for the page's rows only, not for
+  every row of the table.
+- `page()` ordered by a `numeric[]`, `date[]`, `timestamp[]` or `timestamptz[]`
+  column accepts its own cursor.
+- A prepared parameter declared `jsonb<T | null>()` binds JSON `null`.
+- An embedding model answering NaN or Infinity: a hybrid search falls back to
+  words, and `insert()` and `reindex()` reject with an error naming the model,
+  instead of PostgreSQL's.
+- On Bun.SQL a `date` after 275760-09-13 fails to read with an error saying so;
+  it read as `"0NaN-NaN-NaN BC"`. An integer parameter of `-0` is sent as `0`,
+  so integer arithmetic stays integer on Bun.
+- `traced()`: a span is named after the statement's own table, not the first
+  table in its text (a nested read, a junction, `extract(… from …)`); a cursor's
+  `FETCH` and `CLOSE` carry the stream's table, and a stream's statements are
+  children of its transaction span; statements a failed transaction never sent
+  are marked `error.type: not_sent` instead of repeating the first error; long
+  statement texts are no longer kept in memory.
+- `searchHeadline()` options are bound as a parameter instead of written into
+  the SQL text.
+- `profiler.trace(label, () => query)` records a query the callback returns
+  without awaiting.
+- Types: `jsonb(schema).array` reads, writes and filters with the schema's input
+  type, as `jsonb(schema)` does; an insert accepts `about: undefined` for an
+  embedding under `exactOptionalPropertyTypes`; `coalesce()`, `lag()` and
+  `lead()` take a plain `number[]` fallback for a vector.
+- The better-auth schema generator writes `jsonb()` for a JSON field; the
+  generated module did not load.
+
+### Kit (`symmetria-kit`)
+
+- An SQL default longer than one value is written in parentheses:
+  `DEFAULT 'a' COLLATE "C"` collated the column itself, and `DEFAULT NOT false`
+  or `now() AT TIME ZONE 'UTC'` did not parse.
+- A migration deleted by removing only its directory: `discard` takes it out of
+  the journal and puts the snapshot back, and the error every other command
+  gives says so. Before, `discard` refused with the same error.
+- `vector(n)` to `halfvec(n)` is a caution that says what half precision does:
+  numbers are rounded to about 3 significant digits, and one beyond ±65504 makes
+  the migration fail.
+- `pull` writes `money` as `string` (it arrives formatted, `$12.50`), reads an
+  `oid` or float column without a builder as a number also inside nested
+  results, and writes an array of a type without a builder (an enum array) as an
+  array of its element type, which reads as an array. Re-run `pull` for a schema
+  it wrote before as `customType<string[]>("mood[]")`, which reads as text.
+- `numeric(p)` and PostgreSQL's `numeric(p,0)` are one type for drift, `adopt`
+  and generated migrations.
+- An index declared with its type's default operator class (`text_ops`,
+  `array_ops`, `vector_l2_ops`) no longer reports drift after `migrate`.
+- Extension names may contain a hyphen, as `uuid-ossp` does; a schema `pull`
+  wrote for such a database did not load.
+- `pull` of a database made with `casing: "preserve"` whose table and column
+  names are single lowercase words reads an index named with a capital
+  (`items_byName_idx`) as such; it chose the default casing, skipped the index
+  and the next migration dropped it.
+- A generated migration no longer rebuilds an index that differs only in
+  PostgreSQL's default ordering (`.ascending`, `.descending.nullsFirst`) or in
+  how a storage value is written (`fillfactor: "50"` and `50`).
+- An expression index key in parentheses, `(name COLLATE "C")`, has no drift
+  after `migrate`, and `adopt` takes it.
+- A CHECK or partial-index condition comparing a column with a quoted literal
+  (`num.above("0")`, which PostgreSQL stores as `num > '0'::numeric`) is no
+  change after `pull`; it was dropped and added again.
+- Defaults that differ only in how PostgreSQL prints the value (arrays, JSON,
+  timestamps, intervals such as `90 minutes` and `01:30:00`) are no change, so
+  the first migration from a pulled schema does not set them again.
+- A narrowing type change and cleared embeddings are written with a
+  `-- symmetria: destructive: …` comment above them, and `lint` of the saved
+  file rates them as destructive, as `generate` did; it rated them as caution.
+
 ## 3.3.0 — 2026-11-21
 
 Fixes and additions from running Symmetria in production with a search by

@@ -197,4 +197,17 @@ describe.skipIf(!databaseUrl)("query terminals on PostgreSQL", () => {
         ),
     ).toEqual({ affectedRows: 0 });
   });
+
+  test("count() and exists() of a query that aggregates every row count its one row", async () => {
+    const totals = database.users((_user, { count }) => ({ n: count() }));
+    const none = database.users((_user, { count }) => ({ n: count() }), {
+      where: (user) => user.id.below(0),
+    });
+
+    expect(await totals).toEqual([{ n: 7 }]);
+    expect(await totals.count()).toBe(1);
+    expect(await none).toEqual([{ n: 0 }]);
+    expect(await none.count()).toBe(1);
+    expect(await none.exists()).toBe(true);
+  });
 });

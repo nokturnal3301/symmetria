@@ -902,7 +902,7 @@
     ]
   },
   "json/arithmetic-and-aggregates": {
-    "sql": "SELECT ((((((\"posts\".\"metadata\" #> ARRAY[$1::text]) #>> '{}')))::double precision) + $2::text::double precision) AS \"next\", SUM(((((\"posts\".\"metadata\" #> ARRAY[$3::text]) #>> '{}')))::numeric)::numeric AS \"total\", (MAX(ARRAY[(\"posts\".\"metadata\" #> ARRAY[$4::text])]) FILTER (WHERE (\"posts\".\"metadata\" #> ARRAY[$4::text]) <> 'null'::jsonb))[1] AS \"best\"\nFROM \"posts\" AS \"posts\"\nWHERE (\"posts\".\"metadata\" #> ARRAY[$5::text]) > $6::text::jsonb",
+    "sql": "SELECT ((((((\"posts\".\"metadata\" #> ARRAY[$1::text]) #>> '{}')))::double precision) + $2::text::double precision) AS \"next\", SUM(((((\"posts\".\"metadata\" #> ARRAY[$3::text]) #>> '{}')))::numeric)::numeric AS \"total\", (MAX(ARRAY[(\"posts\".\"metadata\" #> ARRAY[$4::text])]) FILTER (WHERE (\"posts\".\"metadata\" #> ARRAY[$4::text]) <> 'null'::jsonb))[1] AS \"best\"\nFROM \"posts\" AS \"posts\"\nWHERE (NULLIF((\"posts\".\"metadata\" #> ARRAY[$5::text]), 'null'::jsonb)) > $6::text::jsonb",
     "parameters": ["rating", 1, "rating", "rating", "rating", "2"]
   },
   "json/set": {
@@ -1114,7 +1114,7 @@
     "error": "symmetria: casing must be \"snake_case\" or \"preserve\""
   },
   "invalid-schema/extension-before-executor": {
-    "error": "symmetria: extension names are lowercase identifiers, not \"Bad Name\""
+    "error": "symmetria: extension names are lowercase identifiers such as \"pg_trgm\" or \"uuid-ossp\", not \"Bad Name\""
   },
   "invalid-schema/executor-and-driver-before-index": {
     "error": "symmetria: supply either driver or executor"

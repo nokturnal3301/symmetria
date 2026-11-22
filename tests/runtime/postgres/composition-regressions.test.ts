@@ -11,6 +11,12 @@ import {
   bool,
   timestamptz,
   prepare,
+  table,
+  many,
+  maybe,
+  one,
+  oneOf,
+  uuid,
   type Decimal,
 } from "../../../packages/runtime/src";
 
@@ -513,6 +519,251 @@ test("nested arrays decode JSON elements and preserve numeric array shapes", asy
         { where: (items) => items.objects.has({ name: "Ada" }) },
       ),
     ).toEqual([{ id: 1 }]);
+  } finally {
+    await database.$close();
+  }
+});
+
+/** Two writers and three articles, one of them with an editor. */
+const articles = async () => {
+  const writers = table({ id: int, name: text, posts: many, edited: many });
+  const driver = isolatedDriver();
+  const database = createDatabase({
+    schema: schema({
+      writers,
+      articles: table({
+        id: int,
+        title: text,
+        price: numeric(10, 2).nullable,
+        state: oneOf("draft", "published"),
+        author: one(writers.posts),
+        editor: maybe(writers.edited),
+      }),
+    }),
+    driver,
+  });
+  driver.createTables(database);
+
+  await database.writers.insert([
+    { id: 1, name: "Ada" },
+    { id: 2, name: "Bob" },
+  ]);
+  await database.articles.insert([
+    {
+      id: 1,
+      title: "a1",
+      price: "1.10",
+      state: "draft",
+      authorId: 1,
+      editorId: 2,
+    },
+    {
+      id: 2,
+      title: "a2",
+      price: "1.10",
+      state: "published",
+      authorId: 1,
+      editorId: null,
+    },
+    {
+      id: 3,
+      title: "b1",
+      price: null,
+      state: "draft",
+      authorId: 2,
+      editorId: null,
+    },
+  ]);
+
+  return database;
+};
+
+test("a path through a relation reads its own row after a crossJoin of it", async () => {
+  const database = await articles();
+
+  try {
+    const rows = await database.articles(
+      (article, { crossJoin }) => ({
+        article: article.id,
+        writer: crossJoin(article.editor).id,
+        editor: article.editor.name,
+      }),
+      {
+        orderBy: (article, { selected }) => [
+          article.id.asc,
+          selected.writer.asc,
+        ],
+      },
+    );
+
+    // Every article with every writer, and each article's own editor.
+    expect(rows).toHaveLength(6);
+    expect(
+      rows.every((row) => row.editor === (row.article === 1 ? "Bob" : null)),
+    ).toBe(true);
+    expect(
+      await database.articles(
+        (article, { crossJoin }) => ({
+          article: article.id,
+          writer: crossJoin(article.authorId).id,
+        }),
+        {
+          where: (article) => article.author.name.is("Bob"),
+          orderBy: (_article, { selected }) => selected.writer.asc,
+        },
+      ),
+    ).toEqual([
+      { article: 3, writer: 1 },
+      { article: 3, writer: 2 },
+    ]);
+  } finally {
+    await database.$close();
+  }
+});
+
+test("option callbacks reach the join the projection made", async () => {
+  const database = await articles();
+
+  try {
+    expect(
+      await database.writers(
+        (writer, { innerJoin }) => ({
+          writer: writer.id,
+          article: innerJoin(writer.posts).id,
+        }),
+        {
+          where: (writer, { innerJoin }) => innerJoin(writer.posts).id.above(1),
+          orderBy: (writer, { innerJoin }) => innerJoin(writer.posts).id.asc,
+        },
+      ),
+    ).toEqual([
+      { writer: 1, article: 2 },
+      { writer: 2, article: 3 },
+    ]);
+  } finally {
+    await database.$close();
+  }
+});
+
+test("aggregate() reads only the rows a limit or offset leaves", async () => {
+  const database = await articles();
+
+  try {
+    expect(
+      await database
+        .articles({ orderBy: { id: "asc" }, limit: 2 })
+        .aggregate((article, { count, sum }) => ({
+          n: count(),
+          total: sum(article.price),
+        })),
+    ).toEqual({ n: 2, total: "2.20" });
+    expect(
+      await database
+        .articles({ orderBy: { id: "asc" }, offset: 2 })
+        .aggregate((_article, { count }) => ({ n: count() })),
+    ).toEqual({ n: 1 });
+  } finally {
+    await database.$close();
+  }
+});
+
+test("a path to an enum field of a nested object in a CTE", async () => {
+  const database = await articles();
+
+  try {
+    const wrapped = database
+      .articles((article) => ({
+        id: article.id,
+        meta: { state: article.state },
+      }))
+      .cte("wrapped");
+
+    expect(
+      await wrapped((row) => ({ id: row.id, state: row.meta.path("state") }), {
+        orderBy: (row) => row.id.asc,
+      }),
+    ).toEqual([
+      { id: 1, state: "draft" },
+      { id: 2, state: "published" },
+      { id: 3, state: "draft" },
+    ]);
+    expect(
+      await wrapped((row) => ({ id: row.id }), {
+        where: (row) => row.meta.path("state").is("published"),
+      }),
+    ).toEqual([{ id: 2 }]);
+  } finally {
+    await database.$close();
+  }
+});
+
+test("text operations on enum and uuid columns, nested key order under distinct, bound headline options", async () => {
+  const driver = isolatedDriver();
+  const database = createDatabase({
+    schema: schema({
+      records: table({
+        id: int,
+        state: oneOf("draft", "published"),
+        token: uuid,
+        label: text,
+      }),
+    }),
+    driver,
+  });
+  driver.createTables(database);
+
+  try {
+    await database.records.insert([
+      {
+        id: 1,
+        state: "draft",
+        token: "00000000-0000-4000-8000-000000000001",
+        label: "draft",
+      },
+      {
+        id: 2,
+        state: "published",
+        token: "00000000-0000-4000-8000-000000000002",
+        label: "other",
+      },
+    ]);
+
+    const ids = (where: Parameters<typeof database.records>[1]) =>
+      database.records((record) => ({ id: record.id }), where);
+
+    expect(await ids({ where: (r) => r.state.like("dr%") })).toEqual([
+      { id: 1 },
+    ]);
+    expect(await ids({ where: (r) => r.token.like("%0002") })).toEqual([
+      { id: 2 },
+    ]);
+    expect(await ids({ where: (r) => r.label.is(r.state) })).toEqual([
+      { id: 1 },
+    ]);
+    expect(await ids({ where: (r) => r.state.search("published") })).toEqual([
+      { id: 2 },
+    ]);
+
+    // Built as jsonb for DISTINCT, the nested object keeps its key order.
+    const [nested] = await database.records(
+      (record) => ({ who: { label: record.label, id: record.id } }),
+      { distinct: true, where: (r) => r.id.is(1) },
+    );
+
+    expect(Object.keys(nested!.who)).toEqual(["label", "id"]);
+
+    // Headline options are a parameter PostgreSQL reads as such.
+    expect(
+      await database.records(
+        (record) => ({
+          snippet: record.label.searchHeadline("draft", {
+            startSel: "<b>",
+            stopSel: "</b>",
+          }),
+        }),
+        { where: (r) => r.id.is(1) },
+      ),
+    ).toEqual([{ snippet: "<b>draft</b>" }]);
   } finally {
     await database.$close();
   }

@@ -279,6 +279,12 @@ export const preparePlan = (
         const bound = values[node.name];
 
         if (bound === null && !node.nullable) {
+          // A JSON value that may be null (jsonb<T | null>()) binds JSON null,
+          // as a write of the same column stores it.
+          if (node.sqlType === "jsonb" || node.sqlType === "json") {
+            return node.codec ? node.codec.encode(null as never) : "null";
+          }
+
           throw new Error(`symmetria: parameter "${node.name}" cannot be null`);
         }
 

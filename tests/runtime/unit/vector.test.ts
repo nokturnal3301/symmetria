@@ -8,6 +8,8 @@ import {
   prepare,
   operatorClass,
   createIndexesSQL,
+  coalesce,
+  lag,
 } from "../../../packages/runtime/src";
 import { vector } from "../../../packages/runtime/src/entries/vector";
 import { migrationSnapshot } from "../../../packages/kit/src";
@@ -179,4 +181,36 @@ test("invalid vector declarations are rejected early", () => {
       bad: (doc.content as unknown as typeof doc.embedding).l2Distance([1]),
     })),
   ).toThrow(/require a vector column/);
+});
+
+test("a distance reads as a number inside JSON, and a plain array is a vector fallback", async () => {
+  const database = schema(
+    { documents },
+    {
+      executor: async () => [
+        // A nested result: PostgreSQL writes a NaN distance as the text "NaN".
+        { id: 1, nested: [{ distance: "NaN" }], filled: "[0,0,0]" },
+      ],
+    },
+  );
+  const [row] = await database.documents((document) => ({
+    id: document.id,
+    nested: database.documents((inner) => ({
+      distance: inner.embedding.cosineDistance([1, 0, 0]),
+    })),
+    // A number[] fallback type-checks, as it encodes.
+    filled: coalesce(document.optional, [0, 0, 0]),
+  }));
+
+  expect(Number.isNaN(row!.nested[0]!.distance)).toBe(true);
+  expect(typeof row!.nested[0]!.distance).toBe("number");
+  expect(
+    database
+      .documents((document) => ({
+        previous: lag(document.embedding, 1, [9, 9, 9]).over({
+          orderBy: document.id.asc,
+        }),
+      }))
+      .toSQL().parameters,
+  ).toContain("[9,9,9]");
 });

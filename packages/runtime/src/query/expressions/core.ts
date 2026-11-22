@@ -39,7 +39,15 @@ import type {
   VectorOperator,
   QueryColumn,
 } from "./column-types";
-import { castNode, jsonScalar, arithmetic, isJsonValue } from "./arithmetic";
+import {
+  asText,
+  castNode,
+  isTextType,
+  jsonScalar,
+  arithmetic,
+  isJsonValue,
+  readsAsString,
+} from "./arithmetic";
 import {
   searchLanguage,
   searchMode,
@@ -207,17 +215,44 @@ export const compare = (
     );
   }
 
-  const right = valueNode(value, description.codec);
+  let right = valueNode(value, description.codec);
+  let left = description;
+  // A text column compared with an enum, uuid or date column: PostgreSQL has
+  // no operator for the pair, so the other one compares as text.
+  const other =
+    value && typeof value === "object" && COLUMN_EXPRESSION in value
+      ? readColumn(value as never)
+      : undefined;
+
+  if (other) {
+    if (isTextType(expressionSqlType(description)) && readsAsString(other)) {
+      right = castNode(right, "text");
+    } else if (
+      readsAsString(description) &&
+      isTextType(expressionSqlType(other))
+    ) {
+      left = asText(description);
+    }
+  }
+
+  const nullable =
+    right.kind === "placeholder" &&
+    right.nullable &&
+    (operator === "=" || operator === "<>");
 
   return predicate({
     kind: "comparison",
-    left: description.node,
+    // JSON null is null here as in is(null); `=` matches it to no value
+    // either way, so it keeps the plain operand an index can serve.
+    left: NULL_LIKE.has(operator) ? jsonNullAsNull(left) : left.node,
     operator,
     right,
-    ...(right.kind === "placeholder" &&
-    right.nullable &&
-    (operator === "=" || operator === "<>")
-      ? { nullableParameter: true as const }
+    ...(nullable
+      ? {
+          nullableParameter: true as const,
+          // Bound to null, the comparison is is(null): JSON null counts too.
+          nullCheck: readPredicate(nullPredicate(description, false)),
+        }
       : {}),
   });
 };
@@ -234,10 +269,28 @@ export const membership = (
       throw new Error("symmetria: IN requires a single-column subquery");
     }
 
+    // Text against an enum, uuid or date subquery compares as text.
+    const [selected] = query.selection as [ExpressionDescription];
+    const textual = isTextType(expressionSqlType(description));
+
     return predicate({
       kind: "membership",
-      value: description.node,
-      values: query,
+      value:
+        !textual && isTextType(expressionSqlType(selected))
+          ? asText(description).node
+          : description.node,
+      values:
+        textual && readsAsString(selected)
+          ? freeze({
+              ...query,
+              selection: freeze([
+                freeze({
+                  ...selected,
+                  node: castNode(selected.node, "text"),
+                }),
+              ]),
+            })
+          : query,
       negated,
     });
   }
@@ -252,7 +305,7 @@ export const membership = (
 
   return predicate({
     kind: "membership",
-    value: description.node,
+    value: negated ? jsonNullAsNull(description) : description.node,
     values: freeze(values.map((value) => valueNode(value, description.codec))),
     negated,
   });
@@ -280,28 +333,45 @@ export const storesJsonNull = (description: ExpressionDescription): boolean =>
   !description.node.description.binding.projection &&
   expressionSqlType(description) === "jsonb";
 
+/**
+ * A JSON path reads a missing key as SQL NULL and a key holding JSON null as
+ * a JSON value; both decode to null, so both count as null in conditions. So
+ * do JSON null in a nullable column (an update can store it), a path carried
+ * through a CTE or a derived table, and a JSON scalar subquery.
+ */
+const jsonNullAsNull = (description: ExpressionDescription): ValueNode =>
+  isJsonValue(description) && !storesJsonNull(description)
+    ? freeze({
+        kind: "raw",
+        parts: freeze([
+          "NULLIF(",
+          expressionSqlType(description) === "json"
+            ? castNode(description.node, "jsonb")
+            : description.node,
+          ", 'null'::jsonb)",
+        ]),
+        sqlType: "jsonb",
+      })
+    : description.node;
+
+/** Comparisons that tell a NULL operand from a value. */
+const NULL_LIKE = new Set<ComparisonOperator>([
+  "<>",
+  "<",
+  "<=",
+  ">",
+  ">=",
+  "IS DISTINCT FROM",
+  "IS NOT DISTINCT FROM",
+]);
+
 export const nullPredicate = (
   description: ExpressionDescription,
   negated: boolean,
 ): Predicate => {
-  // A JSON path reads a missing key as SQL NULL and a key holding JSON null
-  // as a JSON value; both decode to null, so both count as null here.
   const check: PredicateDescription = {
     kind: "nullCheck",
-    value:
-      description.node.kind === "jsonPath" && isJsonValue(description)
-        ? freeze({
-            kind: "raw",
-            parts: freeze([
-              "NULLIF(",
-              expressionSqlType(description) === "json"
-                ? castNode(description.node, "jsonb")
-                : description.node,
-              ", 'null'::jsonb)",
-            ]),
-            sqlType: "jsonb",
-          })
-        : description.node,
+    value: jsonNullAsNull(description),
     negated,
   };
 
@@ -628,7 +698,7 @@ export class ColumnHandle {
   search(query: unknown, options: SearchOptions = {}) {
     return predicate({
       kind: "search",
-      value: this[COLUMN_EXPRESSION].node,
+      value: asText(this[COLUMN_EXPRESSION]).node,
       query: valueNode(query),
       language: this.searchConfiguration(options.language),
       mode: searchMode(options.mode),
@@ -641,7 +711,7 @@ export class ColumnHandle {
       codec: codecFor("real")!,
       node: freeze({
         kind: "searchRank",
-        value: this[COLUMN_EXPRESSION].node,
+        value: asText(this[COLUMN_EXPRESSION]).node,
         query: valueNode(query),
         language: this.searchConfiguration(options.language),
         mode: searchMode(options.mode),
@@ -663,7 +733,7 @@ export class ColumnHandle {
       outputName: "searchHeadline",
       node: freeze({
         kind: "searchHeadline",
-        value: description.node,
+        value: asText(description).node,
         query: valueNode(query),
         language: searchLanguage(options.language),
         mode: searchMode(options.mode),
@@ -690,6 +760,8 @@ export class ColumnHandle {
         right: valueNode(query, description.codec),
         sqlType: "double precision",
       }),
+      // Inside JSON (a nested result, $batch) a NaN distance is the text "NaN".
+      codec: codecFor("double precision")!,
     });
   }
 
@@ -757,11 +829,19 @@ export class ColumnHandle {
   }
 
   like(pattern: string) {
-    return compare(jsonScalar(this[COLUMN_EXPRESSION]), "LIKE", pattern);
+    return compare(
+      asText(jsonScalar(this[COLUMN_EXPRESSION])),
+      "LIKE",
+      pattern,
+    );
   }
 
   ilike(pattern: string) {
-    return compare(jsonScalar(this[COLUMN_EXPRESSION]), "ILIKE", pattern);
+    return compare(
+      asText(jsonScalar(this[COLUMN_EXPRESSION])),
+      "ILIKE",
+      pattern,
+    );
   }
 
   plus(value: unknown) {

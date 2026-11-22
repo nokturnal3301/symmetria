@@ -137,4 +137,28 @@ describe.skipIf(!databaseUrl)("a scope on a junction table", () => {
       await isolated.database.postTags((row) => ({ tenant: row.tenantId })),
     ).toEqual([{ tenant: 1 }, { tenant: 1 }]);
   });
+
+  test("a join of the relation under a scope on its target leaves out the hidden rows", async () => {
+    const database = isolated.database;
+    const [own] = await database.posts
+      .insert([{ title: "both labels" }])
+      .returning((row) => ({ id: row.id }));
+
+    await database.postTags
+      .insert([
+        { postsId: own!.id, tagsId: first },
+        { postsId: own!.id, tagsId: second },
+      ])
+      .execute();
+
+    const visible = database.$scope({ tags: (tag) => tag.label.is("first") });
+
+    // The link to "second" is no extra row with a NULL label.
+    expect(
+      await visible.posts(
+        (row, { join }) => ({ title: row.title, label: join(row.tags).label }),
+        { where: (row) => row.title.is("both labels") },
+      ),
+    ).toEqual([{ title: "both labels", label: "first" }]);
+  });
 });

@@ -7,6 +7,7 @@ import { serveProfiler } from "./http";
 import { cloneParameter } from "../query/codecs";
 import { postgresRenderer } from "../query/compile/postgres/render";
 import {
+  CONNECTION_CLAIM,
   normalizeResult,
   type CompiledQuery,
   type Driver,
@@ -175,7 +176,9 @@ export const createProfiler = (
     const started = performance.now();
 
     try {
-      return await context.run(request, operation);
+      // Awaited inside the request: a query the callback returns without
+      // awaiting runs when it is awaited, and belongs to the request too.
+      return await context.run(request, async () => await operation());
     } catch (error) {
       request.error = error instanceof Error ? error.message : String(error);
       throw error;
@@ -347,6 +350,9 @@ export const createProfiler = (
 
   const wrapDriver = (driver: Driver): Driver =>
     Object.freeze({
+      ...(CONNECTION_CLAIM in driver
+        ? { [CONNECTION_CLAIM]: driver[CONNECTION_CLAIM] }
+        : {}),
       execute: wrapExecutor(driver.execute, driver.execute),
       close: driver.close,
       ...(driver.session ? { session: driver.session } : {}),

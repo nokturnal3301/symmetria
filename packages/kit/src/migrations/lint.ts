@@ -2,6 +2,7 @@
  * Schema-level lint: reviews a migration plan for operations that lose data,
  * fail on populated tables or need deploy planning.
  */
+import { normalizeSqlType } from "./drift";
 import { quoteIdentifier } from "symmetria/internal";
 import {
   changedDefinition,
@@ -14,6 +15,7 @@ import {
 import {
   conversionMessage,
   embeddingChange,
+  halfPrecision,
   typeConversion,
 } from "./conversions";
 import type { MigrationColumn, MigrationTable } from "./snapshot";
@@ -301,7 +303,7 @@ export const lintMigration = (
     renamedColumns: Readonly<Record<string, string>> = {},
   ): void => {
     const retyped =
-      before.sqlType !== after.sqlType ||
+      normalizeSqlType(before.sqlType) !== normalizeSqlType(after.sqlType) ||
       (before.enumeration !== after.enumeration &&
         !renamedEnumeration(before.enumeration, after.enumeration));
     const change = retyped ? typeConversion(before, after) : undefined;
@@ -329,6 +331,14 @@ export const lintMigration = (
             : change.refused
               ? "Move or change the values that do not fit first, then generate with --allow-destructive; PostgreSQL refuses values that still do not fit."
               : "Copy the column or back up the table if the lost precision matters, then generate with --allow-destructive.",
+        after.name,
+      );
+    } else if (retyped && halfPrecision(before, after)) {
+      report(
+        "caution",
+        table.name,
+        `Column "${after.name}" changes from ${before.sqlType} to ${after.sqlType}: every stored number is rounded to half precision, about 3 significant digits, and a number beyond ±65504 makes the migration fail.`,
+        "Distances barely change at half precision, and embedding models stay far inside the range; PostgreSQL rewrites the table and builds its vector indexes again, so run it in a quiet hour.",
         after.name,
       );
     } else if (retyped) {

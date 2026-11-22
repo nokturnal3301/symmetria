@@ -26,6 +26,35 @@ export type NumericClass = "decimal" | "bigint" | "float" | "integer";
 export const castNode = (node: ValueNode, sqlType: string): ValueNode =>
   freeze({ kind: "raw", parts: freeze(["(", node, `)::${sqlType}`]), sqlType });
 
+/** Types that read as strings but are not text: an enum, uuid, date or time. */
+const STRING_VALUED =
+  /^(?:enum|uuid|date|time|timetz|timestamp|timestamptz|interval|inet|cidr|macaddr8?)(?:\(|\s|$)/;
+const TEXT_TYPE =
+  /^(?:text|varchar|character varying|char|character|bpchar|citext|name)(?:\(|$)/;
+
+export const isTextType = (sqlType: string): boolean => TEXT_TYPE.test(sqlType);
+
+/** Whether an expression reads as a string without being text. */
+export const readsAsString = (description: ExpressionDescription): boolean =>
+  STRING_VALUED.test(expressionSqlType(description));
+
+/**
+ * The expression as text, for what PostgreSQL defines on text only: LIKE,
+ * full-text search, a comparison with a text column. An enum, uuid or date
+ * has no such operator; as text it matches what its string reads.
+ */
+export const asText = (
+  description: ExpressionDescription,
+): ExpressionDescription => {
+  if (!readsAsString(description)) {
+    return description;
+  }
+
+  const { codec: _codec, ...rest } = description;
+
+  return { ...rest, node: castNode(description.node, "text") };
+};
+
 /** A json/jsonb expression, such as a jsonb column or a path that does not reach a typed field. */
 export const isJsonValue = (description: ExpressionDescription): boolean => {
   const sqlType = expressionSqlType(description);
@@ -145,7 +174,7 @@ export type ArithmeticSide = {
 
 /** SQL types without arithmetic, whose values the types never offer it for: text, enums, dates, arrays, … */
 export const NOT_NUMERIC =
-  /^(text|varchar|char|enum|uuid|boolean|date|time|timestamp|timestamptz|interval|bytea|inet|tsvector|vector)(\(|$)|\[\]$/;
+  /^(text|varchar|char|enum|uuid|boolean|date|time|timestamp|timestamptz|interval|bytea|inet|tsvector|vector|halfvec)(\(|$)|\[\]$/;
 
 /** A column or expression operand; raw SQL of unknown type cannot be typed. */
 export const expressionSide = (

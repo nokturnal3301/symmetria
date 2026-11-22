@@ -146,7 +146,11 @@ export interface Column<Metadata extends ColumnMetadata = ColumnMetadata> {
       hasDefault: false;
     } & (Metadata extends { numeric: infer Numeric }
       ? { numeric: Numeric }
-      : {})
+      : {}) &
+      // A jsonb(schema) stores its input, element by element.
+      (Metadata extends { inputType: infer Input }
+        ? { inputType: Input[] }
+        : {})
   >;
   readonly brand: <const Name extends string>(
     name: Name,

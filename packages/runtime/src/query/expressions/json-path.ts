@@ -93,13 +93,16 @@ export const jsonPathDescription = (
 
     const target = jsonPathTarget(current, key);
     const type = target ? expressionSqlType(target) : "jsonb";
+    // An enum's type name is not known here: its label reads as text.
     const scalarType =
-      type !== "derived" &&
-      type !== "json" &&
-      type !== "jsonb" &&
-      !type.endsWith("[]")
-        ? type
-        : undefined;
+      type === "enum"
+        ? "text"
+        : type !== "derived" &&
+            type !== "json" &&
+            type !== "jsonb" &&
+            !type.endsWith("[]")
+          ? type
+          : undefined;
     const codec = scalarType ? target?.codec : jsonValueCodec(target);
 
     current = {

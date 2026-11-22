@@ -81,7 +81,9 @@ export const columnIdentifier = (name: string) =>
 
 /** JavaScript value type for a PostgreSQL type without a builder, as both drivers deliver it. */
 export const customValueType = (sqlType: string): string => {
-  if (/^(oid|money)$/.test(sqlType) || /^float\d$/.test(sqlType)) {
+  // money arrives as formatted text ("$12.50"); oid and floats as numbers
+  // at the top level but as text inside JSON, which `asNumber()` evens out.
+  if (sqlType === "oid" || /^float\d$/.test(sqlType)) {
     return "number";
   }
 
@@ -281,14 +283,23 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       !catalog.details.find((entry) => entry.name === table.name)?.partition &&
       table.name !== PRISMA_MIGRATIONS,
   );
-  const casing = chooseCasing([
-    ...declarable.map((table) => table.name),
-    ...catalog.columns
-      .filter((column) =>
-        declarable.some((table) => table.name === column.table_name),
+  const casing = chooseCasing(
+    [
+      ...declarable.map((table) => table.name),
+      ...catalog.columns
+        .filter((column) =>
+          declarable.some((table) => table.name === column.table_name),
+        )
+        .map((column) => column.column_name),
+    ],
+    // Single lowercase words fit either casing; an index named with a
+    // capital (`items_byName_idx`) only comes from `casing: "preserve"`.
+    catalog.indexDetails
+      .filter((entry) =>
+        declarable.some((table) => table.name === entry.table_name),
       )
-      .map((column) => column.column_name),
-  ]);
+      .map((entry) => entry.index_name),
+  );
   const allocateTableKey = keyAllocator(isReservedTableKey);
 
   for (const table of catalog.tables) {

@@ -215,7 +215,7 @@ describe.skipIf(!url)("migration engine on PostgreSQL", () => {
         allowDestructive: true,
       }))!;
       expect(shorten.up).toBe(
-        'ALTER TABLE "users" ALTER COLUMN "name" TYPE varchar(5);\n',
+        '-- symmetria: destructive: Column "name" narrows from text to varchar(5): values longer than 5 characters make the migration fail, and trailing spaces past the limit are cut.\nALTER TABLE "users" ALTER COLUMN "name" TYPE varchar(5);\n',
       );
 
       const failure = await runner()

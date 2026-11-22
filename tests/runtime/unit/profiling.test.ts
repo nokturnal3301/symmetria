@@ -345,3 +345,30 @@ test("profiler rejects a non-loopback bind address at runtime", async () => {
     profiler.serve({ hostname: "0.0.0.0" as "127.0.0.1", port: 0 }),
   ).rejects.toThrow(/loopback/);
 });
+
+test("trace() records a query its callback returns without awaiting", async () => {
+  const profiler = createProfiler();
+  const driver: Driver = {
+    execute: async () => [{ id: 1 }],
+    close: async () => {},
+  };
+  const database = schema(
+    { records: { id: int, amount: bigint } },
+    { driver: profiler.driver(driver) },
+  );
+
+  // A query runs when it is awaited, which trace() does inside the request.
+  expect(
+    await profiler.trace("returned", () =>
+      database.records((records) => ({ id: records.id })),
+    ),
+  ).toEqual([{ id: 1 }]);
+
+  const [request] = profiler.snapshot();
+
+  expect(request!.label).toBe("returned");
+  expect(request!.queries).toHaveLength(1);
+  expect(profiler.snapshot().map((entry) => entry.label)).not.toContain(
+    "background query",
+  );
+});

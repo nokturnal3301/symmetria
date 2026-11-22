@@ -120,6 +120,12 @@ export type QueryContext = {
   columns: (binding: TableBinding) => RuntimeScope[string];
   bindings: () => SelectPlan["bindings"];
   reservedAliases: Set<string>;
+  /**
+   * While option callbacks run: a relation joined without a name reaches the
+   * JOIN the projection made of it, where in the projection each call is a
+   * JOIN of its own.
+   */
+  options?: boolean;
 };
 
 export const createTableRegistry = (

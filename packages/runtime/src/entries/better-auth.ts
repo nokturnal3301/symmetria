@@ -110,7 +110,7 @@ const COLUMN_TYPES: Readonly<Record<string, string>> = {
   string: "text",
   boolean: "bool",
   date: "timestamptz",
-  json: "jsonb",
+  json: "jsonb()",
   "string[]": "text.array",
   "number[]": "int.array",
 };

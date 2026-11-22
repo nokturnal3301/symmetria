@@ -81,6 +81,10 @@ export const castChangesLiteral = (
   return scale !== null && fraction.length > Number(scale[1] ?? 0);
 };
 
+/** The type PostgreSQL names in a literal's cast: `numeric`, not `numeric(10,2)`. */
+const castType = (sqlType: string): string =>
+  sqlType.startsWith("numeric(") ? "numeric" : sqlType;
+
 export const isLiteral = (node: SqlExpression): boolean =>
   node.kind === "constant" || node.kind === "boolean" || node.kind === "null";
 
@@ -201,6 +205,29 @@ export const simplifyExpression = (
       if (isLiteral(left) && !isLiteral(right)) {
         [left, right] = [right, left];
         operator = FLIPPED_COMPARISON[operator]!;
+      }
+
+      // A quoted literal compared with a column takes the column's type, as
+      // PostgreSQL resolves it and prints it back: `num > E'0'` is stored
+      // as `num > '0'::numeric`. Text columns compare as text, which
+      // PostgreSQL prints with casts of its own, and are left as they are.
+      if (
+        left.kind === "column" &&
+        right.kind === "constant" &&
+        !right.numeric &&
+        right.type === undefined
+      ) {
+        const type = columns.get(left.name);
+        const own = type === undefined ? undefined : normalizeSqlType(type);
+
+        if (
+          own !== undefined &&
+          !TEXT_TYPES.test(own) &&
+          !LENGTH_TYPES.test(own) &&
+          !own.endsWith("[]")
+        ) {
+          right = simplify({ kind: "cast", value: right, type: castType(own) });
+        }
       }
 
       // `x = true` holds exactly when x does, NULL included; `x = false` is `NOT x`.

@@ -35,7 +35,13 @@ import {
   readQuery,
   createExpression,
 } from "./core";
-import { castNode, isJsonValue, jsonScalar } from "./arithmetic";
+import {
+  castNode,
+  isJsonValue,
+  isTextType,
+  jsonScalar,
+  readsAsString,
+} from "./arithmetic";
 import { searchLanguage } from "./search";
 import { windowExpression, type WindowExpression } from "./windows";
 
@@ -137,7 +143,7 @@ export const average = <
   });
 
 /** Types PostgreSQL orders without a MIN or MAX of their own, besides JSON and boolean. */
-export const ELEMENT_ORDERED = /^(uuid|bytea|tsvector|vector)(\(|$)/;
+export const ELEMENT_ORDERED = /^(uuid|bytea|tsvector|vector|halfvec)(\(|$)/;
 
 /** A JSON value as jsonb: `json` has no equality or ordering. */
 export const jsonbNode = (description: ExpressionDescription): ValueNode =>
@@ -244,6 +250,14 @@ export const coalesce = <Expression extends SelectedColumn>(
   TraitsOf<Expression>
 > => {
   const description = readColumn(expression);
+  const fallbackNode = valueNode(fallback, description.codec);
+  // Text with an enum, uuid or date fallback: COALESCE needs one type.
+  const textFallback =
+    fallback !== null &&
+    typeof fallback === "object" &&
+    COLUMN_EXPRESSION in fallback &&
+    isTextType(expressionSqlType(description)) &&
+    readsAsString(readColumn(fallback as SelectedColumn));
 
   return createExpression({
     ...description,
@@ -253,7 +267,7 @@ export const coalesce = <Expression extends SelectedColumn>(
         isJsonValue(description)
           ? withoutJsonNull(description)
           : description.node,
-        valueNode(fallback, description.codec),
+        textFallback ? castNode(fallbackNode, "text") : fallbackNode,
       ]),
     }),
     outputName: "coalesce",

@@ -8,6 +8,14 @@ import type { LintFinding } from "./lint";
 
 export type SQLFinding = LintFinding & { readonly statement: number };
 
+/**
+ * The comment generate writes before a statement that loses data (a
+ * narrowing type change, cleared embeddings), which the SQL alone does not
+ * show: lint of the saved file rates it as generate did.
+ */
+export const DESTRUCTIVE_NOTE = "-- symmetria: destructive:";
+const DESTRUCTIVE_LINE = /^--\s*symmetria:\s*destructive:\s*(.*)$/m;
+
 const IDENTIFIER = String.raw`(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)`;
 const TABLE_NAME = String.raw`(${IDENTIFIER}(?:\s*\.\s*${IDENTIFIER})?)`;
 const CREATED_TABLE = new RegExp(
@@ -143,324 +151,349 @@ export const lintMigrationSQL = (sql: string, name = "SQL"): SQLFinding[] => {
     }),
   );
 
-  return statements.flatMap(({ words, code }, position): SQLFinding[] => {
-    const text = words.join(" ");
-    const createdTable = code.match(CREATED_TABLE)?.[1];
+  const findings = statements.flatMap(
+    ({ words, code }, position): SQLFinding[] => {
+      const text = words.join(" ");
+      const createdTable = code.match(CREATED_TABLE)?.[1];
 
-    if (createdTable) {
-      created.add(tableKey(createdTable));
-    }
+      if (createdTable) {
+        created.add(tableKey(createdTable));
+      }
 
-    const target = code.match(TARGET_TABLE)?.[1];
-    const table = target === undefined ? undefined : tableKey(target);
-    const newTable = table !== undefined && created.has(table);
-    const column = (name: string) => `${table}.${identifierKey(name)}`;
+      const target = code.match(TARGET_TABLE)?.[1];
+      const table = target === undefined ? undefined : tableKey(target);
+      const newTable = table !== undefined && created.has(table);
+      const column = (name: string) => `${table}.${identifierKey(name)}`;
 
-    const finding = (
-      level: SQLFinding["level"],
-      message: string,
-      advice: string,
-    ): SQLFinding => ({
-      level,
-      table: name,
-      statement: position + 1,
-      message: `Statement ${position + 1}: ${message}`,
-      advice,
-    });
+      const finding = (
+        level: SQLFinding["level"],
+        message: string,
+        advice: string,
+      ): SQLFinding => ({
+        level,
+        table: name,
+        statement: position + 1,
+        message: `Statement ${position + 1}: ${message}`,
+        advice,
+      });
 
-    const rebuild = finding(
-      "caution",
-      "Rebuilds a constraint or index that this migration creates again.",
-      "The rebuild scans the table under a lock; on large tables prefer a rename or a concurrent build.",
-    );
-    const destructive = finding(
-      "destructive",
-      "Removes data or a database object.",
-      "Review the exact SQL and deploy dependent application changes first.",
-    );
-    const review = finding(
-      "caution",
-      "Contains a schema change, data operation or executable SQL requiring review.",
-      "Verify locks, data preconditions and the upgrade against representative data. SQL lint does not analyze function bodies.",
-    );
-    const unique = finding(
-      "blocking",
-      "Requires unique existing values.",
-      "Check and resolve duplicates before applying.",
-    );
+      const rebuild = finding(
+        "caution",
+        "Rebuilds a constraint or index that this migration creates again.",
+        "The rebuild scans the table under a lock; on large tables prefer a rename or a concurrent build.",
+      );
+      const destructive = finding(
+        "destructive",
+        "Removes data or a database object.",
+        "Review the exact SQL and deploy dependent application changes first.",
+      );
+      const review = finding(
+        "caution",
+        "Contains a schema change, data operation or executable SQL requiring review.",
+        "Verify locks, data preconditions and the upgrade against representative data. SQL lint does not analyze function bodies.",
+      );
+      const unique = finding(
+        "blocking",
+        "Requires unique existing values.",
+        "Check and resolve duplicates before applying.",
+      );
 
-    /** A key or check dropped earlier and added again after its columns changed type. */
-    const rebuiltAfterRetype = (
-      constraint: string | undefined,
-      keys: string[] | undefined,
-    ): boolean =>
-      constraint !== undefined &&
-      dropped.has(objectKey(constraint)) &&
-      (keys
-        ? keys.length > 0 && keys.every((key) => retyped.has(column(key)))
-        : [...retyped].some((key) => key.startsWith(`${table}.`)));
+      /** A key or check dropped earlier and added again after its columns changed type. */
+      const rebuiltAfterRetype = (
+        constraint: string | undefined,
+        keys: string[] | undefined,
+      ): boolean =>
+        constraint !== undefined &&
+        dropped.has(objectKey(constraint)) &&
+        (keys
+          ? keys.length > 0 && keys.every((key) => retyped.has(column(key)))
+          : [...retyped].some((key) => key.startsWith(`${table}.`)));
 
-    const alteration = code.match(ALTER_TABLE);
-    const actions = alteration ? splitActions(alteration[2]!) : [];
+      const alteration = code.match(ALTER_TABLE);
+      const actions = alteration ? splitActions(alteration[2]!) : [];
 
-    // Renames change the catalog only, under a brief ACCESS EXCLUSIVE lock. The
-    // action itself has to be RENAME: a table or column may be called `rename`.
-    if (
-      RENAMED_OBJECT.test(code) ||
-      (actions.length > 0 && actions.every((action) => RENAME.test(action)))
-    ) {
-      return [];
-    }
+      // Renames change the catalog only, under a brief ACCESS EXCLUSIVE lock. The
+      // action itself has to be RENAME: a table or column may be called `rename`.
+      if (
+        RENAMED_OBJECT.test(code) ||
+        (actions.length > 0 && actions.every((action) => RENAME.test(action)))
+      ) {
+        return [];
+      }
 
-    if (alteration) {
-      const findings = actions.flatMap((action): SQLFinding[] => {
-        const actionWords = wordsOf(action);
-        const actionText = actionWords.join(" ");
-        const droppedConstraint = action.match(DROPPED_CONSTRAINT)?.[1];
+      if (alteration) {
+        const findings = actions.flatMap((action): SQLFinding[] => {
+          const actionWords = wordsOf(action);
+          const actionText = actionWords.join(" ");
+          const droppedConstraint = action.match(DROPPED_CONSTRAINT)?.[1];
 
-        if (droppedConstraint !== undefined) {
-          dropped.add(objectKey(droppedConstraint));
+          if (droppedConstraint !== undefined) {
+            dropped.add(objectKey(droppedConstraint));
 
-          return recreated.has(objectKey(droppedConstraint))
-            ? [rebuild]
-            : [destructive];
-        }
-
-        if (/\bDROP(?:$| (?!DEFAULT\b|NOT\b|IDENTITY\b))/.test(actionText)) {
-          return [destructive];
-        }
-
-        const altered = action.match(ALTERED_COLUMN);
-        const alteredText = altered ? wordsOf(altered[2]!).join(" ") : "";
-        const retypes = /^(?:SET DATA )?TYPE\b/.test(alteredText);
-
-        if (retypes) {
-          retyped.add(column(altered![1]!));
-        }
-
-        if (retypes && TRUNCATING_CAST.test(altered![2]!)) {
-          return [
-            finding(
-              "destructive",
-              "USING casts explicitly to a length-limited string type, which cuts longer values instead of failing.",
-              "Leave USING out (or cast to text) so PostgreSQL refuses values that do not fit, unless the column only gets longer.",
-            ),
-          ];
-        }
-
-        if (newTable) {
-          return [];
-        }
-
-        if (/^SET NOT NULL\b/.test(alteredText)) {
-          return [
-            finding(
-              "blocking",
-              "Requires non-null values in existing rows.",
-              "Backfill first, then validate the constraint.",
-            ),
-          ];
-        }
-
-        if (retypes) {
-          return [
-            finding(
-              "caution",
-              "Changing a column type rewrites the table under an ACCESS EXCLUSIVE lock unless the cast is binary-coercible.",
-              "Expect downtime proportional to table size; for large tables add a new column, backfill and switch.",
-            ),
-          ];
-        }
-
-        // A column default applies to future rows only: a catalog change.
-        if (/^(?:SET|DROP) DEFAULT\b/.test(alteredText)) {
-          return [];
-        }
-
-        if (!/^ADD\b/.test(actionText)) {
-          return [review];
-        }
-
-        // Table constraints may be named (ADD CONSTRAINT …) or anonymous
-        // (ADD PRIMARY KEY …); everything else adds a column.
-        if (
-          /^ADD (?:CONSTRAINT|PRIMARY KEY|UNIQUE|CHECK|FOREIGN KEY|EXCLUDE)\b/.test(
-            actionText,
-          )
-        ) {
-          const constraint = action.match(NAMED_CONSTRAINT)?.[1];
-          const keys =
-            action
-              .match(KEY_COLUMNS)?.[1]!
-              .match(new RegExp(IDENTIFIER, "g")) ?? undefined;
-
-          if (/\b(?:UNIQUE|PRIMARY KEY)\b/.test(actionText)) {
-            if (/\bUSING INDEX\b/.test(actionText)) {
-              return [review];
-            }
-
-            return rebuiltAfterRetype(constraint, keys ?? [])
-              ? [
-                  finding(
-                    "caution",
-                    "Rebuilds a key dropped earlier in this migration after its columns change type.",
-                    "The rebuild scans the table under an ACCESS EXCLUSIVE lock; it fails only if the conversion makes existing values collide.",
-                  ),
-                ]
-              : [unique];
+            return recreated.has(objectKey(droppedConstraint))
+              ? [rebuild]
+              : [destructive];
           }
 
-          const foreign = /\bFOREIGN KEY\b/.test(actionText);
+          if (/\bDROP(?:$| (?!DEFAULT\b|NOT\b|IDENTITY\b))/.test(actionText)) {
+            return [destructive];
+          }
 
-          if (
-            /\bNOT VALID\b/.test(actionText) ||
-            (foreign &&
-              !!keys?.length &&
-              keys.every((key) => nullColumns.has(column(key))))
-          ) {
+          const altered = action.match(ALTERED_COLUMN);
+          const alteredText = altered ? wordsOf(altered[2]!).join(" ") : "";
+          const retypes = /^(?:SET DATA )?TYPE\b/.test(alteredText);
+
+          if (retypes) {
+            retyped.add(column(altered![1]!));
+          }
+
+          if (retypes && TRUNCATING_CAST.test(altered![2]!)) {
+            return [
+              finding(
+                "destructive",
+                "USING casts explicitly to a length-limited string type, which cuts longer values instead of failing.",
+                "Leave USING out (or cast to text) so PostgreSQL refuses values that do not fit, unless the column only gets longer.",
+              ),
+            ];
+          }
+
+          if (newTable) {
+            return [];
+          }
+
+          if (/^SET NOT NULL\b/.test(alteredText)) {
+            return [
+              finding(
+                "blocking",
+                "Requires non-null values in existing rows.",
+                "Backfill first, then validate the constraint.",
+              ),
+            ];
+          }
+
+          if (retypes) {
+            return [
+              finding(
+                "caution",
+                "Changing a column type rewrites the table under an ACCESS EXCLUSIVE lock unless the cast is binary-coercible.",
+                "Expect downtime proportional to table size; for large tables add a new column, backfill and switch.",
+              ),
+            ];
+          }
+
+          // A column default applies to future rows only: a catalog change.
+          if (/^(?:SET|DROP) DEFAULT\b/.test(alteredText)) {
+            return [];
+          }
+
+          if (!/^ADD\b/.test(actionText)) {
             return [review];
           }
 
-          if (foreign || /\bCHECK\b/.test(actionText)) {
-            return rebuiltAfterRetype(constraint, foreign ? keys : undefined)
-              ? [rebuild]
-              : [
-                  finding(
-                    "blocking",
-                    `Adds a ${foreign ? "foreign key" : "CHECK constraint"} that validates every existing row under a lock; the statement fails when a row violates it.`,
-                    "Add it NOT VALID, then run VALIDATE CONSTRAINT in a later statement or migration, which takes a lighter lock.",
-                  ),
-                ];
+          // Table constraints may be named (ADD CONSTRAINT …) or anonymous
+          // (ADD PRIMARY KEY …); everything else adds a column.
+          if (
+            /^ADD (?:CONSTRAINT|PRIMARY KEY|UNIQUE|CHECK|FOREIGN KEY|EXCLUDE)\b/.test(
+              actionText,
+            )
+          ) {
+            const constraint = action.match(NAMED_CONSTRAINT)?.[1];
+            const keys =
+              action
+                .match(KEY_COLUMNS)?.[1]!
+                .match(new RegExp(IDENTIFIER, "g")) ?? undefined;
+
+            if (/\b(?:UNIQUE|PRIMARY KEY)\b/.test(actionText)) {
+              if (/\bUSING INDEX\b/.test(actionText)) {
+                return [review];
+              }
+
+              return rebuiltAfterRetype(constraint, keys ?? [])
+                ? [
+                    finding(
+                      "caution",
+                      "Rebuilds a key dropped earlier in this migration after its columns change type.",
+                      "The rebuild scans the table under an ACCESS EXCLUSIVE lock; it fails only if the conversion makes existing values collide.",
+                    ),
+                  ]
+                : [unique];
+            }
+
+            const foreign = /\bFOREIGN KEY\b/.test(actionText);
+
+            if (
+              /\bNOT VALID\b/.test(actionText) ||
+              (foreign &&
+                !!keys?.length &&
+                keys.every((key) => nullColumns.has(column(key))))
+            ) {
+              return [review];
+            }
+
+            if (foreign || /\bCHECK\b/.test(actionText)) {
+              return rebuiltAfterRetype(constraint, foreign ? keys : undefined)
+                ? [rebuild]
+                : [
+                    finding(
+                      "blocking",
+                      `Adds a ${foreign ? "foreign key" : "CHECK constraint"} that validates every existing row under a lock; the statement fails when a row violates it.`,
+                      "Add it NOT VALID, then run VALIDATE CONSTRAINT in a later statement or migration, which takes a lighter lock.",
+                    ),
+                  ];
+            }
+
+            return [review];
           }
 
-          return [review];
-        }
+          const added = action.match(ADDED_COLUMN);
+          const definition = added ? wordsOf(added[2]!).join(" ") : actionText;
 
-        const added = action.match(ADDED_COLUMN);
-        const definition = added ? wordsOf(added[2]!).join(" ") : actionText;
+          if (
+            /\bNOT NULL\b/.test(definition) &&
+            !/\bDEFAULT\b/.test(definition)
+          ) {
+            return [
+              finding(
+                "blocking",
+                "Requires non-null values in existing rows.",
+                "Backfill first, then validate the constraint.",
+              ),
+            ];
+          }
 
-        if (
-          /\bNOT NULL\b/.test(definition) &&
-          !/\bDEFAULT\b/.test(definition)
-        ) {
-          return [
-            finding(
-              "blocking",
-              "Requires non-null values in existing rows.",
-              "Backfill first, then validate the constraint.",
-            ),
-          ];
-        }
+          if (
+            /\b(?:GENERATED\b.*\b(?:IDENTITY|STORED)|(?:SMALL|BIG)?SERIAL)\b/.test(
+              definition,
+            )
+          ) {
+            return [
+              finding(
+                "caution",
+                "An identity, serial or stored generated column rewrites every existing row.",
+                "Add a plain column, backfill in batches, then attach the identity or expression.",
+              ),
+            ];
+          }
 
-        if (
-          /\b(?:GENERATED\b.*\b(?:IDENTITY|STORED)|(?:SMALL|BIG)?SERIAL)\b/.test(
-            definition,
+          if (VOLATILE_DEFAULT.test(definition)) {
+            return [
+              finding(
+                "caution",
+                "A volatile default rewrites every existing row.",
+                "Add the column without the default, backfill in batches, then set the default.",
+              ),
+            ];
+          }
+
+          if (/\b(?:UNIQUE|PRIMARY KEY)\b/.test(definition)) {
+            return /\bDEFAULT\b/.test(definition) ? [unique] : [];
+          }
+
+          if (added && !/\bDEFAULT\b/.test(definition)) {
+            nullColumns.add(column(added[1]!));
+          }
+
+          return [];
+        });
+
+        return findings
+          .filter(
+            (entry, index) =>
+              findings.findIndex(
+                (other) =>
+                  other.level === entry.level &&
+                  other.message === entry.message,
+              ) === index,
           )
-        ) {
-          return [
-            finding(
-              "caution",
-              "An identity, serial or stored generated column rewrites every existing row.",
-              "Add a plain column, backfill in batches, then attach the identity or expression.",
-            ),
-          ];
-        }
+          .sort(
+            (left, right) => levelOrder[left.level] - levelOrder[right.level],
+          );
+      }
 
-        if (VOLATILE_DEFAULT.test(definition)) {
-          return [
-            finding(
-              "caution",
-              "A volatile default rewrites every existing row.",
-              "Add the column without the default, backfill in batches, then set the default.",
-            ),
-          ];
-        }
+      const droppedIndex = code.match(DROPPED_INDEX)?.[1];
 
-        if (/\b(?:UNIQUE|PRIMARY KEY)\b/.test(definition)) {
-          return /\bDEFAULT\b/.test(definition) ? [unique] : [];
-        }
+      if (droppedIndex !== undefined) {
+        dropped.add(objectKey(droppedIndex));
 
-        if (added && !/\bDEFAULT\b/.test(definition)) {
-          nullColumns.add(column(added[1]!));
-        }
+        return recreated.has(objectKey(droppedIndex))
+          ? [rebuild]
+          : [destructive];
+      }
 
+      if (
+        /^(DROP|TRUNCATE|DELETE)\b/.test(text) ||
+        /^(?:WITH|MERGE)\b.*\bDELETE\b/.test(text)
+      ) {
+        return [destructive];
+      }
+
+      if (newTable) {
         return [];
-      });
+      }
 
-      return findings
-        .filter(
-          (entry, index) =>
-            findings.findIndex(
-              (other) =>
-                other.level === entry.level && other.message === entry.message,
-            ) === index,
+      if (/^CREATE UNIQUE INDEX\b/.test(text)) {
+        const index = code.match(CREATED_INDEX)?.[1];
+
+        return index !== undefined &&
+          dropped.has(objectKey(index)) &&
+          [...retyped].some((key) => key.startsWith(`${table}.`))
+          ? [rebuild]
+          : [unique];
+      }
+
+      if (/^CREATE INDEX\b/.test(text) && !words.includes("CONCURRENTLY")) {
+        return [
+          finding(
+            "caution",
+            "Index construction blocks writes.",
+            "Use a dedicated nontransactional migration with CREATE INDEX CONCURRENTLY on large tables.",
+          ),
+        ];
+      }
+
+      // A new enum label changes the catalog only; existing rows are untouched.
+      if (/^ALTER TYPE\b.*\bADD VALUE\b/.test(text)) {
+        return [];
+      }
+
+      if (
+        /^(ALTER|UPDATE|INSERT|DO|CALL|WITH|SELECT|MERGE)\b/.test(text) ||
+        /^CREATE (?:OR REPLACE )?(?:FUNCTION|PROCEDURE|TRIGGER|RULE)\b/.test(
+          text,
         )
-        .sort(
-          (left, right) => levelOrder[left.level] - levelOrder[right.level],
-        );
-    }
+      ) {
+        return [review];
+      }
 
-    const droppedIndex = code.match(DROPPED_INDEX)?.[1];
+      if (!/^(CREATE|COMMENT|GRANT|REVOKE)\b/.test(text)) {
+        return [
+          finding(
+            "caution",
+            "SQL is outside the static migration checks.",
+            "Review this statement and exercise it with verify.",
+          ),
+        ];
+      }
 
-    if (droppedIndex !== undefined) {
-      dropped.add(objectKey(droppedIndex));
-
-      return recreated.has(objectKey(droppedIndex)) ? [rebuild] : [destructive];
-    }
-
-    if (
-      /^(DROP|TRUNCATE|DELETE)\b/.test(text) ||
-      /^(?:WITH|MERGE)\b.*\bDELETE\b/.test(text)
-    ) {
-      return [destructive];
-    }
-
-    if (newTable) {
       return [];
-    }
+    },
+  );
+  const noted = statements.flatMap(({ sql }, position): SQLFinding[] => {
+    const note = DESTRUCTIVE_LINE.exec(sql);
 
-    if (/^CREATE UNIQUE INDEX\b/.test(text)) {
-      const index = code.match(CREATED_INDEX)?.[1];
-
-      return index !== undefined &&
-        dropped.has(objectKey(index)) &&
-        [...retyped].some((key) => key.startsWith(`${table}.`))
-        ? [rebuild]
-        : [unique];
-    }
-
-    if (/^CREATE INDEX\b/.test(text) && !words.includes("CONCURRENTLY")) {
-      return [
-        finding(
-          "caution",
-          "Index construction blocks writes.",
-          "Use a dedicated nontransactional migration with CREATE INDEX CONCURRENTLY on large tables.",
-        ),
-      ];
-    }
-
-    // A new enum label changes the catalog only; existing rows are untouched.
-    if (/^ALTER TYPE\b.*\bADD VALUE\b/.test(text)) {
-      return [];
-    }
-
-    if (
-      /^(ALTER|UPDATE|INSERT|DO|CALL|WITH|SELECT|MERGE)\b/.test(text) ||
-      /^CREATE (?:OR REPLACE )?(?:FUNCTION|PROCEDURE|TRIGGER|RULE)\b/.test(text)
-    ) {
-      return [review];
-    }
-
-    if (!/^(CREATE|COMMENT|GRANT|REVOKE)\b/.test(text)) {
-      return [
-        finding(
-          "caution",
-          "SQL is outside the static migration checks.",
-          "Review this statement and exercise it with verify.",
-        ),
-      ];
-    }
-
-    return [];
+    return note
+      ? [
+          {
+            level: "destructive",
+            table: name,
+            statement: position + 1,
+            message: `Statement ${position + 1}: ${note[1]}`,
+            advice:
+              "generate needed --allow-destructive for it; back up what it loses before it runs.",
+          },
+        ]
+      : [];
   });
+
+  return [...noted, ...findings];
 };

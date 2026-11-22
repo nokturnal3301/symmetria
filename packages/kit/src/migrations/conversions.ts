@@ -356,6 +356,30 @@ export const typeConversion = (
 };
 
 /**
+ * `vector(n)` to `halfvec(n)`: every number is rounded to half precision, the
+ * point of the change (half the storage, distances barely move), and one
+ * beyond ±65504 fails the cast. A caution rather than a destructive change.
+ */
+export const halfPrecision = (
+  before: MigrationColumn,
+  after: MigrationColumn,
+): boolean => {
+  if (before.enumeration || after.enumeration) {
+    return false;
+  }
+
+  const source = parse(before.sqlType);
+  const target = parse(after.sqlType);
+
+  return (
+    source.base === "vector" &&
+    target.base === "halfvec" &&
+    source.array === target.array &&
+    source.first === target.first
+  );
+};
+
+/**
  * A change between `timestamptz` and `timestamp`, for a value or for an
  * array of them. A plain cast converts through the time zone of the session
  * that runs the migration, so the stored values would depend on who

@@ -107,12 +107,17 @@ const fingerprints = new WeakMap<SelectPlan, string>();
 const cursorValueMatches = (sqlType: string, value: string): boolean => {
   const type = sqlType.toLowerCase();
 
+  // An array's text form; PostgreSQL checks its elements when it casts.
+  if (type.endsWith("[]")) {
+    return value.startsWith("{") && value.endsWith("}");
+  }
+
   if (/^(?:smallint|integer|int|bigint|int[248])$/.test(type)) {
     return /^-?\d{1,19}$/.test(value);
   }
 
   if (
-    /^(?:numeric|decimal)/.test(type) ||
+    /^(?:numeric|decimal)(?:\(|$)/.test(type) ||
     /^(?:real|double precision)$/.test(type)
   ) {
     return /^(?:NaN|-?Infinity|-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)$/i.test(
@@ -120,7 +125,7 @@ const cursorValueMatches = (sqlType: string, value: string): boolean => {
     );
   }
 
-  if (/^(?:timestamptz|timestamp|date)/.test(type)) {
+  if (/^(?:timestamptz|timestamp|date)(?:\(|$)/.test(type)) {
     if (value === "infinity" || value === "-infinity") {
       return true;
     }

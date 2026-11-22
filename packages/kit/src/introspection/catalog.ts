@@ -38,6 +38,8 @@ export type IndexDetailRow = {
   included: string[];
   /** Non-default operator class per key, null when the default applies. */
   opclasses: (string | null)[];
+  /** Operator class per key, the default one included. */
+  opclass_names: string[];
   /** Collation per key when it differs from the key's own (a `COLLATE` in the definition), else null. */
   collations: (string | null)[];
   /** Storage parameters as `name=value` strings, or null. */
@@ -100,6 +102,9 @@ export const readIndexDetails = (options: CatalogOptions) =>
       ARRAY(SELECT CASE WHEN opclass.opcdefault THEN NULL ELSE opclass.opcname::text END
         FROM unnest(index.indclass::oid[]) WITH ORDINALITY classes(oid, position)
         JOIN pg_opclass opclass ON opclass.oid = classes.oid ORDER BY position) AS opclasses,
+      ARRAY(SELECT opclass.opcname::text
+        FROM unnest(index.indclass::oid[]) WITH ORDINALITY classes(oid, position)
+        JOIN pg_opclass opclass ON opclass.oid = classes.oid ORDER BY position) AS opclass_names,
       ARRAY(SELECT CASE
           WHEN index.indcollation[position - 1] = 0 THEN NULL
           WHEN index.indkey[position - 1] <> 0 THEN (SELECT CASE WHEN keycolumn.attcollation = index.indcollation[position - 1] THEN NULL ELSE collation_entry.collname::text END

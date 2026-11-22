@@ -7,6 +7,7 @@ import { NotFoundError, TooManyRowsError } from "../../errors";
 import { freeze } from "../plan/freeze";
 import { count, readColumn } from "../expressions";
 import { derivedBinding } from "../plan/derived";
+import { containsNode } from "../plan/traverse";
 import type { SelectPlan } from "../plan/types";
 import {
   EMPTY,
@@ -25,8 +26,27 @@ const withoutLocking = (plan: SelectPlan): SelectPlan => {
   return rest;
 };
 
+/**
+ * A projection of aggregates without GROUP BY (`{ n: count() }`): the query
+ * returns one row whatever the source holds, so that is what counts.
+ */
+const aggregatesAll = (plan: SelectPlan): boolean =>
+  !plan.grouping.length &&
+  plan.selection.some(
+    (expression) =>
+      containsNode(expression.node, (node) => node.kind === "aggregate") &&
+      !containsNode(
+        expression.node,
+        (node) => node.kind === "window" || node.kind === "relativeWindow",
+      ),
+  );
+
 /** The selection a wrapped plan keeps so its row count matches the user's query. */
 const innerSelection = (plan: SelectPlan): SelectPlan["selection"] => {
+  if (aggregatesAll(plan)) {
+    return plan.selection;
+  }
+
   if (!plan.distinct) {
     return presentSelection;
   }
@@ -57,7 +77,8 @@ export const countPlan = (plan: SelectPlan): SelectPlan => {
     plan.offset !== undefined ||
     plan.grouping.length > 0 ||
     plan.having.length > 0 ||
-    plan.distinct;
+    plan.distinct ||
+    aggregatesAll(plan);
 
   derived = counted
     ? freeze({
@@ -89,6 +110,8 @@ export const existsPlan = (
 ): SelectPlan => {
   const parameterized =
     typeof plan.limit === "object" || typeof plan.offset === "object";
+  // Its one row exists whatever the source holds; it is read as it is.
+  const wrapped = parameterized || aggregatesAll(plan);
 
   if (parameterized && !allowPlaceholderLimit) {
     throw new Error("symmetria: bind a parameterized LIMIT with prepare()");
@@ -102,7 +125,7 @@ export const existsPlan = (
   }
 
   return (variants[allowPlaceholderLimit ? 1 : 0] ??= freeze(
-    parameterized
+    wrapped
       ? {
           ...initialPlan(
             derivedBinding(

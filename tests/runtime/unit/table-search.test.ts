@@ -8,6 +8,7 @@ import {
   text,
   uuid,
   type CompiledQuery,
+  type InferInsert,
 } from "../../../packages/runtime/src";
 import {
   bm25,
@@ -308,7 +309,7 @@ test("a model that fails rejects the insert before anything is sent", async () =
         content: "c",
       })
       .execute(),
-  ).rejects.toThrow("custom returned 1 numbers; 2 expected");
+  ).rejects.toThrow("custom returned 1 numbers for a text; 2 expected");
 });
 
 test("rows the write refuses never reach the model", async () => {
@@ -391,7 +392,7 @@ test("search() ranks by words and meaning in one statement", async () => {
       "LIMIT 40),",
       '"search_about_meaning" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ("chunks"."about" <=> $5::text::vector) ASC) AS "position", ("chunks"."about" <=> $5::text::vector) AS "rank"',
       'FROM "chunks" AS "chunks"',
-      `WHERE (SELECT CASE WHEN current_setting('hnsw.iterative_scan', true) IS NULL THEN '' ELSE set_config('hnsw.iterative_scan', 'strict_order', true) END || CASE WHEN current_setting('hnsw.max_scan_tuples', true) IS NULL THEN '' ELSE set_config('hnsw.max_scan_tuples', '2147483647', true) END) IS NOT NULL AND (SELECT COUNT(*) AS "matches"`,
+      `WHERE (SELECT CASE WHEN current_setting('hnsw.iterative_scan', true) IS NULL THEN '' ELSE set_config('hnsw.iterative_scan', 'strict_order', true) END || CASE WHEN current_setting('hnsw.max_scan_tuples', true) IS NULL THEN '' ELSE set_config('hnsw.max_scan_tuples', '2147483647', true) END || CASE WHEN current_setting('hnsw.scan_mem_multiplier', true) IS NULL THEN '' ELSE set_config('hnsw.scan_mem_multiplier', '1000', true) END) IS NOT NULL AND (SELECT COUNT(*) AS "matches"`,
       'FROM "search_about_meaning_probe" AS "search_about_meaning_probe") > $6 AND "chunks"."owner" = $7 AND "chunks"."about" IS NOT NULL',
       'ORDER BY ("chunks"."about" <=> $5::text::vector) ASC',
       "LIMIT 40),",
@@ -659,4 +660,45 @@ test("reindex() goes by descending key and missing() counts what is left", async
   await expect(
     database.chunks.search.reindex({ order: "newest" as never }),
   ).rejects.toThrow('reindex() order is "asc" or "desc"');
+});
+
+test("a model that answers NaN fails like a model that is down", async () => {
+  const broken = embedder(
+    2,
+    async (texts) => texts.map(() => [Number.NaN, 1]),
+    {
+      name: "broken",
+    },
+  );
+  const { database, calls } = recording(tables(broken), [{ id: 1 }]);
+  const rows = await database.chunks.search({ about: "keys" });
+
+  // The search falls back to its words.
+  expect(rows).toEqual([{ id: 1 } as never]);
+  expect((rows.partial?.error as Error).message).toBe(
+    "symmetria: broken returned a number that is not finite for a question",
+  );
+  calls.length = 0;
+  await expect(
+    database.chunks
+      .insert({ noteId: 1, owner: "u", title: "t", content: "c" })
+      .execute(),
+  ).rejects.toThrow(
+    "symmetria: broken returned a number that is not finite for a text",
+  );
+  expect(calls).toHaveLength(0);
+});
+
+test("an insert may leave an embedding undefined, under exactOptionalPropertyTypes", () => {
+  const searched = schema(tables());
+  type Insert = InferInsert<typeof searched.chunks>;
+  const row: Insert = {
+    noteId: 1,
+    owner: "u",
+    title: "t",
+    content: "c",
+    about: undefined,
+  };
+
+  expect(row.about).toBeUndefined();
 });

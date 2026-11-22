@@ -408,7 +408,7 @@ test("predicates chain with and() and or()", () => {
   );
 });
 
-test("update() and delete() take their filter as an option", () => {
+test("update() and delete() take their filter as an option", async () => {
   const { database } = recording();
   const chained = database.posts
     .update({ title: "x" })
@@ -446,13 +446,20 @@ test("update() and delete() take their filter as an option", () => {
       .toSQL().sql,
   ).toEndWith('WHERE "posts"."id" = $2 AND "posts"."version" = $3');
 
-  // An object that names no column must not become "every row".
-  expect(() => database.posts.delete({ where: {} })).toThrow(
+  // An object that names no column must not become "every row". Request
+  // values empty it (`{ id: undefined }`), so the write is refused when it
+  // runs and its catch() sees it.
+  expect(() => database.posts.delete({ where: {} }).toSQL()).toThrow(
     "symmetria: delete() where: {} names no column; call .all() to delete every row",
   );
   expect(() =>
-    database.posts.update({ title: "x" }, { where: { id: undefined } }),
+    database.posts.update({ title: "x" }, { where: { id: undefined } }).toSQL(),
   ).toThrow("update() where: {} names no column");
+  await expect(
+    database.posts
+      .update({ title: "x" }, { where: { id: undefined } })
+      .execute(),
+  ).rejects.toThrow("update() where: {} names no column");
   // A missing option leaves the statement unrestricted, which is refused as before.
   expect(() => database.posts.delete({ where: undefined }).toSQL()).toThrow(
     'delete() on "posts" has no where(); call .all()',

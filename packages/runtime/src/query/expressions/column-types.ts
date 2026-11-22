@@ -28,12 +28,14 @@ export type Comparable<Stored, Value = Stored> =
   | SelectedColumn<Value | null>;
 /**
  * A literal a column's codec encodes: its stored form, safe integers for
- * bigint, any string for decimals (not for enum labels that look numeric).
+ * bigint, any string for decimals (not for enum labels that look numeric),
+ * a plain number array for a vector.
  */
 export type Literal<Stored> =
   | NonNullable<Stored>
   | (bigint extends NonNullable<Stored> ? number : never)
-  | (IsDecimalText<NonNullable<Stored>> extends true ? string : never);
+  | (IsDecimalText<NonNullable<Stored>> extends true ? string : never)
+  | ([NonNullable<Stored>] extends [Vector] ? readonly number[] : never);
 /** The stored form of an expression's value. */
 export type StoredOf<Expression> = StoredValue<
   ExpressionValue<Expression>,

@@ -471,10 +471,11 @@ export const declareConditions = (
 export const declaredExtensions = (
   extensions: readonly string[],
 ): readonly string[] => {
+  // Lowercase names, with the hyphen of "uuid-ossp"; DDL quotes them.
   for (const extension of extensions) {
-    if (!/^[a-z_][a-z0-9_]*$/.test(extension)) {
+    if (!/^[a-z_][a-z0-9_-]*$/.test(extension)) {
       throw new Error(
-        `symmetria: extension names are lowercase identifiers, not "${extension}"`,
+        `symmetria: extension names are lowercase identifiers such as "pg_trgm" or "uuid-ossp", not "${extension}"`,
       );
     }
   }

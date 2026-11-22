@@ -327,7 +327,7 @@ export const queryJsonSemanticsTests = (): void => {
     }
   });
 
-  test("JSON equality distinguishes scalar types, SQL NULL and JSON null across preparation and projections", async () => {
+  test("JSON equality distinguishes scalar types, and is(null) counts SQL NULL and JSON null, across preparation and projections", async () => {
     const { database, close } = await fixture();
 
     try {
@@ -359,7 +359,8 @@ export const queryJsonSemanticsTests = (): void => {
             orderBy: (records) => records.id.ascending,
           },
         ),
-      ).toEqual([3, 4, 5, 6, 7, 8].map((id) => ({ id })));
+        // Row 8's JSON null is null, as for is(null): no value to compare.
+      ).toEqual([3, 4, 5, 6, 7].map((id) => ({ id })));
       expect(
         await database.records(
           (records) => ({
@@ -397,9 +398,13 @@ export const queryJsonSemanticsTests = (): void => {
           (records) => ({
             id: records.id,
           }),
-          { where: (records) => records.document.is(null) },
+          {
+            where: (records) => records.document.is(null),
+            orderBy: (records) => records.id.ascending,
+          },
         ),
-      ).toEqual([{ id: 2 }]);
+        // SQL NULL and the JSON null of row 8 both read back as null.
+      ).toEqual([{ id: 2 }, { id: 8 }]);
       const matching = prepare(
         { value: jsonb<unknown>().nullable },
         (parameters) =>
@@ -621,7 +626,8 @@ export const queryJsonSemanticsTests = (): void => {
             orderBy: (records) => records.id.ascending,
           },
         ),
-      ).toEqual([4, 5, 6, 7, 8].map((id) => ({ id })));
+        // Row 8's JSON null is null, as for is(null).
+      ).toEqual([4, 5, 6, 7].map((id) => ({ id })));
       expect(
         await database.records(
           (records) => ({

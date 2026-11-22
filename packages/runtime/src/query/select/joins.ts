@@ -22,7 +22,12 @@ import {
 } from "../plan/types";
 import type { shapeExpressions } from "./projections";
 import { primaryKeyColumns, type ColumnSnapshot } from "../../schema/assembly";
-import { createScope, initialPlan, validatePredicate } from "./scope";
+import {
+  createScope,
+  initialPlan,
+  presentSelection,
+  validatePredicate,
+} from "./scope";
 import { columnsOnly } from "./suggest";
 import {
   CONDITION,
@@ -298,10 +303,54 @@ export const joinRelation = (
     );
     const sourceForeignKey = columnNode(junction, relation.sourceForeignKey);
     const targetForeignKey = columnNode(junction, relation.targetForeignKey);
-    addJoin(
-      junction,
-      equals(reference(sourceForeignKey, source), sourceForeignKey),
+    const linked = equals(
+      reference(sourceForeignKey, source),
+      sourceForeignKey,
     );
+
+    // Two LEFT JOINs keep a link whose target the scope hides, as a row of
+    // NULLs; the link joins only when its target is one the scope admits.
+    if (kind === "LEFT" && registry.scopePredicates(target).length) {
+      let scopedNumber = junctionNumber;
+
+      while (reserved(`__symmetria_scoped_${scopedNumber}`)) {
+        scopedNumber += 1;
+      }
+
+      const admitted = registry.bindingFor(
+        target.table.name,
+        `__symmetria_scoped_${scopedNumber}`,
+      );
+
+      addJoin(
+        junction,
+        freeze({
+          kind: "group",
+          operator: "AND",
+          predicates: freeze([
+            linked,
+            freeze({
+              kind: "exists",
+              negated: false,
+              query: freeze({
+                ...initialPlan(admitted),
+                predicates: freeze([
+                  equals(
+                    targetForeignKey,
+                    reference(targetForeignKey, admitted),
+                  ),
+                  ...registry.scopePredicates(admitted),
+                ]),
+                selection: presentSelection,
+              }),
+            }),
+          ]),
+        }),
+      );
+    } else {
+      addJoin(junction, linked);
+    }
+
     addJoin(
       target,
       equals(targetForeignKey, reference(targetForeignKey, target)),
@@ -591,16 +640,48 @@ export const localJoin = (
     );
   }
 
+  // The relation's own row is not the row of a CROSS JOIN, so the two never
+  // stand in for each other.
+  const sameRelation = (join: JoinDescription) =>
+    join.relation?.from === relation.owner &&
+    join.relation.name === relation.relation &&
+    (join.kind === "CROSS") === (kind === "CROSS");
+
   if (relation.explicitAlias) {
     const existing = context.plan.joins.find(
-      (join) =>
-        join.binding.alias === relation.alias &&
-        join.relation?.from === relation.owner &&
-        join.relation.name === relation.relation,
+      (join) => join.binding.alias === relation.alias && sameRelation(join),
     );
 
     if (existing) {
       return context.columns(existing.binding);
+    }
+  }
+
+  const resolved =
+    kind === "AUTO"
+      ? relation.nullable ||
+        Object.hasOwn(context.registry.scopes, relation.target)
+        ? "LEFT"
+        : "INNER"
+      : kind === "CROSS"
+        ? "CROSS"
+        : relationKind(kind);
+
+  // As with a table source: an option callback reaches the JOIN the
+  // projection made (or a path made) of the same relation and kind.
+  if (context.options && !relation.explicitAlias && kind !== "CROSS") {
+    const matches = context.plan.joins.filter(
+      (join) => sameRelation(join) && join.kind === resolved,
+    );
+
+    if (matches.length === 1) {
+      return context.columns(matches[0]!.binding);
+    }
+
+    if (matches.length > 1) {
+      throw new Error(
+        `symmetria: "${relation.relation}" is joined more than once; name the JOIN with .as() to refer to it`,
+      );
     }
   }
 
@@ -635,12 +716,7 @@ export const localJoin = (
   context.plan = joinRelation(
     context.registry,
     context.plan,
-    kind === "AUTO"
-      ? relation.nullable ||
-        Object.hasOwn(context.registry.scopes, relation.target)
-        ? "LEFT"
-        : "INNER"
-      : relationKind(kind),
+    resolved as "LEFT" | "INNER",
     relation.from,
     relation.relation,
     alias,

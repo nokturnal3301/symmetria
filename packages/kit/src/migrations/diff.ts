@@ -2,6 +2,7 @@
  * Computes the migration plan between two schema snapshots: table, column, constraint, index and enum changes,
  * rename hints and the full CREATE script for an empty database.
  */
+import { normalizeSqlType } from "./drift";
 import { quoteIdentifier } from "symmetria/internal";
 import {
   expressionUsesLiteral,
@@ -9,12 +10,15 @@ import {
 } from "./expression-tokens";
 import { expressionKey, indexKeyKey } from "./expressions";
 import {
+  conversionMessage,
   castless,
   embeddingChange,
   typeConversion,
   utcConversion,
   widens,
 } from "./conversions";
+import { DESTRUCTIVE_NOTE } from "./sql-lint";
+import { defaultKey } from "./default-values";
 import type { CompiledQuery, SchemaSnapshot } from "symmetria";
 import {
   columnSQL,
@@ -120,6 +124,16 @@ const comparable = (
       ? {
           keys: entry.keys.map((key) =>
             typeof key === "string" ? indexKeyKey(key, columns) : key,
+          ),
+        }
+      : {}),
+    // PostgreSQL keeps storage parameters as text: fillfactor 50 is "50".
+    ...(entry.with && typeof entry.with === "object"
+      ? {
+          with: Object.fromEntries(
+            Object.entries(entry.with as Record<string, unknown>).map(
+              ([name, value]) => [name, String(value)],
+            ),
           ),
         }
       : {}),
@@ -395,7 +409,8 @@ const direction = (
     previous: MigrationColumn,
     next: MigrationColumn,
   ): boolean =>
-    previous.sqlType !== next.sqlType ||
+    // numeric(6) is numeric(6,0): spellings of one type change nothing.
+    normalizeSqlType(previous.sqlType) !== normalizeSqlType(next.sqlType) ||
     (previous.enumeration === undefined
       ? undefined
       : (enumerationRenames.get(previous.enumeration) ??
@@ -981,8 +996,10 @@ const direction = (
           statements.push("SET TIME ZONE 'UTC'");
         }
 
+        // The saved SQL says what generate knew: lint of the file rates it
+        // as generate did.
         statements.push(
-          `${prefix} TYPE ${columnTypeSQL(next)}${conversion === undefined ? "" : ` USING ${conversion}`}`,
+          `${change?.lossy ? `${DESTRUCTIVE_NOTE} ${supplied === undefined ? conversionMessage(previous, next, change) : `Column "${next.name}" narrows from ${previous.enumeration ?? previous.sqlType} to ${next.enumeration ?? next.sqlType} with the USING conversion given for it.`}\n` : ""}${prefix} TYPE ${columnTypeSQL(next)}${conversion === undefined ? "" : ` USING ${conversion}`}`,
         );
 
         if (atUtc === "array") {
@@ -1039,25 +1056,32 @@ const direction = (
 
       if (
         next.default !== undefined &&
-        (column.typeChanged || previous.default !== next.default)
+        (column.typeChanged ||
+          (previous.default !== next.default &&
+            // Two spellings of one value (a pulled default) are no change.
+            (previous.default === undefined ||
+              defaultKey(previous.default, next) !==
+                defaultKey(next.default, next))))
       ) {
         statements.push(`${prefix} SET DEFAULT ${next.default}`);
       }
 
       // Embeddings of other text, or of another model, would rank rows by
       // what they no longer say; emptied, reindex() computes them again.
+      const stale = embeddingChange(
+        previous,
+        next,
+        Object.fromEntries(
+          pair.columns.map((match) => [match.before.name, match.after.name]),
+        ),
+      );
+
       if (
-        embeddingChange(
-          previous,
-          next,
-          Object.fromEntries(
-            pair.columns.map((match) => [match.before.name, match.after.name]),
-          ),
-        ) &&
+        stale &&
         !(column.typeChanged && typeConversion(previous, next)?.cleared)
       ) {
         statements.push(
-          `UPDATE ${quoteIdentifier(pair.after.name)} SET ${quoteIdentifier(next.name)} = NULL WHERE ${quoteIdentifier(next.name)} IS NOT NULL`,
+          `${DESTRUCTIVE_NOTE} the embeddings in "${next.name}" are cleared: ${stale}.\nUPDATE ${quoteIdentifier(pair.after.name)} SET ${quoteIdentifier(next.name)} = NULL WHERE ${quoteIdentifier(next.name)} IS NOT NULL`,
         );
       }
     }

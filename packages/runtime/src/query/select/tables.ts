@@ -15,6 +15,7 @@ import {
 import { compileTemplate, executeCompiled } from "../compile";
 import { batchCollectors } from "../plan/batching";
 import {
+  COLUMN_EXPRESSION,
   createExpression,
   readColumn,
   readPredicate,
@@ -108,9 +109,14 @@ const restricted = (
     const predicates = equalityPredicates(row, value) as readonly unknown[];
 
     if (!predicates.length) {
-      throw new Error(
-        `symmetria: ${kind}() where: {} names no column; call .all() to ${kind} every row`,
+      // Refused when the write runs, as an emptied list is.
+      dataError(
+        new Error(
+          `symmetria: ${kind}() where: {} names no column; call .all() to ${kind} every row`,
+        ),
       );
+
+      return [];
     }
 
     // One condition is that condition, as `.where()` would write it.
@@ -318,6 +324,19 @@ export const createQueryTables = (
     ): SelectPlan => {
       const binding = shapeFrame.bindings ? freeze({ ...root }) : root;
       const values = keyValues.map((value, position) => {
+        const node =
+          value && typeof value === "object" && COLUMN_EXPRESSION in value
+            ? readColumn(value as never).node
+            : undefined;
+
+        // A key is one row; a parameter that may be null would compare as
+        // `IS NULL` and reach every row whose key is NULL.
+        if (node?.kind === "placeholder" && node.nullable) {
+          throw new Error(
+            `symmetria: ${label} "${keys[position]!.name}" cannot be a nullable parameter (${node.name}); declare it without .nullable`,
+          );
+        }
+
         if (
           Array.isArray(value) &&
           !keys[position]!.sqlType.endsWith("[]") &&

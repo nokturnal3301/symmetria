@@ -314,4 +314,53 @@ describe.skipIf(!databaseUrl)("$batch on PostgreSQL", () => {
     expect(await database.users.count()).toBe(2);
     expect(await database.$batch(() => [])).toEqual([]);
   });
+
+  test("reads whose CTEs share a name, and DISTINCT ordered by a bigint or numeric column", async () => {
+    const ranked = (db: typeof database) =>
+      db
+        .posts((post, { rowNumber }) => ({
+          id: post.id,
+          position: rowNumber().over({
+            partitionBy: [post.authorId],
+            orderBy: post.views.desc,
+          }),
+        }))
+        .cte("ranked");
+    const views = (db: typeof database) =>
+      db.posts((post) => ({ views: post.views }), {
+        distinct: true,
+        orderBy: (post) => post.views.desc,
+      });
+    const prices = (db: typeof database) =>
+      db.posts((post) => ({ price: post.price }), {
+        distinct: true,
+        orderBy: { price: "asc" },
+      });
+    const alone = {
+      best: await ranked(database)({
+        where: (row) => row.position.is(1),
+        orderBy: (row) => row.id.asc,
+      }),
+      second: await ranked(database)({
+        where: (row) => row.position.is(2),
+      }).count(),
+      total: await database.posts.count(),
+      views: await views(database),
+      prices: await prices(database),
+    };
+
+    expect(alone.views[0]).toEqual({ views: 9007199254740993n });
+    expect(
+      await database.$batch((db) => ({
+        best: ranked(db)({
+          where: (row) => row.position.is(1),
+          orderBy: (row) => row.id.asc,
+        }),
+        second: ranked(db)({ where: (row) => row.position.is(2) }).count(),
+        total: db.posts.count(),
+        views: views(db),
+        prices: prices(db),
+      })),
+    ).toEqual(alone);
+  });
 });

@@ -54,8 +54,8 @@ export class DuplicateConflictKeyError extends SymmetriaError {
   override name = "DuplicateConflictKeyError";
   readonly table: string;
 
-  constructor(message: string, table: string) {
-    super(message, "SYMMETRIA_DUPLICATE_CONFLICT_KEY");
+  constructor(message: string, table: string, options?: ErrorOptions) {
+    super(message, "SYMMETRIA_DUPLICATE_CONFLICT_KEY", options);
     this.table = table;
   }
 }

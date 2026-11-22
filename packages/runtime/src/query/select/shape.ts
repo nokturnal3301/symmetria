@@ -349,6 +349,7 @@ export const applyShape = (
       const projection = callback(columns, tools as never);
 
       if (options !== undefined) {
+        context.options = true;
         let fields: object | undefined;
         const selected = () =>
           (fields ??= selectedFields(projection, context.plan));
@@ -397,6 +398,7 @@ export const applyShape = (
     });
   } finally {
     toolState.active = false;
+    context.options = false;
   }
 
   if (

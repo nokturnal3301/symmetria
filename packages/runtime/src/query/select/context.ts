@@ -268,6 +268,10 @@ export const createContext = (
           Object.hasOwn(registry.scopes, relation.target);
         let base: SelectPlan | undefined;
         let shaped = false;
+        // Inside that shape's callback, the relation's count(), exists(),
+        // quantifiers and aggregates read sources of their own: the shape
+        // already reads the relation's.
+        let shaping = 0;
         let related: TableBinding;
 
         const nestedPlan = (): SelectPlan => {
@@ -308,8 +312,12 @@ export const createContext = (
           selectedAlias: string,
           customAlias: boolean,
         ): RuntimeScope[string] => {
+          // A CROSS JOIN of the relation pairs every row with every other;
+          // a path reads the row's own related row, unless it names the
+          // CROSS JOIN by its alias.
           const previous = context.plan.joins.find(
             (join) =>
+              (join.kind !== "CROSS" || customAlias) &&
               join.relation?.from === binding &&
               join.relation.name === property &&
               (!customAlias || join.binding.alias === selectedAlias),
@@ -343,7 +351,11 @@ export const createContext = (
           filtered = false,
           customAlias = false,
         ): object => {
-          const current = () => plan ?? nestedPlan();
+          const current = () => {
+            const query = plan ?? nestedPlan();
+
+            return shaping ? queryOccurrence(query) : query;
+          };
 
           const evaluate = <Result>(
             callback: (columns: RuntimeScope[string]) => Result,
@@ -354,9 +366,19 @@ export const createContext = (
               context.bindings,
               depth + 1,
             );
-            const result = evaluateContext(nested, () =>
-              callback(nested.columns(nested.plan.bindings[related.alias]!)),
-            );
+            let result: Result;
+
+            // The relation named again inside its own quantifier reads
+            // sources of its own, as inside its first shape.
+            shaping += 1;
+
+            try {
+              result = evaluateContext(nested, () =>
+                callback(nested.columns(nested.plan.bindings[related.alias]!)),
+              );
+            } finally {
+              shaping -= 1;
+            }
 
             return { nested, result };
           };
@@ -521,12 +543,20 @@ export const createContext = (
                 context.bindings,
                 depth + 1,
               );
-              const query = applyShape(
-                nested,
-                occurrence.bindings[related.alias]!,
-                callback,
-                options,
-              );
+              let query: SelectPlan;
+
+              shaping += 1;
+
+              try {
+                query = applyShape(
+                  nested,
+                  occurrence.bindings[related.alias]!,
+                  callback,
+                  options,
+                );
+              } finally {
+                shaping -= 1;
+              }
 
               if (!query.selection.length) {
                 return build(query, selectedAlias, true);
@@ -602,6 +632,7 @@ export const createContext = (
                     node: freeze({
                       kind: "raw",
                       sqlType: "boolean",
+                      composed: true,
                       parts: freeze([
                         "EXISTS ",
                         {

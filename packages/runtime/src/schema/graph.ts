@@ -379,7 +379,7 @@ type SearchEmbeddings<Columns> = Columns extends {
         readonly meaning: true;
       }
         ? Name
-        : never]?: readonly number[] | null;
+        : never]?: readonly number[] | null | undefined;
     }
   : {};
 

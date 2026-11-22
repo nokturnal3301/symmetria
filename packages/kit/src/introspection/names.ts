@@ -82,7 +82,10 @@ export const keyFor = (sqlName: string, casing: Casing): string =>
  * The casing that lets most names be declared without `.named()`: Prisma-style
  * camelCase (`createdAt`) chooses `"preserve"`, snake_case (`created_at`) the default.
  */
-export const chooseCasing = (names: readonly string[]): Casing => {
+export const chooseCasing = (
+  names: readonly string[],
+  indexNames: readonly string[] = [],
+): Casing => {
   let snake = 0;
   let preserved = 0;
 
@@ -95,6 +98,10 @@ export const chooseCasing = (names: readonly string[]): Casing => {
     } else if (asPreserved && !asSnake) {
       preserved += 1;
     }
+  }
+
+  if (preserved === snake && indexNames.some((name) => /[A-Z]/.test(name))) {
+    return "preserve";
   }
 
   return preserved > snake ? "preserve" : "snake_case";

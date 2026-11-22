@@ -10,6 +10,8 @@ import {
   timestamp,
   timestamptz,
   prepare,
+  bigint,
+  createDatabase,
 } from "../../../packages/runtime/src";
 import { bun } from "../../support/postgres";
 import { postgres as pg } from "../../../packages/runtime/src/entries/pg";
@@ -382,3 +384,48 @@ describe.skipIf(!url)(
     });
   },
 );
+
+describe.skipIf(!url)("named prepared statements on node-postgres", () => {
+  test("a statement prepared before its column changed type is prepared again", async () => {
+    const before = schema({ items: { id: int, n: int } });
+    const fixture = await testDatabase({
+      url: url!,
+      schema: before,
+      driver: (options) => pg({ ...options, prepare: true }),
+      max: 2,
+      prefix: "symmetria_prepared",
+    });
+    const read = (database: typeof fixture.database) =>
+      database.items((item) => ({ n: item.n }), {
+        where: (item) => item.id.is(1),
+      });
+
+    try {
+      await fixture.database.items.insert([
+        { id: 1, n: 1 },
+        { id: 2, n: 2 },
+      ]);
+      // Both connections prepare the statement.
+      await Promise.all(
+        Array.from({ length: 6 }, () => read(fixture.database)),
+      );
+      await fixture.driver.execute({
+        sql: "ALTER TABLE items ALTER COLUMN n TYPE bigint",
+        parameters: [],
+      });
+
+      // PostgreSQL refuses the old plan ("cached plan must not change result
+      // type"); outside a transaction the call runs again under a new name.
+      const migrated = createDatabase({
+        schema: schema({ items: { id: int, n: bigint } }),
+        driver: fixture.driver,
+      });
+
+      for (let call = 0; call < 6; call += 1) {
+        expect(await read(migrated as never)).toEqual([{ n: 1n }] as never);
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+});

@@ -7,8 +7,10 @@ import {
   text,
   prepare,
   operatorClass,
+  maximum,
+  minimum,
 } from "../../../packages/runtime/src";
-import { vector } from "../../../packages/runtime/src/entries/vector";
+import { vector, halfvec } from "../../../packages/runtime/src/entries/vector";
 import { testDatabase } from "../../support/postgres";
 import { hasExtension } from "../../support/extensions";
 
@@ -22,7 +24,8 @@ const documents = table({
     .using("hnsw")
     .with({ m: 16, ef_construction: 64 }),
 }));
-const model = schema({ documents }, { extensions: ["vector"] });
+const halves = table({ id: int.auto, half: halfvec(3) });
+const model = schema({ documents, halves }, { extensions: ["vector"] });
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 const available = await hasExtension(databaseUrl, "vector");
@@ -172,5 +175,38 @@ describe.skipIf(!available)("pgvector on PostgreSQL", () => {
     });
 
     expect(plan).toContain("documents_embedding_idx");
+  });
+
+  test("minimum() and maximum() of a halfvec compare element by element", async () => {
+    await database.halves.insert([
+      { half: [1, 0, 0] as never },
+      { half: [0, 1, 0] as never },
+    ]);
+
+    expect(
+      await database.halves.aggregate((row) => ({
+        least: minimum(row.half),
+        top: maximum(row.half),
+      })),
+    ).toEqual({ least: [0, 1, 0], top: [1, 0, 0] } as never);
+  });
+
+  test("a NaN distance reads as a number inside a nested result", async () => {
+    const [row] = await database.documents(
+      (document) => ({
+        id: document.id,
+        nested: database.documents(
+          (inner) => ({
+            // The cosine distance to a zero vector is NaN in pgvector.
+            distance: inner.embedding.cosineDistance([0, 0, 0]),
+          }),
+          { where: (inner) => inner.id.is(document.id) },
+        ),
+      }),
+      { limit: 1 },
+    );
+
+    expect(typeof row!.nested[0]!.distance).toBe("number");
+    expect(Number.isNaN(row!.nested[0]!.distance)).toBe(true);
   });
 });

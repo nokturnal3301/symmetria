@@ -123,6 +123,7 @@ const parsers: NonNullable<PoolConfig["types"]> = {
 /** Statements worth preparing: one SELECT or write, not DDL, cursors or transaction control. */
 const PREPARABLE = /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/;
 const PREPARED_LIMIT = 500;
+const STALE_STATEMENT = Symbol("symmetria.pg.staleStatement");
 
 /**
  * A failure that leaves the client unusable: the connection was lost or the
@@ -170,6 +171,7 @@ export const postgres = (
   // limit (IN lists and literal LIMITs of every length) stay unnamed, so a
   // connection never holds more than that many prepared statements.
   const statementNames = new Map<string, string>();
+  let statementOrdinal = 0;
   const statementName = (sql: string): string | undefined => {
     if (!prepare || !PREPARABLE.test(sql)) {
       return undefined;
@@ -178,12 +180,23 @@ export const postgres = (
     let name = statementNames.get(sql);
 
     if (!name && statementNames.size < PREPARED_LIMIT) {
-      name = `symmetria_${statementNames.size}`;
+      name = `symmetria_${statementOrdinal++}`;
       statementNames.set(sql, name);
     }
 
     return name;
   };
+  // A column a statement reads changed its type since the connection
+  // prepared it. node-postgres would keep sending the stale name on that
+  // connection, and every connection that prepared it would fail the same
+  // way: the text gets a new name, which each connection prepares afresh.
+  const staleStatement = (error: unknown, sql: string, name: string) =>
+    sqlState(error) === "0A000" &&
+    /cached plan must not change result type/.test(
+      error instanceof Error ? error.message : String(error),
+    ) &&
+    statementNames.get(sql) === name &&
+    statementNames.delete(sql);
 
   const result = (value: QueryResult | QueryResult[]): ExecutionResult => {
     if (Array.isArray(value)) {
@@ -207,8 +220,11 @@ export const postgres = (
     let released = false;
     let failure: Error | undefined;
 
+    // A server that ends the session reports why (57P01, 25P03), and the
+    // closed socket follows as "Connection terminated unexpectedly": the
+    // first error is the one that says what happened.
     const onError = (error: Error) => {
-      failure = error;
+      failure ??= error;
     };
 
     client.on("error", onError);
@@ -232,11 +248,22 @@ export const postgres = (
         // takes several commands in one text; a prepared statement takes one.
         const name = values.length ? statementName(query.sql) : undefined;
 
-        return result(
-          await (name
-            ? client.query({ name, text: query.sql, values })
-            : client.query(query.sql, values)),
-        );
+        if (!name) {
+          return result(await client.query(query.sql, values));
+        }
+
+        try {
+          return result(await client.query({ name, text: query.sql, values }));
+        } catch (error) {
+          if (staleStatement(error, query.sql, name)) {
+            // Fails inside a transaction, which the error has aborted; the
+            // statement is then freed with the connection.
+            await client.query(`DEALLOCATE "${name}"`).catch(() => {});
+            throw Object.assign(error as Error, { [STALE_STATEMENT]: true });
+          }
+
+          throw error;
+        }
       },
       release,
       // node-postgres closes a client released with `true`.
@@ -250,7 +277,17 @@ export const postgres = (
         const connection = await connect();
 
         try {
-          return await connection.execute(query);
+          try {
+            return await connection.execute(query);
+          } catch (error) {
+            // Outside a transaction the failed statement did nothing: it runs
+            // again under its new name.
+            if ((error as { [STALE_STATEMENT]?: true })[STALE_STATEMENT]) {
+              return await connection.execute(query);
+            }
+
+            throw error;
+          }
         } catch (error) {
           // A client killed mid-query may not have noticed its closed socket
           // yet; returned to the pool, it would fail the next query.

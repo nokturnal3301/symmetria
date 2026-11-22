@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
 import {
+  createDatabase,
   databaseError,
+  int,
+  schema,
   type CompiledQuery,
 } from "../../../packages/runtime/src";
 import {
@@ -394,4 +397,80 @@ test("a pool request from inside the transactions that hold every connection is 
     });
   });
   expect(pair.log).toContain("second connection");
+});
+
+test("work a transaction scheduled may use the pool while its COMMIT is on the way", async () => {
+  const log: string[] = [];
+  const connection = (): PostgresConnection => ({
+    execute: async (query) => {
+      log.push(query.sql);
+      await new Promise((resolve) =>
+        setTimeout(resolve, query.sql === "COMMIT" ? 30 : 1),
+      );
+
+      return { rows: [], affectedRows: 0 };
+    },
+    release: () => {},
+    discard: async () => {},
+  });
+  const driver = createPostgresDriver({
+    execute: (query) => connection().execute(query),
+    connect: async () => connection(),
+    cancel: async () => {},
+    close: async () => {},
+    max: 1,
+  });
+  let later: Promise<unknown> | undefined;
+
+  await driver.transaction(async (tx) => {
+    await tx.execute(statement("INSERT"));
+    // Fires during COMMIT, which frees the connection it waits for.
+    later = new Promise((resolve, reject) => {
+      setTimeout(
+        () => driver.execute(statement("later")).then(resolve, reject),
+        10,
+      );
+    });
+  });
+
+  await later;
+  expect(log).toContain("later");
+});
+
+test("$close() from work a transaction started runs once the transaction has ended", async () => {
+  const { driver } = recordingPool(4);
+  const database = createDatabase({
+    schema: schema({ records: { id: int } }),
+    driver,
+  });
+  let closed: Promise<unknown> | undefined;
+
+  await database.$transaction(async () => {
+    // A worker started inside the transaction that closes the database later.
+    closed = new Promise((resolve, reject) => {
+      setTimeout(() => database.$close().then(resolve, reject), 20);
+    });
+  });
+
+  await expect(closed!).resolves.toBeUndefined();
+});
+
+test("a session ended for a transaction's time limit is a lost connection", () => {
+  // idle_in_transaction_session_timeout and transaction_timeout end the session.
+  for (const code of ["25P03", "25P04"]) {
+    expect(
+      databaseError(
+        Object.assign(new Error("terminating connection due to timeout"), {
+          code,
+        }),
+      ),
+    ).toMatchObject({ kind: "connection", sqlState: code });
+  }
+
+  // Other states of class 25 are mistakes in the statement, not the connection.
+  expect(
+    databaseError(
+      Object.assign(new Error("read-only transaction"), { code: "25006" }),
+    ),
+  ).toMatchObject({ kind: "other" });
 });

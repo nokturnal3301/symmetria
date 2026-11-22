@@ -38,9 +38,11 @@ export const model = schema({ users, posts });
 `author: one(users.posts)` declares a required foreign key. It gives a post an
 `authorId` column and an `author` relationship, and a user the `posts` it names
 on the other side. `editor` is optional, so `editorId` can be `null`, and its
-slot distinguishes a user's edited posts from authored posts. The older
-spelling, `author: users` and `editor: users.nullable.inverse("edited")`,
-declares the same tables and is still accepted
+slot distinguishes a user's edited posts from authored posts. The older spelling
+is still accepted: `author: users.index` and
+`editor: users.nullable.index.inverse("edited")` declare the same tables.
+Without `.index` (`author: users`) the key column gets no index, which `one()`
+and `maybe()` always create
 ([relations](reference.md#relations-one-maybe-many)). Existing databases rarely
 follow one convention: `users.by("email")` references a unique column instead of
 the primary key, `users.column("created_by")` keeps a legacy column name,

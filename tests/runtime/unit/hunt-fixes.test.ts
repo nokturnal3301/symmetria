@@ -200,7 +200,7 @@ test("the nearest rows are asked of the index in full", () => {
       })
       .toSQL().sql;
   const iterative =
-    "CASE WHEN current_setting('hnsw.iterative_scan', true) IS NULL THEN '' ELSE set_config('hnsw.iterative_scan', 'strict_order', true) END || CASE WHEN current_setting('hnsw.max_scan_tuples', true) IS NULL THEN '' ELSE set_config('hnsw.max_scan_tuples', '2147483647', true) END";
+    "CASE WHEN current_setting('hnsw.iterative_scan', true) IS NULL THEN '' ELSE set_config('hnsw.iterative_scan', 'strict_order', true) END || CASE WHEN current_setting('hnsw.max_scan_tuples', true) IS NULL THEN '' ELSE set_config('hnsw.max_scan_tuples', '2147483647', true) END || CASE WHEN current_setting('hnsw.scan_mem_multiplier', true) IS NULL THEN '' ELSE set_config('hnsw.scan_mem_multiplier', '1000', true) END";
 
   // The index filters after it has picked its rows; it keeps scanning.
   expect(nearest(10)).toContain(
@@ -255,16 +255,18 @@ test("an IVFFlat index reads on past its lists, and its rows are sorted again", 
       'ORDER BY "__symmetria_order_0" + 0 ASC, "__symmetria_order_1" ASC',
     ].join("\n"),
   );
-  // A row lock cannot pass through the outer sort: the index is left as it is.
-  expect(
-    database
-      .places((place) => ({ id: place.id }), {
-        orderBy: (place) => place.at.l2Distance([1, 0, 0]).asc,
-        limit: 5,
-        forUpdate: true,
-      })
-      .toSQL().sql,
-  ).not.toContain("ivfflat");
+  // A row lock stays on the inner statement; the outer one sorts again.
+  const locked = database
+    .places((place) => ({ id: place.id }), {
+      orderBy: (place) => place.at.l2Distance([1, 0, 0]).asc,
+      limit: 5,
+      forUpdate: true,
+    })
+    .toSQL().sql;
+
+  expect(locked).toContain("'relaxed_order'");
+  expect(locked).toContain('LIMIT 5\nFOR UPDATE) AS "__symmetria_nearest"');
+  expect(locked).toEndWith('ORDER BY "__symmetria_order_0" + 0 ASC');
 });
 
 test("pages by distance compare rows exactly", async () => {

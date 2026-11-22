@@ -55,6 +55,42 @@ test("auth generate writes the tables better-auth needs", () => {
   });
 });
 
+test("a JSON field of a plugin becomes a jsonb() column the module can load", async () => {
+  const tables = getAuthTables(options) as Record<
+    string,
+    { fields: Record<string, unknown> }
+  >;
+  const withPreferences = {
+    ...tables,
+    user: {
+      ...tables.user!,
+      fields: {
+        ...tables.user!.fields,
+        preferences: { type: "json", required: false },
+      },
+    },
+  };
+  const written = authSchemaSource(withPreferences as never);
+
+  expect(written).toContain("  preferences: jsonb().nullable,");
+
+  const file = join(import.meta.dir, ".better-auth-json.generated.ts");
+
+  try {
+    await Bun.write(
+      file,
+      written.replace('"symmetria"', '"../../../packages/runtime/src"'),
+    );
+    const { authTables: loaded } = (await import(file)) as {
+      authTables: Parameters<typeof schema>[0];
+    };
+
+    expect(() => schema({ ...loaded })).not.toThrow();
+  } finally {
+    await rm(file, { force: true });
+  }
+});
+
 describe.skipIf(!databaseUrl)("better-auth on a Symmetria database", () => {
   let isolated: Awaited<ReturnType<typeof testDatabase<typeof model>>>;
   let auth: any;

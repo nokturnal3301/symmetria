@@ -472,7 +472,10 @@ Also supported: `crossJoin`, `distinct`, `groupBy`, `having`, `offset`,
 bind one array parameter on PostgreSQL: `= ANY($1::type[])`; a `null` in the
 list is rejected where the query is built, because SQL's `NOT IN (…, NULL)`
 matches no row: combine the list with `is(null)` or `isNot(null)`), `between`,
-`like` / `ilike`, `isDistinctFrom`, and `and` / `or` / `not`.
+`like` / `ilike`, `isDistinctFrom`, and `and` / `or` / `not`. On an enum, uuid,
+date, time, interval or inet column, `like`, `ilike` and full-text search read
+the value as text, as PostgreSQL prints it (`day.like("2024-%")`), and a
+comparison with a text column compares it as text.
 
 ### Shape-first queries
 
@@ -609,11 +612,16 @@ key; an aggregate over a relation is not one.
 A projection holds fields only; a `$`-prefixed key in it is rejected. Option
 callbacks run after the projection on the same source, so they can reach the
 JOINs it made: relation paths such as `post.author.name` reuse the JOIN of
-`innerJoin(post.authorId)`, and `innerJoin(source)` without an ON callback
-returns the JOIN of a source the projection joined once. A source or relation
-joined several times is addressed through its explicit alias, for example
-`innerJoin(user.posts.as("first"))`. Filters, ordering and grouping append
-across calls; LIMIT/OFFSET and DISTINCT replace previous values when supplied.
+`innerJoin(post.authorId)`, `innerJoin(source)` without an ON callback returns
+the JOIN of a source the projection joined once, and `join`, `innerJoin` or
+`leftJoin` of a relation returns the JOIN of that relation and kind the
+projection made (in the projection itself, each call is a JOIN of its own). A
+source or relation joined several times is addressed through its explicit alias,
+for example `innerJoin(user.posts.as("first"))`; without one, such a call is
+refused. A `crossJoin` of a relation is a JOIN of its own: a path through the
+relation still reads the row's own related row. Filters, ordering and grouping
+append across calls; LIMIT/OFFSET and DISTINCT replace previous values when
+supplied.
 
 An options-only branch preserves the previous projection:
 
@@ -1300,8 +1308,10 @@ statements needs a context manager, which the OpenTelemetry Node SDK registers.
 
 Values are never recorded: they travel as parameters, and the text holds `$1` in
 their place. A failed statement records the exception and sets the span's status
-to error, as does the transaction it aborts. `traced()` wraps any driver,
-including one that already carries a profiler.
+to error, as does the transaction it aborts. Both name the error by its class,
+SQLSTATE and constraint (`QueryError (23505) on constraint "users_email_key"`)
+and leave out its message and stack, where PostgreSQL may quote a value.
+`traced()` wraps any driver, including one that already carries a profiler.
 
 ## Prepared queries
 
@@ -1995,7 +2005,10 @@ scope. Raw expressions inside a nested query block only that query's rewrite.
 - `jsonb<Value>()` → `Value`, `timestamptz` → `Date`. JSON `null` follows the
   column: on a non-nullable jsonb column (`jsonb<string | null>()`) a JS `null`
   is written as the JSON value `null` (`'null'::jsonb`), reads back as `null`
-  and is found by `is(null)`; on a `.nullable` column `null` is SQL NULL.
+  and is found by `is(null)`; on a `.nullable` column `null` is SQL NULL. A JSON
+  `null` can still reach a nullable column (copied from a JSON path, or written
+  with SQL) and also reads back as `null`, so there `is(null)` and `isNot(null)`
+  count it as null too.
 - `timestamp` (without time zone) → `Date`, read and written as UTC: the
   convention of Prisma, Drizzle and Rails, independent of the server's and the
   process's time zone, on both drivers. `timestamp(3)` and `timestamptz(3)` set
@@ -2010,15 +2023,20 @@ scope. Raw expressions inside a nested query block only that query's rewrite.
   `count.above(6.5)`, `small.is(70000)` or `quantity.multiply(1.5)` fails the
   query with the same Symmetria error on both drivers before it is sent
   (`smallint.auto` is an identity column). `real` and `doublePrecision` →
-  `number` (`NaN`, `±Infinity` and `-0` round-trip). `real` reads as the
-  shortest decimal that is the same single-precision value, as PostgreSQL prints
-  it: `0.1`, not `0.10000000149011612`; `searchRank()` (a `real`) reads the same
-  way.
+  `number` (`NaN`, `±Infinity` and `-0` round-trip, except that `-0` reads as
+  `0` inside a nested object of a CTE, derived table, `distinct` or grouped
+  read, which PostgreSQL builds as `jsonb`, whose numbers have no `-0`). `real`
+  reads as the shortest decimal that is the same single-precision value, as
+  PostgreSQL prints it: `0.1`, not `0.10000000149011612`; `searchRank()` (a
+  `real`) reads the same way.
 - `date` → `"YYYY-MM-DD"` text with no time-zone shift, in PostgreSQL's form on
   both drivers (`"0999-05-05"`, `"0044-03-15 BC"`, `"infinity"`), `time` →
   `"HH:MM:SS"` text, `interval` → PostgreSQL's text form such as
   `"1 day 02:00:00"`, `inet` → text, `bytea` → `Uint8Array`. The `symmetria/pg`
-  adapter reads `date` and `interval` as text so both drivers agree.
+  adapter reads `date` and `interval` as text so both drivers agree. Bun.SQL
+  makes a `date` a JavaScript `Date`, which ends at 275760-09-13: a later date
+  fails to read with an error saying so, and reads through `symmetria/pg` or as
+  text.
 - `jsonb(schema)` takes any [Standard Schema](https://standardschema.dev) object
   (Zod, Valibot, ArkType, …) and validates every written and read value
   synchronously; invalid input fails the query with the issue paths, and an
@@ -2058,17 +2076,19 @@ Mistakes in the shape of a query throw where it is built: an unknown column or
 relation, a CTE named like a table, invalid options or conflict columns,
 arithmetic on an untyped `sql<Value>` template, `match()` literals of different
 types. `update()` and `delete()` without `where()` or `.all()` are refused once
-the statement is complete, when it is compiled. Problems with the values a query
-carries reject its promise when it runs (`await`, `.execute()`, `.then()`,
-`.one()` and the other terminals), for reads and writes alike, before anything
-is sent: `null` for a NOT NULL column, a missing required value, an `update()`
-with no values, input a `jsonb(schema)` rejects, fractional or out-of-range
-`int` / `smallint` numbers (also as arithmetic operands), unsafe `bigint`
-numbers, text that is not a number for a `numeric` column, invalid `Date`s, NULL
-array elements, a null lookup key, duplicate upsert conflict keys and values a
-custom codec rejects. PostgreSQL itself rejects unknown enum labels when the
-statement runs. So `insert(body).catch(handle)` and `try { await … } catch` see
-every value error the same way, and building a query never throws because of its
+the statement is complete, when it is compiled, and so are those whose filter
+leaves no condition, such as a list emptied by request values (`[userId && …]`)
+or `where: { authorId: undefined }`. Problems with the values a query carries
+reject its promise when it runs (`await`, `.execute()`, `.then()`, `.one()` and
+the other terminals), for reads and writes alike, before anything is sent:
+`null` for a NOT NULL column, a missing required value, an `update()` with no
+values, input a `jsonb(schema)` rejects, fractional or out-of-range `int` /
+`smallint` numbers (also as arithmetic operands), unsafe `bigint` numbers, text
+that is not a number for a `numeric` column, invalid `Date`s, NULL array
+elements, a null lookup key, duplicate upsert conflict keys and values a custom
+codec rejects. PostgreSQL itself rejects unknown enum labels when the statement
+runs. So `insert(body).catch(handle)` and `try { await … } catch` see every
+value error the same way, and building a query never throws because of its
 values. `toSQL()` returns SQL rather than a promise, so it throws value errors
 directly, as does `prepare()` for values fixed in the query; parameters of a
 prepared query and `$scope()` values are checked at every execution. Messages
@@ -2145,15 +2165,18 @@ transaction mode must support prepared statements (PgBouncer 1.21+ with
 `max_prepared_statements`). After several executions PostgreSQL may switch a
 prepared statement to one general plan for all values, which is usually as good
 and occasionally much worse than a plan made for each value
-(`plan_cache_mode = force_custom_plan` keeps the latter). And a statement
-prepared before a migration changed the type of a column it reads fails once
-with "cached plan must not change result type" on connections opened before the
-migration. At most 500 statement texts get a name; texts beyond that (IN lists
-and literal limits of every length) are sent unnamed. Bun's pool prepares
-statements by default and turns it off with `prepare: false`. Bun's pool has no
-place to run such a statement and sends most values in binary, which these
-settings do not touch; where a database or role changes `IntervalStyle` or
-`extra_float_digits`, give the defaults to the Bun adapter yourself:
+(`plan_cache_mode = force_custom_plan` keeps the latter). And when a migration
+changes the type of a column a prepared statement reads, PostgreSQL refuses the
+statement with "cached plan must not change result type": outside a transaction
+the adapter prepares it again under a new name and runs it, so the call
+succeeds; inside one the error has already aborted the transaction, so that one
+transaction fails and the next one prepares the statement again. At most 500
+statement texts get a name; texts beyond that (IN lists and literal limits of
+every length) are sent unnamed. Bun's pool prepares statements by default and
+turns it off with `prepare: false`. Bun's pool has no place to run such a
+statement and sends most values in binary, which these settings do not touch;
+where a database or role changes `IntervalStyle` or `extra_float_digits`, give
+the defaults to the Bun adapter yourself:
 `postgres({ url, connection: { IntervalStyle: "postgres", extra_float_digits: 1 } })`
 (a connection pooler must allow these start-up parameters).
 
@@ -2518,16 +2541,28 @@ each module sends is tested against a stand-in; only Voyage's and Ollama's
 shapes were also exercised through a running application.
 
 **Writing.** `insert()` and `upsert()` ask the model once for all the rows that
-need an embedding, before the statement is sent, including rows created by a
-nested insert. A row that brings its own (`{ ...row, about: vector }`), or whose
-text is empty or a SQL expression, is written as it is. If the model fails, the
-write is rejected and nothing is sent. A write the rows already fail (a missing
-required column, a value its column cannot hold, an unknown column, a chained
-call that cannot be made) is rejected before the model is asked. The write is
-still chained as usual (`returning()`, `onConflict()`); only `toSQL()` and
-`prepare()` on such a write throw, because the statement does not exist until
-the embedding does. Inside `$transaction` the connection is held while the model
-answers; embed beforehand and pass the vectors when that matters.
+need an embedding, before the statement is sent. Rows created by a nested insert
+get theirs as well, with one request per `INSERT` the nested write sends (rows
+written alongside children are inserted one at a time); for many rows a bulk
+`insert()` per table asks fewer times. A row that brings its own
+(`{ ...row, about: vector }`) is written as it is. A row whose text is empty, or
+not known before PostgreSQL writes it, is written without an embedding (`NULL`)
+for `reindex()` to compute: a column given as a SQL expression, a column left
+out that has a default, and a column an upsert leaves out, which the existing
+row keeps. An upsert's update list (`update: [...]`, `doUpdate(...)`) that names
+every embedded column updates the embedding with them; one that names only some
+of them clears it, since the stored text is partly unknown. If the model fails,
+the write is rejected and nothing is sent. A write the rows already fail (a
+missing required column, a value its column cannot hold, an unknown column, a
+chained call that cannot be made) is rejected before the model is asked: the
+write is built once to check it, so the callbacks of its chained calls (`where`,
+`doUpdate`, `returning`) run twice. A nested insert checks each level's rows
+when that level is written, so a mistake in a child row is found after the model
+answered for the rows above it. The write is still chained as usual
+(`returning()`, `onConflict()`); only `toSQL()` and `prepare()` on such a write
+throw, because the statement does not exist until the embedding does. Inside
+`$transaction` the connection is held while the model answers; embed beforehand
+and pass the vectors when that matters.
 
 An `UPDATE` that changes one of the embedded columns sets the embedding to
 `NULL` in the same statement, because it would describe the old text; an
@@ -2811,9 +2846,13 @@ path components, and retain JSON value types. On a `jsonb(schema)` column, and
 inside such a field of a nested result, they follow the stored (input) shape,
 since that is what the database holds. Missing paths and JSON null decode to
 null, and `is(null)`, `isNot(null)`, `coalesce()` and `whereNotNull()` agree
-with that: a missing path and a present JSON null both count as null. To tell
-the two apart, compare in SQL (``sql<boolean>`${doc.meta} ? 'size'` ``).
-`contains()` uses `@>` and accepts partial objects/subarrays.
+with that: a missing path and a present JSON null both count as null. So do the
+other comparisons: `isNot(3)`, `notIn([3])`, `above()` and `below()` leave both
+out, and `isDistinctFrom(null)` holds for neither. Ordering is PostgreSQL's
+`jsonb` order, where JSON null is a value that sorts before every other value
+and SQL NULL follows `nullsFirst`/`nullsLast`. To tell the two apart, compare in
+SQL (``sql<boolean>`${doc.meta} ? 'size'` ``). `contains()` uses `@>` and
+accepts partial objects/subarrays.
 
 `set(key, value)` changes one key of a jsonb value and keeps the rest, where
 assigning the column would replace the whole document:
@@ -3120,7 +3159,8 @@ to a transaction-only helper is a compile-time error.
   `serialization`, `deadlock`, `connection` or `other`:
   `if (databaseError(error)?.kind === "unique") …`. `connection` means the
   connection was lost or could not be opened (the server ended the session,
-  SQLSTATE class 08 or 57P01–57P05, or a socket error); such errors without a
+  SQLSTATE class 08, 57P01–57P05, or 25P03/25P04 for a transaction that went
+  over its idle or total time limit, or a socket error); such errors without a
   server SQLSTATE report `08006` for a lost connection and `08001` for one that
   could not be opened, so a retry is worth trying. `undefined` means the failure
   did not come from the database at all, such as a Symmetria validation error.
@@ -3233,28 +3273,31 @@ Generation rejects dropped tables or columns, removed enum labels, cleared
 search embeddings and type changes that narrow existing values unless
 `--allow-destructive` is explicitly supplied; the refusal lists each destructive
 operation. A generated migration is printed with the same review `lint` gives
-it, so cautions such as a rewritten table are seen before it runs. `discard`
-takes the latest migration back while no database has applied it (see the Kit
-README). Narrowing means a value can change or stop fitting: a shorter
-`varchar`/`char` or `bit` length, fewer `numeric` decimal places (values are
-rounded), `numeric` or floating point to an integer type, a smaller integer type
-(`bigint` to `integer`, either to `smallint`: the migration fails while a value
-is out of range), an integer type to `boolean` (every value other than 0 becomes
-true), fewer fractional-second digits on `timestamp`/`time`/`interval`, a
-timestamp to `date` or `time`, or a number into a floating-point type that keeps
-fewer digits. A change to a length-limited string type is generated without a
-`USING` cast: an explicit `::varchar(5)` would silently cut `Alexandria` to
-`Alexa`, while PostgreSQL's own assignment cast refuses the long value, so the
-migration fails and rolls back with the data intact. The same holds for the
-`down.sql` of a widening change: a rollback to the shorter type fails on values
-that no longer fit instead of cutting them. A type change PostgreSQL has no cast
-for (a number to `uuid`, a value to an array of it) is refused when the
-migration is generated, since its SQL could not run even on an empty table; give
-the conversion for both directions under `using` in the `--diff` file. A rename
-needs a `--diff` hint; it is never guessed from similar names. The API uses
-`allowDestructive: true` for intentional removals. Column declarations keep
-their order in `CREATE TABLE`; snapshot hashes ignore column order so reordering
-source declarations does not create a migration.
+it, so cautions such as a rewritten table are seen before it runs. A narrowing
+type change and cleared embeddings are written with a comment above them
+(`-- symmetria: destructive: …`), since the SQL alone does not show what they
+lose; `lint` of the saved file reads it and rates them as destructive, as
+`generate` did. `discard` takes the latest migration back while no database has
+applied it (see the Kit README). Narrowing means a value can change or stop
+fitting: a shorter `varchar`/`char` or `bit` length, fewer `numeric` decimal
+places (values are rounded), `numeric` or floating point to an integer type, a
+smaller integer type (`bigint` to `integer`, either to `smallint`: the migration
+fails while a value is out of range), an integer type to `boolean` (every value
+other than 0 becomes true), fewer fractional-second digits on
+`timestamp`/`time`/`interval`, a timestamp to `date` or `time`, or a number into
+a floating-point type that keeps fewer digits. A change to a length-limited
+string type is generated without a `USING` cast: an explicit `::varchar(5)`
+would silently cut `Alexandria` to `Alexa`, while PostgreSQL's own assignment
+cast refuses the long value, so the migration fails and rolls back with the data
+intact. The same holds for the `down.sql` of a widening change: a rollback to
+the shorter type fails on values that no longer fit instead of cutting them. A
+type change PostgreSQL has no cast for (a number to `uuid`, a value to an array
+of it) is refused when the migration is generated, since its SQL could not run
+even on an empty table; give the conversion for both directions under `using` in
+the `--diff` file. A rename needs a `--diff` hint; it is never guessed from
+similar names. The API uses `allowDestructive: true` for intentional removals.
+Column declarations keep their order in `CREATE TABLE`; snapshot hashes ignore
+column order so reordering source declarations does not create a migration.
 
 `diff` compares the current declaration to the latest local snapshot, not to the
 live database. CHECK expressions, partial-index predicates and index key

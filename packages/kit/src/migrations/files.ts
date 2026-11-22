@@ -181,6 +181,8 @@ const readMigrationState = async (
     readonly undo?: MigrationJournal["undo"];
     /** The snapshot is not the schema after the journal's last migration. */
     readonly mismatch?: true;
+    /** The journal's last migration, whose directory was deleted by hand. */
+    readonly removed?: MigrationManifest;
   }
 > => {
   const entries = await readDirectory(directory);
@@ -224,20 +226,31 @@ const readMigrationState = async (
     parseMetadata(directory, "snapshot.json", snapshotText!),
   );
 
+  const listed = Array.isArray(journal?.migrations)
+    ? journal.migrations.map((manifest) => String(manifest?.id))
+    : [];
+  // Only the latest directory is gone: the usual way to delete a migration
+  // by hand, which discard repairs.
+  const latestRemoved =
+    listed.length === directories.length + 1 &&
+    directories.every((id, position) => listed[position] === id);
+  let removed: MigrationManifest | undefined;
+
+  if (latestRemoved && options.snapshotMismatch === "keep") {
+    removed = journal.migrations.pop();
+  }
+
   if (
     !journal ||
     journal.version !== 1 ||
     !Array.isArray(journal.migrations) ||
     journal.migrations.length !== directories.length
   ) {
-    const listed = Array.isArray(journal?.migrations)
-      ? journal.migrations.map((manifest) => String(manifest?.id))
-      : [];
     const unlisted = directories.filter((id) => !listed.includes(id));
     const absent = listed.filter((id) => !directories.includes(id));
 
     throw new Error(
-      `symmetria: migration journal ${join(directory, "meta", "migration.json")} does not match the SQL directories in ${directory} (${listed.length} listed, ${directories.length} found${absent.length ? `; missing directories: ${absent.join(", ")}` : ""}${unlisted.length ? `; directories not in the journal: ${unlisted.join(", ")}` : ""})`,
+      `symmetria: migration journal ${join(directory, "meta", "migration.json")} does not match the SQL directories in ${directory} (${listed.length} listed, ${directories.length} found${absent.length ? `; missing directories: ${absent.join(", ")}` : ""}${unlisted.length ? `; directories not in the journal: ${unlisted.join(", ")}` : ""})${latestRemoved ? `. If "${listed.at(-1)}" was deleted by hand, "symmetria discard" takes it out of the journal and puts the snapshot back` : ""}`,
     );
   }
 
@@ -312,6 +325,7 @@ const readMigrationState = async (
         migrations,
         snapshot,
         ...(undo ? { undo } : {}),
+        ...(removed ? { removed } : {}),
         mismatch: true,
       };
     }
@@ -321,7 +335,12 @@ const readMigrationState = async (
     );
   }
 
-  return { migrations, snapshot, ...(undo ? { undo } : {}) };
+  return {
+    migrations,
+    snapshot,
+    ...(undo ? { undo } : {}),
+    ...(removed ? { removed } : {}),
+  };
 };
 
 /** One current schema snapshot and a compact journal for the entire SQL chain. */
@@ -808,10 +827,29 @@ export const discardMigration = async (
       snapshotMismatch: "keep",
     });
     const latest = state.migrations.at(-1);
+    const { removed } = state;
+
+    if (removed && options.id !== undefined && options.id !== removed.id) {
+      throw new Error(
+        `symmetria: only the latest migration can be discarded; it is "${removed.id}" (its directory is already gone), not "${options.id}"`,
+      );
+    }
+
+    // Its directory deleted, a migration that changed nothing leaves only
+    // its journal entry behind.
+    if (removed && !state.mismatch) {
+      await writeMigrationFiles(
+        directory,
+        { snapshot: state.snapshot },
+        state.migrations.map((entry) => entry.manifest),
+      );
+
+      return { id: removed.id, source: "journal" };
+    }
 
     // A migration removed by hand left a snapshot of what it made.
     if (state.mismatch) {
-      if (options.id !== undefined) {
+      if (options.id !== undefined && !removed) {
         throw new Error(
           `symmetria: ${join(directory, "meta", "snapshot.json")} does not match the journal, so "${options.id}" cannot be discarded; run discard without an ID to put the snapshot back first`,
         );
@@ -832,7 +870,9 @@ export const discardMigration = async (
         state.migrations.map((entry) => entry.manifest),
       );
 
-      return { source: found.source };
+      return removed
+        ? { id: removed.id, source: found.source }
+        : { source: found.source };
     }
 
     if (!latest) {

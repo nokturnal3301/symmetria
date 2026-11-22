@@ -21,7 +21,12 @@ import {
   type Bindings,
   type Compilation,
 } from "./state";
-import { orderingSql, projectionSql, valueSql } from "./values";
+import {
+  jsonPrecisionSql,
+  orderingSql,
+  projectionSql,
+  valueSql,
+} from "./values";
 import { predicateSql } from "./predicates";
 
 export const tableSql = (
@@ -131,7 +136,8 @@ const DISTANCES = new Set(["<->", "<=>", "<#>", "<+>"]);
  * filters only afterwards, so a filtered or a long LIMIT would come up short
  * without an error. For this statement the index returns as many rows as are
  * asked for (1000 is its ceiling) and, from pgvector 0.8, keeps scanning until
- * enough rows pass the filters. `set_config(…, true)` lasts for the
+ * enough rows pass the filters, with as much memory as that takes (up to
+ * pgvector's limit of 1000 × work_mem). `set_config(…, true)` lasts for the
  * transaction, which outside `$transaction()` is this one statement.
  */
 const nearestScanSql = (
@@ -168,6 +174,10 @@ const nearestScanSql = (
       : []),
     setting("hnsw.iterative_scan", "'strict_order'"),
     setting("hnsw.max_scan_tuples", "'2147483647'"),
+    // The scan also stops at work_mem × this multiplier (1 unless set):
+    // about 23,000 index tuples at 4MB, after which rows that pass the
+    // filters further away were lost without an error.
+    setting("hnsw.scan_mem_multiplier", "'1000'"),
     ...(relaxed ? [setting("ivfflat.iterative_scan", "'relaxed_order'")] : []),
   ].join(" || ")}) IS NOT NULL`;
 };
@@ -186,9 +196,10 @@ const ordersThroughIvfflat = (query: SelectPlan): boolean => {
       ? node.left.description
       : undefined;
 
+  // A row lock stays on the inner statement, which may lock rows in a
+  // subquery; the outer one only sorts them again.
   return (
     !!column &&
-    !query.locking &&
     !query.distinct &&
     !query.grouping.length &&
     (column.binding.table.indexes ?? []).some(
@@ -252,6 +263,46 @@ const renderSelect = (
           ...query.bindings,
         })
       : query.bindings;
+
+  // In JSON, bigint and numeric values travel as text; a DISTINCT query
+  // ordered by such a value would then order by an expression its select
+  // list does not have. It runs as it would at the top level, and the text
+  // casts and the order are applied around it.
+  if (
+    jsonValues &&
+    query.distinct &&
+    query.ordering.length &&
+    query.selection.some(
+      (expression) => jsonPrecisionSql(compilation, expression, "") !== "",
+    )
+  ) {
+    const fields = query.ordering.map((ordering) =>
+      query.selection.find((expression) =>
+        sameExpression(expression.node, ordering.expression.node),
+      ),
+    );
+
+    if (fields.every(Boolean)) {
+      const field = (name: string) =>
+        `"__symmetria_distinct".${quoteIdentifier(name)}`;
+
+      return [
+        `SELECT ${query.selection
+          .map(
+            (expression) =>
+              `${jsonPrecisionSql(compilation, expression, field(expression.outputName))} AS ${quoteIdentifier(expression.outputName)}`,
+          )
+          .join(", ")}`,
+        `FROM (${renderSelect(compilation, query, outerBindings, false, false)}) AS "__symmetria_distinct"`,
+        `ORDER BY ${query.ordering
+          .map(
+            (ordering, position) =>
+              `${field(fields[position]!.outputName)} ${ordering.direction}${ordering.nulls ? ` NULLS ${ordering.nulls}` : ""}`,
+          )
+          .join(", ")}`,
+      ].join("\n");
+    }
+  }
 
   // A grouped or distinct query must repeat an expression as the same text.
   // An ordering by a selected field repeats it too: with the same text and

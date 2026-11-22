@@ -16,6 +16,11 @@ export type RuntimeCodec = {
   readonly element?: RuntimeCodec;
   /** Decoding returns the value as it came; row decoders skip the call. */
   readonly passthrough?: boolean;
+  /**
+   * Decoding returns the value as it came unless PostgreSQL built it as jsonb,
+   * whose sorted keys it puts back in the selected order.
+   */
+  readonly reorders?: boolean;
 };
 
 export type SchemaCodecs = Readonly<
@@ -266,7 +271,9 @@ const integerCodec = (
         );
       }
 
-      return value;
+      // Bun sends -0 as a double, which would run integer arithmetic in
+      // double precision and answer -0.
+      return Object.is(value, -0) ? 0 : value;
     },
     decode: readNumber,
   };
@@ -309,6 +316,13 @@ export const dateCodec: RuntimeCodec = {
   },
   decode: (value) => {
     if (value instanceof Date) {
+      // Bun makes every date a Date, and a Date ends at 275760-09-13.
+      if (Number.isNaN(value.getTime())) {
+        throw new Error(
+          "symmetria: a date beyond 275760-09-13 (or before 271821-04-20 BC) cannot be read through Bun.SQL, which reads it as a JavaScript Date; read it as text (sql<string>`${column}::text`) or use symmetria/pg",
+        );
+      }
+
       // Bun parses dates as UTC midnight; node-postgres as local midnight.
       const utc = value.getUTCHours() === 0 && value.getUTCMinutes() === 0;
 
@@ -434,10 +448,14 @@ export const arrayCodec = (
       const values =
         typeof value === "string" && value.startsWith("[")
           ? (JSON.parse(value) as unknown[])
-          : // Bun reads integer[] and real[] parameters and RETURNING values as typed arrays.
-            ArrayBuffer.isView(value) && !(value instanceof DataView)
-            ? Array.from(value as unknown as ArrayLike<unknown>)
-            : value;
+          : // A type the driver has no parser for (an enum, tsvector or range
+            // array on node-postgres, an enum array on Bun) arrives as text.
+            typeof value === "string" && value.startsWith("{")
+            ? arrayLiteral(value)
+            : // Bun reads integer[] and real[] parameters and RETURNING values as typed arrays.
+              ArrayBuffer.isView(value) && !(value instanceof DataView)
+              ? Array.from(value as unknown as ArrayLike<unknown>)
+              : value;
 
       if (!Array.isArray(values)) {
         throw new Error("symmetria: expected an array value from the database");
@@ -454,6 +472,68 @@ export const arrayCodec = (
     parameterCast: `${elementType}[]`,
     ...(element ? { element } : {}),
   };
+};
+
+/**
+ * A one-dimensional array in PostgreSQL's text form, `{a,"b c",NULL}`, as
+ * its element texts; `NULL` unquoted is a NULL element.
+ */
+const arrayLiteral = (text: string): (string | null)[] => {
+  const values: (string | null)[] = [];
+
+  if (!text.endsWith("}")) {
+    throw new Error("symmetria: expected an array value from the database");
+  }
+
+  let position = 1;
+
+  if (text === "{}") {
+    return values;
+  }
+
+  while (position < text.length) {
+    let element = "";
+
+    if (text[position] === '"') {
+      position += 1;
+
+      while (text[position] !== '"') {
+        if (position >= text.length) {
+          throw new Error(
+            "symmetria: expected an array value from the database",
+          );
+        }
+
+        if (text[position] === "\\") {
+          position += 1;
+        }
+
+        element += text[position];
+        position += 1;
+      }
+
+      position += 1;
+      values.push(element);
+    } else {
+      while (text[position] !== "," && text[position] !== "}") {
+        if (text[position] === "{") {
+          throw new Error(
+            "symmetria: multidimensional arrays are not supported",
+          );
+        }
+
+        element += text[position];
+        position += 1;
+      }
+
+      values.push(element === "NULL" ? null : element);
+    }
+
+    // The delimiter after the element, or the closing brace.
+    position += 1;
+  }
+
+  return values;
 };
 
 /**

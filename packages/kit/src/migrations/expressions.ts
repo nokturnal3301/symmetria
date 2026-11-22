@@ -107,14 +107,21 @@ export const readExpression = (
   }
 };
 
-/** An index key's comparison key: its expression's key, then its ordering. */
+/**
+ * An index key's comparison key: its expression's key, then its ordering
+ * without PostgreSQL's defaults (ASC, NULLS LAST after ASC, NULLS FIRST
+ * after DESC), so `name ASC NULLS LAST` is `name`.
+ */
 export const indexKeyKey = (
   key: string,
   columns?: ReadonlyMap<string, string>,
 ): string => {
-  const ordering = /(?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?$/i.exec(
+  const ordering = /(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/i.exec(
     key,
   )!;
+  const descending = ordering[1]?.toUpperCase() === "DESC";
+  const nulls = ordering[2]?.toUpperCase();
+  const defaultNulls = descending ? "FIRST" : "LAST";
 
-  return `${expressionKey(key.slice(0, ordering.index), columns)}${ordering[0].toUpperCase().replace(/\s+/g, " ")}`;
+  return `${expressionKey(key.slice(0, ordering.index), columns)}${descending ? " DESC" : ""}${nulls && nulls !== defaultNulls ? ` NULLS ${nulls}` : ""}`;
 };

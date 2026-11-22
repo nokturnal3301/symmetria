@@ -2,6 +2,8 @@
  * Filesystem CLI commands: recover a crashed generation, squash the chain and
  * discard the latest migration.
  */
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { postgres } from "symmetria/driver";
 import {
   discardMigration,
@@ -63,7 +65,22 @@ export const discard = async (
   const { migrations } = await loadMigrationState(project.directory).catch(
     () => ({ migrations: [] }),
   );
-  const latest = migrations.at(-1)?.id;
+  // A chain that does not load (a directory deleted by hand) still names
+  // the migration discard would take out of the journal.
+  const listed = migrations.length
+    ? undefined
+    : await readFile(
+        join(project.directory, "meta", "migration.json"),
+        "utf8",
+      ).then(
+        (text) =>
+          (
+            JSON.parse(text) as { migrations?: { id?: unknown }[] }
+          ).migrations?.at(-1)?.id,
+        () => undefined,
+      );
+  const latest =
+    migrations.at(-1)?.id ?? (typeof listed === "string" ? listed : undefined);
 
   if (latest !== undefined) {
     if (project.databaseUrl) {

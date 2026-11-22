@@ -93,8 +93,17 @@ test("narrowing type changes never cut values and lint reports the lossy ones as
     },
   });
   const plan = diffSchemas(before.$snapshot(), after.$snapshot());
+  // The statement as it runs; a lossy one carries a note for lint above it.
   const retype = (column: string) =>
-    plan.up.find((sql) => sql.includes(`ALTER COLUMN "${column}" TYPE`));
+    plan.up
+      .find((sql) => sql.includes(`ALTER COLUMN "${column}" TYPE`))
+      ?.replace(/^-- symmetria: destructive: .*\n/, "");
+
+  expect(
+    plan.up.find((sql) => sql.includes(`ALTER COLUMN "name" TYPE`)),
+  ).toStartWith(
+    '-- symmetria: destructive: Column "name" narrows from text to varchar(5)',
+  );
 
   // Length-limited strings use PostgreSQL's assignment cast, which refuses long values.
   expect(retype("name")).toBe(
@@ -165,7 +174,7 @@ test("narrowing type changes never cut values and lint reports the lossy ones as
     },
   );
   expect(hinted.up).toEqual([
-    'ALTER TABLE "users" ALTER COLUMN "name" TYPE varchar(5) USING left("name", 5)',
+    '-- symmetria: destructive: Column "name" narrows from text to varchar(5) with the USING conversion given for it.\nALTER TABLE "users" ALTER COLUMN "name" TYPE varchar(5) USING left("name", 5)',
   ]);
   expect(levels(hinted).name).toStartWith("destructive:");
 });
@@ -698,4 +707,26 @@ test("a widened column keeps its indexes and checks; a narrowed one rebuilds the
   expect(diffSchemas(narrow, rescaled).up).toContain(
     'DROP INDEX "orders_total_idx"',
   );
+});
+
+test("lint of a saved migration rates a narrowing change as generate did", () => {
+  const plan = diffSchemas(
+    schema({ users: { id: int.auto, name: text } }).$snapshot(),
+    schema({ users: { id: int.auto, name: varchar(5) } }).$snapshot(),
+  );
+  const saved = `${plan.up.join(";\n\n")};\n`;
+
+  // The SQL alone does not show the previous type; the note does.
+  expect(
+    lintMigrationSQL(saved).map((finding) => [finding.level, finding.message]),
+  ).toContainEqual([
+    "destructive",
+    'Statement 1: Column "name" narrows from text to varchar(5): values longer than 5 characters make the migration fail, and trailing spaces past the limit are cut.',
+  ]);
+  // A hand-written ALTER without the note is the caution it always was.
+  expect(
+    lintMigrationSQL(
+      'ALTER TABLE "users" ALTER COLUMN "name" TYPE varchar(5);',
+    ).map((finding) => finding.level),
+  ).not.toContain("destructive");
 });

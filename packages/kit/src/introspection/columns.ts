@@ -205,9 +205,13 @@ export const columnType = (
   }
 
   // Enums of other schemas and arrays of enums have no oneOf() form either.
-  const sqlType = column.data_type;
+  // A one-dimensional array is the element type's `.array`, whose codec
+  // reads the array however the driver delivers it.
+  const sqlType = array
+    ? column.data_type.replace(/\[\]$/, "")
+    : column.data_type;
   const valueType =
-    customValueType(base) + (normalized.endsWith("[]") ? "[]" : "");
+    customValueType(base) + (normalized.endsWith("[]") && !array ? "[]" : "");
   comments.push(`no builder for ${sqlType}`);
   tools.warn({
     code: "custom-type",
@@ -217,7 +221,7 @@ export const columnType = (
     message: `"${table.sqlName}.${column.column_name}" uses ${sqlType}, declared through customType() with driver-native values`,
   });
 
-  return { type: { kind: "custom", sqlType, valueType }, array: false };
+  return { type: { kind: "custom", sqlType, valueType }, array };
 };
 
 export const columnDefault = (

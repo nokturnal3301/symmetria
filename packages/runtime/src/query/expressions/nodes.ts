@@ -118,6 +118,8 @@ export type ValueNode =
       readonly kind: "raw";
       readonly parts: readonly (string | ValueNode)[];
       readonly sqlType?: string;
+      /** Built by Symmetria from the nodes in its parts, not written by hand. */
+      readonly composed?: true;
     }
   | {
       readonly kind: "binary";
@@ -262,6 +264,11 @@ export type PredicateDescription =
         | "&&";
       readonly right: ValueNode;
       readonly nullableParameter?: true;
+      /**
+       * What `is(null)` means for the left side, used when a nullable
+       * parameter is bound to null: a JSON path also counts JSON null.
+       */
+      readonly nullCheck?: PredicateDescription;
     }
   | {
       readonly kind: "search";

@@ -21,6 +21,7 @@ import {
 } from "./state";
 import {
   searchHeadlineSql,
+  headlineOptionsText,
   searchRankSql,
   searchVectorSql,
   tsquerySql,
@@ -333,17 +334,22 @@ const renderValue = (
           coverDensity: !!node.coverDensity,
         },
       );
-    case "searchHeadline":
+    case "searchHeadline": {
+      const value = valueSql(compilation, node.value, bindings);
+      const query = tsquerySql(
+        valueSql(compilation, node.query, bindings),
+        node.language,
+        node.mode,
+      );
+      const options = headlineOptionsText(node.options);
+
       return searchHeadlineSql(
         node.language,
-        valueSql(compilation, node.value, bindings),
-        tsquerySql(
-          valueSql(compilation, node.query, bindings),
-          node.language,
-          node.mode,
-        ),
-        node.options,
+        value,
+        query,
+        options === undefined ? undefined : parameter(compilation, options),
       );
+    }
     case "tsvector":
       return tsvectorSql(
         node.parts.map((part) => ({

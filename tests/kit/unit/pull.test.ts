@@ -206,6 +206,7 @@ const catalog = (
           options: entry.columns.map(() => 0),
           included: [],
           opclasses: entry.columns.map(() => null),
+          opclass_names: entry.columns.map(() => "default_ops"),
           collations: entry.columns.map(() => null),
           reloptions: null,
           predicate: null,
@@ -221,6 +222,9 @@ const catalog = (
         options: index.options ?? index.keys.map(() => 0),
         included: index.included ?? [],
         opclasses: index.opclasses ?? index.keys.map(() => null),
+        opclass_names: (index.opclasses ?? index.keys.map(() => null)).map(
+          (name) => name ?? "default_ops",
+        ),
         collations: index.collations ?? index.keys.map(() => null),
         reloptions: index.reloptions ?? null,
         predicate: index.predicate ?? null,
@@ -425,10 +429,11 @@ describe("pull: columns", () => {
       type: { kind: "builder", name: "bytea" },
       default: { kind: "sql", sql: "'\\x00'::bytea" },
     });
+    // Both drivers deliver money as formatted text ("$12.50").
     expect(column(model, "users", "price").type).toEqual({
       kind: "custom",
       sqlType: "money",
-      valueType: "number",
+      valueType: "string",
     });
     expect(column(model, "users", "note").default).toEqual({
       kind: "sql",
@@ -455,7 +460,7 @@ describe("pull: columns", () => {
     expect(source).toContain("score: smallint.default(-1),");
     expect(source).toContain("blob: bytea.default(sql`'\\\\x00'::bytea`),");
     expect(source).toContain(
-      'price: customType<number>("money", passthrough<number>()).nullable, // pull: no builder for money',
+      'price: customType<string>("money", passthrough<string>()).nullable, // pull: no builder for money',
     );
     expect(source).toMatch(
       /import \{[^}]*bytea,\s+customType,\s+date,[^}]*\} from/,
@@ -528,10 +533,10 @@ describe("pull: columns", () => {
       values: ["happy", "sad"],
       name: "mood",
     });
-    expect(column(model, "events", "moods").type).toEqual({
-      kind: "custom",
-      sqlType: "mood[]",
-      valueType: "string[]",
+    // An array of enums is the element type's .array, whose codec reads it.
+    expect(column(model, "events", "moods")).toMatchObject({
+      type: { kind: "custom", sqlType: "mood", valueType: "string" },
+      array: true,
     });
     expect(model.enumerations).toEqual(["mood"]);
     expect(

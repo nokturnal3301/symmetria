@@ -19,13 +19,17 @@ import {
   maximum,
   coalesce,
   exists,
+  notExists,
   not,
   or,
   defaultValue,
   table,
   index,
+  uuid,
+  date,
   type CompiledQuery,
   type Decimal,
+  type InferInsert,
 } from "../../../packages/runtime/src";
 import { expectDataError } from "../../support/data-errors";
 
@@ -665,7 +669,7 @@ test("is() and isNot() cover equality, NULL checks and enum members", () => {
     )
     .toSQL();
   expect(compiled.sql).toContain(
-    'WHERE ("posts"."title" = $1 AND "posts"."editor_id" IS NULL AND "posts"."metadata" IS NOT NULL AND "posts"."views" <> $2)',
+    `WHERE ("posts"."title" = $1 AND "posts"."editor_id" IS NULL AND (NULLIF("posts"."metadata", 'null'::jsonb)) IS NOT NULL AND "posts"."views" <> $2)`,
   );
   expect(compiled.parameters).toEqual(["Typed", "1"]);
   const states = schema({
@@ -890,7 +894,8 @@ test("UPDATE and DELETE where() combines predicate arrays with AND, like the whe
     () => model.posts.delete({ where: (posts) => posts.id.notIn([]) }),
     () => model.posts.update({ title: "x" }, { where: () => [and(), and()] }),
   ]) {
-    expect(empty).toThrow("leaves no condition");
+    // Refused when the statement is compiled, as a missing where() is.
+    expect(() => empty().toSQL()).toThrow("leaves no condition");
   }
 
   // A filter no row passes is a filter: it writes nothing.
@@ -930,6 +935,67 @@ test("UPDATE and DELETE accept relation paths and quantifiers through primary-ke
       .where((posts) => posts.id.is(1))
       .toSQL().sql,
   ).toBe('DELETE FROM "posts" AS "posts"\nWHERE "posts"."id" = $1');
+});
+
+test("a relation quantifier that holds for every row is no filter for UPDATE or DELETE", () => {
+  const search = "" as string;
+  const selected: number[] = [];
+
+  for (const everyRow of [
+    // Over a list whose entries were all skipped.
+    () =>
+      model.users.delete({
+        where: (users) =>
+          users.posts.every((posts) => [search && posts.title.is(search)]),
+      }),
+    () =>
+      model.users.delete({
+        where: (users) => users.posts.none((posts) => posts.id.in(selected)),
+      }),
+    () =>
+      model.users.delete({
+        where: (users) =>
+          not(users.posts.some((posts) => posts.id.in(selected))),
+      }),
+    () =>
+      model.users.delete({ where: (users) => users.posts.every(() => and()) }),
+    () =>
+      model.users.delete({ where: (users) => users.posts.none(() => or()) }),
+    () =>
+      model.users.delete({
+        where: () =>
+          notExists(
+            model.posts((posts) => ({ id: posts.id }), {
+              where: (posts) => posts.id.in(selected),
+            }),
+          ),
+      }),
+    () =>
+      model.users.update(
+        { active: false },
+        {
+          where: (users) => users.posts.none((posts) => posts.id.in(selected)),
+        },
+      ),
+  ]) {
+    expect(() => everyRow().toSQL()).toThrow("where() leaves no condition");
+  }
+
+  // Real conditions stay conditions: no post at all, posts that pass, and a
+  // quantifier no row passes, which writes nothing.
+  for (const filtered of [
+    () => model.users.delete({ where: (users) => users.posts.none() }),
+    () =>
+      model.users.delete({
+        where: (users) => users.posts.every((posts) => posts.title.is("x")),
+      }),
+    () =>
+      model.users.delete({
+        where: (users) => users.posts.some((posts) => posts.id.in(selected)),
+      }),
+  ]) {
+    expect(() => filtered().toSQL()).not.toThrow();
+  }
 });
 
 test("pages() iterates keyset pages until the cursor runs out", async () => {
@@ -1298,6 +1364,33 @@ test("duplicate DO UPDATE conflict keys and table-named CTEs fail before SQL run
   ).toThrow(/CTE "counters" has the SQL name of table "counters"/);
 });
 
+test("timestamp conflict keys before 2000 round the way PostgreSQL does", () => {
+  const local = schema({
+    stamps: { id: int.auto, at: timestamptz(0).unique, n: int },
+  });
+  const millennium = Date.UTC(2000, 0, 1);
+  const upsert = (first: number, second: number) => () =>
+    local.stamps
+      .upsert(
+        [
+          { at: new Date(first), n: 1 },
+          { at: new Date(second), n: 2 },
+        ],
+        { by: "at" },
+      )
+      .toSQL();
+
+  // PostgreSQL counts from 2000-01-01 and rounds halves away from it:
+  // 23:59:59.5 on the last day of 1999 is 23:59:59, not midnight.
+  expect(upsert(millennium - 500, millennium - 1000)).toThrow(
+    /rows 1 and 2 of the upsert on "stamps" share a conflict key/,
+  );
+  expect(upsert(millennium - 500, millennium)).not.toThrow();
+  expect(upsert(millennium + 500, millennium + 1000)).toThrow(
+    /share a conflict key/,
+  );
+});
+
 test("column.is exposes enum labels as predicates and is otherwise a plain function", () => {
   const local = schema({
     records: {
@@ -1369,4 +1462,97 @@ test("column.is exposes enum labels as predicates and is otherwise a plain funct
     .records(id, { where: () => sql<"a" | "b">`'a'`.is.b })
     .toSQL();
   expect(typed.parameters).toEqual(["b"]);
+});
+
+test("JSON null is null in comparisons that tell NULL from a value", () => {
+  const sqlOf = (where: Parameters<typeof model.posts>[1]) =>
+    model.posts((posts) => ({ id: posts.id }), where).toSQL().sql;
+  const path = '("posts"."metadata" #> ARRAY[$1::text])';
+
+  // is(null) counts JSON null; so do the comparisons that skip NULL.
+  expect(
+    sqlOf({ where: (posts) => posts.metadata.path("tags").isNot(["a"]) }),
+  ).toContain(`(NULLIF(${path}, 'null'::jsonb)) <>`);
+  expect(
+    sqlOf({ where: (posts) => posts.metadata.path("tags").notIn([["a"]]) }),
+  ).toContain(`(NULLIF(${path}, 'null'::jsonb)) NOT IN`);
+  // Equality never matches JSON null to a value; it keeps the plain path.
+  expect(
+    sqlOf({ where: (posts) => posts.metadata.path("tags").is(["a"]) }),
+  ).toContain(`WHERE ${path} =`);
+});
+
+test("text operations on an enum, uuid or date read it as text", () => {
+  const local = schema({
+    records: {
+      id: int.auto,
+      state: oneOf("draft", "published"),
+      token: uuid,
+      day: date,
+      label: text,
+    },
+  });
+  const where = (
+    filter: Parameters<typeof local.records>[1] extends infer Options
+      ? Options extends { where?: infer Where }
+        ? Where
+        : never
+      : never,
+  ) =>
+    local.records((records) => ({ id: records.id }), { where: filter }).toSQL()
+      .sql;
+
+  expect(where((records) => records.state.like("dr%"))).toContain(
+    '(("records"."state")::text) LIKE $1',
+  );
+  expect(where((records) => records.day.like("2024-%"))).toContain(
+    '(("records"."day")::text) LIKE $1',
+  );
+  expect(where((records) => records.token.ilike("abc%"))).toContain(
+    '(("records"."token")::text) ILIKE $1',
+  );
+  // A text column compared with an enum or uuid column compares as text.
+  expect(where((records) => records.label.is(records.state))).toContain(
+    '"records"."label" = (("records"."state")::text)',
+  );
+  expect(where((records) => records.label.is(records.token))).toContain(
+    '"records"."label" = (("records"."token")::text)',
+  );
+  // Text itself is left alone.
+  expect(where((records) => records.label.like("a%"))).toContain(
+    '"records"."label" LIKE $1',
+  );
+});
+
+test("jsonb(schema).array reads, writes and filters with the schema's input", () => {
+  // A schema whose input (stored) is a string and whose output is a Date.
+  const event = {
+    "~standard": {
+      version: 1 as const,
+      vendor: "test",
+      validate: (value: unknown) => ({
+        value: { at: new Date((value as { at: string }).at) },
+      }),
+      types: undefined as unknown as {
+        input: { at: string };
+        output: { at: Date };
+      },
+    },
+  };
+  const local = schema({
+    logs: { id: int.auto, one: jsonb(event), list: jsonb(event).array },
+  });
+  type Insert = InferInsert<typeof local.logs>;
+  const stored = { at: "2026-01-01T00:00:00Z" };
+  const row: Insert = { one: stored, list: [stored] };
+  // @ts-expect-error writes take what is stored, not the schema's output
+  const output: Insert = { one: stored, list: [{ at: new Date(0) }] };
+
+  void output;
+  expect(row.list).toEqual([stored]);
+  expect(
+    local.logs((logs) => ({ id: logs.id }), {
+      where: (logs) => logs.list.has(stored),
+    }),
+  ).toBeDefined();
 });

@@ -144,8 +144,9 @@ describe.skipIf(!available)("search declarations in migrations", () => {
         allowDestructive: true,
       }))!;
 
+      // The note tells lint of the saved file what generate knew.
       expect(reply.up).toBe(
-        'UPDATE "messages" SET "about" = NULL WHERE "about" IS NOT NULL;\n',
+        '-- symmetria: destructive: the embeddings in "about" are cleared: it embeds reply_text, text instead of text.\nUPDATE "messages" SET "about" = NULL WHERE "about" IS NOT NULL;\n',
       );
       await runner().migrate();
 

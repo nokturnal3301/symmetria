@@ -130,14 +130,17 @@ describe.skipIf(!databaseUrl)("fixes of the 2.5.0 bug hunt", () => {
   test("a write whose filter came out empty is refused and writes nothing", async () => {
     const nobody: number | undefined = undefined;
 
-    expect(() =>
-      database.comments.delete({
-        where: (comment) => [nobody && comment.authorId.is(nobody)],
-      }),
-    ).toThrow("leaves no condition");
-    expect(() =>
-      database.comments.update({ body: "x" }, { where: [] }),
-    ).toThrow("leaves no condition");
+    // Refused when the write runs, so its catch() sees it.
+    await expect(
+      database.comments
+        .delete({
+          where: (comment) => [nobody && comment.authorId.is(nobody)],
+        })
+        .execute(),
+    ).rejects.toThrow("leaves no condition");
+    await expect(
+      database.comments.update({ body: "x" }, { where: [] }).execute(),
+    ).rejects.toThrow("leaves no condition");
     await expect(tenant().comments.delete().execute()).rejects.toThrow(
       'delete() on "comments" has no where()',
     );

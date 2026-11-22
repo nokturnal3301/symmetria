@@ -4,10 +4,14 @@
  */
 import { freeze } from "../plan/freeze";
 import { embeddingColumns } from "../../schema/search-columns";
-import { scopeViolation } from "../../driver/errors";
+import { scopeViolation, sqlState } from "../../driver/errors";
 import { collectDataErrors, dataError } from "../codecs/deferred";
 import type { PredicateList } from "../select/types";
-import { rejectDuplicateKeys } from "./conflict-keys";
+import {
+  duplicateKeyError,
+  duplicateKeyProbe,
+  rejectDuplicateKeys,
+} from "./conflict-keys";
 import type { MutationOptions } from "./types";
 import {
   compilePlan,
@@ -44,6 +48,7 @@ import {
 import {
   DEFAULT_VALUE,
   WRITE_TAG,
+  normalizeResult,
   type CompiledQuery,
   type MutationPlan,
   type QueryExecutor,
@@ -70,7 +75,9 @@ const jsonNullValue = (
 
 /**
  * A condition every row passes whatever the data: a list that filtered down to
- * nothing (`[userId && …]` without a user), `and()`, `not(or())`, `notIn([])`.
+ * nothing (`[userId && …]` without a user), `and()`, `not(or())`, `notIn([])`,
+ * and a relation quantifier over such a condition (`every(() => [skipped])`,
+ * `none((post) => post.id.in([]))`), which holds for every row the same way.
  */
 const unconditional = (description: PredicateDescription): boolean => {
   switch (description.kind) {
@@ -80,18 +87,22 @@ const unconditional = (description: PredicateDescription): boolean => {
         : description.predicates.some(unconditional);
     case "not":
       return impossible(description.predicate);
+    case "notTrue":
+      return impossible(description.predicate);
     case "membership":
       return (
         description.negated &&
         Array.isArray(description.values) &&
         !description.values.length
       );
+    case "exists":
+      return description.negated && empty(description.query);
     default:
       return false;
   }
 };
 
-/** A condition no row passes: `or()`, `in([])`. */
+/** A condition no row passes: `or()`, `in([])`, `some()` over one of them. */
 const impossible = (description: PredicateDescription): boolean => {
   switch (description.kind) {
     case "group":
@@ -100,16 +111,24 @@ const impossible = (description: PredicateDescription): boolean => {
         : description.predicates.some(impossible);
     case "not":
       return unconditional(description.predicate);
+    case "notTrue":
+      return unconditional(description.predicate);
     case "membership":
       return (
         !description.negated &&
         Array.isArray(description.values) &&
         !description.values.length
       );
+    case "exists":
+      return !description.negated && empty(description.query);
     default:
       return false;
   }
 };
+
+/** A subquery that returns no row whatever the data: `EXISTS` of it is false. */
+const empty = (query: SelectPlan): boolean =>
+  query.limit === 0 || query.predicates.some(impossible);
 
 export const createMutation = (
   kind: MutationPlan["kind"],
@@ -146,13 +165,17 @@ export const createMutation = (
     };
 
     // A filter that holds for every row is a missing filter: the write would
-    // reach the whole table without saying so.
+    // reach the whole table without saying so. Request values often empty it
+    // (`[userId && …]`), so it is refused when the write runs, like a missing
+    // where(), and reaches the write's catch().
     const conditional = (
       description: PredicateDescription,
     ): PredicateDescription => {
       if (unconditional(description)) {
-        throw new Error(
-          `symmetria: ${kind}() where() leaves no condition (an empty list, and() or notIn([]) holds for every row); call .all() to ${kind} every row`,
+        dataError(
+          new Error(
+            `symmetria: ${kind}() where() leaves no condition (an empty list, and() or notIn([]) holds for every row); call .all() to ${kind} every row`,
+          ),
         );
       }
 
@@ -408,10 +431,17 @@ export const createMutation = (
       const result = compile
         ? executeCompiled(plan, compile(plan), execute)
         : executePlan(plan, execute);
+      const upsert = plan.conflict?.action === "update" && plan.conflict;
 
-      return plan.checks
+      return plan.checks || upsert
         ? result.catch((error: unknown) => {
-            throw scopeViolation(error);
+            // PostgreSQL found two rows with one key ("cannot affect row a
+            // second time"): the documented refusal, whatever the spelling.
+            if (upsert && sqlState(error) === "21000") {
+              throw duplicateKeyError(root, upsert.columns, error);
+            }
+
+            throw plan.checks ? scopeViolation(error) : error;
           })
         : result;
     };
@@ -462,6 +492,23 @@ export const createMutation = (
     const runChunks = async (atomicExecutor: QueryExecutor | undefined) => {
       const rows: Record<string, unknown>[] = [];
       let affectedRows = 0;
+
+      // Split over several statements, a later row with an earlier row's key
+      // would overwrite it without an error. Keys this code cannot compare
+      // as their type does (inet, interval, jsonb …) are compared by
+      // PostgreSQL first, in the same transaction.
+      if (state.conflict?.action === "update") {
+        const probe = duplicateKeyProbe(state.conflict.columns, state.values);
+        const execute = atomicExecutor ?? executor;
+
+        if (
+          probe &&
+          execute &&
+          normalizeResult(await execute(probe)).rows.length
+        ) {
+          throw duplicateKeyError(root, state.conflict.columns);
+        }
+      }
 
       for (const chunk of chunks!) {
         const result = await run(chunk, atomicExecutor);

@@ -409,3 +409,32 @@ test("arrays accept Bun's typed arrays and reject NULL elements their type canno
   ]);
   expect(int.array.nullable.definition.sqlType).toBe("integer[]");
 });
+
+test("an array the driver leaves as PostgreSQL's text reads as an array", () => {
+  // An enum array on both drivers, a range or tsvector array on node-postgres.
+  const texts = codecFor("text[]")!;
+
+  expect(texts.decode('{happy,"a b","with \\"quote\\""}')).toEqual([
+    "happy",
+    "a b",
+    'with "quote"',
+  ]);
+  // Quoted, NULL is a word; bare, it is a NULL element.
+  expect(texts.decode('{"NULL",""}')).toEqual(["NULL", ""]);
+  expect(() => texts.decode("{a,NULL}")).toThrow(/contains a NULL element/);
+  expect(texts.decode("{}")).toEqual([]);
+  expect(() => texts.decode("{{1,2},{3,4}}")).toThrow(
+    "multidimensional arrays are not supported",
+  );
+});
+
+test("integer -0 is sent as 0, and Bun's out-of-range dates fail to read", () => {
+  // Bun sends -0 as a double, which would run integer arithmetic as floats.
+  expect(Object.is(codecFor("integer")!.encode(-0 as never), 0)).toBe(true);
+  expect(Object.is(codecFor("smallint")!.encode(-0 as never), 0)).toBe(true);
+  // Bun makes a date a JavaScript Date, which ends at 275760-09-13.
+  expect(() => codecFor("date")!.decode(new Date(Number.NaN))).toThrow(
+    "a date beyond 275760-09-13 (or before 271821-04-20 BC) cannot be read through Bun.SQL",
+  );
+  expect(codecFor("date")!.decode("300000-01-01")).toBe("300000-01-01");
+});

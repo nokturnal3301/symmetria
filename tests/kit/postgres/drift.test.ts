@@ -12,6 +12,7 @@ import {
   oneOf,
   index,
   sql,
+  operatorClass,
 } from "../../../packages/runtime/src";
 import { normalizeResult } from "../../../packages/runtime/src/entries/internal";
 import { detectDrift } from "../../../packages/kit/src";
@@ -328,6 +329,33 @@ describe.skipIf(!databaseUrl)("PostgreSQL drift definitions", () => {
         );
       }
 
+      expect(
+        await detectDrift({
+          execute: fixture.driver.execute,
+          snapshot: model.$snapshot(),
+          schemaName: fixture.namespace,
+        }),
+      ).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("spellings PostgreSQL stores in its own form have no drift after migrate", async () => {
+    const model = schema({
+      items: table({ id: int.auto, name: text, amount: numeric(6) }).indexes(
+        (t) => ({
+          // Stored as the column with a collation, not as an expression.
+          byNameC: index(sql<string>`(${t.name} COLLATE "C")`),
+          // The type's default operator class, written out.
+          byNameText: index(operatorClass(t.name, "text_ops")),
+        }),
+      ),
+    });
+    const fixture = await testDatabase({ url: databaseUrl!, schema: model });
+
+    try {
+      // numeric(6) is stored as numeric(6,0).
       expect(
         await detectDrift({
           execute: fixture.driver.execute,

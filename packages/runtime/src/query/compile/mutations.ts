@@ -124,7 +124,7 @@ const columnArrays = (
 
     if (!base) {
       // These bind with a cast, which a column of nothing but NULL never shows.
-      const empty = /^(jsonb|json|real|vector)(?:\(\d+\))?$/.exec(
+      const empty = /^(jsonb|json|real|vector|halfvec)(?:\(\d+\))?$/.exec(
         column.sqlType,
       )?.[1];
 

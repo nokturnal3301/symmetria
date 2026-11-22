@@ -165,3 +165,35 @@ test("a migration removed by hand: discard puts the snapshot back from the journ
       )?.up,
     ).toContain('ADD COLUMN "reply" text');
   }));
+
+test("a migration deleted by removing its directory: discard takes it out of the journal", () =>
+  withMigrationDirectory(async (directory) => {
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: version(1),
+    });
+    const before = (await loadMigrationState(directory)).snapshot;
+
+    await generateMigration({ directory, name: "reply", snapshot: version(2) });
+    await rm(join(directory, "000002_reply"), { recursive: true });
+
+    // Every command refuses the chain and names the way out.
+    await expect(loadMigrationState(directory)).rejects.toThrow(
+      'If "000002_reply" was deleted by hand, "symmetria discard" takes it out of the journal and puts the snapshot back',
+    );
+    await expect(
+      discardMigration({ directory, id: "000001_initial" }),
+    ).rejects.toThrow('it is "000002_reply" (its directory is already gone)');
+    expect(await discardMigration({ directory })).toEqual({
+      id: "000002_reply",
+      source: "journal",
+    });
+
+    const state = await loadMigrationState(directory);
+
+    expect(state.migrations.map((migration) => migration.id)).toEqual([
+      "000001_initial",
+    ]);
+    expect(snapshotHash(state.snapshot)).toBe(snapshotHash(before));
+  }));

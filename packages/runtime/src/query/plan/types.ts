@@ -34,6 +34,15 @@ export type Awaitable<Value> = Pick<
 /** The tags thenables carry: `Object.prototype.toString` names what they are. */
 export const QUERY_TAG = "SymmetriaQuery";
 export const WRITE_TAG = "SymmetriaWrite";
+
+/**
+ * A driver's way to count a connection a `stream()` reserves as held by the
+ * code that iterates it: called where the loop starts, it returns a holder
+ * the stream marks open while it holds the connection. A query in the loop
+ * then fails at once where it would wait forever for that connection.
+ */
+export const CONNECTION_CLAIM = Symbol("symmetria.driver.claim");
+export type ConnectionClaim = () => { open: boolean };
 export type ExecutionResult = {
   rows: Record<string, unknown>[];
   affectedRows: number;
@@ -83,6 +92,8 @@ export type Driver = {
   readonly session?: <Result>(
     callback: (driver: SessionDriver) => Promise<Result>,
   ) => Promise<Result>;
+  /** See `CONNECTION_CLAIM`. */
+  readonly [CONNECTION_CLAIM]?: ConnectionClaim;
 };
 
 export type SessionDriver = {

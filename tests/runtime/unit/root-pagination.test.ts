@@ -6,6 +6,8 @@ import {
   int,
   text,
   bigint,
+  numeric,
+  date,
   timestamptz,
   prepare,
   rowNumber,
@@ -285,4 +287,52 @@ test("a page cursor identifies the query, not the $scope() values in force", asy
       })
       .page({ size: 1, after: nextCursor }),
   ).rejects.toThrow(/another query/);
+});
+
+test("a page ordered by an array column accepts its own cursor", async () => {
+  const local = schema(
+    {
+      items: {
+        id: int.auto,
+        amounts: numeric(10, 2).array,
+        days: date.array,
+      },
+    },
+    {
+      executor: async () => [
+        {
+          id: 1,
+          __symmetria_cursor_0: "{1.50,2.00}",
+          __symmetria_cursor_1: "1",
+        },
+        { id: 2, __symmetria_cursor_0: "{3.00}", __symmetria_cursor_1: "2" },
+      ],
+    },
+  );
+  const list = local.items((item) => ({ id: item.id }), {
+    orderBy: (item) => [item.amounts.asc, item.id.asc],
+  });
+  const { nextCursor } = await list.page({ size: 1 });
+
+  // The array's text form is its cursor value; the type check is PostgreSQL's.
+  expect(await list.page({ size: 1, after: nextCursor })).toMatchObject({
+    items: [{ id: 1 }],
+  });
+});
+
+test("exists() in a paginated projection keeps the root rows paged first", () => {
+  const { sql } = database
+    .users(
+      (user) => ({
+        name: user.name,
+        posts: user.posts.count(),
+        has: user.posts.exists(),
+      }),
+      { orderBy: (user) => user.id.asc, limit: 3 },
+    )
+    .toSQL();
+
+  // The subqueries run for the page's rows, not for every user.
+  expect(sql).toContain('FROM (SELECT "users"."id" AS "id"');
+  expect(sql).toContain("EXISTS (SELECT");
 });

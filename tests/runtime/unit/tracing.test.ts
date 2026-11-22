@@ -13,7 +13,10 @@ import {
   table,
   int,
   text,
+  many,
+  one,
 } from "../../../packages/runtime/src";
+import { createPostgresDriver } from "../../../packages/runtime/src/driver/pool";
 import type {
   Driver,
   TransactionDriver,
@@ -138,7 +141,10 @@ test("statements of a transaction are children of its span", async () => {
 });
 
 test("a failed statement marks its span and the transaction around it", async () => {
-  const refused = Object.assign(new Error("duplicate key"), { code: "23505" });
+  const refused = Object.assign(
+    new Error('invalid input value for enum: "ada@example.test"'),
+    { code: "23505", constraint: "users_email_key" },
+  );
   const database = createDatabase({
     schema: declared,
     driver: traced(
@@ -151,7 +157,7 @@ test("a failed statement marks its span and the transaction around it", async ()
     database.$transaction((transaction) =>
       transaction.users.insert({ name: "Ada" }),
     ),
-  ).rejects.toThrow("duplicate key");
+  ).rejects.toThrow("ada@example.test");
 
   const [statement, transaction] = exporter.getFinishedSpans();
 
@@ -163,6 +169,15 @@ test("a failed statement marks its span and the transaction around it", async ()
   expect(statement!.events.map((event) => event.name)).toEqual(["exception"]);
   expect(transaction!.name).toBe("transaction");
   expect(transaction!.status.code).toBe(SpanStatusCode.ERROR);
+  // PostgreSQL's message may quote a value; the spans name the error only.
+  expect(statement!.status.message).toBe(
+    'Error (23505) on constraint "users_email_key"',
+  );
+  expect(
+    JSON.stringify(
+      exporter.getFinishedSpans().map((span) => [span.status, span.events]),
+    ),
+  ).not.toContain("ada@example.test");
 });
 
 test("a table in another schema keeps its qualified name", async () => {
@@ -192,4 +207,93 @@ test("the profiler still sees queries through a traced driver", async () => {
   expect(request!.queries).toHaveLength(1);
   expect(request!.queries[0]!.kind).toBe("select");
   expect(spans().map((span) => span.name)).toEqual(["SELECT users"]);
+  exporter.reset();
+
+  // A cursor's name is new for every stream; its spans carry the table.
+  for await (const _ of database
+    .users((user) => ({ name: user.name }))
+    .stream({ size: 2 })) {
+    // one row
+  }
+
+  expect(
+    spans()
+      .map((span) => span.name)
+      .filter((name) => name !== "transaction" && !name.startsWith("SET")),
+  ).toEqual(["DECLARE users", "FETCH users", "CLOSE users"]);
+});
+
+test("a span is named after the statement's own table, and a cursor after its stream", async () => {
+  const writers = table({ id: int.auto, name: text, posts: many });
+  const relations = schema({
+    users: writers,
+    posts: table({ id: int.auto, title: text, author: one(writers.posts) }),
+  });
+  const database = createDatabase({
+    schema: relations,
+    driver: traced(stub(), { tracer }),
+  });
+
+  // The nested read and the count are subqueries inside the users statement.
+  await database.users((user) => ({
+    name: user.name,
+    posts: user.posts((post) => ({ title: post.title })),
+    total: user.posts.count(),
+  }));
+  expect(spans().map((span) => span.name)).toEqual(["SELECT users"]);
+});
+
+/** A pool whose transactions queue statements, as PostgreSQL connections do. */
+const queueing = (fail: (sql: string) => unknown): Driver => {
+  const answer = async (query: { sql: string }) => {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const error = fail(query.sql);
+
+    if (error) {
+      throw error;
+    }
+
+    return { rows: [{ id: 1, name: "Ada", count: 1 }], affectedRows: 1 };
+  };
+
+  return createPostgresDriver({
+    execute: answer,
+    connect: async () => ({
+      execute: answer,
+      release: () => {},
+      discard: async () => {},
+    }),
+    cancel: async () => {},
+    close: async () => {},
+    max: 4,
+  });
+};
+
+test("statements a failed transaction never sent are marked, not failed again", async () => {
+  const refused = Object.assign(new Error("duplicate key"), { code: "23505" });
+  const database = createDatabase({
+    schema: declared,
+    driver: traced(
+      queueing((sql) => (sql.startsWith("INSERT") ? refused : undefined)),
+      { tracer },
+    ),
+  });
+
+  await database
+    .$transaction(async (transaction) => {
+      const first = transaction.users.insert({ name: "Ada" }).execute();
+      const second = transaction.users.count();
+
+      await Promise.allSettled([first, second]);
+    })
+    .catch(() => {});
+
+  const statements = exporter
+    .getFinishedSpans()
+    .filter((span) => span.name !== "transaction");
+
+  expect(statements.map((span) => span.attributes["error.type"])).toEqual([
+    "23505",
+    "not_sent",
+  ]);
 });

@@ -9,6 +9,7 @@ import {
   createDatabase,
   self,
   sql,
+  bigint,
 } from "../../../packages/runtime/src";
 
 test("nested scopes see an outer JOIN added after an earlier relation resolved bindings", async () => {
@@ -379,6 +380,73 @@ test("callable relations preserve function-metadata column names and nested outp
         ),
       })),
     ).toEqual([{ name: "Ada", length: 3, then: [{ name: "Ada" }] }]);
+  } finally {
+    await database.$close();
+  }
+});
+
+test("a relation's aggregate inside its own shape, and DISTINCT bigints in a nested collection", async () => {
+  const driver = isolatedDriver();
+  const database = createDatabase({
+    schema: schema({
+      users: { id: int, name: text },
+      posts: ({ users }) => ({
+        id: int,
+        title: text,
+        views: bigint,
+        author: users,
+      }),
+    }),
+    driver,
+  });
+  driver.createTables(database);
+
+  try {
+    await database.users.insert([
+      { id: 1, name: "Ada" },
+      { id: 2, name: "Bob" },
+    ]);
+    await database.posts.insert([
+      { id: 1, title: "a1", views: 9007199254740993n, authorId: 1 },
+      { id: 2, title: "a2", views: 5n, authorId: 1 },
+      { id: 3, title: "a3", views: 5n, authorId: 1 },
+      { id: 4, title: "b1", views: 7n, authorId: 2 },
+    ]);
+
+    expect(
+      await database.users(
+        (user) => ({
+          name: user.name,
+          posts: user.posts(
+            (post) => ({ title: post.title, ofTotal: user.posts.count() }),
+            { orderBy: (post) => post.id.asc, limit: 1 },
+          ),
+          views: user.posts((post) => ({ views: post.views }), {
+            distinct: true,
+            orderBy: (post) => post.views.asc,
+          }),
+          selected: database.posts((post) => ({ views: post.views }), {
+            where: (post) => post.authorId.is(user.id),
+            distinct: true,
+            orderBy: (post) => post.views.desc,
+          }),
+        }),
+        { orderBy: (user) => user.id.asc },
+      ),
+    ).toEqual([
+      {
+        name: "Ada",
+        posts: [{ title: "a1", ofTotal: 3 }],
+        views: [{ views: 5n }, { views: 9007199254740993n }],
+        selected: [{ views: 9007199254740993n }, { views: 5n }],
+      },
+      {
+        name: "Bob",
+        posts: [{ title: "b1", ofTotal: 1 }],
+        views: [{ views: 7n }],
+        selected: [{ views: 7n }],
+      },
+    ]);
   } finally {
     await database.$close();
   }

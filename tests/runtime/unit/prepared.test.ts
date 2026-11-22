@@ -225,3 +225,58 @@ test("prepared subqueries share parameter numbering and reject escaped scopes", 
       .toSQL(),
   ).toThrow(/bind parameter/);
 });
+
+test("a prepared lookup by key refuses a parameter that may be null", () => {
+  const database = schema({
+    users: { id: int.auto, name: text, email: text.unique.nullable },
+  });
+
+  // Bound to null it would compare as IS NULL and reach every NULL key.
+  expect(() =>
+    prepare({ email: text.nullable }, (p) =>
+      database.users.by.email(p.email as never).delete(),
+    ),
+  ).toThrow('unique key "email" cannot be a nullable parameter (email)');
+  expect(() =>
+    prepare({ id: int.nullable }, (p) =>
+      database.users.byId(p.id as never).update({ name: "x" }),
+    ),
+  ).toThrow('primary key "id" cannot be a nullable parameter (id)');
+  expect(() =>
+    prepare({ email: text }, (p) => database.users.by.email(p.email).delete()),
+  ).not.toThrow();
+});
+
+test("a prepared JSON parameter that may hold null binds JSON null", async () => {
+  const calls: CompiledQuery[] = [];
+  const body = jsonb<{ a: number } | null>();
+  const database = schema(
+    { docs: { id: int, body } },
+    {
+      executor: async (query) => {
+        calls.push(query);
+
+        return [];
+      },
+    },
+  );
+  const find = prepare({ body }, (p) =>
+    database.docs((doc) => ({ id: doc.id }), {
+      where: (doc) => doc.body.is(p.body),
+    }),
+  );
+
+  await find({ body: null });
+  expect(calls[0]!.sql).toContain('"docs"."body" = $1::text::jsonb');
+  expect(calls[0]!.parameters).toEqual(["null"]);
+  // A parameter of another type still refuses null.
+  const named = prepare({ id: int }, (p) =>
+    database.docs((doc) => ({ id: doc.id }), {
+      where: (doc) => doc.id.is(p.id),
+    }),
+  );
+
+  await expect(named({ id: null as never })).rejects.toThrow(
+    'parameter "id" cannot be null',
+  );
+});

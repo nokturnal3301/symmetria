@@ -6,6 +6,7 @@ import {
   many,
   int,
   text,
+  sql,
   type Predicate,
 } from "../../../packages/runtime/src";
 import {
@@ -284,3 +285,152 @@ describe.skipIf(!withBm25)(
   "search by BM25 and meaning on PostgreSQL with pg_search",
   suite("bm25", bm25),
 );
+
+/** A model that answers with the length of each text, and records what it was asked. */
+const lengthsAsked: string[] = [];
+const lengths = embedder(
+  2,
+  async (texts) => {
+    lengthsAsked.push(...texts);
+
+    return texts.map((value) => [value.length, 1]);
+  },
+  { name: "lengths" },
+);
+const written = schema({
+  docs: table({
+    id: int.auto,
+    slug: text.unique,
+    title: text,
+    content: text.nullable,
+  }).search((doc) => ({
+    about: { meaning: lengths(doc.title, doc.content) },
+  })),
+});
+
+describe.skipIf(!withVector)("embedded writes on PostgreSQL", () => {
+  let isolated: Awaited<ReturnType<typeof testDatabase<typeof written>>>;
+  let database: typeof isolated.database;
+
+  const stored = async (slug: string) =>
+    (
+      (await isolated.driver.execute({
+        sql: "SELECT title, content, about::text AS about FROM docs WHERE slug = $1",
+        parameters: [slug],
+      })) as { rows: unknown[] }
+    ).rows[0] as {
+      title: string;
+      content: string | null;
+      about: string | null;
+    };
+
+  beforeAll(async () => {
+    isolated = await testDatabase({
+      url: databaseUrl!,
+      schema: written,
+      prefix: "symmetria_search_writes",
+      max: 2,
+      searchPath: ["public"],
+    });
+    database = isolated.database;
+  });
+
+  afterAll(async () => {
+    await isolated?.close();
+  });
+
+  test("an upsert stores the embedding of the text the row ends up with", async () => {
+    await database.docs.insert([
+      { slug: "a", title: "first", content: "keys" },
+      { slug: "b", title: "first", content: null },
+      { slug: "c", title: "first", content: null },
+    ]);
+
+    // An update list of the text columns, without the embedding.
+    await database.docs.upsert(
+      { slug: "b", title: "second text", content: null },
+      { by: "slug", update: ["title", "content"] },
+    );
+    await database.docs
+      .insert({ slug: "c", title: "second text", content: null })
+      .onConflict("slug")
+      .doUpdate("title", "content");
+    expect(await stored("b")).toMatchObject({ about: "[11,1]" });
+    expect(await stored("c")).toMatchObject({ about: "[11,1]" });
+
+    // The update replaces the title and keeps content, which the model did
+    // not see: the embedding is left for reindex() instead of guessed.
+    await database.docs.upsert({ slug: "a", title: "soup" }, { by: "slug" });
+    expect(await stored("a")).toEqual({
+      title: "soup",
+      content: "keys",
+      about: null,
+    });
+    expect(await database.docs.search.missing()).toBe(1);
+
+    // One row without text does not make the others look different.
+    await database.docs.upsert(
+      [
+        { slug: "d", title: "has text", content: null },
+        { slug: "e", title: "", content: null },
+      ],
+      { by: "slug" },
+    );
+    expect(await stored("d")).toMatchObject({ about: "[8,1]" });
+    expect(await stored("e")).toMatchObject({ about: null });
+  });
+
+  test("a row with an SQL expression in its text is written without an embedding", async () => {
+    lengthsAsked.length = 0;
+    await database.docs.insert({
+      slug: "s",
+      title: "garage",
+      content: sql<string>`'keys are in the ' || 'blue box'`,
+    });
+
+    expect(lengthsAsked).toEqual([]);
+    expect(await stored("s")).toEqual({
+      title: "garage",
+      content: "keys are in the blue box",
+      about: null,
+    });
+  });
+});
+
+const worded = schema({
+  pages: table({ id: int.auto, body: text }).search((page) => ({
+    find: { words: fullText(page.body) },
+  })),
+});
+
+describe.skipIf(!databaseUrl)("search by words in any script", () => {
+  test("words with combining marks, and e-mail addresses, are found", async () => {
+    const isolated = await testDatabase({
+      url: databaseUrl!,
+      schema: worded,
+      prefix: "symmetria_search_words",
+      max: 1,
+    });
+
+    try {
+      for (const [body, word] of [
+        ["यह हिन्दी भाषा है", "हिन्दी"],
+        ["กุญแจ รถ อยู่ ที่ไหน", "กุญแจ"],
+        ["le café est fermé".normalize("NFD"), "café".normalize("NFD")],
+        ["write to ada@example.com today", "ada@example.com"],
+      ] as const) {
+        const { id } = await isolated.database.pages
+          .insert({ body })
+          .returning("id");
+
+        expect(
+          await isolated.database.pages.search((page) => ({ id: page.id }), {
+            find: word,
+          }),
+        ).toContainEqual({ id });
+      }
+    } finally {
+      await isolated.close();
+    }
+  });
+});

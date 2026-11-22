@@ -241,7 +241,9 @@ const schemaRuntime = (
 });
 
 /** The drivers whose transaction callback the current async context runs in. */
-const openTransactions = new AsyncLocalStorage<ReadonlySet<object>>();
+const openTransactions = new AsyncLocalStorage<
+  readonly { readonly driver: object; open: boolean }[]
+>();
 
 const declaredByTable = new WeakMap<object, readonly Search[]>();
 
@@ -281,11 +283,11 @@ const createTableHandle = (
 
   const searches = tableSearches.get(tableSnapshot) ?? [];
   const embedded = searches.length
-    ? embeddedSearches(searchesOf(tableSnapshot), searchColumns)
+    ? embeddedSearches(searchesOf(tableSnapshot), searchColumns, tableSnapshot)
     : [];
   // Rows whose searches keep an embedding wait for it before they are written.
   const embedding =
-    <Values>(write: (values: Values) => object) =>
+    <Values>(write: (values: Values) => object, upsert = false) =>
     (values: Values, ...rest: unknown[]): object => {
       const rows = (Array.isArray(values) ? values : [values]) as Record<
         string,
@@ -299,7 +301,26 @@ const createTableHandle = (
         );
       }
 
-      return deferredWrite(async (chained) => {
+      return deferredWrite(async (_chained, calls) => {
+        // `doUpdate("title")` that sets every column an embedding reads also
+        // sets the embedding computed for those values.
+        const chained = (builder: object) =>
+          calls.reduce(
+            (current, [method, argumentsList]) =>
+              (
+                current as Record<
+                  string,
+                  (...values: readonly unknown[]) => object
+                >
+              )[method]!(
+                ...(method === "doUpdate" &&
+                argumentsList.every((name) => typeof name === "string")
+                  ? withEmbeddedColumns(argumentsList)
+                  : argumentsList),
+              ),
+            builder,
+          );
+
         // A write the rows already fail is refused before a model is paid for.
         const [, failure] = collectDataErrors(() =>
           chained(
@@ -311,16 +332,41 @@ const createTableHandle = (
           throw failure.error;
         }
 
-        const filled = await embedRows(embedded, rows);
+        // An upsert keeps the columns it does not set; their text is unknown here.
+        const filled = await embedRows(
+          embedded,
+          rows,
+          upsert || calls.some(([method]) => method === "onConflict"),
+        );
 
         return {
-          builder: (write as (...argumentsList: unknown[]) => object)(
-            Array.isArray(values) ? filled : filled[0],
-            ...rest,
+          builder: chained(
+            (write as (...argumentsList: unknown[]) => object)(
+              Array.isArray(values) ? filled : filled[0],
+              ...(upsert ? [withEmbeddings(rest[0])] : rest),
+            ),
           ),
+          chained: true as const,
         };
       });
     };
+
+  // A list of columns to overwrite that holds every column an embedding
+  // reads also overwrites the embedding, which describes exactly those values.
+  const withEmbeddedColumns = (update: readonly unknown[]): unknown[] => [
+    ...update,
+    ...embedded
+      .filter((search) => search.sources.every((name) => update.includes(name)))
+      .map((search) => search.column)
+      .filter((column) => !update.includes(column)),
+  ];
+  const withEmbeddings = (options: unknown): unknown => {
+    const update = (options as { update?: unknown } | undefined)?.update;
+
+    return Array.isArray(update)
+      ? { ...(options as object), update: withEmbeddedColumns(update) }
+      : options;
+  };
 
   return extendBuilder(queryTable, {
     $name: tableSnapshot.sqlName,
@@ -345,6 +391,7 @@ const createTableHandle = (
       ? {
           upsert: embedding(
             (queryTable as { upsert: (values: unknown) => object }).upsert,
+            true,
           ),
         }
       : {}),
@@ -471,16 +518,27 @@ const bindDatabase = (
       );
     }
 
-    const held = new Set(openTransactions.getStore()).add(driver);
+    return retryTransaction((settings) => {
+      // Code the callback starts that still runs after it returned (a timer,
+      // a shutdown hook) is not inside the transaction any more.
+      const entry = { driver, open: true };
+      const held = [
+        ...(openTransactions.getStore() ?? []).filter((outer) => outer.open),
+        entry,
+      ];
 
-    return retryTransaction(
-      (settings) =>
-        driver.transaction!(
-          (connection) => openTransactions.run(held, () => run(connection)),
-          settings,
-        ),
-      options,
-    );
+      return driver.transaction!(
+        (connection) =>
+          openTransactions.run(held, async () => {
+            try {
+              return await run(connection);
+            } finally {
+              entry.open = false;
+            }
+          }),
+        settings,
+      );
+    }, options);
   };
 
   // A transaction usually touches a few tables of many: handles are built
@@ -561,7 +619,12 @@ const bindDatabase = (
             $close: async () => {
               // Closing waits for open transactions, and this one would
               // wait for the close: neither would ever finish.
-              if (driver && openTransactions.getStore()?.has(driver)) {
+              if (
+                driver &&
+                openTransactions
+                  .getStore()
+                  ?.some((entry) => entry.open && entry.driver === driver)
+              ) {
                 throw new Error(
                   "symmetria: $close() was called inside a $transaction() of the same database; close it after the transaction ends",
                 );

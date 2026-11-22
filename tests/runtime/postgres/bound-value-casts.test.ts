@@ -14,6 +14,10 @@ import {
   timestamptz,
   date,
   varchar,
+  inet,
+  interval,
+  jsonb,
+  not,
 } from "../../../packages/runtime/src";
 import { postgres as pg } from "../../../packages/runtime/src/entries/pg";
 import { testDatabase as isolatedDatabase } from "../../../packages/kit/src/testing";
@@ -33,7 +37,15 @@ const code = customType<string>("char(5)", {
 });
 const prices = table({ amount: numeric(10, 2).primaryKey, note: text });
 const tokens = table({ id: uuid.primaryKey, code, note: text.nullable });
-const model = schema({ things, prices, tokens });
+const stage = oneOf("draft", "published");
+const entries = table({
+  id: int.auto,
+  stage: stage.nullable,
+  meta: jsonb<{ size?: number | null }>(),
+});
+const hosts = table({ id: int.auto, address: inet.unique, label: text });
+const spans = table({ id: int.auto, length: interval.unique, label: text });
+const model = schema({ things, prices, tokens, entries, hosts, spans });
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
@@ -235,6 +247,90 @@ describe.skipIf(!databaseUrl)(
           )
           .execute(),
       ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
+    });
+
+    test("upsert keys of inet and interval equal in another spelling are one key, also when split", async () => {
+      await expect(
+        database.hosts
+          .upsert(
+            [
+              { address: "10.0.0.1", label: "first" },
+              { address: "10.0.0.1/32", label: "last" },
+            ],
+            { by: "address" },
+          )
+          .execute(),
+      ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
+
+      // Above 65,535 parameters the upsert is several statements, where the
+      // later row would overwrite the earlier one without an error.
+      const rows = (first: string, last: string) =>
+        Array.from({ length: 22_000 }, (_, index) => ({
+          length:
+            index === 0 ? first : index === 21_999 ? last : `${index + 2} days`,
+          label: index === 21_999 ? "last" : "first",
+        }));
+
+      await expect(
+        database.spans
+          .upsert(rows("1 day", "24:00:00"), { by: "length" })
+          .execute(),
+      ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
+      expect(await database.spans.count()).toBe(0);
+      expect(
+        (
+          await database.spans.upsert(rows("1 day", "25:00:00"), {
+            by: "length",
+          })
+        ).affectedRows,
+      ).toBe(22_000);
+    });
+
+    test("a nullable parameter compares like the literal it is bound to", async () => {
+      await database.entries.insert([
+        { stage: "draft", meta: {} },
+        { stage: "published", meta: { size: null } },
+        { stage: null, meta: { size: 3 } },
+      ]);
+      const ids = async (rows: PromiseLike<{ id: number }[]>) =>
+        (await rows).map((row) => row.id).sort();
+      const other = prepare({ stage: stage.nullable }, (p) =>
+        database.entries((entry) => ({ id: entry.id }), {
+          where: (entry) => entry.stage.isNot(p.stage),
+        }),
+      );
+      const negated = prepare({ stage: stage.nullable }, (p) =>
+        database.entries((entry) => ({ id: entry.id }), {
+          where: (entry) => not(entry.stage.is(p.stage)),
+        }),
+      );
+      const sized = prepare({ size: int.nullable }, (p) =>
+        database.entries((entry) => ({ id: entry.id }), {
+          where: (entry) => entry.meta.path("size").is(p.size as never),
+        }),
+      );
+
+      // An enum: the NULL row is neither "draft" nor something else, as in SQL.
+      expect(await ids(other({ stage: "draft" }))).toEqual([2]);
+      expect(await ids(negated({ stage: "draft" }))).toEqual([2]);
+      expect(await ids(other({ stage: null }))).toEqual([1, 2]);
+      expect(
+        await ids(
+          database.entries((entry) => ({ id: entry.id }), {
+            where: (entry) => entry.stage.isNot("draft"),
+          }),
+        ),
+      ).toEqual([2]);
+      // A JSON path: null counts JSON null and a missing key, as is(null) does.
+      expect(await ids(sized({ size: null }))).toEqual(
+        await ids(
+          database.entries((entry) => ({ id: entry.id }), {
+            where: (entry) => entry.meta.path("size").is(null),
+          }),
+        ),
+      );
+      expect(await ids(sized({ size: null }))).toEqual([1, 2]);
+      expect(await ids(sized({ size: 3 }))).toEqual([3]);
     });
 
     test("in() and notIn() refuse a null in the list", () => {

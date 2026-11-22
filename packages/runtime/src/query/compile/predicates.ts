@@ -123,9 +123,16 @@ export const predicateSql = (
       }
 
       const type = sqlTypeOf(description.left);
+      const isNull = description.nullCheck
+        ? predicateSql(compilation, description.nullCheck, bindings)
+        : `${left} IS NULL`;
+      const whenNull = operator === "<>" ? `NOT (${isNull})` : isNull;
 
+      // An enum type's name is not known here to cast the parameter; the
+      // comparison comes first, so PostgreSQL takes the type from it. As in
+      // the CASE form, a NULL row never matches a value under = or <>.
       if (type === "enum") {
-        return `${left} ${operator === "<>" ? "IS DISTINCT FROM" : "IS NOT DISTINCT FROM"} ${right}`;
+        return `(${comparison} OR (${right} IS NULL AND ${whenNull}))`;
       }
 
       const checked = renderer.cast(right, {
@@ -133,7 +140,7 @@ export const predicateSql = (
         type: type === "derived" ? description.right.sqlType : type,
       });
 
-      return `(CASE WHEN ${checked} IS NULL THEN ${left} IS ${operator === "<>" ? "NOT " : ""}NULL ELSE ${comparison} END)`;
+      return `(CASE WHEN ${checked} IS NULL THEN ${whenNull} ELSE ${comparison} END)`;
     }
     case "between": {
       const operand = (node: ValueNode) =>

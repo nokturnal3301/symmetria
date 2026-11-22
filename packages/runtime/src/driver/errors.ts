@@ -79,9 +79,13 @@ export const isRetryableTransactionError = (error: unknown): boolean => {
   return state === "40001" || state === "40P01";
 };
 
-/** Connection exceptions (class 08) and the shutdowns that end a session (57P01–57P05). */
+/**
+ * Connection exceptions (class 08), the shutdowns that end a session
+ * (57P01–57P05) and the timeouts that end it inside a transaction
+ * (25P03 idle_in_transaction_session_timeout, 25P04 transaction_timeout).
+ */
 const connectionState = (state: string): boolean =>
-  state.startsWith("08") || /^57P0[1-5]$/.test(state);
+  state.startsWith("08") || /^(?:57P0[1-5]|25P0[34])$/.test(state);
 
 /** Socket and pool failures, which carry no SQLSTATE. */
 const NODE_POSTGRES_CONNECTION =
@@ -100,7 +104,7 @@ const SOCKET_CODES = new Set([
 
 /**
  * Whether the connection itself failed, rather than a statement: the server
- * ended the session (class 08, 57P01–57P05), a socket error, or a client-side
+ * ended the session (class 08, 57P01–57P05, 25P03–25P04), a socket error, or a client-side
  * connection loss (`Connection terminated unexpectedly` on node-postgres,
  * `ERR_POSTGRES_CONNECTION_CLOSED` and similar on Bun).
  */

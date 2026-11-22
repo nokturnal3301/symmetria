@@ -162,10 +162,16 @@ test("a model of another length empties the embeddings instead of failing on the
     }).$snapshot();
   const plan = diffSchemas(declared(model), declared(eight));
 
-  expect(plan.up).toContain(
+  // The statements as they run; each carries a note for lint above it.
+  const executed = (statements: readonly string[]) =>
+    statements.map((sql) =>
+      sql.replace(/^-- symmetria: destructive: .*\n/, ""),
+    );
+
+  expect(executed(plan.up)).toContain(
     'ALTER TABLE "documents" ALTER COLUMN "about" TYPE vector(8) USING NULL',
   );
-  expect(plan.down).toContain(
+  expect(executed(plan.down)).toContain(
     'ALTER TABLE "documents" ALTER COLUMN "about" TYPE vector(4) USING NULL',
   );
   expect(

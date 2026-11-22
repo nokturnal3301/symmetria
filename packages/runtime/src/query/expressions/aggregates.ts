@@ -331,7 +331,7 @@ const blocksRootPagination = (node: ValueNode): boolean =>
       candidate.kind === "window" ||
       candidate.kind === "relativeWindow" ||
       candidate.kind === "aggregate" ||
-      candidate.kind === "raw",
+      (candidate.kind === "raw" && !candidate.composed),
   );
 
 /**

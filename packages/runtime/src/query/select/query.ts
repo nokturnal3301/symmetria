@@ -1,4 +1,5 @@
 /** Query handles: the shared prototype of every query and the callable that extends it. */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { freeze } from "../plan/freeze";
 import { collectDataErrors } from "../codecs/deferred";
 import { createExpression } from "../expressions";
@@ -13,11 +14,13 @@ import { queryOccurrence } from "../plan/occurrence";
 import { executePage } from "./pagination";
 import { PREPARE_QUERY, preparePlan } from "./prepared";
 import {
+  CONNECTION_CLAIM,
   QUERY_PLAN,
   QUERY_TAG,
   TABLE_SOURCE,
   normalizeResult,
   type CommonTableExpression,
+  type Driver,
   type QueryExecutor,
   type QueryReference,
   type SelectPlan,
@@ -67,6 +70,18 @@ export const endStreams = async (owner: object): Promise<void> => {
 const closedStream = () =>
   new Error("symmetria: the database was closed while this stream was open");
 
+/** How a dropped stream gives its connection back: see `dropped`. */
+type StreamLink = { release?: () => void };
+
+/**
+ * An iterator read partly and then dropped without `return()` never reaches
+ * its `finally`; once it is garbage, its transaction ends and the connection
+ * goes back to the pool.
+ */
+const dropped = new FinalizationRegistry<StreamLink>((link) =>
+  link.release?.(),
+);
+
 /**
  * Rows through a server-side cursor on a reserved connection. The hold callback
  * publishes the connection's executor and stays open until iteration finishes,
@@ -76,6 +91,8 @@ async function* streamRows(
   hold: ConnectionHold,
   plan: SelectPlan,
   size: number,
+  claim: { open: boolean } | undefined,
+  link: StreamLink,
 ): AsyncGenerator<Record<string, unknown>> {
   const compiled = compilePlan(plan);
   const decode = rowDecoder(plan);
@@ -83,7 +100,11 @@ async function* streamRows(
   const ready = Promise.withResolvers<QueryExecutor>();
   const finished = Promise.withResolvers<void>();
   const held = hold(async (execute) => {
-    ready.resolve(execute);
+    // The loop runs in its caller's context; its statements run in the
+    // transaction's, as its other statements do (a tracer's span, a profile).
+    const inside = AsyncLocalStorage.snapshot();
+
+    ready.resolve((query) => inside(() => execute(query)));
     await finished.promise;
   });
   held.catch(() => {});
@@ -132,6 +153,22 @@ async function* streamRows(
       }),
     ]);
 
+    if (claim) {
+      claim.open = true;
+    }
+
+    link.release = () => {
+      if (claim) {
+        claim.open = false;
+      }
+
+      if (owner) {
+        streams.get(owner)?.delete(end);
+      }
+
+      finished.resolve();
+    };
+
     // A stream reads to the end, so its cursor is planned like the plain
     // query. PostgreSQL otherwise plans a cursor to start fast, and may pick
     // an approximate index (pgvector's) that returns only some of the rows.
@@ -176,6 +213,12 @@ async function* streamRows(
     failed = true;
     throw error;
   } finally {
+    if (claim) {
+      claim.open = false;
+    }
+
+    dropped.unregister(link);
+
     if (owner) {
       streams.get(owner)?.delete(end);
     }
@@ -192,13 +235,18 @@ async function* streamRows(
       return;
     }
 
-    // Runs on completion, on an early `break` and on errors.
-    if (!failed && declared && execute) {
+    // Runs on completion, on an early `break` and on errors, also on a row
+    // that failed to decode: inside $transaction an open cursor would roll
+    // the whole transaction back. After a failed statement CLOSE fails too;
+    // the first error is the one reported.
+    if (declared && execute) {
       try {
         await execute({ sql: `CLOSE ${cursor}`, parameters: [] });
       } catch (error) {
-        failure = error;
-        failed = true;
+        if (!failed) {
+          failure = error;
+          failed = true;
+        }
       }
     }
 
@@ -612,16 +660,40 @@ export const createQueryFactory = (
           }
 
           return {
-            [Symbol.asyncIterator]: () => streamRows(hold, plan, size),
+            [Symbol.asyncIterator]: () => {
+              // Called where the loop starts, so a query in the loop body
+              // sees the connection this stream holds.
+              const claim = (hold as { owner?: Driver }).owner?.[
+                CONNECTION_CLAIM
+              ]?.();
+              const link: StreamLink = {};
+              const iterator = streamRows(hold, plan, size, claim, link);
+
+              dropped.register(iterator, link, link);
+
+              return iterator;
+            },
           };
         },
         /** The shape's single row: aggregates over the source, as one object. */
         async aggregate(this: QueryHandle, shape: ShapeCallback) {
-          return (
-            this as unknown as (shape: ShapeCallback) => {
-              one: () => Promise<Record<string, unknown>>;
-            }
-          )(shape).one();
+          type Source = ((
+            shape: ShapeCallback,
+          ) => Source & { one: () => Promise<Record<string, unknown>> }) & {
+            as: (name: string) => Source;
+          };
+          const plan = this[QUERY_STATE].plan;
+          // LIMIT, OFFSET and their ordering pick the rows the aggregates
+          // read, so they stay with those rows in a derived table instead of
+          // applying to the one result row.
+          const source =
+            plan.limit !== undefined || plan.offset !== undefined
+              ? (this as unknown as Source)((_row, tools) => ({
+                  ...(tools as unknown as { row: Record<string, unknown> }).row,
+                })).as("__symmetria_aggregated")
+              : (this as unknown as Source);
+
+          return source(shape).one();
         },
         async first(this: QueryHandle) {
           const state = runnable(this[QUERY_STATE]);

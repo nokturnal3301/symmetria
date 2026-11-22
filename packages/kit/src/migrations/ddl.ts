@@ -23,8 +23,109 @@ export const enumerationSQL = (
 ): string =>
   `CREATE TYPE ${quoteIdentifier(name)} AS ENUM (${values.map(quoteLiteral).join(", ")})`;
 
+const IDENTIFIER =
+  /^(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)(?:\.(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*))*/;
+const NUMBER = /^-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/i;
+const TYPE_WORDS =
+  /^(?: varying| precision| with time zone| without time zone)?(?:\(\s*\d+(?:\s*,\s*\d+)?\s*\))?(?:\[\d*\])*/i;
+
+/** The end of the parenthesized text starting at `start`, quotes skipped. */
+const closing = (text: string, start: number): number => {
+  let depth = 0;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (char === "'" || char === '"') {
+      const end = text.indexOf(char, index + 1);
+
+      if (end < 0) {
+        return -1;
+      }
+
+      index = end;
+    } else if (char === "(") {
+      depth += 1;
+    } else if (char === ")" && (depth -= 1) === 0) {
+      return index + 1;
+    }
+  }
+
+  return -1;
+};
+
+/**
+ * Whether an SQL default is one value: a literal, a number, a name, a call or
+ * a parenthesized expression, each with casts. `DEFAULT` in CREATE TABLE takes
+ * only a restricted expression, and reads the rest of a longer one as more of
+ * the column: `DEFAULT 'a' COLLATE "C"` collates the column itself, and
+ * `DEFAULT NOT false` does not parse. Anything else goes in parentheses.
+ */
+const singleValue = (expression: string): boolean => {
+  const text = expression.trim();
+  let index = 0;
+
+  if (/^E?'/i.test(text)) {
+    const escapes = text[0] !== "'";
+
+    index = escapes ? 2 : 1;
+
+    while (index < text.length) {
+      if (escapes && text[index] === "\\") {
+        index += 2;
+      } else if (text[index] === "'") {
+        if (text[index + 1] !== "'") {
+          break;
+        }
+
+        index += 2;
+      } else {
+        index += 1;
+      }
+    }
+
+    if (index >= text.length) {
+      return false;
+    }
+
+    index += 1;
+  } else if (text[0] === "(") {
+    index = closing(text, 0);
+  } else if (NUMBER.test(text)) {
+    index = NUMBER.exec(text)![0].length;
+  } else {
+    const name = IDENTIFIER.exec(text);
+
+    if (!name) {
+      return false;
+    }
+
+    index = name[0].length;
+
+    if (text[index] === "(") {
+      index = closing(text, index);
+    }
+  }
+
+  while (index > 0 && text.startsWith("::", index)) {
+    const type = IDENTIFIER.exec(text.slice(index + 2));
+
+    if (!type) {
+      return false;
+    }
+
+    index += 2 + type[0].length;
+    index += TYPE_WORDS.exec(text.slice(index))![0].length;
+  }
+
+  return index === text.length;
+};
+
+export const defaultSQL = (expression: string): string =>
+  singleValue(expression) ? expression : `(${expression})`;
+
 export const columnSQL = (column: MigrationColumn): string =>
-  `${quoteIdentifier(column.name)} ${columnTypeSQL(column)}${column.identity ? ` ${identitySQL(column)}` : ""}${column.default === undefined ? "" : ` DEFAULT ${column.default}`}${column.generated === undefined ? "" : ` GENERATED ALWAYS AS (${column.generated}) STORED`}${column.notNull ? " NOT NULL" : ""}`;
+  `${quoteIdentifier(column.name)} ${columnTypeSQL(column)}${column.identity ? ` ${identitySQL(column)}` : ""}${column.default === undefined ? "" : ` DEFAULT ${defaultSQL(column.default)}`}${column.generated === undefined ? "" : ` GENERATED ALWAYS AS (${column.generated}) STORED`}${column.notNull ? " NOT NULL" : ""}`;
 
 export const primaryKeySQL = (table: MigrationTable): string =>
   `CONSTRAINT ${quoteIdentifier(objectName(table.name, "pkey"))} PRIMARY KEY (${table.primaryKey.map(quoteIdentifier).join(", ")})`;

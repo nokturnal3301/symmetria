@@ -16,8 +16,11 @@ import {
   bool,
   sql,
   varchar,
+  numeric,
+  interval,
+  date,
 } from "../../../packages/runtime/src";
-import { vector } from "../../../packages/runtime/src/entries/vector";
+import { vector, halfvec } from "../../../packages/runtime/src/entries/vector";
 import {
   migrationSnapshot,
   parseMigrationSnapshot,
@@ -901,7 +904,8 @@ test("timestamptz and timestamp convert at UTC, not in the migrating session's t
 
   expect(diffSchemas(build(true), build(false))).toMatchObject({
     up: [
-      `ALTER TABLE "events" ALTER COLUMN "at" TYPE timestamp(3) USING "at" AT TIME ZONE 'UTC'`,
+      // Rounding to milliseconds loses digits; the saved SQL says so for lint.
+      `-- symmetria: destructive: Column "at" narrows from timestamptz to timestamp(3): fractional seconds are rounded to 3 digits.\nALTER TABLE "events" ALTER COLUMN "at" TYPE timestamp(3) USING "at" AT TIME ZONE 'UTC'`,
     ],
     down: [
       `ALTER TABLE "events" ALTER COLUMN "at" TYPE timestamptz USING "at" AT TIME ZONE 'UTC'`,
@@ -1123,4 +1127,166 @@ test("a type change PostgreSQL has no cast for asks for the conversion", () => {
   ).toEqual([
     'ALTER TABLE "items" ALTER COLUMN "value" TYPE uuid USING gen_random_uuid()',
   ]);
+});
+
+test("an SQL default longer than one value is written in parentheses", () => {
+  const model = schema({
+    items: table({
+      id: int.auto,
+      code: text.default(sql`'a' COLLATE "C"`),
+      ok: bool.default(sql`NOT false`),
+      at: timestamp.default(sql`now() AT TIME ZONE 'UTC'`),
+      created: timestamptz.default(sql`now()`),
+      label: text.default(sql`'x'::text`),
+    }),
+  });
+  const [create] = createSchemaSQL(model.$snapshot()).map(
+    (statement) => statement.sql,
+  );
+
+  // Unparenthesized, COLLATE would collate the column itself and the
+  // others would not parse.
+  expect(create).toContain(`"code" text DEFAULT ('a' COLLATE "C") NOT NULL`);
+  expect(create).toContain('"ok" boolean DEFAULT (NOT false) NOT NULL');
+  expect(create).toContain(
+    `"at" timestamp DEFAULT (now() AT TIME ZONE 'UTC') NOT NULL`,
+  );
+  expect(create).toContain('"created" timestamptz DEFAULT now() NOT NULL');
+  expect(create).toContain(`"label" text DEFAULT 'x'::text NOT NULL`);
+});
+
+test("vector to halfvec is a caution that says what half precision does", () => {
+  const embeddings = (column: ReturnType<typeof vector>) =>
+    schema(
+      { documents: table({ id: int.auto, embedding: column }) },
+      { extensions: ["vector"] },
+    ).$snapshot();
+  const findings = lintMigration(
+    diffSchemas(embeddings(vector(3)), embeddings(halfvec(3) as never)),
+  );
+
+  expect(findings.map((finding) => [finding.level, finding.message])).toEqual([
+    [
+      "caution",
+      'Column "embedding" changes from vector(3) to halfvec(3): every stored number is rounded to half precision, about 3 significant digits, and a number beyond ±65504 makes the migration fail.',
+    ],
+  ]);
+});
+
+test("spellings PostgreSQL treats as one value are no migration", () => {
+  const none = (
+    before: { $snapshot(): Parameters<typeof diffSchemas>[0] },
+    after: typeof before,
+  ) =>
+    expect(diffSchemas(before.$snapshot(), after.$snapshot()).up).toEqual([]);
+
+  // numeric(6) is numeric(6,0).
+  none(
+    schema({ items: { id: int.auto, n: numeric(6) } }),
+    schema({ items: { id: int.auto, n: numeric(6, 0) } }),
+  );
+
+  // An index's default ordering, and storage values as PostgreSQL keeps them.
+  const names = table({ id: int.auto, name: text });
+
+  none(
+    schema({ items: names.indexes((t) => ({ byName: index(t.name) })) }),
+    schema({
+      items: names.indexes((t) => ({ byName: index(t.name.ascending) })),
+    }),
+  );
+  none(
+    schema({
+      items: names.indexes((t) => ({ byName: index(t.name.descending) })),
+    }),
+    schema({
+      items: names.indexes((t) => ({
+        byName: index(t.name.descending.nullsFirst),
+      })),
+    }),
+  );
+  none(
+    schema({
+      items: names.indexes((t) => ({
+        byName: index(t.name).with({ fillfactor: "50" }),
+      })),
+    }),
+    schema({
+      items: names.indexes((t) => ({
+        byName: index(t.name).with({ fillfactor: 50 }),
+      })),
+    }),
+  );
+
+  // A quoted literal compared with a column has the column's type.
+  const measured = table({ id: int.auto, n: numeric(10, 2), day: date });
+
+  none(
+    schema({ items: measured.checks((t) => ({ k: t.n.above("0") })) }),
+    schema({
+      items: measured.checks((t) => ({
+        k: sql<boolean>`${t.n} > '0'::numeric`,
+      })),
+    }),
+  );
+  none(
+    schema({
+      items: measured.checks((t) => ({ k: t.day.above("1999-01-01") })),
+    }),
+    schema({
+      items: measured.checks((t) => ({
+        k: sql<boolean>`${t.day} > '1999-01-01'::date`,
+      })),
+    }),
+  );
+
+  // Value defaults in PostgreSQL's printed form, as pull writes them.
+  none(
+    schema({
+      items: {
+        id: int.auto,
+        tags: text.array.default(["a b", "c"]),
+        meta: jsonb<{ a: number }>().default({ a: 1 }),
+        at: timestamptz.default(new Date("2026-01-01T00:00:00Z")),
+        wait: interval.default("90 minutes"),
+      },
+    }),
+    schema({
+      items: {
+        id: int.auto,
+        tags: text.array.default(sql`'{"a b",c}'::text[]`),
+        meta: jsonb<{ a: number }>().default(sql`'{"a": 1}'::jsonb`),
+        at: timestamptz.default(
+          sql`'2026-01-01 00:00:00+00'::timestamp with time zone`,
+        ),
+        wait: interval.default("01:30:00"),
+      },
+    }),
+  );
+  // A different value is still a change.
+  expect(
+    diffSchemas(
+      schema({
+        items: { id: int.auto, wait: interval.default("90 minutes") },
+      }).$snapshot(),
+      schema({
+        items: { id: int.auto, wait: interval.default("2 hours") },
+      }).$snapshot(),
+    ).up,
+  ).toEqual([`ALTER TABLE "items" ALTER COLUMN "wait" SET DEFAULT E'2 hours'`]);
+});
+
+test("an extension name may have a hyphen, as uuid-ossp does", () => {
+  const model = schema(
+    { items: { id: int.auto } },
+    { extensions: ["uuid-ossp", "pg_trgm"] },
+  );
+
+  expect(model.$snapshot().extensions).toEqual(["pg_trgm", "uuid-ossp"]);
+  expect(
+    createSchemaSQL(model.$snapshot()).map((entry) => entry.sql),
+  ).toContain('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"');
+  expect(() =>
+    schema({ items: { id: int.auto } }, { extensions: ["Bad Name"] }),
+  ).toThrow('extension names are lowercase identifiers such as "pg_trgm"');
 });

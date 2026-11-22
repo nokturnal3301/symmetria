@@ -53,6 +53,8 @@ export type MigrationSnapshot = {
 };
 
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/;
+/** Extension names as schema() takes them: "pg_trgm", "uuid-ossp". */
+const EXTENSION = /^[a-z_][a-z0-9_-]*$/;
 
 export const compareNames = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
@@ -665,7 +667,7 @@ export const parseMigrationSnapshot = (input: unknown): MigrationSnapshot => {
     (!Array.isArray(extensions) ||
       !extensions.length ||
       extensions.some(
-        (name) => typeof name !== "string" || !IDENTIFIER.test(name),
+        (name) => typeof name !== "string" || !EXTENSION.test(name),
       ) ||
       new Set(extensions).size !== extensions.length)
   ) {

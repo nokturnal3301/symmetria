@@ -108,9 +108,18 @@ const send = async (
       }
     });
 
-    // Every read compiles alone, so the failure belongs to all of them.
+    // Every read compiles alone, so they only fail together, as two reads
+    // that each define a CTE of one name do: they go in separate statements.
     if (sound.length === reads.length) {
-      return rejectAll(reads, error);
+      if (reads.length === 1) {
+        return rejectAll(reads, error);
+      }
+
+      const half = Math.ceil(reads.length / 2);
+
+      await send(reads.slice(0, half), executor);
+
+      return send(reads.slice(half), executor);
     }
 
     return send(sound, executor);

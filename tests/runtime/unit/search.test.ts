@@ -102,7 +102,7 @@ test("searchRank() renders weights, normalization and cover density", () => {
   ).toThrow(/between 0 and 63/);
 });
 
-test("searchHeadline() renders ts_headline() with a validated options literal", () => {
+test("searchHeadline() renders ts_headline() with validated options as a parameter", () => {
   const plain = model
     .posts((post) => ({ snippet: post.title.searchHeadline("bun") }))
     .toSQL();
@@ -122,9 +122,14 @@ test("searchHeadline() renders ts_headline() with a validated options literal", 
   expect(plain.sql).toContain(
     `ts_headline('simple', "posts"."title", websearch_to_tsquery('simple', $1)) AS "snippet"`,
   );
+  // The options are a parameter: their values stay out of the SQL text.
   expect(styled.sql).toContain(
-    `ts_headline('english', "posts"."body", plainto_tsquery('english', $1), 'StartSel="<b class=""hit"">", StopSel="</b>", MaxWords=10, HighlightAll=true') AS "snippet"`,
+    `ts_headline('english', "posts"."body", plainto_tsquery('english', $1), $2::text) AS "snippet"`,
   );
+  expect(styled.parameters).toEqual([
+    "bun",
+    'StartSel="<b class=""hit"">", StopSel="</b>", MaxWords=10, HighlightAll=true',
+  ]);
   expect(() =>
     model.posts((post) => ({
       snippet: post.title.searchHeadline("bun", { maxWords: -1 }),

@@ -8,9 +8,11 @@ import { dataError } from "../codecs/deferred";
 import type { ValueNode } from "../expressions";
 import {
   DEFAULT_VALUE,
+  type CompiledQuery,
   type MutationPlan,
   type TableBinding,
 } from "../plan/types";
+import { quoteIdentifier } from "../compile/state";
 
 /**
  * A decimal as one spelling per value: `1`, `1.0`, `+1` and `1e0` are the same
@@ -113,10 +115,19 @@ const timestampKey = (text: string, type: string): string | undefined => {
   const micros =
     BigInt(milliseconds) * 1000n + BigInt((parts[7] ?? "").padEnd(6, "0"));
   const unit = 10n ** BigInt(6 - Number(column[2] ?? 6));
-  const rest = ((micros % unit) + unit) % unit;
+  // PostgreSQL counts from 2000-01-01 and rounds half away from that point:
+  // 1999-06-01 00:00:00.5 becomes 00:00:00 in timestamptz(0), 2001 rounds up.
+  const since = micros - POSTGRES_EPOCH;
+  const rounded =
+    since >= 0n
+      ? ((since + unit / 2n) / unit) * unit
+      : -(((-since + unit / 2n) / unit) * unit);
 
-  return `timestamp:${micros - rest + (rest * 2n >= unit ? unit : 0n)}`;
+  return `timestamp:${rounded}`;
 };
+
+/** 2000-01-01T00:00:00Z in microseconds since 1970: PostgreSQL's zero. */
+const POSTGRES_EPOCH = 946_684_800_000_000n;
 
 /**
  * The key of a text value as its column's type compares it: decimals by
@@ -223,4 +234,84 @@ export const rejectDuplicateKeys = (
 
     seen.set(key, position);
   });
+};
+
+/** The refusal of two rows with one conflict key, as PostgreSQL compares them. */
+export const duplicateKeyError = (
+  root: TableBinding,
+  columns: readonly ColumnSnapshot[],
+  cause?: unknown,
+): DuplicateConflictKeyError =>
+  new DuplicateConflictKeyError(
+    `symmetria: two rows of the upsert on "${root.table.name}" share a conflict key (${columns.map((column) => column.name).join(", ")}) as PostgreSQL compares it; ON CONFLICT DO UPDATE cannot change a row twice, so merge or remove the duplicates`,
+    root.table.name,
+    cause === undefined ? undefined : { cause },
+  );
+
+/** A bound value as PostgreSQL's text input of its column type reads it. */
+const textInput = (value: unknown): string =>
+  typeof value === "string"
+    ? value
+    : value instanceof Date
+      ? value.toISOString()
+      : value instanceof Uint8Array
+        ? `\\x${Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("")}`
+        : value !== null && typeof value === "object"
+          ? JSON.stringify(value, (_key, entry: unknown) =>
+              typeof entry === "bigint" ? String(entry) : entry,
+            )
+          : String(value);
+
+const textArray = (values: readonly string[]): string =>
+  `{${values.map((value) => `"${value.replace(/[\\"]/g, (character) => `\\${character}`)}"`).join(",")}}`;
+
+/**
+ * A query that finds two rows with one conflict key, comparing keys as
+ * their column types compare them in PostgreSQL itself (`inet` with and
+ * without `/32`, `interval` spellings, jsonb key order, time zones). Run
+ * before an upsert that is split into several statements, where a later
+ * duplicate would otherwise overwrite an earlier one silently. Rows whose key
+ * is NULL, a default or an SQL expression never conflict here.
+ */
+export const duplicateKeyProbe = (
+  columns: readonly ColumnSnapshot[],
+  rows: MutationPlan["values"],
+): CompiledQuery | undefined => {
+  const keys = columns.map((): string[] => []);
+
+  for (const values of rows) {
+    const bound = columns.map((column) => values[column.name]);
+
+    if (
+      bound.every(
+        (value) =>
+          value !== undefined &&
+          value !== DEFAULT_VALUE &&
+          value.kind === "parameter" &&
+          value.value !== null,
+      )
+    ) {
+      bound.forEach((value, position) =>
+        keys[position]!.push(
+          textInput((value as Extract<ValueNode, { kind: "parameter" }>).value),
+        ),
+      );
+    }
+  }
+
+  if (keys[0]!.length < 2) {
+    return undefined;
+  }
+
+  const names = columns.map((_column, position) => `k${position}`);
+  // An enum compares as its labels; every other type as itself.
+  const typed = columns.map(
+    (column, position) =>
+      `${quoteIdentifier(names[position]!)}::${column.sqlType === "enum" ? "text" : column.sqlType}`,
+  );
+
+  return {
+    sql: `SELECT 1 AS "duplicate" FROM unnest(${columns.map((_column, position) => `$${position + 1}::text[]`).join(", ")}) AS "keys"(${names.map(quoteIdentifier).join(", ")}) GROUP BY ${typed.join(", ")} HAVING count(*) > 1 LIMIT 1`,
+    parameters: keys.map(textArray),
+  };
 };

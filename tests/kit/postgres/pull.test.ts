@@ -19,6 +19,7 @@ import {
   table,
   index,
   int,
+  interval,
   numeric,
   sql,
   text,
@@ -480,7 +481,7 @@ describe.skipIf(!url)("pull", () => {
       expect(result.source).toContain("date: dateTable,");
       expect(result.source).toContain("soldOn: date,");
       expect(result.source).toContain(
-        'amount: customType<number>("money", passthrough<number>()).nullable,',
+        'amount: customType<string>("money", passthrough<string>()).nullable,',
       );
       expect(result.source).toContain("delete: ({ sql: sqlTable }) =>");
       expect(result.source).toContain(".checks((sqlTable) => ({");
@@ -1272,5 +1273,48 @@ describe.skipIf(!url)("pull round trip", () => {
         "--json",
       );
       expect(JSON.parse(flagged.stdout)).toMatchObject({ tables: [] });
+    }));
+
+  test("a schema's own database pulls back to no migration", () =>
+    sandbox(async ({ driver, directory, run }) => {
+      const declared = schema(
+        {
+          items: table({
+            id: int.auto,
+            name: text,
+            amount: numeric(6),
+            tags: text.array.default(["a b", "c"]),
+            wait: interval.default("90 minutes"),
+          })
+            .indexes((t) => ({
+              // A capital in the name only casing: "preserve" gives.
+              byName: index(t.name.ascending),
+              byAmount: index(t.amount).with({ fillfactor: "50" }),
+            }))
+            .checks((t) => ({ positive: t.amount.above("0") })),
+        },
+        { casing: "preserve" },
+      );
+
+      for (const statement of createSchemaSQL(declared.$snapshot())) {
+        await run(statement.sql);
+      }
+
+      const pulled = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+      const path = join(directory, "own.ts");
+
+      await writeFile(path, pulled.source);
+
+      const { appSchema } = await import(pathToFileURL(path).href);
+
+      // Extensions are the database's: other suites install vector.
+      const { extensions: _extensions, ...tables } = appSchema.$snapshot();
+
+      expect(pulled.warnings).toEqual([]);
+      expect(pulled.source).toContain(`casing: "preserve"`);
+      expect(diffSchemas(declared.$snapshot(), tables).up).toEqual([]);
     }));
 });
