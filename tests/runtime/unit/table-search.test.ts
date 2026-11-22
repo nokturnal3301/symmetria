@@ -384,17 +384,17 @@ test("search() ranks by words and meaning in one statement", async () => {
       'FROM "chunks" AS "chunks"',
       'WHERE "chunks"."owner" = $1 AND "chunks"."about" IS NOT NULL',
       "LIMIT 10001),",
-      '"search_about_meaning_exact" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY (("chunks"."about" <=> $2::text::vector)) + 0 ASC, "chunks"."id" ASC) AS "position", (("chunks"."about" <=> $2::text::vector)) + 0 AS "rank"',
+      '"search_about_meaning_exact" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY (("chunks"."about" <=> (SELECT $2::text::vector))) + 0 ASC, "chunks"."id" ASC) AS "position", (("chunks"."about" <=> (SELECT $2::text::vector))) + 0 AS "rank"',
       'FROM "chunks" AS "chunks"',
       'WHERE (SELECT COUNT(*) AS "matches"',
       'FROM "search_about_meaning_probe" AS "search_about_meaning_probe") <= $3 AND "chunks"."owner" = $4 AND "chunks"."about" IS NOT NULL',
-      'ORDER BY (("chunks"."about" <=> $2::text::vector)) + 0 ASC, "chunks"."id" ASC',
+      'ORDER BY (("chunks"."about" <=> (SELECT $2::text::vector))) + 0 ASC, "chunks"."id" ASC',
       "LIMIT 40),",
-      '"search_about_meaning" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ("chunks"."about" <=> $5::text::vector) ASC) AS "position", ("chunks"."about" <=> $5::text::vector) AS "rank"',
+      '"search_about_meaning" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ("chunks"."about" <=> (SELECT $5::text::vector)) ASC) AS "position", ("chunks"."about" <=> (SELECT $5::text::vector)) AS "rank"',
       'FROM "chunks" AS "chunks"',
       `WHERE (SELECT CASE WHEN current_setting('hnsw.iterative_scan', true) IS NULL THEN '' ELSE set_config('hnsw.iterative_scan', 'strict_order', true) END || CASE WHEN current_setting('hnsw.max_scan_tuples', true) IS NULL THEN '' ELSE set_config('hnsw.max_scan_tuples', '2147483647', true) END || CASE WHEN current_setting('hnsw.scan_mem_multiplier', true) IS NULL THEN '' ELSE set_config('hnsw.scan_mem_multiplier', '1000', true) END) IS NOT NULL AND (SELECT COUNT(*) AS "matches"`,
       'FROM "search_about_meaning_probe" AS "search_about_meaning_probe") > $6 AND "chunks"."owner" = $7 AND "chunks"."about" IS NOT NULL',
-      'ORDER BY ("chunks"."about" <=> $5::text::vector) ASC',
+      'ORDER BY ("chunks"."about" <=> (SELECT $5::text::vector)) ASC',
       "LIMIT 40),",
       '"search_fused" AS (SELECT coalesce("search_about_meaning_exact"."id", "search_about_meaning"."id") AS "id", (coalesce(1.0 / (60 + "search_about_meaning_exact"."position"), 0)) + (coalesce(1.0 / (60 + "search_about_meaning"."position"), 0)) AS "score"',
       'FROM "search_about_meaning_exact" AS "search_about_meaning_exact"',
@@ -473,7 +473,7 @@ test("a filtered search by meaning ranks few rows exactly and many through the i
   );
   // `+ 0` is an ordering the vector index cannot produce.
   expect(filtered.sql).toContain(
-    'ORDER BY (("chunks"."about" <=> $2::text::vector)) + 0 ASC, "chunks"."id" ASC',
+    'ORDER BY (("chunks"."about" <=> (SELECT $2::text::vector))) + 0 ASC, "chunks"."id" ASC',
   );
   expect(filtered.sql).toContain(
     'FROM "search_about_meaning_probe" AS "search_about_meaning_probe") <= $3 AND',

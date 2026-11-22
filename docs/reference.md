@@ -2411,9 +2411,16 @@ side can be NULL) and work in projections, `where` and `orderBy`: `l2Distance`
 `innerProduct` (`<#>`, PostgreSQL's negative inner product, so smaller is more
 similar) and `l1Distance` (`<+>`, pgvector 0.7+). The argument is a `number[]`,
 another vector column or expression, or a `prepare()` parameter declared with
-`vector(n)`; it binds as `$1::text::vector`. Nearest-neighbour queries are
-`orderBy` a distance plus `limit`, which lets HNSW and IVFFlat indexes serve
-them.
+`vector(n)`; it binds as `(SELECT $1::text::vector)`, so the statement reads it
+once. Written as a bare cast, it would be read again for every row compared
+whenever PostgreSQL plans the statement once for all values, which it may do
+from the sixth run of a statement a connection keeps prepared (Bun's default):
+for a vector of 1024 numbers that made a filtered search 15 to 30 times slower.
+Such a plan for all values still sorts every row a `where` leaves rather than
+following the vector index, about 3 µs a row; where filtered searches over many
+rows matter, `postgres({ url, prepare: false })` plans each statement for its
+values. Nearest-neighbour queries are `orderBy` a distance plus `limit`, which
+lets HNSW and IVFFlat indexes serve them.
 
 An HNSW index is approximate in a way that can silently lose rows: it picks
 `hnsw.ef_search` candidates (40 unless set) and applies the query's other

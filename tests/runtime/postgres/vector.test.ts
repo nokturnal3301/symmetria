@@ -209,4 +209,55 @@ describe.skipIf(!available)("pgvector on PostgreSQL", () => {
     expect(typeof row!.nested[0]!.distance).toBe("number");
     expect(Number.isNaN(row!.nested[0]!.distance)).toBe(true);
   });
+
+  test("a reused plan reads the question vector once, not for every row", async () => {
+    const query = database
+      .documents((doc) => ({ id: doc.id }), {
+        where: (doc) => doc.content.isNot("none"),
+        orderBy: (doc) => doc.embedding.cosineDistance([1, 0, 0]).asc,
+        limit: 2,
+      })
+      .toSQL();
+    const text = (value: unknown) => `'${String(value).replaceAll("'", "''")}'`;
+
+    // A kept statement switches to a generic plan after five runs; this one
+    // has it from the start. The distance compares against the vector the
+    // plan read once, where `$n::text::vector` would parse it on every row.
+    const plan = await isolated.driver.transaction(async (transaction) => {
+      await transaction.execute({
+        sql: "SET LOCAL plan_cache_mode = force_generic_plan",
+        parameters: [],
+      });
+      await transaction.execute({
+        sql: `PREPARE nearest_generic AS ${query.sql}`,
+        parameters: [],
+      });
+
+      try {
+        return rowsOf(
+          await transaction.execute({
+            sql: `EXPLAIN (VERBOSE, COSTS OFF) EXECUTE nearest_generic(${query.parameters.map(text).join(", ")})`,
+            parameters: [],
+          }),
+        ).map((row) => String(Object.values(row)[0]).trim());
+      } finally {
+        await transaction.execute({
+          sql: "DEALLOCATE nearest_generic",
+          parameters: [],
+        });
+      }
+    });
+    const ordering = plan.filter((line) =>
+      /^(?:Sort Key|Order By):/.test(line),
+    );
+
+    expect(ordering.length).toBeGreaterThan(0);
+    expect(ordering.filter((line) => line.includes("::vector"))).toEqual([]);
+    expect(
+      await database.documents((doc) => ({ content: doc.content }), {
+        orderBy: (doc) => doc.embedding.cosineDistance([1, 0, 0]).asc,
+        limit: 1,
+      }),
+    ).toEqual([{ content: "east" }]);
+  });
 });

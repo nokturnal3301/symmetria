@@ -122,7 +122,7 @@ export const operandSql = (
 ): string => {
   const sql = valueSql(compilation, node, bindings);
 
-  return node.kind === "raw" ? `(${sql})` : sql;
+  return node.kind === "raw" && !node.delimited ? `(${sql})` : sql;
 };
 
 /** One ORDER BY key with its direction and optional NULLS position. */

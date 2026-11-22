@@ -51,30 +51,31 @@ test("distance operators compile with a cast vector parameter and no array metho
     .toSQL();
 
   expect(query.sql).toContain(
-    `("documents"."embedding" <-> $1::text::vector) AS "l2"`,
+    `("documents"."embedding" <-> (SELECT $1::text::vector)) AS "l2"`,
+  );
+  // One vector, read once wherever it is compared: one parameter.
+  expect(query.sql).toContain(
+    `("documents"."embedding" <=> (SELECT $1::text::vector)) AS "cosine"`,
   );
   expect(query.sql).toContain(
-    `("documents"."embedding" <=> $2::text::vector) AS "cosine"`,
+    `("documents"."embedding" <#> (SELECT $1::text::vector)) AS "inner"`,
   );
   expect(query.sql).toContain(
-    `("documents"."embedding" <#> $3::text::vector) AS "inner"`,
-  );
-  expect(query.sql).toContain(
-    `("documents"."embedding" <+> $4::text::vector) AS "l1"`,
+    `("documents"."embedding" <+> (SELECT $1::text::vector)) AS "l1"`,
   );
   expect(query.sql).toContain(
     `("documents"."embedding" <-> "documents"."optional") AS "between"`,
   );
   expect(query.sql).toContain(
-    `IS NOT NULL AND ("documents"."embedding" <=> $2::text::vector) < $5`,
+    `IS NOT NULL AND ("documents"."embedding" <=> (SELECT $1::text::vector)) < $2`,
   );
   expect(query.sql).toContain(
-    `ORDER BY ("documents"."embedding" <=> $2::text::vector) ASC`,
+    `ORDER BY ("documents"."embedding" <=> (SELECT $1::text::vector)) ASC`,
   );
   expect(query.parameters[0]).toBe("[0.1,0.2,0.3]");
   // The filter and the ordering reuse the selected distance: one vector is sent.
-  expect(query.parameters).toHaveLength(5);
-  expect(query.parameters[4]).toBe(0.5);
+  expect(query.parameters).toHaveLength(2);
+  expect(query.parameters[1]).toBe(0.5);
 });
 
 test("prepared vector parameters and writes encode embeddings as pgvector text", () => {
@@ -87,7 +88,7 @@ test("prepared vector parameters and writes encode embeddings as pgvector text",
   const compiled = nearest.toSQL({ query: [1, 2, 3], size: 2 });
 
   expect(compiled.sql).toContain(
-    `ORDER BY ("documents"."embedding" <-> $1::text::vector) ASC`,
+    `ORDER BY ("documents"."embedding" <-> (SELECT $1::text::vector)) ASC`,
   );
   expect(compiled.parameters).toEqual(["[1,2,3]", 2]);
 

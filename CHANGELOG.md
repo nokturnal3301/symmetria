@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.4.1 — 2026-11-22
+
+### Runtime (`symmetria`)
+
+- A vector compared by distance (`table.search()` by meaning, `orderBy` and
+  `where` on a distance) is bound as `(SELECT $1::text::vector)` and read once
+  per statement. Bound as `$1::text::vector`, it was read again for every row
+  compared once PostgreSQL planned the statement for all values, which it may do
+  from the sixth run of a statement the connection keeps prepared (Bun's
+  default, or `symmetria/pg` with `prepare: true`): a filtered search by meaning
+  with vectors of 1024 numbers went from 14 ms to 370 ms and stayed there. A
+  vector used several times in one statement is also sent once. Such a plan for
+  all values still sorts every row a `where` leaves instead of following the
+  vector index, about 3 µs a row; `postgres({ url, prepare: false })` avoids it.
+
 ## 3.4.0 — 2026-11-22
 
 Fixes from a bug hunt on 3.3.0: wrong results, lost or wrong stored data,

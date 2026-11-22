@@ -751,13 +751,28 @@ export class ColumnHandle {
       );
     }
 
+    const right = valueNode(query, description.codec);
+
     return createExpression<number, string>({
       outputName: name,
       node: freeze({
         kind: "binary",
         left: description.node,
         operator,
-        right: valueNode(query, description.codec),
+        // A bound vector is read once: `(SELECT $1::text::vector)` is
+        // evaluated before the scan. Written bare, a plan PostgreSQL reuses
+        // for every value (a kept statement after five runs) converts the
+        // text again for each row it compares, about 50 µs for 1024 numbers.
+        right:
+          right.kind === "parameter" || right.kind === "placeholder"
+            ? freeze({
+                kind: "raw",
+                parts: freeze(["(SELECT ", right, ")"]),
+                sqlType: expressionSqlType(description),
+                composed: true,
+                delimited: true,
+              })
+            : right,
         sqlType: "double precision",
       }),
       // Inside JSON (a nested result, $batch) a NaN distance is the text "NaN".

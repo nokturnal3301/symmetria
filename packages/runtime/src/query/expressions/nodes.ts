@@ -120,6 +120,8 @@ export type ValueNode =
       readonly sqlType?: string;
       /** Built by Symmetria from the nodes in its parts, not written by hand. */
       readonly composed?: true;
+      /** Its SQL is one parenthesized term, which an operand needs no more of. */
+      readonly delimited?: true;
     }
   | {
       readonly kind: "binary";

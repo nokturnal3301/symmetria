@@ -247,10 +247,10 @@ test("an IVFFlat index reads on past its lists, and its rows are sorted again", 
   expect(sql).toBe(
     [
       'SELECT "id"',
-      `FROM (SELECT "places"."id" AS "id", ("places"."at" <-> $3::text::vector) AS "__symmetria_order_0", "places"."id" AS "__symmetria_order_1"`,
+      `FROM (SELECT "places"."id" AS "id", ("places"."at" <-> (SELECT $3::text::vector)) AS "__symmetria_order_0", "places"."id" AS "__symmetria_order_1"`,
       'FROM "places" AS "places"',
       sql.split("\n")[3],
-      'ORDER BY ("places"."at" <-> $2::text::vector) ASC, "places"."id" ASC',
+      'ORDER BY ("places"."at" <-> (SELECT $2::text::vector)) ASC, "places"."id" ASC',
       'LIMIT 5) AS "__symmetria_nearest"',
       'ORDER BY "__symmetria_order_0" + 0 ASC, "__symmetria_order_1" ASC',
     ].join("\n"),
@@ -283,7 +283,7 @@ test("pages by distance compare rows exactly", async () => {
 
   // An approximate index may skip rows, and a page may not.
   expect(last().sql).toContain(
-    'ORDER BY (("documents"."embedding" <-> $3::text::vector) + $4) ASC, "documents"."id" ASC',
+    'ORDER BY (("documents"."embedding" <-> (SELECT $3::text::vector)) + $4) ASC, "documents"."id" ASC',
   );
   expect(last().sql).not.toContain("set_config");
 });
