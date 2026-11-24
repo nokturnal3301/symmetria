@@ -23,6 +23,7 @@ import {
   type PlaceholderNode,
   type ExpressionDescription,
   type PredicateDescription,
+  type ScopePredicate,
   type ValueNode,
 } from "../expressions";
 import { createMutation } from "../write/mutations";
@@ -41,7 +42,9 @@ import type { ShapeCallback } from "./joins";
 import { equalityPredicates, plainRecord } from "./shape";
 import { createQueryFactory } from "./query";
 import {
+  NO_SCOPES,
   createTableRegistry,
+  restrictingScope,
   type SchemaTables,
   type TableScopes,
 } from "./registry";
@@ -183,7 +186,7 @@ export type QueryTables = {
 export const createQueryTables = (
   schemaTables: SchemaTables,
   executor?: QueryExecutor,
-  scopes: TableScopes = {},
+  scopes: TableScopes = NO_SCOPES,
   atomic?: AtomicRunner,
   hold?: ConnectionHold,
 ): QueryTables => {
@@ -870,7 +873,10 @@ export const createQueryTables = (
       return handle;
     },
     checkScope: (tableName) => {
-      rootOf(tableName);
+      const { root, plan } = rootOf(tableName);
+
+      // A callback that already admits every row fails `$scope()` itself.
+      restrictingScope((plan.predicates[0] as ScopePredicate).predicate, root);
     },
   };
 };

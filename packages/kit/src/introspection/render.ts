@@ -5,6 +5,7 @@
  * and a slot (`posts: many`) on the table it points to.
  */
 import { sqlKey, type Casing } from "symmetria";
+import { commentText } from "../migrations/snapshot";
 import { escapeTemplate, quoteString } from "./names";
 import type {
   ColumnType,
@@ -31,6 +32,12 @@ export type RenderOptions = {
   /** Module specifier for the search entry (default: `${module}/search`). */
   readonly searchModule?: string;
 };
+
+/**
+ * The customType() option that names a domain's base type; the runtime reads
+ * and writes the values as that type's builder does.
+ */
+export const CUSTOM_TYPE_BASE_OPTION = "base";
 
 const PASSTHROUGH = `/** Driver-native values for types without a builder; replace with real codecs when convenient. */
 const passthrough = <Value>() => ({
@@ -79,6 +86,7 @@ const IMPORT_ORDER = [
   "tsvector",
   "uuid",
   "varchar",
+  "type Decimal",
 ];
 
 const typeSource = (type: ColumnType, imports: Set<string>): string => {
@@ -116,9 +124,15 @@ const typeSource = (type: ColumnType, imports: Set<string>): string => {
     case "custom":
       imports.add("customType");
 
-      return type.valueType === "number"
-        ? `customType<number>(${quoteString(type.sqlType)}, asNumber())`
-        : `customType<${type.valueType}>(${quoteString(type.sqlType)}, passthrough<${type.valueType}>())`;
+      if (/\bDecimal\b/.test(type.valueType)) {
+        imports.add("type Decimal");
+      }
+
+      return type.base !== undefined
+        ? `customType<${type.valueType}>(${quoteString(type.sqlType)}, { ${CUSTOM_TYPE_BASE_OPTION}: ${quoteString(type.base)} })`
+        : type.valueType === "number"
+          ? `customType<number>(${quoteString(type.sqlType)}, asNumber())`
+          : `customType<${type.valueType}>(${quoteString(type.sqlType)}, passthrough<${type.valueType}>())`;
   }
 };
 
@@ -347,8 +361,9 @@ const referenceSource = (
   return source;
 };
 
+/** Notes quote names from the database: commentText() keeps each on its line. */
 const comment = (notes: readonly string[]): string =>
-  notes.length ? ` // pull: ${notes.join("; ")}` : "";
+  notes.length ? ` // pull: ${commentText(notes.join("; "))}` : "";
 
 const memberLine = (
   member: PulledMember,
@@ -536,7 +551,7 @@ const tableSource = (
   }
 
   const body = [
-    ...table.comments.map((note) => `${indent}// pull: ${note}`),
+    ...table.comments.map((note) => `${indent}// pull: ${commentText(note)}`),
     ...table.members.map(
       (member) =>
         `${indent}${memberLine(member, imports, casing, bindings, junction)}`,
@@ -544,7 +559,7 @@ const tableSource = (
     ...declared.map((slot) => `${indent}${slot.key}: ${slot.kind},`),
     ...table.skipped.map(
       (column) =>
-        `${indent}// ${column.sqlName} ${column.dataType}: pull: ${column.reason}`,
+        `${indent}// ${commentText(`${column.sqlName} ${column.dataType}: pull: ${column.reason}`)}`,
     ),
   ];
   // Chain links are rendered as line arrays so outer indentation applies to every line.
@@ -646,7 +661,9 @@ export const renderSchema = (
   }
   const customs = model.tables.flatMap((table) =>
     table.members.flatMap((member) =>
-      member.kind === "column" && member.type.kind === "custom"
+      member.kind === "column" &&
+      member.type.kind === "custom" &&
+      member.type.base === undefined
         ? [member.type.valueType]
         : [],
     ),
@@ -688,7 +705,7 @@ export const renderSchema = (
       ]
     : [];
   const sections = [
-    header.map((line) => `// ${line}`).join("\n"),
+    header.map((line) => `// ${commentText(line)}`).join("\n"),
     [
       importLine(
         IMPORT_ORDER.filter((name) => imports.has(name)),
@@ -704,7 +721,7 @@ export const renderSchema = (
           model.skippedTables
             .map(
               (table) =>
-                `// pull: table "${table.sqlName}" skipped: ${table.reason}`,
+                `// pull: ${commentText(`table "${table.sqlName}" skipped: ${table.reason}`)}`,
             )
             .join("\n"),
         ]

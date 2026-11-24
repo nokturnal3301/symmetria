@@ -57,7 +57,9 @@ test("a to-one condition relation needs a primary key on its target", () => {
   const keyless = schema({
     people: plain,
     notes: table({ id: int.auto, owner: text }).relations((note, { to }) => ({
-      person: to(plain).one((person) => note.owner.is(person.name)),
+      person: to(plain)
+        .one((person) => note.owner.is(person.name))
+        .inverse("notes"),
     })),
   });
 
@@ -65,6 +67,33 @@ test("a to-one condition relation needs a primary key on its target", () => {
     keyless.notes((note) => ({ person: note.person.name })).toSQL(),
   ).toThrow(
     /"notes\.person" is one\(\) and resolves to the first match by the primary key of "people", which has none/,
+  );
+  // Its inverse lists rows by the same first match, so it needs the key too.
+  expect(() =>
+    keyless.people((person) => ({ total: person.notes.count() })).toSQL(),
+  ).toThrow(
+    /"notes\.person" is one\(\) and resolves to the first match by the primary key of "people", which has none/,
+  );
+});
+
+test("the inverse of a one() compares a composite primary key column by column", () => {
+  const members = table({ org: int, seat: int, name: text }).primaryKey(
+    (member) => [member.org, member.seat],
+  );
+  const notes = table({ id: int.auto, owner: text }).relations(
+    (note, { to }) => ({
+      member: to(members)
+        .one((member) => note.owner.is(member.name))
+        .inverse("notes"),
+    }),
+  );
+
+  expect(
+    schema({ members, notes })
+      .members((member) => ({ total: member.notes.count() }))
+      .toSQL().sql,
+  ).toContain(
+    'AND ("members_2"."org" < "members"."org" OR ("members_2"."org" = "members"."org" AND "members_2"."seat" < "members"."seat")))',
   );
 });
 
@@ -98,8 +127,64 @@ test("inverse() exposes the relation from the target table as a collection", () 
     }))
     .toSQL();
 
+  // A post belongs to the user it resolves to: its first match by key, so
+  // no other matching user sorts before this one.
+  const firstMatch = (alias: string) =>
+    `("${alias}"."reviewer_name" = "users"."name" AND "users"."id" IS NOT NULL AND NOT EXISTS (SELECT 1 AS "present"\nFROM "users" AS "users_2"\nWHERE "${alias}"."reviewer_name" = "users_2"."name" AND "users_2"."id" < "users"."id"))`;
+
   expect(sql).toContain(
-    'FROM "posts" AS "__symmetria_aggregate_0"\nWHERE "__symmetria_aggregate_0"."reviewer_name" = "users"."name"',
+    `FROM "posts" AS "__symmetria_aggregate_0"\nWHERE ${firstMatch("__symmetria_aggregate_0")}`,
+  );
+  // In every form: counts, quantifiers, join helpers and write filters.
+  for (const query of [
+    model.users((user) => ({ total: user.reviewed.count() })),
+    model.users((user) => ({ id: user.id }), {
+      where: (user) => user.reviewed.some(),
+    }),
+    model.users((user) => ({ id: user.id }), {
+      where: (user) => user.reviewed.none(),
+    }),
+    model.users.update({ active: false }).where((user) => user.reviewed.some()),
+    model.users.delete({
+      where: (user) => user.reviewed.every((post) => post.title.is("x")),
+    }),
+  ]) {
+    expect(query.toSQL().sql).toContain(
+      `WHERE ${firstMatch("__symmetria_aggregate_0")}`,
+    );
+  }
+  expect(
+    model
+      .users((user, { innerJoin }) => ({
+        id: user.id,
+        title: innerJoin(user.reviewed).title,
+      }))
+      .toSQL().sql,
+  ).toContain(`INNER JOIN "posts" AS "reviewed" ON ${firstMatch("reviewed")}`);
+  // Among the users the scope admits, as the forward relation picks them.
+  expect(
+    model
+      .$scope({ users: (user) => user.active.is(true) })
+      .users((user) => ({ total: user.reviewed.count() }))
+      .toSQL().sql,
+  ).toContain(
+    'WHERE "__symmetria_aggregate_0"."reviewer_name" = "users_2"."name" AND "users_2"."active" = $1 AND "users_2"."id" < "users"."id"',
+  );
+  // A many() relation's inverse lists every match, as before.
+  const notes = table({ id: int.auto, topic: text });
+  const tags = table({ id: int.auto, topic: text }).relations(
+    (tag, { to }) => ({
+      notes: to(notes)
+        .many((note) => note.topic.is(tag.topic))
+        .inverse("tags"),
+    }),
+  );
+  expect(
+    schema({ notes, tags })
+      .notes((note) => ({ total: note.tags.count() }))
+      .toSQL().sql,
+  ).toContain(
+    'WHERE "notes"."topic" = "__symmetria_aggregate_0"."topic") AS "total"',
   );
 });
 

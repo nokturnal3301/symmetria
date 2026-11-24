@@ -201,7 +201,7 @@ export const mutationSql = (
       fragments.push(
         arrays
           ? // One array per column: the statement's text and its parameter
-            // count no longer grow with the number of rows.
+            // count do not grow with the number of rows.
             `(${columns.map((column) => quoteIdentifier(column.sqlName)).join(", ")}) SELECT * FROM unnest(${arrays
               .map(
                 ({ values, type }) =>
@@ -290,9 +290,16 @@ export const mutationSql = (
     );
   }
 
-  // Every row the statement writes, with its final values, must satisfy the scope.
+  // Every row the statement writes, with its final values, must satisfy the
+  // scope. Its column is named like no returned field, which it would hide.
+  let checkName = "__symmetria_scope";
+
+  while (query.selection.some(({ outputName }) => outputName === checkName)) {
+    checkName += "_";
+  }
+
   const check = query.checks
-    ? `${scopeCheckSql(compilation, query, query.checks, query.kind === "update" ? "update" : "insert")} AS "__symmetria_scope"`
+    ? `${scopeCheckSql(compilation, query, query.checks, query.kind === "update" ? "update" : "insert")} AS ${quoteIdentifier(checkName)}`
     : undefined;
 
   if (query.selection.length) {

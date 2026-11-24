@@ -3,7 +3,13 @@
  * `meaning: geminiEmbedding(chunk.title, chunk.content)`. The key is read
  * from `GEMINI_API_KEY` or `GOOGLE_API_KEY` unless given.
  */
-import { apiKey, inBatches, postJson } from "../embedders/http";
+import {
+  apiKey,
+  inBatches,
+  postJson,
+  requestOptions,
+  type RequestOptions,
+} from "../embedders/http";
 import { embedder } from "../schema/search";
 
 /** `batchEmbedContents` takes at most 100 texts. */
@@ -14,7 +20,7 @@ const BATCH = 100;
  */
 const DEFAULT_SIZE = 1536;
 
-export type GoogleOptions = {
+export type GoogleOptions = RequestOptions & {
   readonly apiKey?: string;
   /** Embedding length; sent as `outputDimensionality`. */
   readonly size?: number;
@@ -23,6 +29,7 @@ export type GoogleOptions = {
 
 export const google = (model: string, options: GoogleOptions = {}) => {
   const size = options.size ?? DEFAULT_SIZE;
+  const request = requestOptions(model, options);
 
   return embedder(
     size,
@@ -51,6 +58,7 @@ export const google = (model: string, options: GoogleOptions = {}) => {
                 outputDimensionality: size,
               })),
             },
+            request,
           )
         ).embeddings.map((embedding) => embedding.values),
       ),

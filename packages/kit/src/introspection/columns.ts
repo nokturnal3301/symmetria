@@ -1,7 +1,12 @@
 import { sqlKey } from "symmetria";
 import { normalizeSqlType } from "../migrations/drift";
 import { expressionKey } from "../migrations/expressions";
-import { conventionalNames, isReservedColumnKey, sqlString } from "./names";
+import {
+  conventionalNames,
+  isReservedColumnKey,
+  quoteString,
+  sqlString,
+} from "./names";
 import type {
   PullWarning,
   ColumnType,
@@ -13,12 +18,15 @@ import {
   type CatalogColumn,
   type TableFacts,
   customValueType,
+  domainValueType,
   serialFix,
 } from "./model";
 
 export type ColumnTools = {
   ownsEnum: (column: CatalogColumn) => boolean;
   enumValues: (name: string) => string[] | undefined;
+  /** A domain's base type (the innermost one for a domain over a domain), else undefined. */
+  domainBase: (name: string) => string | undefined;
   serialSequence: (
     column: CatalogColumn,
     reference: string,
@@ -352,18 +360,70 @@ export const columnType = (
   const sqlType = array
     ? column.data_type.replace(/\[\]$/, "")
     : column.data_type;
+  // A domain reads like its base type: PostgreSQL sends its values under the
+  // base type's OID, so a domain over bigint delivers bigints.
+  const domain = normalized.endsWith("[]") && !array ? undefined : sqlType;
+  const domainType =
+    domain === undefined ? undefined : tools.domainBase(domain);
+  const domainValue =
+    domainType === undefined ? undefined : domainValueType(domainType);
+
+  if (domainType !== undefined && domainValue !== undefined) {
+    comments.push(`domain over ${domainType}`);
+    tools.warn({
+      code: "custom-type",
+      table: table.sqlName,
+      column: column.column_name,
+      object: sqlType,
+      message: `"${table.sqlName}.${column.column_name}" uses domain ${sqlType} over ${domainType}, declared through customType() with the base type's values; migrations do not create the domain`,
+    });
+
+    return {
+      type: {
+        kind: "custom",
+        sqlType,
+        valueType: domainValue,
+        base: domainType,
+      },
+      array,
+    };
+  }
+
+  // A domain over a type without a builder (json, oid, money) is declared
+  // like a column of that type: its values are the base type's.
+  const native =
+    domainType === undefined ? undefined : normalizeSqlType(domainType);
+  const nativeElement = native?.replace(/(?:\[\])+$/, "");
   const valueType =
-    customValueType(base) + (normalized.endsWith("[]") && !array ? "[]" : "");
-  comments.push(`no builder for ${sqlType}`);
+    native === undefined || nativeElement === undefined
+      ? customValueType(base) +
+        (normalized.endsWith("[]") && !array ? "[]" : "")
+      : customValueType(nativeElement.replace(/\(.*\)$/, "")) +
+        native.slice(nativeElement.length);
+  comments.push(
+    domainType === undefined
+      ? `no builder for ${sqlType}`
+      : `domain over ${domainType}, no builder for it`,
+  );
   tools.warn({
     code: "custom-type",
     table: table.sqlName,
     column: column.column_name,
     object: sqlType,
-    message: `"${table.sqlName}.${column.column_name}" uses ${sqlType}, declared through customType() with driver-native values`,
+    message:
+      domainType === undefined
+        ? `"${table.sqlName}.${column.column_name}" uses ${sqlType}, declared through customType() with driver-native values`
+        : `"${table.sqlName}.${column.column_name}" uses domain ${sqlType} over ${domainType}, declared through customType() with driver-native values; migrations do not create the domain`,
   });
 
-  return { type: { kind: "custom", sqlType, valueType }, array };
+  return {
+    type: {
+      kind: "custom",
+      sqlType,
+      valueType,
+    },
+    array,
+  };
 };
 
 export const columnDefault = (
@@ -497,19 +557,19 @@ export const literalDefault = (
           return decimal ? decimal[1] : undefined;
         case "date":
           return quoted && quoted[2] === "date"
-            ? JSON.stringify(unescapeLiteral(quoted[1]!))
+            ? quoteString(unescapeLiteral(quoted[1]!))
             : undefined;
         case "time":
           return quoted && quoted[2] === "time without time zone"
-            ? JSON.stringify(unescapeLiteral(quoted[1]!))
+            ? quoteString(unescapeLiteral(quoted[1]!))
             : undefined;
         case "interval":
           return quoted && quoted[2] === "interval"
-            ? JSON.stringify(unescapeLiteral(quoted[1]!))
+            ? quoteString(unescapeLiteral(quoted[1]!))
             : undefined;
         case "inet":
           return quoted && quoted[2] === "inet"
-            ? JSON.stringify(unescapeLiteral(quoted[1]!))
+            ? quoteString(unescapeLiteral(quoted[1]!))
             : undefined;
         case "bool":
           return text === "true" || text === "false" ? text : undefined;
@@ -517,7 +577,7 @@ export const literalDefault = (
         case "uuid":
           return quoted &&
             /^(text|character varying(\(\d+\))?|uuid|bpchar)$/.test(quoted[2]!)
-            ? JSON.stringify(unescapeLiteral(quoted[1]!))
+            ? quoteString(unescapeLiteral(quoted[1]!))
             : undefined;
         case "jsonb":
           return quoted &&
@@ -531,18 +591,18 @@ export const literalDefault = (
     case "varchar":
       return quoted &&
         /^(text|character varying(\(\d+\))?|bpchar)$/.test(quoted[2]!)
-        ? JSON.stringify(unescapeLiteral(quoted[1]!))
+        ? quoteString(unescapeLiteral(quoted[1]!))
         : undefined;
     case "numeric": {
       const decimal =
         /^(-?\d+(?:\.\d+)?)$/.exec(text) ??
         /^'(-?\d+(?:\.\d+)?)'::numeric(\(\d+(,\d+)?\))?$/.exec(text);
 
-      return decimal ? JSON.stringify(decimal[1]) : undefined;
+      return decimal ? quoteString(decimal[1]!) : undefined;
     }
     case "enum":
       return quoted && type.values.includes(unescapeLiteral(quoted[1]!))
-        ? JSON.stringify(unescapeLiteral(quoted[1]!))
+        ? quoteString(unescapeLiteral(quoted[1]!))
         : undefined;
     case "custom": {
       if (type.valueType === "number") {
@@ -554,7 +614,7 @@ export const literalDefault = (
       }
 
       if (type.valueType.startsWith('"') && quoted) {
-        const value = JSON.stringify(unescapeLiteral(quoted[1]!));
+        const value = quoteString(unescapeLiteral(quoted[1]!));
 
         return type.valueType.split(" | ").includes(value) ? value : undefined;
       }

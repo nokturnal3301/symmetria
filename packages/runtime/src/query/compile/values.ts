@@ -2,17 +2,21 @@
  * Renders value expressions, operands, orderings and projections to SQL with the right codecs and casts.
  */
 import { bigintCodec, numericCodec, cloneParameter } from "../codecs";
-import { expressionSqlType } from "../plan/metadata";
+import { expressionSqlType, valueSqlType } from "../plan/metadata";
 import { sameExpression } from "../plan/equivalence";
 import { containsNode } from "../plan/traverse";
+import { closedRawSql } from "../expressions/raw-text";
 import type {
   ExpressionDescription,
+  SearchMode,
   ValueNode,
   WindowBoundary,
 } from "../expressions";
+import type { JsonRowsShape } from "./postgres/types";
 import { containsBinding, type OrderingDescription } from "../plan/types";
 import {
   aliasSql,
+  keyAlias,
   parameter,
   quoteIdentifier,
   renderContext,
@@ -22,23 +26,39 @@ import {
 import {
   searchHeadlineSql,
   headlineOptionsText,
+  isJsonType,
   searchRankSql,
+  searchTextSql,
+  searchValueType,
   searchVectorSql,
   tsquerySql,
   tsvectorSql,
 } from "./postgres/search";
+import { predicateSql } from "./predicates";
 
-/** bigint and numeric values travel as text inside JSON to keep their precision. */
+/**
+ * bigint and numeric values travel as text inside JSON to keep their precision,
+ * by any of their names (`int8`, `DECIMAL(30,10)`) and as a customType's base.
+ */
 export const jsonPrecisionSql = (
   compilation: Compilation,
   expression: ExpressionDescription,
   value: string,
 ): string => {
   const sqlType = expressionSqlType(expression);
+  // A page cursor's fingerprint keeps the casts chosen by the declared
+  // spelling, the form earlier versions sent, so their cursors stay valid.
+  const type = compilation.shapeOnly ? sqlType : valueSqlType(expression);
   const array =
-    sqlType.endsWith("[]") || expression.codec?.parameterCast?.endsWith("[]");
+    type.endsWith("[]") || expression.codec?.parameterCast?.endsWith("[]");
   const codec = array ? expression.codec?.element : expression.codec;
-  const scalarType = array ? sqlType.slice(0, -2) : sqlType;
+  const scalarType = compilation.shapeOnly
+    ? array
+      ? sqlType.slice(0, -2)
+      : sqlType
+    : type.endsWith("[]")
+      ? type.slice(0, -2)
+      : type;
 
   if (
     codec !== bigintCodec &&
@@ -138,6 +158,13 @@ export const orderingSql = (
   return `${sql} ${ordering.direction}${nulls ? ` NULLS ${nulls}` : ""}`;
 };
 
+/** A value as the text a full-text function reads; schema DDL reads it the same way. */
+const searchTextOf = (node: ValueNode, sql: string): string =>
+  searchTextSql(searchValueType(node), sql);
+
+const isJsonValue = (node: ValueNode): boolean =>
+  isJsonType(searchValueType(node));
+
 /** The document side of a full-text match; multi-part documents are parenthesized before `@@`. */
 export const searchVector = (
   compilation: Compilation,
@@ -146,7 +173,7 @@ export const searchVector = (
   language: string,
 ): string => {
   const rendered = searchVectorSql(
-    valueSql(compilation, node, bindings),
+    searchTextOf(node, valueSql(compilation, node, bindings)),
     language,
     expressionSqlType({ node, outputName: "value" }) === "tsvector",
   );
@@ -157,8 +184,36 @@ export const searchVector = (
 };
 
 /**
- * An aggregate call, rendered with its argument now and completed with a
- * window's OVER clause, if any, right after the call. MIN and MAX of a type
+ * The question of a rank or a headline, which PostgreSQL computes for every
+ * row: a bound question is parsed once per statement, `(SELECT to_tsquery(…))`.
+ * Under a generic plan, which a prepared statement may switch to from its
+ * sixth run, `to_tsquery(cfg, $1)` is no constant and would be parsed again
+ * for every row. A match (`@@`) keeps the call, so that a custom plan sees the
+ * question when it estimates the rows. A page cursor's fingerprint keeps the
+ * bare call, the form earlier versions sent, so their cursors stay valid.
+ */
+const rowQuerySql = (
+  compilation: Compilation,
+  node: ValueNode,
+  bindings: Bindings,
+  language: string,
+  mode: SearchMode,
+): string => {
+  const query = tsquerySql(
+    valueSql(compilation, node, bindings),
+    language,
+    mode,
+  );
+
+  return !compilation.shapeOnly &&
+    (node.kind === "parameter" || node.kind === "placeholder")
+    ? `(SELECT ${query})`
+    : query;
+};
+
+/**
+ * An aggregate call: its argument renders first, and a window's OVER clause,
+ * if any, is added right after the call. MIN and MAX of a type
  * without them take the first element of the aggregated one-element arrays,
  * which order by the type's comparison, skipping NULL and JSON null.
  */
@@ -186,6 +241,40 @@ const aggregateSql = (
       : aggregate;
   };
 };
+
+/**
+ * A sql`` template with values inside a comment or quoted text, where
+ * PostgreSQL reads no parameter: such a value must bind none, and must not
+ * end the comment or text early, which would leave the fragment open.
+ */
+const enclosedRawSql = (
+  compilation: Compilation,
+  node: Extract<ValueNode, { kind: "raw" }>,
+  bindings: Bindings,
+): string =>
+  closedRawSql(
+    node.parts
+      .map((part, position) => {
+        if (typeof part === "string") {
+          return part;
+        }
+
+        const bound = compilation.parameters.length;
+        const sql = operandSql(compilation, part, bindings);
+
+        if (
+          node.enclosed!.includes(position) &&
+          compilation.parameters.length !== bound
+        ) {
+          throw new Error(
+            "symmetria: a sql`` template interpolates a value inside a comment or quoted text, where PostgreSQL reads no parameter; move it out (a pattern is '%' || ${value} || '%')",
+          );
+        }
+
+        return sql;
+      })
+      .join(""),
+  );
 
 const renderValue = (
   compilation: Compilation,
@@ -256,10 +345,15 @@ const renderValue = (
         : bound;
     }
     case "raw":
-      // Page cursors fingerprint the shape: issued before 3.4.1 bound the
-      // value bare, and they stay valid.
-      if (node.readOnce && compilation.shapeOnly) {
+      // A page cursor's fingerprint keeps the value bare, without the
+      // read-once subquery or the JSON null wrapper, the form earlier
+      // versions sent, so their cursors stay valid.
+      if ((node.readOnce || node.wraps) && compilation.shapeOnly) {
         return operandSql(compilation, node.parts[1] as ValueNode, bindings);
+      }
+
+      if (node.enclosed) {
+        return enclosedRawSql(compilation, node, bindings);
       }
 
       return node.parts
@@ -269,6 +363,8 @@ const renderValue = (
             : operandSql(compilation, part, bindings),
         )
         .join("");
+    case "condition":
+      return `(${predicateSql(compilation, node.predicate, bindings)})`;
     case "binary":
       return `(${operandSql(compilation, node.left, bindings)} ${node.operator} ${operandSql(compilation, node.right, bindings)})`;
     case "aggregate":
@@ -327,8 +423,10 @@ const renderValue = (
     case "searchRank":
       return searchRankSql(
         searchVector(compilation, node.value, bindings, node.language),
-        tsquerySql(
-          valueSql(compilation, node.query, bindings),
+        rowQuerySql(
+          compilation,
+          node.query,
+          bindings,
           node.language,
           node.mode,
         ),
@@ -341,9 +439,14 @@ const renderValue = (
         },
       );
     case "searchHeadline": {
-      const value = valueSql(compilation, node.value, bindings);
-      const query = tsquerySql(
-        valueSql(compilation, node.query, bindings),
+      const value = searchTextOf(
+        node.value,
+        valueSql(compilation, node.value, bindings),
+      );
+      const query = rowQuerySql(
+        compilation,
+        node.query,
+        bindings,
         node.language,
         node.mode,
       );
@@ -359,8 +462,12 @@ const renderValue = (
     case "tsvector":
       return tsvectorSql(
         node.parts.map((part) => ({
-          value: valueSql(compilation, part.value, bindings),
+          value: searchTextOf(
+            part.value,
+            valueSql(compilation, part.value, bindings),
+          ),
           ...(part.weight ? { weight: part.weight } : {}),
+          ...(isJsonValue(part.value) ? { isJson: true } : {}),
           isVector:
             expressionSqlType({ node: part.value, outputName: "value" }) ===
             "tsvector",
@@ -379,8 +486,49 @@ const renderValue = (
         compilation.selectSql(node.query, bindings, true, jsonOutput),
         node.many,
         jsonOutput,
+        nestedRow(node.query.selection),
       );
   }
+};
+
+const ROW_ALIAS = "__symmetria_row";
+
+/**
+ * How nested rows become JSON when the plain form would not do: a field named
+ * like the rows' alias would stand for the row, so the alias changes, and a
+ * key written under a shorter alias (`keyAlias`) is rebuilt under the key.
+ */
+const nestedRow = (
+  selection: readonly ExpressionDescription[],
+): JsonRowsShape | undefined => {
+  if (
+    !selection.some(
+      ({ outputName }) => outputName.length > 21 || outputName === ROW_ALIAS,
+    )
+  ) {
+    return undefined;
+  }
+
+  const columns = selection.map(({ outputName }) => keyAlias(outputName));
+  let alias = ROW_ALIAS;
+
+  while (columns.includes(alias)) {
+    alias += "_";
+  }
+
+  const row = quoteIdentifier(alias);
+
+  return columns.every(
+    (column, position) => column === selection[position]!.outputName,
+  )
+    ? { alias: row }
+    : {
+        alias: row,
+        fields: selection.map(({ outputName }, position) => ({
+          key: outputName,
+          value: `${row}.${quoteIdentifier(columns[position]!)}`,
+        })),
+      };
 };
 
 export const projectionSql = (
@@ -410,6 +558,18 @@ export const projectionSql = (
             })
           : value;
 
-      return `${projected} AS ${quoteIdentifier(expression.outputName)}`;
+      const alias = keyAlias(expression.outputName);
+
+      // A key could be spelled like another, longer key's alias.
+      if (
+        alias !== expression.outputName &&
+        selection.some((other) => other.outputName === alias)
+      ) {
+        throw new Error(
+          `symmetria: the result key "${alias}" is also the SQL alias of a longer key; rename one of them`,
+        );
+      }
+
+      return `${projected} AS ${quoteIdentifier(alias)}`;
     })
     .join(", ");

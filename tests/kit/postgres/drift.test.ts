@@ -15,7 +15,11 @@ import {
   operatorClass,
 } from "../../../packages/runtime/src";
 import { normalizeResult } from "../../../packages/runtime/src/entries/internal";
-import { detectDrift } from "../../../packages/kit/src";
+import {
+  detectDrift,
+  migrationSnapshot,
+  parseMigrationSnapshot,
+} from "../../../packages/kit/src";
 import { expressionKey } from "../../../packages/kit/src/migrations/expressions";
 import { testDatabase } from "../../support/postgres";
 
@@ -336,6 +340,106 @@ describe.skipIf(!databaseUrl)("PostgreSQL drift definitions", () => {
           schemaName: fixture.namespace,
         }),
       ).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("a minus before a cast and the cast of the negated number compare the same exactly where PostgreSQL gives them one value", async () => {
+    const fixture = await testDatabase({
+      url: databaseUrl!,
+      schema: schema({ marker: { id: int } }),
+    });
+    // What PostgreSQL makes of it, as text (a float's -0 shows), or that it refuses it.
+    const value = async (expression: string) => {
+      try {
+        const [row] = normalizeResult(
+          await fixture.driver.execute({
+            sql: `SELECT (${expression})::text AS value`,
+            parameters: [],
+          }),
+        ).rows as { value: string }[];
+
+        return row!.value;
+      } catch {
+        return "refused";
+      }
+    };
+
+    try {
+      for (const [number, casts] of [
+        ["0.5", "::integer"],
+        ["0.25", "::real::float8"],
+        ["5", "::real::float8"],
+        ["1.5", "::smallint"],
+        ["0.1", "::real::float8"],
+        ["2.5", "::float8::integer"],
+        ["2147483520", "::real::integer"],
+        ["0.5", "::integer::float8"],
+        ["0.81743454", "::text::numeric(5,2)"],
+        ["32767.5", "::smallint"],
+        ["2147483647", "::real::integer"],
+        ["2147483647.5", "::float8::integer"],
+        ["32768", "::text::smallint"],
+        ["1e-7", "::integer::float8"],
+        ["0.5", "::real::integer::float8"],
+        ["0.04", "::numeric(2,1)::float8"],
+        ["0", "::real::float8"],
+      ]) {
+        const minus = `-${number}${casts}`;
+        const negated = `(-${number})${casts}`;
+
+        expect([
+          minus,
+          expressionKey(`"f" > ${minus}`) === expressionKey(`"f" > ${negated}`),
+        ]).toEqual([minus, (await value(minus)) === (await value(negated))]);
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("a default and an index predicate saved by 3.5.0 ending in a -- comment have no drift", async () => {
+    const model = schema({
+      items: table({
+        id: int.auto,
+        n: int.default(sql`1 -- one`).nullable,
+        m: int.nullable,
+      }).indexes((t) => ({
+        m: index(t.m).where(sql<boolean>`${t.m} > 0 -- positive`),
+      })),
+    });
+    const fixture = await testDatabase({ url: databaseUrl!, schema: model });
+    const current = migrationSnapshot(model.$snapshot());
+    // 3.5.0 saved them without the line break after the comment.
+    const saved = (text: string) =>
+      parseMigrationSnapshot(
+        JSON.parse(
+          JSON.stringify(current)
+            .replaceAll("\\n", "")
+            .replace("1 -- one", text),
+        ) as typeof current,
+      );
+    const drift = (snapshot: typeof current) =>
+      detectDrift({
+        execute: fixture.driver.execute,
+        snapshot,
+        schemaName: fixture.namespace,
+      });
+
+    try {
+      expect(await drift(current)).toEqual([]);
+      expect(await drift(saved("1 -- one"))).toEqual([]);
+      // Another value is still drift.
+      expect(await drift(saved("2 -- two"))).toEqual([
+        {
+          kind: "default-mismatch",
+          table: "items",
+          column: "n",
+          expected: "2 -- two",
+          actual: "1",
+        },
+      ]);
     } finally {
       await fixture.close();
     }

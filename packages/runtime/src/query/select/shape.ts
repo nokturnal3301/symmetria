@@ -133,8 +133,18 @@ const sourceColumn = (
   option: string,
   key: string,
 ): RuntimeScope[string][string] => {
-  // An unknown key throws here, with the closest known name.
-  const column = columns[key];
+  // An unknown key throws here, with the closest known name; a name every
+  // object has (constructor, toString) reads through as no column.
+  const column =
+    Object.hasOwn(columns, key) || !(key in Object.prototype)
+      ? columns[key]
+      : undefined;
+
+  if (column === undefined) {
+    throw new Error(
+      `symmetria: ${option}: "${key}" is not a column; the object form takes column names`,
+    );
+  }
 
   if (!column || typeof column !== "object" || !(COLUMN_EXPRESSION in column)) {
     throw new Error(
@@ -417,8 +427,12 @@ export const applyShape = (
 
   for (const [name] of entries) {
     if (name.startsWith("$")) {
+      const option = name.slice(1);
+
       throw new Error(
-        `symmetria: "${name}" is not a field; query options such as ${name.slice(1)} belong to the second argument: posts(shape, { ${name.slice(1)}: … })`,
+        queryOptionNames.has(option as keyof QueryOptions<never, never>)
+          ? `symmetria: "${name}" is not a field; query options such as ${option} belong to the second argument: posts(shape, { ${option}: … })`
+          : `symmetria: "${name}" cannot be a field name: names starting with "$" are reserved; rename the field`,
       );
     }
   }

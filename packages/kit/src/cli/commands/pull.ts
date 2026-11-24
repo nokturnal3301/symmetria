@@ -1,7 +1,13 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { pullSchema } from "../../introspection";
-import { loadProject, withDatabase, type CliContext } from "../context";
+import { commentText } from "../../migrations/snapshot";
+import {
+  databaseUrlOf,
+  loadProject,
+  withDatabase,
+  type CliContext,
+} from "../context";
 import { formatCreated, formatPullWarnings } from "../ui/format";
 
 /**
@@ -23,8 +29,7 @@ export const pull = async (
 
     return undefined;
   });
-  const databaseUrl =
-    values["database-url"] ?? project?.databaseUrl ?? explicit;
+  const database = project ?? databaseUrlOf(values, {});
   const { metadataSchema, metadataTable } = project?.config ?? {};
   // Only the tables the config and flags name: Prisma's history table, which
   // other commands leave out on their own, stays listed for review here.
@@ -34,15 +39,19 @@ export const pull = async (
       ...(values["ignore-table"] ?? []),
     ]),
   ];
-  const result = await withDatabase({ databaseUrl }, (driver) =>
-    context.progress("Reading the database", () =>
-      pullSchema({
+  const result = await withDatabase(database, (driver, signal) =>
+    context.progress("Reading the database", async () => {
+      const pulled = await pullSchema({
         execute: driver.execute,
         ...(metadataSchema ? { metadataSchema } : {}),
         ...(metadataTable ? { metadataTable } : {}),
         ...(ignoreTables.length ? { ignoreTables } : {}),
-      }),
-    ),
+      });
+      // Ctrl-C while reading: write no file.
+      signal.throwIfAborted();
+
+      return pulled;
+    }),
   );
 
   await mkdir(dirname(path), { recursive: true });
@@ -84,7 +93,7 @@ export const pull = async (
           ? [
               `Review (${result.warnings.length})`,
               ...result.warnings.flatMap((warning) => [
-                `  [${warning.code}] ${warning.message}`,
+                `  [${warning.code}] ${commentText(warning.message)}`,
                 ...(warning.fix ? [`    fix: ${warning.fix}`] : []),
               ]),
             ]

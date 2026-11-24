@@ -7,7 +7,7 @@ import { indexSQL } from "./ddl";
 import { readCatalog, readExtensions } from "./catalog";
 import { readIndexDetails } from "../introspection/catalog";
 import { constraintDrift } from "./drift-constraints";
-import { expressionsMatch } from "./drift-expressions";
+import { enclosed, expressionsMatch } from "./drift-expressions";
 import {
   migrationSnapshot,
   parseMigrationSnapshot,
@@ -421,10 +421,10 @@ export const detectDrift = async (
           ) &&
           !(await expressionsMatch(
             [
-              `(${expected})::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
+              `${enclosed(expected)}::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
             ],
             [
-              `(${details.default})::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
+              `${enclosed(details.default)}::${column.enumeration ? quoteIdentifier(column.enumeration) : column.sqlType}`,
             ],
             table.name,
             options,

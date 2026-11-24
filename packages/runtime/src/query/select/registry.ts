@@ -9,19 +9,74 @@ import { codecFor, codecMap, type SchemaCodecs } from "../codecs";
 import { collectDataErrors } from "../codecs/deferred";
 import { quoteIdentifier } from "../compile";
 import {
+  and,
   readPredicate,
   type Predicate,
   type PredicateDescription,
   type ScopePredicate,
 } from "../expressions";
-import type { SelectPlan, TableBinding } from "../plan/types";
+import type {
+  SelectPlan,
+  SourceDescription,
+  TableBinding,
+} from "../plan/types";
+import { truth } from "../write/mutations";
 import { EMPTY, createScope, initialPlan } from "./scope";
 import { columnsOnly } from "./suggest";
 import type { RuntimeScope } from "./types";
 
-export type TableScopes = Readonly<
-  Record<string, (columns: RuntimeScope[string]) => Predicate>
->;
+type TableScope = (columns: RuntimeScope[string]) => Predicate;
+
+/** Scopes by table name; without a prototype, so a table named `toString` has none. */
+export type TableScopes = Readonly<Record<string, TableScope>>;
+
+export const NO_SCOPES: TableScopes = Object.freeze(Object.create(null));
+
+/** The callbacks a scope narrowed by `$scope()` again ANDs, in order. */
+const scopeParts = new WeakMap<TableScope, readonly TableScope[]>();
+
+const partsOf = (scope: TableScope): readonly TableScope[] =>
+  scopeParts.get(scope) ?? [scope];
+
+/** `previous` narrowed by `added`, as `$scope()` on a scoped database does. */
+export const narrowedScope = (
+  previous: TableScope,
+  added: TableScope,
+): TableScope => {
+  const narrowed: TableScope = (columns) =>
+    and(previous(columns), added(columns));
+
+  scopeParts.set(narrowed, [...partsOf(previous), ...partsOf(added)]);
+
+  return narrowed;
+};
+
+/** Whether `outer` already ANDs every callback of `inner`, so `inner` adds nothing to it. */
+export const coversScope = (outer: TableScope, inner: TableScope): boolean => {
+  const parts = partsOf(outer);
+
+  return partsOf(inner).every((part) => parts.includes(part));
+};
+
+/**
+ * A `$scope()` filter that holds for every row, such as `and()` of
+ * conditions that were all skipped (`tenant && …` without a tenant), would
+ * read and write every tenant's rows: it fails closed. An emptied list is a
+ * condition here: `notIn(blocked)` with nobody blocked, or `contains(required)`
+ * with nothing required, admits the rows it asks for.
+ */
+export const restrictingScope = (
+  predicate: PredicateDescription,
+  binding: TableBinding,
+): PredicateDescription => {
+  if (truth(predicate, binding, { scope: true }) === true) {
+    throw new Error(
+      `symmetria: the $scope() filter of "${binding.table.name}" holds for every row, so it restricts nothing (such as and() or a list whose conditions were all skipped, like \`tenant && …\` without a tenant, isNot(null) of a NOT NULL column, or a condition together with its opposite); nothing is read or written through it`,
+    );
+  }
+
+  return predicate;
+};
 
 export type TableRegistry = {
   readonly snapshot: SchemaSnapshot;
@@ -32,6 +87,11 @@ export type TableRegistry = {
     binding: TableBinding,
   ) => readonly PredicateDescription[];
   readonly scopedPlan: (binding: TableBinding) => SelectPlan;
+};
+
+/** A join source with the registry, and so the `$scope()`, of the database it came from. */
+export type ScopedSource = SourceDescription & {
+  readonly registry?: TableRegistry;
 };
 
 /**
@@ -130,16 +190,31 @@ export type QueryContext = {
 
 export const createTableRegistry = (
   { snapshot, tablesByName, codecsFor }: SchemaTables,
-  scopes: TableScopes = {},
+  scopes: TableScopes = NO_SCOPES,
 ): TableRegistry => {
   // One evaluator per table, so equal scope filters compare as equal.
   const evaluators = new Map<string, ScopePredicate["evaluate"]>();
+
+  const scopeResult = (
+    scope: TableScope,
+    occurrence: TableBinding,
+  ): PredicateDescription =>
+    readPredicate(
+      scope(
+        columnsOnly(
+          occurrence.table,
+          createScope({ [occurrence.alias]: occurrence })[occurrence.alias]!,
+          "$scope() predicates",
+        ),
+      ),
+    );
 
   /**
    * $scope() predicates apply wherever a scoped table enters a plan. Callbacks
    * may read changing values (a tenant id): they run when a query is built,
    * which fixes the SQL, and again at every execution, which binds the values
-   * current then (see the compiler's scope refresh).
+   * current then (see the compiler's scope refresh). A result that holds for
+   * every row fails that execution.
    */
   const scopePredicates = (
     binding: TableBinding,
@@ -154,17 +229,7 @@ export const createTableRegistry = (
 
     if (!evaluate) {
       evaluate = (occurrence: TableBinding) =>
-        readPredicate(
-          scope(
-            columnsOnly(
-              occurrence.table,
-              createScope({ [occurrence.alias]: occurrence })[
-                occurrence.alias
-              ]!,
-              "$scope() predicates",
-            ),
-          ),
-        );
+        restrictingScope(scopeResult(scope, occurrence), occurrence);
       evaluators.set(binding.table.name, evaluate);
     }
 
@@ -173,9 +238,14 @@ export const createTableRegistry = (
         kind: "scope",
         binding,
         evaluate,
-        // A value the codecs reject now fails each execution, which runs the
-        // callback again; the build only needs the predicate's SQL.
-        predicate: collectDataErrors(() => evaluate(binding), false)[0],
+        // The build only needs the predicate's SQL: a value the codecs
+        // reject while the query is built fails each execution instead,
+        // which runs the callback again, and a result that admits every row
+        // at build time is refused when the query runs.
+        predicate: collectDataErrors(
+          () => scopeResult(scope, binding),
+          false,
+        )[0],
       }),
     ];
   };

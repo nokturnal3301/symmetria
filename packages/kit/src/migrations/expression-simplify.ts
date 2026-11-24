@@ -46,6 +46,29 @@ export const canonicalNumber = (text: string): string => {
   return /^-?\d+$/.test(value) ? BigInt(value).toString() : value.toLowerCase();
 };
 
+/** Float types, whose zero has a sign: `-0::float8` is -0, `(-0)::float8` is 0. */
+const FLOAT_TYPES = /^(?:real|double precision|float[48]?(?:\(\d+\))?)$/;
+const ZERO = /^[+-]?(?:0+(?:\.0*)?|\.0+)(?:e[+-]?\d+)?$/i;
+/** The magnitude of each integer type's most negative value, which its positive side lacks. */
+const INTEGER_LIMITS: ReadonlyMap<string, bigint> = new Map([
+  ["smallint", 32768n],
+  ["integer", 2147483648n],
+  ["bigint", 9223372036854775808n],
+]);
+
+/** A number of a type in one spelling: a zero has no sign, except a float's. */
+const typedNumber = (text: string, type: string | undefined): string => {
+  if (!ZERO.test(text)) {
+    return canonicalNumber(text);
+  }
+
+  const zero = canonicalNumber(text.replace(/^[+-]/, ""));
+
+  return text.startsWith("-") && type !== undefined && FLOAT_TYPES.test(type)
+    ? `-${zero}`
+    : zero;
+};
+
 const INTERVAL_UNITS: Readonly<
   Record<string, [months: number, micros: number]>
 > = {
@@ -273,12 +296,49 @@ export const canonicalLiteral = (value: string, type: string): string => {
 export const INTEGER_TYPES = /^(integer|bigint|smallint)$/;
 export const LENGTH_TYPES = /^(?:character varying|character|char)\((\d+)\)$/;
 export const SCALE_TYPES = /^numeric\(\d+(?:,(\d+))?\)$/;
+const PRECISION_TYPES = /^numeric\((\d+)(?:,(\d+))?\)$/;
+/** Exponents beyond any integer or numeric(p,s) type's digits: such a cast fails. */
+const EXPONENT_LIMIT = 2000;
+
+/**
+ * A number's digits before and after the point, exponent applied, without
+ * leading or trailing zeros: `2.5e0` is 2 and 5, `1.5e1` is 15 and nothing.
+ * Undefined for text that is no number, or an exponent past any type's digits.
+ */
+const decimalDigits = (
+  text: string,
+): { negative: boolean; whole: string; fraction: string } | undefined => {
+  const number = /^\s*([+-]?)(\d*)(?:\.(\d*))?(?:e([+-]?\d+))?\s*$/i.exec(text);
+
+  if (!number || (!number[2] && !number[3])) {
+    return undefined;
+  }
+
+  const exponent = Number(number[4] ?? 0);
+
+  if (Math.abs(exponent) > EXPONENT_LIMIT) {
+    return undefined;
+  }
+
+  const point = number[2]!.length + exponent;
+  const digits = `${number[2]}${number[3] ?? ""}`;
+  const padded =
+    point < 0 ? `${"0".repeat(-point)}${digits}` : digits.padEnd(point, "0");
+  const at = Math.max(point, 0);
+
+  return {
+    negative: number[1] === "-",
+    whole: padded.slice(0, at).replace(/^0+/, ""),
+    fraction: padded.slice(at).replace(/0+$/, ""),
+  };
+};
 
 /**
  * Whether a cast gives a literal another value, so it is no rendering detail:
- * `'abc'::varchar(2)` is `'ab'`, `1.9::integer` is `2` and `1.25::numeric(3,1)`
- * is `1.3`. The casts PostgreSQL prints on its own (`'a'::text`,
- * `'-100'::integer`) never do.
+ * `'abc'::varchar(2)` is `'ab'`, `1.9::integer` and `2.5e0::integer` round,
+ * `1.25::numeric(3,1)` is `1.3`, and a number out of an integer type's range
+ * (`32768::smallint`) or a numeric(p,s)'s digits fails. The casts PostgreSQL
+ * prints on its own (`'a'::text`, `'-100'::integer`) never do.
  */
 export const castChangesLiteral = (
   literal: Extract<SqlExpression, { kind: "constant" }>,
@@ -290,19 +350,312 @@ export const castChangesLiteral = (
     return [...literal.value].length > Number(length[1]);
   }
 
-  const fraction = /^[+-]?\d*\.(\d*?)0*$/.exec(literal.value)?.[1];
+  const integer = INTEGER_TYPES.test(type);
+  const precision = PRECISION_TYPES.exec(type);
 
-  if (fraction === undefined || fraction === "") {
+  if (!integer && !precision) {
     return false;
   }
 
-  if (INTEGER_TYPES.test(type)) {
+  const digits = decimalDigits(literal.value);
+
+  if (!digits) {
+    // A number with an exponent past any type's digits; other text is read by the type.
+    return /^\s*[+-]?(?:\d+\.?\d*|\.\d+)e/i.test(literal.value);
+  }
+
+  if (integer) {
+    const limit = INTEGER_LIMITS.get(type)!;
+    const magnitude = BigInt(digits.whole || "0");
+
+    return (
+      digits.fraction !== "" ||
+      (digits.negative ? magnitude > limit : magnitude >= limit)
+    );
+  }
+
+  const scale = Number(precision![2] ?? 0);
+
+  return (
+    digits.fraction.length > scale ||
+    digits.whole.length > Number(precision![1]) - scale
+  );
+};
+
+/** The significant digits a float keeps of a decimal: more, and it holds another number. */
+const FLOAT_DIGITS = (type: string): number => (type === "real" ? 6 : 15);
+
+/**
+ * Whether a cast of a float literal shows that the float is not the decimal
+ * written: a float rounds half to even where a decimal rounds half away from
+ * zero (`2.5::float8::integer` is 2, `2.5::integer` 3), a real holds another
+ * double than the decimal (`0.1::real::float8`), and a decimal of more digits
+ * than the float keeps comes back rounded.
+ */
+const floatCastShows = (
+  literal: Extract<SqlExpression, { kind: "constant" }>,
+  type: string,
+): boolean => {
+  const from = literal.type;
+
+  if (!literal.numeric || from === undefined || !FLOAT_TYPES.test(from)) {
+    return false;
+  }
+
+  if (type === from) {
+    return false;
+  }
+
+  if (from === "real" && FLOAT_TYPES.test(type)) {
     return true;
   }
 
-  const scale = SCALE_TYPES.exec(type);
+  if (
+    !INTEGER_TYPES.test(type) &&
+    !/^numeric(?:\(|$)/.test(type) &&
+    !FLOAT_TYPES.test(type)
+  ) {
+    return false;
+  }
 
-  return scale !== null && fraction.length > Number(scale[1] ?? 0);
+  const digits = decimalDigits(literal.value);
+
+  return (
+    !digits ||
+    `${digits.whole}${digits.fraction}`.replace(/^0+/, "").length >
+      FLOAT_DIGITS(from) ||
+    (INTEGER_TYPES.test(type) && digits.fraction !== "")
+  );
+};
+
+/** Rounds a magnitude half to even, as PostgreSQL rounds a float to an integer. */
+const roundHalfEven = (value: number): number => {
+  const rounded = Math.round(value);
+
+  return rounded - value === 0.5 && rounded % 2 !== 0 ? rounded - 1 : rounded;
+};
+
+/** Rounds a magnitude's digits half away from zero to `scale` decimals, as PostgreSQL rounds a numeric. */
+const roundDigits = (
+  whole: bigint,
+  fraction: string,
+  scale: number,
+): { whole: bigint; fraction: string } => {
+  if (fraction.length <= scale) {
+    return { whole, fraction };
+  }
+
+  const unit = 10n ** BigInt(scale);
+  const kept =
+    whole * unit +
+    BigInt(fraction.slice(0, scale) || "0") +
+    (fraction[scale]! >= "5" ? 1n : 0n);
+
+  return {
+    whole: kept / unit,
+    fraction: (kept % unit).toString().padStart(scale, "0").replace(/0+$/, ""),
+  };
+};
+
+/** Whether a double lies exactly halfway between two reals (single-precision floats). */
+const halfwayReal = (value: number): boolean => {
+  const real = Math.fround(value);
+  const other = 2 * value - real;
+
+  return real !== value && Math.fround(other) === other;
+};
+
+/** A float's text: the fewest digits that read back as it, as PostgreSQL writes it. */
+const shortestFloat = (float: { value: number; type: string }): string => {
+  if (float.type !== "real") {
+    return String(float.value);
+  }
+
+  for (let digits = 1; digits < 9; digits++) {
+    const text = float.value.toPrecision(digits);
+
+    if (Math.fround(Number(text)) === float.value) {
+      return text;
+    }
+  }
+
+  return float.value.toPrecision(9);
+};
+
+/**
+ * Whether a minus before a number cast through `types` (inside out) gives the
+ * value the casts give the negated number: `-0.5::integer`, which PostgreSQL
+ * reads as `-(0.5::integer)`, is `(-0.5)::integer`, and `-0.25::real::float8`
+ * is `(-0.25)::real::float8`. A cast to an integer, a numeric, a numeric(p,s)
+ * or a float rounds the same on either side of zero, so it holds for those
+ * casts, except where the positive number reaches an integer type's most
+ * negative value on the way, which only the negated one holds
+ * (`-32767.5::smallint` and `-2147483647::real::integer` fail, the negated
+ * casts are -32768 and -2147483648), and where a float comes out zero, whose
+ * sign the minus keeps only outside the casts (`-1e-7::integer::float8` is -0,
+ * `(-1e-7)::integer::float8` is 0). The casts are followed as PostgreSQL makes
+ * them; where a float's rounding, computed here in double precision, lands
+ * next to one of those edges, it says no. `types` are normalized type names.
+ */
+export const minusCommutes = (
+  digits: string,
+  written: readonly string[],
+): boolean => {
+  const start = decimalDigits(digits);
+  // `float` is double precision; `float(p)` is real up to 24 binary digits.
+  const types = written.map((type) => {
+    const float = /^float(?:\((\d+)\))?$/.exec(type);
+
+    return !float
+      ? type
+      : Number(float[1] ?? 53) <= 24
+        ? "real"
+        : "double precision";
+  });
+
+  if (!start || start.negative || types.length === 0) {
+    return false;
+  }
+
+  let whole = BigInt(start.whole || "0");
+  let fraction = start.fraction;
+  /**
+   * The magnitude while it is a float, which float, and whether it may be a
+   * unit off: a decimal made a real here is rounded twice (to a double, then
+   * to a real), where PostgreSQL rounds once. The two differ only where the
+   * double lies halfway between two reals, and an integer up to 2^53 is its
+   * double.
+   */
+  let float: { value: number; type: string; near: boolean } | undefined;
+  /** Whether the magnitude is zero; a zero stays zero through every cast. */
+  let zero: boolean | "unsure" = whole === 0n && fraction === "";
+  const settle = (isZero: boolean, unsure: boolean): boolean | "unsure" =>
+    zero === true || isZero
+      ? true
+      : zero === "unsure" || unsure
+        ? "unsure"
+        : false;
+
+  for (const [index, type] of types.entries()) {
+    if (type === "real" || type === "double precision") {
+      const exact = float?.value ?? Number(`${whole}.${fraction || "0"}`);
+      const value = type === "real" ? Math.fround(exact) : exact;
+
+      // Out of the float's range, both spellings fail.
+      if (!Number.isFinite(value) || (value === 0 && zero === false)) {
+        return false;
+      }
+
+      float = {
+        value,
+        type,
+        near: float
+          ? float.near
+          : type === "real" &&
+            !(fraction === "" && whole <= 2n ** 53n) &&
+            halfwayReal(exact),
+      };
+      continue;
+    }
+
+    // A number written as text and read back keeps its value. A float is
+    // written in the fewest digits that read back as it, not those of its
+    // cast to numeric.
+    if (type === "text" && index < types.length - 1) {
+      if (float) {
+        const printed = !float.near && decimalDigits(shortestFloat(float));
+
+        if (!printed) {
+          return false;
+        }
+
+        whole = BigInt(printed.whole || "0");
+        fraction = printed.fraction;
+        float = undefined;
+      }
+
+      continue;
+    }
+
+    const limit = INTEGER_LIMITS.get(type);
+    const precision = PRECISION_TYPES.exec(type);
+
+    if (limit === undefined && type !== "numeric" && !precision) {
+      return false;
+    }
+
+    if (float && limit !== undefined) {
+      const edge = Number(limit);
+      const rounded = roundHalfEven(float.value);
+      // Where the float may be a unit off, close to the edge is not known.
+      const close = (to: number, scale: number) =>
+        float!.near && Math.abs(float!.value - to) <= scale * 2 ** -20;
+
+      if (close(edge - 0.5, edge) || rounded >= edge) {
+        return false;
+      }
+
+      zero = settle(rounded === 0, close(0.5, 1));
+      whole = BigInt(rounded);
+      fraction = "";
+      float = undefined;
+      continue;
+    }
+
+    if (float) {
+      // A float becomes a numeric through its first 6 (real) or 15 digits.
+      const printed = decimalDigits(
+        float.value.toPrecision(FLOAT_DIGITS(float.type)),
+      );
+
+      if (!printed) {
+        return false;
+      }
+
+      whole = BigInt(printed.whole || "0");
+      fraction = printed.fraction;
+      float = undefined;
+    }
+
+    const scale =
+      limit !== undefined
+        ? 0
+        : precision
+          ? Number(precision[2] ?? 0)
+          : undefined;
+
+    if (scale !== undefined) {
+      ({ whole, fraction } = roundDigits(whole, fraction, scale));
+    }
+
+    if (limit !== undefined && whole >= limit) {
+      return false;
+    }
+
+    zero = settle(whole === 0n && fraction === "", false);
+  }
+
+  return !FLOAT_TYPES.test(types[types.length - 1]!) || zero === false;
+};
+
+/**
+ * The number under a chain of casts (`0.5` in `0.5::real::float8`) with the
+ * casts' types from the inside out, or undefined for anything else.
+ */
+const castNumber = (
+  node: SqlExpression,
+): { digits: string; types: string[] } | undefined => {
+  const types: string[] = [];
+  let current = node;
+
+  while (current.kind === "cast") {
+    types.unshift(current.type);
+    current = current.value;
+  }
+
+  return current.kind === "constant" && current.numeric
+    ? { digits: current.value, types }
+    : undefined;
 };
 
 /** The type PostgreSQL names in a literal's cast: `numeric`, not `numeric(10,2)`. */
@@ -372,14 +725,38 @@ export const simplifyExpression = (
       const value = simplify(node.value);
 
       if (value.kind === "constant") {
+        if (floatCastShows(value, node.type)) {
+          const { type, ...digits } = value;
+
+          return {
+            ...node,
+            value: { kind: "cast", value: digits, type: type! },
+          };
+        }
+
         if (castChangesLiteral(value, node.type)) {
-          return { ...node, value };
+          // A number in quotes is that number to a numeric(p,s) cast, as
+          // PostgreSQL prints one it keeps quoted (`'2147483649'::numeric(3,0)`).
+          return !value.numeric &&
+            value.type === undefined &&
+            PRECISION_TYPES.test(node.type) &&
+            /^[+-]?[\d.]/.test(value.value) &&
+            decimalDigits(value.value) !== undefined
+            ? {
+                ...node,
+                value: {
+                  kind: "constant",
+                  value: canonicalNumber(value.value),
+                  numeric: true,
+                },
+              }
+            : { ...node, value };
         }
 
         return NUMERIC_TYPES.test(node.type) && /^[+-]?[\d.]/.test(value.value)
           ? {
               kind: "constant",
-              value: canonicalNumber(value.value),
+              value: typedNumber(value.value, node.type),
               numeric: true,
               type: node.type,
             }
@@ -391,6 +768,11 @@ export const simplifyExpression = (
       }
 
       if (value.kind === "array" && value.values.every(isLiteral)) {
+        return value;
+      }
+
+      // A second cast to the same type changes nothing; PostgreSQL drops it.
+      if (value.kind === "cast" && value.type === node.type) {
         return value;
       }
 
@@ -424,9 +806,32 @@ export const simplifyExpression = (
     case "unary": {
       const value = simplify(node.value);
 
-      if (value.kind === "constant" && value.numeric) {
+      // A number cast to text stays text: `-5::text` negates text, which fails.
+      if (
+        value.kind === "constant" &&
+        value.numeric &&
+        (value.type === undefined ||
+          NUMERIC_TYPES.test(value.type) ||
+          FLOAT_TYPES.test(value.type))
+      ) {
         if (node.operator === "+") {
           return value;
+        }
+
+        // `-2147483648::integer` fails where `(-2147483648)::integer` does not.
+        const limit =
+          value.type === undefined ? undefined : INTEGER_LIMITS.get(value.type);
+        const magnitude = decimalDigits(value.value);
+
+        if (
+          node.operator === "-" &&
+          limit !== undefined &&
+          !value.value.startsWith("-") &&
+          !(
+            magnitude?.fraction === "" && BigInt(magnitude.whole || "0") < limit
+          )
+        ) {
+          return { ...node, value };
         }
 
         if (node.operator === "-") {
@@ -434,9 +839,29 @@ export const simplifyExpression = (
             ...value,
             value: value.value.startsWith("-")
               ? value.value.slice(1)
-              : canonicalNumber(`-${value.value}`),
+              : typedNumber(`-${value.value}`, value.type),
           };
         }
+      }
+
+      // A cast that gives the number another value stays a cast:
+      // `-0.5::integer` is `(-0.5)::integer` where minusCommutes says so.
+      const chain =
+        node.operator === "-" && value.kind === "cast"
+          ? castNumber(node.value)
+          : undefined;
+
+      if (chain && minusCommutes(chain.digits, chain.types)) {
+        return simplify(
+          chain.types.reduce<SqlExpression>(
+            (inner, type) => ({ kind: "cast", value: inner, type }),
+            {
+              kind: "unary",
+              operator: "-",
+              value: { kind: "constant", value: chain.digits, numeric: true },
+            },
+          ),
+        );
       }
 
       return { ...node, value };

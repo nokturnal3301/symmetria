@@ -15,7 +15,13 @@ import {
 } from "../../schema/assembly";
 import { plainRecord } from "../select/shape";
 import { returningProjection, returningSelector } from "../select/projections";
-import { conditionWrite, nestedInput, uniqueKeys } from "./nested-input";
+import {
+  compareKeys,
+  conditionWrite,
+  keySortValues,
+  nestedInput,
+  uniqueKeys,
+} from "./nested-input";
 
 type RuntimeQuery = {
   (
@@ -65,6 +71,14 @@ export const createNestedInsert = (
     lookupFields,
     lookupKey,
     connected,
+    readsExactly,
+    keyShape,
+    insertedRow,
+    rowShape,
+    readRow,
+    matchedPosition,
+    keyValue,
+    primarySortValues,
   } = nestedInput(snapshot, tableName, codecs);
 
   // A value the codecs reject fails the insert when it runs.
@@ -113,22 +127,57 @@ export const createNestedInsert = (
               continue;
             }
 
-            const rows = await (database[name] as RuntimeQuery)(
-              (scope) => ({ ...scope }),
-              {
-                where: (scope) =>
-                  scope[column]!.in([...keys.values()] as never),
-              },
-            ).execute();
             const byKey = new Map<string, unknown>();
 
-            for (const row of rows) {
-              const key = lookupKey(
-                encodeValue(row[column], codecs[name]?.[column]),
-              );
+            if (readsExactly(name, column)) {
+              const rows = await (database[name] as RuntimeQuery)(
+                (scope) => rowShape(name, scope),
+                {
+                  where: (scope) =>
+                    scope[column]!.in([...keys.values()] as never),
+                },
+              ).execute();
 
-              if (key !== undefined) {
-                byKey.set(key, row);
+              for (const read of rows) {
+                const row = readRow(name, read);
+                const key = lookupKey(
+                  encodeValue(row[column], codecs[name]?.[column]),
+                );
+
+                if (key !== undefined) {
+                  byKey.set(key, row);
+                }
+              }
+            } else {
+              // A value read is not the value stored (a timestamptz key
+              // with microseconds reads as a Date without them, so two keys
+              // can read as one), and PostgreSQL may take another spelling
+              // for it: PostgreSQL tells which value each row equals. A
+              // value that equals a row another one took first is looked
+              // up by itself. The values are joined with the table, so a
+              // statement takes many of them; 10,000 keep the list and its
+              // comparisons, two parameters a value, below PostgreSQL's
+              // limit of 65,535.
+              const lookups = [...keys.keys()];
+              const wanted = [...keys.values()];
+
+              for (let start = 0; start < wanted.length; start += 10000) {
+                const values = wanted.slice(start, start + 10000);
+                const rows = await (database[name] as RuntimeQuery)(
+                  (scope) => rowShape(name, scope, { column, values }),
+                  {
+                    where: (scope) => scope[column]!.in(values as never),
+                  },
+                ).execute();
+
+                for (const read of rows) {
+                  const position = matchedPosition(name, read);
+                  const row = readRow(name, read);
+
+                  if (position !== undefined) {
+                    byKey.set(lookups[start + position]!, row);
+                  }
+                }
               }
             }
 
@@ -141,6 +190,16 @@ export const createNestedInsert = (
             cached.set(column, byKey);
           }
         }
+
+        /**
+         * The multi-row INSERT that waits for more rows, if any. Its rows are
+         * not in the database yet, so a connect that finds nothing writes
+         * them first and looks again: a row this insert creates is found by a
+         * later one, also in the same statement's turn.
+         */
+        let waiting:
+          | { readonly name: string; readonly write: () => Promise<void> }
+          | undefined;
 
         const find = async (
           name: string,
@@ -179,20 +238,25 @@ export const createNestedInsert = (
             }
           }
 
-          const rows = await (database[name] as RuntimeQuery)(
-            (columns) => ({
-              ...columns,
-            }),
-            {
-              where: (columns) =>
-                and(
-                  ...names.map((column) =>
-                    columns[column]!.is(fields[column]!),
+          const read = () =>
+            (database[name] as RuntimeQuery)(
+              (columns) => rowShape(name, columns),
+              {
+                where: (columns) =>
+                  and(
+                    ...names.map((column) =>
+                      columns[column]!.is(fields[column]!),
+                    ),
                   ),
-                ),
-              limit: 2,
-            },
-          ).execute();
+                limit: 2,
+              },
+            ).execute();
+          let rows = await read();
+
+          if (!rows.length && waiting?.name === name) {
+            await waiting.write();
+            rows = await read();
+          }
 
           if (rows.length !== 1) {
             throw new NotFoundError(
@@ -201,7 +265,7 @@ export const createNestedInsert = (
             );
           }
 
-          return rows[0]!;
+          return readRow(name, rows[0]!);
         };
 
         const attach = async (
@@ -222,7 +286,9 @@ export const createNestedInsert = (
             .where((rowColumns) =>
               and(
                 ...primary.map((column) =>
-                  rowColumns[column.name]!.is(row[column.name]!),
+                  rowColumns[column.name]!.is(
+                    keyValue(name, row, column.name) as never,
+                  ),
                 ),
               ),
             )
@@ -367,7 +433,11 @@ export const createNestedInsert = (
               {},
               referenced,
             );
-            scalars[relation.foreignKey] = row[referenced];
+            scalars[relation.foreignKey] = keyValue(
+              relation.target,
+              row,
+              referenced,
+            );
           }
         };
 
@@ -382,8 +452,13 @@ export const createNestedInsert = (
           const table = tableByName.get(name)!;
           const { scalars, relations } = split(name, data);
 
-          /** The row a create or connectOrCreate writes: its values and the parent's key. */
+          /**
+           * The row a create or connectOrCreate writes: its values and the
+           * parent's key. connectOrCreate takes a flat payload: its relation
+           * fields are left out, whether the row is found or created.
+           */
           const payloadOf = (
+            target: string,
             operation: string,
             value: unknown,
             extra: Record<string, unknown>,
@@ -400,20 +475,48 @@ export const createNestedInsert = (
               );
             }
 
-            return { ...value, ...extra };
+            if (operation !== "connectOrCreate") {
+              return { ...value, ...extra };
+            }
+
+            const { relations } = tableByName.get(target)!;
+
+            return {
+              ...Object.fromEntries(
+                Object.entries(value).filter(
+                  ([field]) =>
+                    !relations.some((relation) => relation.name === field),
+                ),
+              ),
+              ...extra,
+            };
           };
 
-          /** The unique key a connectOrCreate payload is looked up and upserted by. */
+          /**
+           * The unique key a connectOrCreate payload is looked up and upserted
+           * by: the first populated one. A key holding the parent's foreign key
+           * (`extra`) comes last: the parent is new, so no row has that key
+           * yet; it is used only when the payload populates no other.
+           */
           const upsertKey = (
             target: string,
             payload: Record<string, unknown>,
-          ): readonly string[] | undefined =>
-            uniqueKeys(tableByName.get(target)!).find((names) =>
-              names.every(
-                (field) =>
-                  payload[field] !== null && payload[field] !== undefined,
-              ),
+            extra: Record<string, unknown>,
+          ): readonly string[] | undefined => {
+            const populated = uniqueKeys(tableByName.get(target)!).filter(
+              (names) =>
+                names.every(
+                  (field) =>
+                    payload[field] !== null && payload[field] !== undefined,
+                ),
             );
+
+            return (
+              populated.find((names) =>
+                names.every((field) => !Object.hasOwn(extra, field)),
+              ) ?? populated[0]
+            );
+          };
 
           const resolveRow = async (
             target: string,
@@ -426,13 +529,13 @@ export const createNestedInsert = (
               return find(target, value, scalarColumn);
             }
 
-            const payload = payloadOf(operation, value, extra);
+            const payload = payloadOf(target, operation, value, extra);
 
             if (operation === "create") {
               return (await insertRow(target, payload)).row;
             }
 
-            const key = upsertKey(target, payload);
+            const key = upsertKey(target, payload, extra);
 
             if (!key) {
               throw new Error(
@@ -457,7 +560,7 @@ export const createNestedInsert = (
             }
 
             const [existing] = await (database[target] as RuntimeQuery)(
-              (columns) => ({ ...columns }),
+              (columns) => rowShape(target, columns),
               {
                 where: (columns) =>
                   and(
@@ -468,17 +571,20 @@ export const createNestedInsert = (
             ).execute();
 
             if (existing) {
-              return existing as Record<string, unknown>;
+              return readRow(target, existing);
             }
 
             // Under $scope() the upsert throws SYMMETRIA_OUT_OF_SCOPE when the
             // existing row lies outside the scope, so nothing links to it; like
             // every row of a nested insert, the upserted row is checked too.
-            return mutate(target, "insert", payload)
-              .onConflict(...key)
-              .doUpdate(...key)
-              .returning((row) => row)
-              .execute();
+            return readRow(
+              target,
+              await mutate(target, "insert", payload)
+                .onConflict(...key)
+                .doUpdate(...key)
+                .returning((row) => rowShape(target, row) as Projection)
+                .execute(),
+            );
           };
 
           await forwards(name, data, { scalars, relations }, resolveRow);
@@ -488,14 +594,16 @@ export const createNestedInsert = (
             const result = returning
               ? resultOf(returning, row, table)
               : undefined;
+            const keys = keyShape(name, row);
 
             return {
               row,
+              ...(keys ? { keys } : {}),
               ...(result ? { result } : {}),
             } as Projection;
           });
           const inserted = await mutation.execute();
-          const row = inserted.row as Record<string, unknown>;
+          const row = insertedRow(inserted);
 
           for (const [relation, operations] of relations) {
             if (relation.kind === "one" && !relation.reverse) {
@@ -503,18 +611,35 @@ export const createNestedInsert = (
             }
 
             // The parent value the child foreign key stores: the primary key or a by() column.
-            const parentKey =
-              row[
-                relation.kind === "through"
-                  ? referencedName(
-                      relation.junction,
-                      relation.sourceForeignKey,
-                      name,
-                    )
-                  : referencedName(relation.target, relation.foreignKey, name)
-              ];
+            const parentKey = keyValue(
+              name,
+              row,
+              relation.kind === "through"
+                ? referencedName(
+                    relation.junction,
+                    relation.sourceForeignKey,
+                    name,
+                  )
+                : referencedName(relation.target, relation.foreignKey, name),
+            );
 
-            for (const [operation, value] of Object.entries(operations)) {
+            // Rows the relation's connect and connectOrCreate entries name
+            // are all found (or created) first, which locks no row already
+            // there, and then moved to the parent together, in primary-key
+            // order, whichever key or operation named them: two inserts that
+            // move the same rows then wait for each other in one direction
+            // only, and cannot deadlock. They are moved where the last of
+            // those operations stands, before a create given after it.
+            const moved: {
+              readonly row: Record<string, unknown>;
+              readonly key: readonly unknown[];
+            }[] = [];
+            const steps = Object.entries(operations);
+            const lastMove = steps.findLastIndex(
+              ([operation]) => operation !== "create",
+            );
+
+            for (const [step, [operation, value]] of steps.entries()) {
               const entries = relation.kind === "one" ? [value] : value;
 
               if (!Array.isArray(entries)) {
@@ -531,18 +656,24 @@ export const createNestedInsert = (
               let siblings: Record<string, unknown>[] = [];
 
               const insertSiblings = async () => {
+                if (waiting === batch) {
+                  waiting = undefined;
+                }
+
                 if (siblings.length) {
                   const rows = siblings;
                   siblings = [];
                   await mutate(relation.target, "insert", rows).execute();
                 }
               };
+              const batch = { name: relation.target, write: insertSiblings };
 
               const links: Record<string, unknown>[] = [];
               // Rows that have to be created are created in key order, not
-              // input order: two inserts that create the same rows then wait
-              // for each other in one direction only, and cannot deadlock.
+              // input order, for the same reason: a new key waits for the
+              // insert that wrote it first.
               const upserted = new Map<unknown, Record<string, unknown>>();
+              const moving = new Set<unknown>();
 
               if (operation === "connectOrCreate" && entries.length > 1) {
                 const extra =
@@ -553,26 +684,26 @@ export const createNestedInsert = (
                   const payload = plainRecord(entry)
                     ? { ...entry, ...extra }
                     : undefined;
-                  const key = payload && upsertKey(relation.target, payload);
+                  const key =
+                    payload && upsertKey(relation.target, payload, extra);
 
                   return {
                     entry,
-                    text: key
-                      ? JSON.stringify(
-                          key.map((field: string) => String(payload![field])),
+                    // The values as they are sent: a customType() value is
+                    // its encoded form, which is what PostgreSQL compares.
+                    values: key
+                      ? keySortValues(
+                          key.map((field: string) => payload![field]),
                         )
                       : undefined,
                   };
                 });
 
-                // An entry without a key fails where it stands, in the loop below.
-                if (keyed.every(({ text }) => text !== undefined)) {
+                // An entry without a key fails where it stands, in the loop
+                // below; a key given as a `sql` template has no value to sort by.
+                if (keyed.every(({ values }) => values !== undefined)) {
                   keyed.sort((left, right) =>
-                    left.text! < right.text!
-                      ? -1
-                      : left.text! > right.text!
-                        ? 1
-                        : 0,
+                    compareKeys(left.values!, right.values!),
                   );
 
                   for (const { entry } of keyed) {
@@ -599,7 +730,12 @@ export const createNestedInsert = (
                     : { [relation.foreignKey]: parentKey };
 
                 if (relation.kind !== "through" && operation === "create") {
-                  const payload = payloadOf(operation, entry, extra);
+                  const payload = payloadOf(
+                    relation.target,
+                    operation,
+                    entry,
+                    extra,
+                  );
 
                   if (
                     !related.relations.some((nested) =>
@@ -607,6 +743,7 @@ export const createNestedInsert = (
                     )
                   ) {
                     siblings.push(payload);
+                    waiting = batch;
                     continue;
                   }
 
@@ -617,6 +754,7 @@ export const createNestedInsert = (
                   if (connectsOnly(parts)) {
                     await forwards(relation.target, payload, parts, resolveRow);
                     siblings.push(parts.scalars);
+                    waiting = batch;
                     continue;
                   }
                 }
@@ -635,22 +773,23 @@ export const createNestedInsert = (
                 if (relation.kind === "through") {
                   links.push({
                     [relation.sourceForeignKey]: parentKey,
-                    [relation.targetForeignKey]:
-                      target[
-                        referencedName(
-                          relation.junction,
-                          relation.targetForeignKey,
-                          relation.target,
-                        )
-                      ],
+                    [relation.targetForeignKey]: keyValue(
+                      relation.target,
+                      target,
+                      referencedName(
+                        relation.junction,
+                        relation.targetForeignKey,
+                        relation.target,
+                      ),
+                    ),
                   });
-                } else if (operation !== "create") {
-                  await attach(
-                    relation.target,
-                    target,
-                    relation.foreignKey,
-                    parentKey,
-                  );
+                } else if (operation !== "create" && !moving.has(entry)) {
+                  // An entry given twice (the same object) moves its row once.
+                  moving.add(entry);
+                  moved.push({
+                    row: target,
+                    key: primarySortValues(relation.target, target),
+                  });
                 }
               }
 
@@ -665,6 +804,19 @@ export const createNestedInsert = (
                   )
                   .doNothing()
                   .execute();
+              }
+
+              if (step === lastMove && relation.kind !== "through") {
+                moved.sort((left, right) => compareKeys(left.key, right.key));
+
+                for (const { row: target } of moved) {
+                  await attach(
+                    relation.target,
+                    target,
+                    relation.foreignKey,
+                    parentKey,
+                  );
+                }
               }
             }
           }
@@ -684,6 +836,10 @@ export const createNestedInsert = (
         let roots: Record<string, unknown>[] = [];
 
         const insertRoots = async () => {
+          if (waiting === rootBatch) {
+            waiting = undefined;
+          }
+
           if (!roots.length) {
             return;
           }
@@ -703,6 +859,8 @@ export const createNestedInsert = (
           }
         };
 
+        const rootBatch = { name: tableName, write: insertRoots };
+
         /** A connect of a batched root: nothing else is written for it. */
         const connectRow: ResolveRow = (
           target,
@@ -718,6 +876,7 @@ export const createNestedInsert = (
           if (parts && connectsOnly(parts)) {
             await forwards(tableName, value, parts, connectRow);
             roots.push(parts.scalars);
+            waiting = rootBatch;
             continue;
           }
 

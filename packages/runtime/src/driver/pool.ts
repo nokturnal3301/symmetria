@@ -7,12 +7,14 @@ import {
   type Driver,
   type ExecutionResult,
   type SessionDriver,
+  type StreamClaim,
   type TransactionDriver,
   type TransactionOptions,
 } from "../query/plan/types";
 import { transactionOptionsSQL, runTransaction } from "./transactions";
 import { runPostgresSession } from "./session";
 import { createPendingTasks } from "./pending";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { holders, type Holder } from "./serial";
 import type { QueryProfiler } from "../observability/profiling";
 import { queryError } from "./errors";
@@ -44,6 +46,12 @@ export type PostgresDriver = Driver & {
     callback: (driver: SessionDriver) => Promise<Result>,
   ) => Promise<Result>;
 };
+
+/**
+ * How long a request from code that started the streams holding every
+ * connection waits for one of them to be read on before it is refused.
+ */
+const STARTED_GRACE_MS = 1000;
 
 const rethrow = (error: unknown): never => {
   throw queryError(error);
@@ -77,6 +85,10 @@ export const createPostgresDriver = (
   const pool = classified(adapter);
   const pending = createPendingTasks();
   let closing: Promise<void> | undefined;
+  // The streams that hold one of the pool's connections, and how to end
+  // each: between two rows a stream waits for its reader, which may never
+  // ask again, so close() ends them instead of waiting for their loops.
+  const streams = new Map<Holder, () => Promise<void>>();
 
   const track = <Value>(operation: () => Promise<Value>): Promise<Value> => {
     if (closing) {
@@ -143,24 +155,155 @@ export const createPostgresDriver = (
       `symmetria: this query asks the pool for a connection from inside ${within}, and would wait forever; ${instead} or raise max`,
     );
   };
-  const free = <Value>(operation: () => Promise<Value>): Promise<Value> => {
-    const own = (holders.getStore() ?? []).filter(
-      (holder) => holder.open && holder.pool === pool,
-    );
+  // Requests held back by `gate()`: each checks again when a stream gives
+  // its connection back.
+  const gated = new Set<() => void>();
+  const ownHolders = (list: readonly Holder[]): Holder[] =>
+    list.filter((holder) => holder.open && holder.pool === pool);
+  /** The connections the holders stand for: a stream may be listed twice. */
+  const connections = (own: readonly Holder[]): number =>
+    new Set(own.map((holder) => holder.started ?? holder)).size;
+  /**
+   * A request from code that started streams which hold every connection,
+   * where nothing tells whether that code reads them: a `for await` loop's
+   * body is known (`enter`), but rows read through `ReadableStream.from()`,
+   * `Readable.from()`, a generator that maps them, or by hand, are read
+   * elsewhere. If it reads them, the request would wait forever; if not
+   * (a loop in an async helper, called without `await`), it waits its turn.
+   * It is sent once one of the streams gives its connection back, and
+   * refused once all of them have waited for their readers, with no row
+   * asked for, for `STARTED_GRACE_MS`; a stream that fetches is being read.
+   */
+  const gate = <Value>(
+    operation: () => Promise<Value>,
+    list: readonly Holder[],
+  ): Promise<Value> => {
+    const resume = AsyncLocalStorage.snapshot();
+    const progress = () =>
+      ownHolders(list).reduce(
+        (total, holder) =>
+          total + ((holder.started ?? holder).progress?.() ?? 0),
+        0,
+      );
 
-    return own.length >= pool.max
-      ? Promise.reject(refusal(own))
+    return new Promise<Value>((resolve, reject) => {
+      let seen = progress();
+      let since = performance.now();
+      const stop = () => {
+        clearInterval(timer);
+        gated.delete(check);
+      };
+      const check = () => {
+        const own = ownHolders(list);
+
+        if (closing || connections(own) < pool.max) {
+          stop();
+          resolve(resume(() => track(operation)));
+
+          return;
+        }
+
+        const current = progress();
+
+        // A stream that fetches, or hands out a row its reader asked for,
+        // is being read; one that waits for its reader may never be.
+        if (
+          current !== seen ||
+          own.some((holder) => (holder.started ?? holder).busy?.())
+        ) {
+          seen = current;
+          since = performance.now();
+        } else if (performance.now() - since >= STARTED_GRACE_MS) {
+          stop();
+          reject(refusal(own));
+        }
+      };
+      const timer = setInterval(check, STARTED_GRACE_MS / 4);
+
+      gated.add(check);
+    });
+  };
+  const free = <Value>(operation: () => Promise<Value>): Promise<Value> => {
+    const list = holders.getStore();
+
+    if (!list?.length) {
+      return track(operation);
+    }
+
+    const own = ownHolders(list);
+    // Transactions, sessions and the loops this code is the body of.
+    const firm = own.filter((holder) => !holder.started);
+
+    if (firm.length >= pool.max) {
+      return Promise.reject(refusal(firm));
+    }
+
+    return connections(own) >= pool.max
+      ? gate(operation, list)
       : track(operation);
   };
 
   const driver: PostgresDriver = {
-    // The holder enters the caller's context, which the loop body continues.
+    // Called where the stream's iterator is made. The holder enters the
+    // context of the code that reads the rows, which a loop body continues
+    // (see stream() in query/select/query.ts); the code that made the iterator,
+    // which may or may not read it, gets a `started` entry.
     [CONNECTION_CLAIM]: () => {
-      const holder: Holder = { pool, open: false, stream: true };
+      const holder: Holder & StreamClaim = {
+        pool,
+        open: false,
+        stream: true,
+        enter: () => {
+          const current = holders.getStore() ?? [];
+
+          if (!current.includes(holder)) {
+            holders.enterWith([
+              ...current.filter((outer) => outer.open),
+              holder,
+            ]);
+          }
+        },
+        entered: () => holders.getStore()?.includes(holder) ?? false,
+        // Each operation holds or waits for one connection; one held back
+        // by gate() waits too.
+        contended: () => pending.size() + gated.size > pool.max,
+        hold: (end, progress, busy) => {
+          holder.open = true;
+          holder.progress = progress;
+          holder.busy = busy;
+          streams.set(holder, end);
+
+          // Accepted before close() and given its connection after: it
+          // ends at once.
+          if (closing) {
+            void end();
+          }
+        },
+        release: () => {
+          if (!holder.open) {
+            return;
+          }
+
+          holder.open = false;
+          streams.delete(holder);
+
+          for (const check of [...gated]) {
+            check();
+          }
+        },
+      };
+      const started: Holder = {
+        pool,
+        stream: true,
+        started: holder,
+        get open() {
+          return holder.open;
+        },
+      };
 
       holders.enterWith([
         ...(holders.getStore() ?? []).filter((outer) => outer.open),
-        holder,
+        started,
       ]);
 
       return holder;
@@ -184,7 +327,12 @@ export const createPostgresDriver = (
       free(() =>
         holding((inside) => runPostgresSession(pool, inside), callback),
       ),
-    close: () => (closing ??= pending.settle().then(() => pool.close())),
+    // New work is refused from here on; open streams end their transactions,
+    // then accepted work drains.
+    close: () =>
+      (closing ??= Promise.allSettled([...streams.values()].map((end) => end()))
+        .then(() => pending.settle())
+        .then(() => pool.close())),
   };
 
   return Object.freeze(

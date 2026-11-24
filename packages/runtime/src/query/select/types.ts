@@ -469,10 +469,13 @@ export type ProjectionRow<Selection extends Projection> =
               ? ProjectionRow<Selection[Name]>
               : never;
       };
-/** Query options; every value may also be a callback over the projection's source and tools. */
-/** A predicate list; `undefined`, `null` and `false` entries are skipped, so optional filters need no branching. */
-/** Predicates combined with AND; falsy entries (`q && …` with an empty `q`) are skipped. */
+/**
+ * Predicates combined with AND. Falsy entries (`undefined`, `null`, `false`,
+ * `""`, `0`, such as `q && …` with an empty `q`) are skipped, so optional
+ * filters need no branching.
+ */
 export type PredicateList = readonly (Predicate | SkippedPredicate)[];
+/** Query options as values; `QueryOptions` also takes a callback for each. */
 export type ShapeControls = {
   readonly where?: Predicate | PredicateList;
   readonly orderBy?: Ordering | readonly [Ordering, ...Ordering[]];
@@ -704,9 +707,16 @@ type Terminals<Selection extends Projection> = Preparable<
   readonly first: () => Promise<ProjectionRow<Selection> | null>;
   readonly one: () => Promise<ProjectionRow<Selection>>;
   readonly maybeOne: () => Promise<ProjectionRow<Selection> | null>;
-  /** `SELECT COUNT(*)` with the same filters; LIMIT, OFFSET, GROUP BY and DISTINCT count result rows. */
+  /**
+   * `SELECT COUNT(*)` with the same filters; LIMIT, OFFSET, GROUP BY and
+   * DISTINCT count result rows. With `forUpdate`/`forShare` it locks the rows
+   * it counts (with `skipLocked`, it counts the rows it could lock).
+   */
   readonly count: () => Promise<number>;
-  /** `SELECT 1 … LIMIT 1`: whether at least one row matches. */
+  /**
+   * `SELECT 1 … LIMIT 1`: whether at least one row matches. With
+   * `forUpdate`/`forShare` it locks every row the query selects.
+   */
   readonly exists: () => Promise<boolean>;
   /** One keyset page; `after` moves forward, `before` backward (never both). */
   readonly page: (
@@ -723,6 +733,12 @@ type Terminals<Selection extends Projection> = Preparable<
    */
   readonly stream: (options?: {
     size?: number;
+    /**
+     * Outside a transaction: once the reader has asked for no row this long
+     * while other queries wait for a connection, the stream ends and gives
+     * its connection back (default 60000; `Infinity` never).
+     */
+    idleTimeoutMs?: number;
   }) => AsyncIterable<ProjectionRow<Selection>>;
 };
 export type Query<
@@ -886,7 +902,10 @@ type SearchOptions<Columns, Tools, Searches> = {
   readonly where?: QueryOptions<Columns, Tools>["where"];
   /** How many rows to return; 10 unless given. */
   readonly limit?: number;
-  /** How many rows each way of searching contributes before they are merged. */
+  /**
+   * How many rows each way of searching contributes before they are merged;
+   * `max(40, 4 × limit)` unless given.
+   */
   readonly candidates?: number;
 } & { readonly [Name in keyof Searches]?: SearchInput<Searches[Name]> };
 
@@ -935,8 +954,9 @@ export type TableSearch<
     >,
   ): SearchQuery<ProjectionRow<ShapeSelection<Shape>>>;
   /**
-   * Computes the embeddings that are missing: rows written before the search
-   * was declared, or whose text an UPDATE changed. Resolves to their number.
+   * Computes the embeddings that are missing, such as those of rows written
+   * before the search was declared or whose text an UPDATE changed. Resolves
+   * to the number of rows it embedded.
    */
   readonly reindex: (options?: {
     readonly where?: QueryOptions<
@@ -973,7 +993,8 @@ export type QueryTable<
     RootTable,
     keyof Relations[RootTable] & string,
     RelatedColumns<Rows, Relations, RootTable>,
-    keyof UniqueKeys & string
+    keyof UniqueKeys & string,
+    KeyNames | (UniqueKeys[keyof UniqueKeys] & string)
   > & {
     readonly shape: <const Shape extends ProjectionObject>(
       callback: (
@@ -1047,8 +1068,9 @@ type KeyObject<Row, KeyNames extends keyof Row, UniqueKeys> =
     }[keyof UniqueKeys];
 /**
  * The columns of one key and no others: a key is tried as a whole, so a column
- * beside it would name no key at all. The lookup runs at once, which leaves a
- * `prepare()` parameter nothing to wait for; `byId()` and `by` take those.
+ * beside it would name no key at all. `get()` and `find()` read the row
+ * rather than build a query, so this form takes no `prepare()` parameter;
+ * `byId()` and `by` do.
  */
 type KeyColumns<Row, Names extends keyof Row> = {
   readonly [Name in Names]: WriteValue<NonNullable<Row[Name]>>;
@@ -1103,14 +1125,18 @@ type KeyLookup<
     >,
     "update" | "delete"
   >;
+/** A prepared parameter for a key: a `bigint` key also takes an `int` one. */
+type KeyParameter<Value> =
+  | Parameter<Value>
+  | (bigint extends Value ? Parameter<number> : never);
 /** A key's value as a filter takes it: a `bigint` key also accepts a safe integer. */
 type LookupKey<Row, KeyNames extends keyof Row> = {
   [Name in KeyNames]: [Exclude<KeyNames, Name>] extends [never]
-    ? WriteValue<NonNullable<Row[Name]>> | Parameter<NonNullable<Row[Name]>>
+    ? WriteValue<NonNullable<Row[Name]>> | KeyParameter<NonNullable<Row[Name]>>
     : {
         [Key in KeyNames]:
           | WriteValue<NonNullable<Row[Key]>>
-          | Parameter<NonNullable<Row[Key]>>;
+          | KeyParameter<NonNullable<Row[Key]>>;
       };
 }[KeyNames];
 

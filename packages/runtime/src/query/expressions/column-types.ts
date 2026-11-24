@@ -20,12 +20,16 @@ export type Decimal = `${number}`;
 
 /**
  * A value to compare with: the stored form, safe integers for bigint and any
- * string for decimals (as their codecs accept), or a column of either type.
+ * string for decimals (as their codecs accept), or a column of either type;
+ * a bigint also compares with a number column or prepared parameter.
  */
 export type Comparable<Stored, Value = Stored> =
   | Literal<Stored>
   | SelectedColumn<Stored | null>
-  | SelectedColumn<Value | null>;
+  | SelectedColumn<Value | null>
+  | (bigint extends NonNullable<Stored>
+      ? SelectedColumn<number | null>
+      : never);
 /**
  * A literal a column's codec encodes: its stored form, safe integers for
  * bigint, any string for decimals (not for enum labels that look numeric),

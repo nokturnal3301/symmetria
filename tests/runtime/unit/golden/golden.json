@@ -88,7 +88,7 @@
     "parameters": []
   },
   "conditions/inverse-many": {
-    "sql": "SELECT \"users\".\"name\" AS \"name\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"body\" AS \"body\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\") AS \"__symmetria_row\") AS \"notes\", (SELECT COUNT(*) AS \"count\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\") AS \"total\"\nFROM \"users\" AS \"users\"\nWHERE EXISTS (SELECT 1 AS \"present\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\" AND \"__symmetria_aggregate_0\".\"body\" = $1)",
+    "sql": "SELECT \"users\".\"name\" AS \"name\", (SELECT COALESCE(json_agg(\"__symmetria_row\"), '[]'::json) FROM (SELECT \"__symmetria_aggregate_0\".\"body\" AS \"body\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE (\"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\" AND \"users\".\"id\" IS NOT NULL AND NOT EXISTS (SELECT 1 AS \"present\"\nFROM \"users\" AS \"users_2\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users_2\".\"email\" AND \"users_2\".\"id\" < \"users\".\"id\"))) AS \"__symmetria_row\") AS \"notes\", (SELECT COUNT(*) AS \"count\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE (\"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\" AND \"users\".\"id\" IS NOT NULL AND NOT EXISTS (SELECT 1 AS \"present\"\nFROM \"users\" AS \"users_2\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users_2\".\"email\" AND \"users_2\".\"id\" < \"users\".\"id\"))) AS \"total\"\nFROM \"users\" AS \"users\"\nWHERE EXISTS (SELECT 1 AS \"present\"\nFROM \"notes\" AS \"__symmetria_aggregate_0\"\nWHERE (\"__symmetria_aggregate_0\".\"author_email\" = \"users\".\"email\" AND \"users\".\"id\" IS NOT NULL AND NOT EXISTS (SELECT 1 AS \"present\"\nFROM \"users\" AS \"users_2\"\nWHERE \"__symmetria_aggregate_0\".\"author_email\" = \"users_2\".\"email\" AND \"users_2\".\"id\" < \"users\".\"id\")) AND \"__symmetria_aggregate_0\".\"body\" = $1)",
     "parameters": ["x"]
   },
   "conditions/scoped-one": {
@@ -383,12 +383,12 @@
         "parameters": [1]
       },
       {
-        "sql": "UPDATE \"posts\" AS \"posts\" SET \"author_id\" = $1\nWHERE (\"posts\".\"id\" = $2)",
-        "parameters": [1, 1]
-      },
-      {
         "sql": "SELECT \"posts\".\"id\" AS \"id\", \"posts\".\"slug\" AS \"slug\", \"posts\".\"title\" AS \"title\", \"posts\".\"body\" AS \"body\", \"posts\".\"author_id\" AS \"authorId\", \"posts\".\"editor_id\" AS \"editorId\", \"posts\".\"views\" AS \"views\", \"posts\".\"metadata\" AS \"metadata\", \"posts\".\"document\" AS \"document\", \"posts\".\"status\" AS \"status\", \"posts\".\"labels\" AS \"labels\", \"posts\".\"created_at\" AS \"createdAt\"\nFROM \"posts\" AS \"posts\"\nWHERE (\"posts\".\"slug\" = $1)\nLIMIT 2",
         "parameters": ["known"]
+      },
+      {
+        "sql": "UPDATE \"posts\" AS \"posts\" SET \"author_id\" = $1\nWHERE (\"posts\".\"id\" = $2)",
+        "parameters": [1, 1]
       },
       {
         "sql": "UPDATE \"posts\" AS \"posts\" SET \"author_id\" = $1\nWHERE (\"posts\".\"id\" = $2)",
@@ -886,7 +886,7 @@
     ]
   },
   "json/paths": {
-    "sql": "SELECT (\"users\".\"settings\" #> ARRAY[$1::text]) AS \"theme\", ((\"users\".\"settings\" #> ARRAY[$2::text]) #> ARRAY[$3::text]) AS \"email\", ((\"users\".\"settings\" #> ARRAY[$4::text]) #> ARRAY[$5::text]) AS \"firstTag\", jsonb_array_length(NULLIF(((\"users\".\"settings\" #> ARRAY[$4::text]))::jsonb, 'null'::jsonb)) AS \"next\"\nFROM \"users\" AS \"users\"\nWHERE (\"users\".\"settings\" #> ARRAY[$1::text]) = $6::text::jsonb AND (NULLIF((\"users\".\"settings\" #> ARRAY[$7::text]), 'null'::jsonb)) IS NOT NULL AND (\"users\".\"settings\" #> ARRAY[$1::text]) IN ($8::text::jsonb, $9::text::jsonb) AND \"users\".\"settings\" @> $10::text::jsonb AND EXISTS (SELECT 1 FROM jsonb_array_elements(NULLIF(((\"users\".\"settings\" #> ARRAY[$4::text]))::jsonb, 'null'::jsonb)) AS \"__symmetria_element\"(\"value\") WHERE \"__symmetria_element\".\"value\" = COALESCE($11::text::jsonb, 'null'::jsonb))\nORDER BY (\"users\".\"settings\" #> ARRAY[$1::text]) ASC",
+    "sql": "SELECT (\"users\".\"settings\" #> ARRAY[$1::text]) AS \"theme\", ((\"users\".\"settings\" #> ARRAY[$2::text]) #> ARRAY[$3::text]) AS \"email\", ((\"users\".\"settings\" #> ARRAY[$4::text]) #> ARRAY[$5::text]) AS \"firstTag\", jsonb_array_length(CASE WHEN jsonb_typeof(((\"users\".\"settings\" #> ARRAY[$4::text]))::jsonb) = 'array' THEN ((\"users\".\"settings\" #> ARRAY[$4::text]))::jsonb END) AS \"next\"\nFROM \"users\" AS \"users\"\nWHERE ((\"users\".\"settings\" #> ARRAY[$1::text]) = $6::text::jsonb OR ((\"users\".\"settings\" #> ARRAY[$1::text]) = 'null'::jsonb AND NULL)) AND (NULLIF((\"users\".\"settings\" #> ARRAY[$7::text]), 'null'::jsonb)) IS NOT NULL AND ((\"users\".\"settings\" #> ARRAY[$1::text]) IN ($8::text::jsonb, $9::text::jsonb) OR ((\"users\".\"settings\" #> ARRAY[$1::text]) = 'null'::jsonb AND NULL)) AND (\"users\".\"settings\" @> $10::text::jsonb OR (\"users\".\"settings\" = 'null'::jsonb AND NULL)) AND (CASE WHEN jsonb_typeof(((\"users\".\"settings\" #> ARRAY[$4::text]))::jsonb) = 'array' THEN EXISTS (SELECT 1 FROM jsonb_array_elements(NULLIF(((\"users\".\"settings\" #> ARRAY[$4::text]))::jsonb, 'null'::jsonb)) AS \"__symmetria_element\"(\"value\") WHERE \"__symmetria_element\".\"value\" = COALESCE($11::text::jsonb, 'null'::jsonb)) END)\nORDER BY (\"users\".\"settings\" #> ARRAY[$1::text]) ASC",
     "parameters": [
       "theme",
       "notifications",
@@ -924,7 +924,7 @@
     "parameters": ["theme", "\"light\""]
   },
   "search/match-and-rank": {
-    "sql": "SELECT \"posts\".\"id\" AS \"id\", ts_rank(to_tsvector('english', \"posts\".\"title\"), websearch_to_tsquery('english', $1)) AS \"rank\", ts_headline('simple', \"posts\".\"body\", websearch_to_tsquery('simple', $2)) AS \"headline\", ts_rank(\"posts\".\"document\", websearch_to_tsquery('simple', $3)) AS \"stored\"\nFROM \"posts\" AS \"posts\"\nWHERE to_tsvector('simple', \"posts\".\"title\") @@ websearch_to_tsquery('simple', $4) AND \"posts\".\"document\" @@ websearch_to_tsquery('english', $5)\nORDER BY ts_rank(to_tsvector('simple', \"posts\".\"title\"), websearch_to_tsquery('simple', $6)) DESC",
+    "sql": "SELECT \"posts\".\"id\" AS \"id\", ts_rank(to_tsvector('english', \"posts\".\"title\"), (SELECT websearch_to_tsquery('english', $1))) AS \"rank\", ts_headline('simple', \"posts\".\"body\", (SELECT websearch_to_tsquery('simple', $2))) AS \"headline\", ts_rank(\"posts\".\"document\", (SELECT websearch_to_tsquery('simple', $3))) AS \"stored\"\nFROM \"posts\" AS \"posts\"\nWHERE to_tsvector('simple', \"posts\".\"title\") @@ websearch_to_tsquery('simple', $4) AND \"posts\".\"document\" @@ websearch_to_tsquery('english', $5)\nORDER BY ts_rank(to_tsvector('simple', \"posts\".\"title\"), (SELECT websearch_to_tsquery('simple', $6))) DESC",
     "parameters": ["bun sql", "bun sql", "bun", "bun sql", "bun", "bun sql"]
   },
   "dates/trunc": {
@@ -940,7 +940,7 @@
     "parameters": [0, "a", ["a"], ["x", "y"], 1, "b"]
   },
   "search/document": {
-    "sql": "SELECT \"posts\".\"id\" AS \"id\", ts_rank((setweight(to_tsvector('english', coalesce(\"posts\".\"title\", '')), 'A') || setweight(to_tsvector('english', coalesce(\"posts\".\"body\", '')), 'B')), websearch_to_tsquery('english', $1)) AS \"rank\"\nFROM \"posts\" AS \"posts\"\nWHERE (setweight(to_tsvector('english', coalesce(\"posts\".\"title\", '')), 'A') || setweight(to_tsvector('english', coalesce(\"posts\".\"body\", '')), 'B')) @@ websearch_to_tsquery('english', $2)",
+    "sql": "SELECT \"posts\".\"id\" AS \"id\", ts_rank((setweight(to_tsvector('english', coalesce(\"posts\".\"title\", '')), 'A') || setweight(to_tsvector('english', coalesce(\"posts\".\"body\", '')), 'B')), (SELECT websearch_to_tsquery('english', $1))) AS \"rank\"\nFROM \"posts\" AS \"posts\"\nWHERE (setweight(to_tsvector('english', coalesce(\"posts\".\"title\", '')), 'A') || setweight(to_tsvector('english', coalesce(\"posts\".\"body\", '')), 'B')) @@ websearch_to_tsquery('english', $2)",
     "parameters": ["bun", "bun"]
   },
   "subquery/exists-in-scalar": {

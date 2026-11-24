@@ -360,4 +360,19 @@ model.posts((post) => ({ id: post.id }), {
   await model.$transaction((transaction) =>
     transaction.$batch((db) => [db.users.count()]),
   );
+
+  // The batch's handle offers reads; writes and transactions are refused,
+  // and it still fits a helper that takes the database.
+  const firstUser = (db: typeof model) => db.users.find(1);
+  await model.$batch((db) => [
+    firstUser(db),
+    db.users.byId(1),
+    db.$scope({ users: (user) => user.active.is(true) }).users.count(),
+    // @ts-expect-error a write is not a read
+    db.users.insert({ name: "Ada" }),
+    // @ts-expect-error a write is not a read
+    db.users.delete().all(),
+    // @ts-expect-error a transaction is not a read
+    db.$transaction(async () => 1),
+  ]);
 }

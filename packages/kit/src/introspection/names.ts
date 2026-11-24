@@ -155,6 +155,8 @@ export const keyAllocator = (
 
 /** Every identifier a generated module imports or declares at its top level. */
 export const MODULE_IDENTIFIERS: readonly string[] = [
+  // The value type of a customType() over numeric, imported as a type.
+  "Decimal",
   "and",
   "bigint",
   "bool",
@@ -299,17 +301,45 @@ export const conventionalNames = {
     objectName(table, column, "enum"),
 };
 
-/** Escapes text for a JavaScript template literal. */
+const unicodeEscape = (character: string): string =>
+  `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
+
+/**
+ * What a template literal needs escaped (`\`, a backtick, `${`), and what it
+ * would keep but should not show as it is: a carriage return, which
+ * JavaScript reads as `\n`; the other control characters but the line feed
+ * and the tab; U+2028 and U+2029, which editors show as line breaks; the
+ * bidirectional overrides and isolates, which show text in another order.
+ */
+const TEMPLATE_ESCAPED =
+  /[\\`\r\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]|\$\{/g;
+
+/** Escapes text for a JavaScript template literal, whose cooked text is the text. */
 export const escapeTemplate = (text: string): string =>
-  text.replaceAll("\\", "\\\\").replaceAll("`", "\\`").replaceAll("${", "\\${");
+  text.replace(TEMPLATE_ESCAPED, (match) =>
+    match === "\\" || match === "`" || match === "${"
+      ? `\\${match}`
+      : match === "\r"
+        ? "\\r"
+        : unicodeEscape(match),
+  );
+
+/** What JSON.stringify keeps as it is but a string literal should not show (see TEMPLATE_ESCAPED). */
+const STRING_ESCAPED = /[\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 
 /** A double-quoted JavaScript string literal. */
-export const quoteString = (text: string): string => JSON.stringify(text);
+export const quoteString = (text: string): string =>
+  JSON.stringify(text).replace(STRING_ESCAPED, unicodeEscape);
 
 /** `"identifier"` in SQL, for suggested fixes. */
 export const quoteSql = (identifier: string): string =>
   `"${identifier.replaceAll('"', '""')}"`;
 
-/** `'text'` in SQL, for suggested fixes. */
+/**
+ * `'text'` in SQL, for suggested fixes; text with a backslash as an escape
+ * string (`E'a\\b'`), which reads the same with standard_conforming_strings off.
+ */
 export const sqlString = (text: string): string =>
-  `'${text.replaceAll("'", "''")}'`;
+  text.includes("\\")
+    ? `E'${text.replaceAll("\\", "\\\\").replaceAll("'", "''")}'`
+    : `'${text.replaceAll("'", "''")}'`;

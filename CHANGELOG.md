@@ -1,5 +1,870 @@
 # Changelog
 
+## 3.6.0 — 2026-11-24
+
+Fixes from a bug hunt on 3.5.0 in places no hunt had reached (table search and
+embedding providers, the TypeScript types, the command line, Node.js and
+behaviour under load), and from two more hunts before release: raw SQL and
+quoting, nested writes, differential fuzzing, speed, tenant scopes, write
+filters, running migrations, the reference's promises and the better-auth
+adapter. Rows read or written outside a `$scope()`, writes that touched more
+rows than their filter names, and names from the database that ran as code or
+SQL are among them.
+
+### Runtime (`symmetria`)
+
+- Full-text search finds a row by its own words in every language: PostgreSQL
+  lowercases the question as it lowercased the document (Turkish `İ` and Greek
+  final `Σ` were lowercased by JavaScript's rules and missed). Paths, signed
+  numbers and URL queries keep the characters PostgreSQL's parser keeps
+  (`/etc/hosts`, `-5`, `./run.sh`, `https://x.org/a?b=1`). Plain ASCII questions
+  find every row they found before. A question with a sign, a slash or a URL
+  query next to a word may find more rows, and may rank the rows it finds
+  differently. Punctuation that PostgreSQL's parser drops (`keys?`, `(account,`,
+  `e-mail--`) asks for nothing more than the words, so such a question finds the
+  same rows, ranked the same, as before. However long or repetitive a question
+  is, the query it sends stays bounded: a word made of more than 16 runs of
+  letters and digits is searched by its first run only, and the other spellings
+  sent fit in 128 operands and 256 runs of letters and digits.
+- **Changed:** a search object, and a write that waits for the model to embed
+  its rows, run each time they are awaited, as queries and writes do. A kept
+  search sees rows written since and the current `$scope()` tenant; it embeds
+  its question once and asks the model again only after a failure. An embedded
+  insert awaited twice inserts twice.
+- **Changed:** inside `$transaction`, a write that waits for its embedding and a
+  search that waits for its question's embedding keep the place in the
+  transaction's order they took when they started:
+  `Promise.all([tx.chunks.insert(row), tx.chunks.count()])` counts the row, and
+  a search started before an insert does not see it. The model is asked at once,
+  and the statement runs in a savepoint that holds the transaction's connection
+  until the model has answered. So, as with chunked and nested inserts, catching
+  a failure of such a write leaves the transaction usable instead of aborting
+  it. Each such write or search adds SAVEPOINT and RELEASE statements, and shows
+  as a `savepoint` span under OpenTelemetry.
+- `missing()` and `reindex()` failed over a meaning source column that is not
+  text (an enum, uuid, numeric, a date, a timestamp, jsonb, a boolean, a number,
+  a custom type such as ltree, hstore or bytea) with "invalid input value" or
+  `invalid input syntax for type timestamp with time zone: ""`, and `reindex()`
+  never embedded a row whose value is not a JavaScript string (a timestamp, a
+  number). They now read such columns as a query reads them, through their
+  codecs, and `reindex()` builds the text as an insert does. `missing()` reads a
+  value whose text cannot be empty (a number, a date, uuid, bytes, an array)
+  only to see that it is not NULL, and a jsonb document only for its JSON type,
+  plus its text when it is a JSON string: over 100,000 documents of 2 KB it
+  takes about 14 ms, where `IS NOT NULL` takes 6 ms. `fullText()` reads uuid,
+  numeric, inet and time columns through a cast. Text, varchar, char and citext
+  columns keep the same stored expression, so no migration follows. A
+  `customType()` declared with a text `base` whose own type is not text (ltree,
+  hstore, an enum type) is read through its output.
+- **Changed:** a meaning embeds a source value that is not a string when the row
+  is written, with the text `reindex()` gives it: a number, a bigint or a
+  boolean as JavaScript writes it, a `Date` as its ISO text, bytes as `\x…`, an
+  array or an object as JSON. Before, such a row was written without an
+  embedding. In a json or jsonb column an object or an array is embedded as JSON
+  with its keys sorted, so the text does not depend on the order jsonb keeps
+  keys in, and a JSON string as the string itself. JSON `null`, and a JSON
+  string of only spaces, have no text, as NULL has none. Where PostgreSQL stores
+  a value in its own form (a uuid's letter case, a numeric's scale, an inet's
+  `/32`, a `Date` in a `date` column), an insert embeds the value as written and
+  `reindex()` the value as stored. A number in a `real` column is embedded as
+  the column keeps it (`1 / 3` as `0.33333334`), by an insert and `reindex()`
+  alike. The elements of a `bytea` or `real` array are embedded as a lone value
+  of their type is (a `bytea` array as `["\\x0102"]`, not as JSON objects of
+  byte indexes). Since such rows wait for their embedding, `toSQL()` and
+  `prepare()` of an `insert()` or `upsert()` now also throw ("cannot wait for
+  embeddings") for a table whose meaning reads a column that is not text, such
+  as a number or a date; pass the embedding with the rows to get the SQL.
+- `reindex()` never wrote the embedding of a row whose source column has a codec
+  that changes the stored text (an encrypted or encoded `customType()`): it
+  asked the model again on every call, and `missing()` kept counting the row.
+  The check that a row did not change while the model answered now compares the
+  stored values, so the row is embedded once. A stored value that decodes to
+  only spaces is still counted by `missing()`, which decides in SQL.
+- `reindex()` never ended over a table whose primary key reads in another form
+  than stored: a `timestamptz` with microseconds, a numeric decoded to a number,
+  a `customType()` that decodes. It found no row to write, read the same row
+  again, and asked the model on every turn. It now finds and pages rows by their
+  stored key. Keys read exactly (integers, text, uuid) keep the same SQL.
+- **Changed:** `fullText()` refuses an enum, a date, an interval, money, a
+  timestamp, a range, a multirange or an array column, in any spelling
+  (`timestamp(3) with time zone`, `_text`, `varchar(40)[]`,
+  `character varying(10)[]`, `char(3)[]`, an array of a custom type such as
+  `citext[]`): PostgreSQL cannot keep their text in a generated column, so the
+  migration failed. `search()` over such an array reads its text; it failed with
+  `function to_tsvector(…, character varying[]) does not exist`. `bm25()` takes
+  only the types pg_search matches words in: text, varchar, citext, json and
+  jsonb, and arrays of text or varchar. It refuses every other type of
+  PostgreSQL's own, in any spelling: uuid, numeric, inet, time, a date, a
+  timestamp, an interval, money, numbers, booleans, bytea, `char(n)`, `name`, a
+  tsvector, xml, a range, a multirange, and any other array (`int[]`, `uuid[]`,
+  `citext[]`). It also refuses a `customType()` declared with a `base` when its
+  own SQL type is not one of those (a domain over text, ltree, hstore). With
+  these, the migration failed (char(n), name, tsvector, xml, a multirange,
+  bytea), or every search did ("type `_int4` is not compatible with the `|||`
+  operator"). A `customType()` without `base` is still accepted.
+- `ollama()` reads `OLLAMA_HOST` as the `ollama` command does: without a scheme
+  the port is 11434 (`0.0.0.0`, `127.0.0.1` and `localhost` went to port 80),
+  and `0.0.0.0` is reached at `127.0.0.1`; a URL (`baseUrl` or `OLLAMA_HOST`
+  with a scheme) is used as it is, credentials, port and path included.
+- **Changed:** every ready-made embedding model takes `timeoutMs` (60,000 ms,
+  one minute, unless given) and `signal`. A service that accepts a request and
+  never answers now fails the write or search with an error naming the service,
+  instead of holding it, and its transaction, forever. A model that needs longer
+  than a minute for a large batch needs a larger `timeoutMs`.
+- **Changed:** a row whose embedded text is only whitespace (as JavaScript's
+  `\s` counts it, no-break spaces and byte order marks included) gets no
+  embedding, as a whitespace-only question finds nothing; `missing()` and
+  `reindex()` leave such rows out. To tell, they read each column's first
+  character and look further only when it is a space, so they cost less than in
+  3.5.0, which built each row's whole text.
+- The reference states that a full-text question uses its first 64 distinct
+  words.
+- A full-text rank or headline (`searchRank()`, `searchHeadline()`, and the
+  ranking of `table.search()` by words) parses its question once per statement.
+  On Bun, and with `symmetria/pg`'s `prepare: true`, PostgreSQL may run a
+  prepared statement with a generic plan from its sixth run. There the question
+  was parsed again for every row: a table search for a long question over
+  100,000 matching rows went from about 80 ms on its first runs to 1,400 ms; it
+  now takes about 200 ms. A match (`search()`) still parses the question in
+  place, so the planner sees it.
+- **Changed:** a `stream()` outside a transaction ends its transaction and gives
+  its connection back once its reader has asked for no row for `idleTimeoutMs`
+  (default 60000 ms, one minute) while other queries wait for one of the pool's
+  connections. Reading on then fails with "this stream was ended because its
+  reader asked for no row …". Before, an iterator read partly and dropped
+  without `return()` kept its connection until garbage collection, which Node.js
+  may not run for a long time in a quiet process: the pool starved and `close()`
+  hung. While no query waits, a reader may pause as long as it likes.
+  `stream({ idleTimeoutMs })` sets a shorter or longer time, or `Infinity`.
+- **Changed:** `driver.close()`, and so `testDatabase().close()`, ends the
+  transactions of open streams instead of waiting for their loops, as `$close()`
+  does.
+- **Changed:** `$close()` refuses new work from the moment it is called. Before,
+  a query or a stream started while it ended the open streams still ran, and
+  such a stream kept `$close()` waiting for its whole loop.
+- A `stream()` loop inside an async helper no longer counts its connection as
+  held by the helper's caller. The caller's queries were refused ("…would wait
+  forever") although they would only have waited their turn; they now wait while
+  the loop goes on, however long its fetches take. A query from a `for await`
+  body that would wait for the loop's connection is still refused at once. A
+  query from code that reads a stream another way (`ReadableStream.from()`,
+  `Readable.from()`, an async generator over it, `next()` by hand), while the
+  streams it started hold every connection, is refused once all of them have
+  waited a second for their reader to ask for the next row. The same applies to
+  a helper whose loop body spends longer than a second on a row before asking
+  for the next one. A stream's iterator is still an async generator, so
+  `await using` closes it.
+- **Changed:** `count()` and `exists()` of a source with `forUpdate`/`forShare`
+  lock every row it selects, as the query, `first()` and `aggregate()` do,
+  including `of`, `noWait` and `skipLocked`; with `skipLocked`, `count()` counts
+  the rows it could lock. Before, they took no locks. A locking `count()`,
+  `exists()` or `aggregate()` keeps the source's ordering, the order its rows
+  are locked in. In `$batch()`, these reads of a locking source are refused like
+  the locking query itself; before, `aggregate()` joined the batch with its lock
+  and `count()`/`exists()` joined without one.
+- **Changed:** "too many connections" (SQLSTATE 53300) is a `ConnectionError`
+  (`kind: "connection"`) on both drivers, because the connection could not be
+  opened and a later attempt may get a slot. It was a `QueryError` of kind
+  `other`.
+- A `customType("x")` declared without options (or with `null`), which plain
+  JavaScript can write, reads and writes values as any column of that SQL type
+  does. Every query that bound a value to it failed with "codec.encode is not a
+  function".
+- A `customType()` declared with another name of a 64-bit or decimal type
+  (`int8`, `BIGINT`, `bigserial`, `decimal(30,10)`, `NUMERIC(30,10)`,
+  `dec(30,10)`, `int8[]`, or an array type name such as `_int8` or `_numeric`)
+  kept its precision only at the top level: nested results, `$batch()` and
+  DISTINCT nested objects read it as a JSON number, so 9007199254740993 came
+  back as 9007199254740992, and `dec(30,10)` read
+  12345678901234567890.1234567891 as 12345678901234567000. Every spelling
+  PostgreSQL accepts is now known, `char varying(n)`, `bit varying(n)` and the
+  other array type names (`_bool`, `_uuid`, `_date`, `_timestamptz` …) included.
+- `searchDocument()` and a column's `search()`, `searchRank()` and
+  `searchHeadline()` failed in queries over columns that are not text (an enum,
+  uuid, date, numeric, inet, timestamp, boolean or bigint column), with "invalid
+  input value" or "function to_tsvector(…) does not exist", and
+  `searchDocument()` failed over a jsonb column or a JSON path with "invalid
+  input syntax for type json". They now read such a value as its text, as table
+  search does. A JSON value is read by its string values, as PostgreSQL's
+  full-text functions read it and as `search()` read a jsonb column before: its
+  keys, numbers and booleans are no words, and an index on
+  `to_tsvector(cfg, column)` still serves the match. Text and JSON values render
+  the same SQL as before in `search()`, `searchRank()` and `searchHeadline()`. A
+  `customType()` is read as its `base` (new, see below). One declared without a
+  `base`, as every schema written for 3.5.0 is, is read as it is, as before,
+  since a domain may be text or JSON: `search()`, `searchRank()` and
+  `searchHeadline()` read a domain over jsonb by its string values, and an index
+  on `to_tsvector(cfg, column)` still serves them; `searchDocument()` and
+  `fullText()` over such a domain still fail ("invalid input syntax for type
+  json") until the column declares `base: "jsonb"`.
+- `minimum()` and `maximum()` of a `customType("bool")`, `"BOOLEAN"` or
+  `"UUID"`, and of range types, failed with "function max(…) does not exist".
+- `customType(sqlType, { base })` states the type a domain stands for:
+  `customType<Decimal>("amount", { base: "numeric(30,10)" })` reads and writes
+  as `numeric(30, 10)` does, everywhere, and `{ base: "timestamptz" }` reads
+  `Date`s in nested results too. With `encode` and `decode`, `decode` receives
+  the base type's value. The base is not part of the DDL. Searches read such a
+  column as its base too: `search()`, `searchDocument()` and `fullText()` read a
+  domain over uuid through a cast, and treat one over a date as a date.
+- A vector distance in a CHECK or a partial index's `where()`
+  (`embedding.l2Distance([…]).below(0.5)`) failed at migrate with "cannot use
+  subquery in check constraint" since 3.4.1. DDL writes the vector as 3.4.0 did,
+  so pull and drift agree.
+- `searchDocument()` in an index over a jsonb column or JSON path failed to
+  migrate ("invalid input syntax for type json"), and so did a `fullText()`
+  search over a jsonb or integer column. The index now reads each part as the
+  query reads it: JSON as `coalesce(…, '{}')`, a type known not to be text (one
+  of PostgreSQL's own, an enum, a customType's base) as `(part)::text`, a custom
+  type without a base as it is. So it migrates and serves the query.
+- **Changed:** an index on `searchDocument()` refuses, when the schema is
+  declared, a part whose text PostgreSQL cannot index: an enum, a date, an
+  interval, money, a timestamp, a range, a multirange or an array, or a
+  customType whose base is one of them. Such an index failed at migrate
+  ("functions in index expression must be marked IMMUTABLE"; in 3.5.0 "invalid
+  input value"). Queries and checks still read those columns as text. A
+  `customType()` without `base` cannot be checked (a domain over a date, an enum
+  type, ltree); declare its `base`.
+- On Node.js with symmetria/pg, a `bytea` value was a view into Node's shared 8
+  KB buffer pool: its `.buffer` held other queries' SQL, parameters and rows. It
+  now owns its bytes.
+- A query called with no arguments, as `node:assert`'s `rejects()` and
+  `doesNotReject()` call it, runs and returns its promise, instead of throwing
+  "a shape requires a synchronous callback".
+- A prepared `jsonb(schema)` parameter can be written into its column. A
+  prepared `bigint` parameter takes a safe integer. An `int` parameter compares
+  with a bigint column and looks up a bigint key.
+- **Changed:** the types refuse inserts, upserts, updates, deletes, table search
+  and `$transaction()` on the `$batch()` handle, and `upsert({ by })` and
+  `onConflict()` columns that belong to no primary or unique key. The runtime
+  already refused the writes, `$transaction()` and such key columns. A table
+  search on the `$batch()` handle still runs at runtime, as its own statement
+  outside the batch's single snapshot; run it outside `$batch()`.
+- Docs: the `pull` example in the reference now declares the `tags` table that
+  its junction table points to.
+- A scoped table joined into a query of another database keeps its scope.
+  `db.posts((post, { innerJoin }) => … innerJoin(tenant.users, …))`,
+  `crossJoin(tenant.users)` and `leftJoin(tenant.users.as("author"), …)`, also
+  inside `$batch` and `$transaction`, read only the tenant's users. Before, the
+  JOIN carried only the scope of the query's own database, so another tenant's
+  rows were read. A narrower `tenant.$scope({ users: … }).users` joined into a
+  `tenant` query now adds its condition too.
+- **Changed:** a query with its own fields or options used as a join source is
+  refused: `db.users({ where })`, `db.users({ limit })`, `db.users(shape)`
+  without `.as()`, `db.users.byId(1)`. Before, its filter, limit and fields were
+  silently dropped. The types already refused this. Name a query with selected
+  fields with `.as("name")` to join it as a derived table.
+- **Changed:** `$scope()` reads each table's callback as a property. A class
+  instance whose methods are named after the tables (called with the instance as
+  `this`), an inherited property or a non-enumerable property now scopes its
+  table. Before, such a scope silently filtered nothing. A `Map`, `Set`, array,
+  function, promise or missing argument is refused with a clear error instead of
+  being ignored.
+- Tables named like a member of every object, such as `toString` or `valueOf`,
+  can be queried. Before, every query on them failed with "expected a SQL
+  predicate".
+- **Changed:** a `$scope()` filter that holds for every row is refused, both at
+  `$scope()` and at each execution. Examples:
+  `(post) => and(tenant && post.tenantId.is(tenant))` without a tenant, `and()`,
+  `isNot(null)` of a NOT NULL column. Reads, writes, counts, streams, batches
+  and prepared statements through such a database reject with
+  `the $scope() filter of "posts" holds for every row …`, and nothing is read or
+  written. Before, they read and wrote every tenant's rows. A narrower scope
+  that adds nothing to the scope it narrows is still accepted. In a scope, an
+  emptied list is a condition: `notIn(blocked)` with nobody blocked,
+  `contains([])`, `contains({})` and `not(overlaps([]))` are accepted there, as
+  in 3.5.0. The check refuses a scope whose conditions were all skipped, and one
+  that holds for every row by itself: a condition together with its opposite,
+  `isNot(null)` of a NOT NULL column, `like()` of only `%` of a NOT NULL column
+  (text, or a uuid, date, timestamp or enum). It does not catch a missing tenant
+  beside another real condition
+  (`and(tenant && post.tenantId.is(tenant), post.deleted.is(false))`).
+- **Changed:** the inverse collection of a condition `.one()` relation follows
+  the same first-match rule as the relation itself. `user.reviewed` lists a post
+  only under the user the post resolves to: the first matching user by primary
+  key, among those the scope admits. This holds in nested collections, `count()`
+  and other aggregates, `some()`/`none()`/`every()`, join helpers and write
+  filters. Before, a post was listed and counted under every matching user, so
+  `users.delete({ where: (user) => user.reviewed.some() })` also deleted users
+  that no post resolves to. Like the relation itself, its inverse now needs a
+  primary key on the target table. Foreign-key relations and `.many()` condition
+  relations are unchanged.
+- A write whose `where()`, `doUpdate(…, { where })`, SET values or `returning()`
+  builds a subquery over its own table from the same handle
+  (`db.comments.delete().where((comment) => notExists(db.comments(…, { where: (reply) => reply.parentId.is(comment.id) })))`,
+  or `tx` in both places inside a transaction) compares the subquery's rows with
+  the written row again. Before, the link was lost: "delete the comments nobody
+  replied to" deleted every comment, the `exists()` form wrote nothing, and such
+  a SET value was computed from the wrong row.
+- **Changed:** a prepared UPDATE or DELETE checks its filter again with the
+  values of each execution, and refuses values that make it hold for every row,
+  as the same filter written with those values is refused. Examples: `isNot(p)`
+  or `isDistinctFrom(p)` of a NOT NULL column with `p` bound to null,
+  `count().atLeast(p)` with 0, `count().isNot(p)` with -1,
+  `notIn(query, { limit: p })` with 0, `contains(p)` with `[]`. Before, these
+  wrote every row. It compares parameters by the values they bind, inside
+  subqueries, relation quantifiers and groups too: a condition and its opposite
+  written with two parameters (`or(active.is(a), active.is(b))` bound to `true`
+  and `false`; with equal values `or(status.is(a), status.isNot(b))`,
+  `or(posts.some((post) => post.views.is(a)), posts.none((post) => post.views.is(b)))`,
+  `exists()` beside `notExists()` of such subqueries,
+  `or(count().is(a), count().isNot(b))`) is refused too, and a nullable
+  parameter bound to null counts as `is(null)` there, as written out. It
+  re-checks at each execution only the parts its values can decide; a filter
+  that no values, null included, can make hold for every row (an `or()` of
+  windows `and(at.above(p), at.below(q))`, `or(id.is(a), age.is(b))` or
+  `posts.some((post) => post.views.isNot(b))` with `b` nullable) is not checked
+  again, and its executions cost what they did in 3.5.0. With 1,000 `isNot(p)`
+  of nullable parameters, an execution's client-side work is about 3 to 4 times
+  what binding them cost in 3.5.0.
+- **Changed:** the every-row guard of UPDATE and DELETE also refuses:
+  `contains()` of an empty list or object (`tags.contains([])`,
+  `meta.contains({})`, a JSON path's `contains([])`) and `like()`/`ilike()` of a
+  pattern of only `%` (`like(prefix + "%")` with an empty prefix), written out
+  or bound to a parameter, like `notIn([])` — they match every row that holds a
+  value, and the message says so and points to `isNot(null)` or `.all()`;
+  `not(overlaps([]))`; `not(between(5, 1))` of a NOT NULL number column; a
+  condition together with its opposite in an `or()` (the condition and its
+  `not()`, or two methods that say the opposite of each other: `is` and `isNot`,
+  `in` and `notIn`, `atLeast` and `below`, `atMost` and `above`, `some()` and
+  `none()`, `exists()` and `notExists()`), comparing the same thing where
+  neither side can be NULL. On NOT NULL columns:
+  `or(flag.is(true), flag.is(false))`, `or(id.notIn([2]), id.is(2))`,
+  `or(not(id.in([1, 2])), id.in([2, 1]))`, a list with a value written twice,
+  `or(name.atLeast("m"), name.below("m"))`,
+  `or(name.like("a%"), not(name.like("a%")))`, and a column compared with
+  another (`or(a.is(b), a.isNot(b))`, `or(a.atLeast(b), a.below(b))`). On any
+  column: `or(x.is(null), x.isNot(null))` (also on a NOT NULL jsonb column),
+  `or(user.posts.some(), user.posts.none())`, a `count()` compared both ways,
+  and pairs with `isDistinctFrom()` (`or(id.isDistinctFrom(2), id.is(2))`, also
+  on a jsonb or JSON path operand or an expression such as `id.plus(1)`;
+  `or(meta.isDistinctFrom(null), meta.is(null))` in either order), which hold
+  where the value is NULL or JSON null too. Also refused: comparisons of one
+  number column with numbers that together admit every value
+  (`or(id.atLeast(5), id.below(6))`, `or(id.below(5), id.is(5), id.above(5))`,
+  `or(id.isNot(5), id.atLeast(5))`, `or(id.isNot(1), id.isNot(2))` of a NOT NULL
+  column, `or(x.is(null), x.above(0), x.atMost(0))`, `between()` as one piece, a
+  group of conditions of that column, a group below `not()` read by De Morgan);
+  `length()` of a NOT NULL array compared with what every length passes;
+  `isNot(null)` of a `coalesce()` with a value that is never NULL; and, inside a
+  subquery, a NOT NULL column of the subquery's own table now counts as never
+  NULL. The check looks for these forms and is no proof. Other filters that hold
+  for every row are written as given: a part it cannot tell is never NULL
+  (arithmetic such as `or(id.plus(1).atLeast(5), id.plus(1).below(5))`, a
+  relation path such as `post.author.name`, other SQL in a template), numbers
+  written as different text (`or(balance.is("5"), balance.isNot("5.0"))` of a
+  numeric column), and ranges of text or dates with different bounds
+  (`or(name.atLeast("m"), name.below("n"))`). Building an UPDATE or DELETE takes
+  1.1 to 2 times as long as in 3.5.0 for long filters (an `and()` of 30 `or()`s,
+  an `or()` of 30 `and()`s, a 3,000-value `in()` beside a `notIn()`, an `and()`
+  of 1,000 `isNot()` of one column), about 1.5 times for 200 small updates (up
+  to 1.9 times in some runs), 1.8 to 2.6 times for an `or()` of 64 comparisons
+  of one or two columns, and 1.3 to 2.4 times for filters nested 50 to 1,000
+  levels deep (`where = or(where, …)` built step by step, chains of
+  `not(or(…, not(and(…))))`): the time grows in step with the depth, and 1,000
+  levels build in 3 to 6 ms.
+- **Changed:** a condition interpolated alone into `sql<boolean>`
+  (``sql<boolean>`${post.id.notIn([])}` ``) is checked as that condition, also
+  in parentheses or followed by `= true` or `IS TRUE`
+  (``sql<boolean>`(${…})` ``; `IS TRUE` is read as the condition with NULL as
+  FALSE, so below a `not()` it holds where the condition is NULL): a write
+  filter or a `$scope()` filter that holds for every row is refused in this form
+  too. Other SQL around it keeps the template opaque.
+- **Changed:** an upsert split into several statements compares keys under the
+  column's collation: with a case-insensitive `text.collate(…)` column, "Alpha"
+  and "ALPHA" are refused as one key (`SYMMETRIA_DUPLICATE_CONFLICT_KEY`).
+  Before, the later row silently overwrote the earlier one.
+- An upsert split into several statements and keyed by an array column
+  (`text.array.unique`, `timestamptz.array.unique`, …) no longer fails with
+  "malformed array literal".
+- A `sql` fragment cannot reach into the SQL Symmetria writes after it. A
+  fragment ending in a `--` comment gets a line break after it. Before, the
+  comment swallowed the field's ` AS "key"` (the field was missing from the
+  rows), an ORDER BY's ` DESC`, the next `SET` assignment, or the `$scope()`
+  check of a write's RETURNING (rows were written outside the scope). Fragments
+  without a comment are written as before.
+- **Changed:** a `sql` template that leaves a `/*` comment, a `'…'` string, a
+  `"…"` quoted name or a dollar-quoted string open is refused when it is built.
+  A value interpolated inside a comment or quoted text, where PostgreSQL reads
+  no parameter, is refused when the query compiles; before, node-postgres failed
+  with "bind message supplies … parameters" as a ConnectionError. Write
+  `'%' || ${term} || '%'` instead of `'%${term}%'`. Fragments are read as
+  PostgreSQL reads them with `standard_conforming_strings` on, so with it off a
+  `\'` in a plain string must be written `''`.
+- A condition interpolated into `sql` (`${post.title.is("a")}`, `exists()`,
+  `and()`) is written as its SQL in parentheses, and an ordering
+  (`${post.views.descending}`) as its SQL with the direction. Both were bound as
+  the JSON text `{}`.
+- **Changed:** `sql` refuses to interpolate a query (interpolate
+  `query.scalar()` or `exists(query)` instead), a function, a Map, a Set, a
+  class instance or an array that holds a column. Before, these were bound as
+  `{}`, or as the instance's own fields, or failed with "DataCloneError". A
+  condition, ordering or query passed as a value elsewhere (`column.is(…)`, an
+  insert) is refused the same way. A value that cannot be copied names itself
+  instead of failing with "DataCloneError".
+- **Changed:** a `sql` template with an escape that JavaScript reads as no text
+  (`\u` without hex digits, `\x`, `\1`, a Windows path such as `'C:\users'`) is
+  refused with the escape named. Before, queries failed with an internal
+  TypeError, and a default became empty SQL ("invalid migration snapshot").
+  Write `\\` for a backslash.
+- A result key longer than 63 bytes (such as 22 Japanese characters) works at
+  the top level, nested, in `$batch`, `returning()`, `page()`, `stream()`,
+  `.as()` and CTEs. It is selected under an alias made of its first bytes and a
+  hash, and comes back under the key; before, it was refused as too long. Keys
+  that fit are written as before, so page cursors stay valid.
+- A nested relation or `$batch` field named `__symmetria_row` returns its rows;
+  the relation came back as `[{}]`, and a one-to-one failed. A `returning()`
+  field named `__symmetria_scope` keeps its value in a scoped write. A field
+  named `__symmetria_order_0` no longer clashes with the order columns of an
+  IVFFlat nearest search. Page cursors issued before stay valid.
+- Nested-object keys with a backslash are written as `E'…'` literals, which read
+  the same with `standard_conforming_strings` off. With it off, such a key ended
+  its literal early, and a crafted key ran SQL of its choosing. Page cursors
+  issued before for such queries stay valid.
+- `where: { constructor: … }`, and another name every object has, is refused as
+  naming no column (the error called it a relation). A field named `$1` is
+  refused with an error saying that names starting with `$` are reserved.
+- The reference states that `ConnectionError` covers SQLSTATE class 08, 08P01
+  `protocol_violation` included. It also states that a `sql` fragment without
+  `.of` comes back as the driver parses it (Bun can return an `int4[]` as
+  `Int32Array`; `sql.of(int.array)` returns an array).
+- **Changed:** a `sql` default, check or index expression ending in a `--`
+  comment is stored in the snapshot with a line break after it. CREATE TABLE
+  with such an expression failed before. Snapshots saved without the line break
+  need no migration. A default set by `ALTER … SET DEFAULT` and an index
+  `where()` ending in a comment, which ran before, no longer show as drift in
+  `drift`, `verify`, `adopt` and `repair`, and a later migration that restores
+  one of them ends the comment with a line break: before, the comment took in
+  the semicolon and the statement after it.
+- **Changed:** on a NOT NULL `jsonb` column, a stored JSON `null` (what a JS
+  `null` is written as) now counts as null in every comparison, as on a nullable
+  column or a JSON path. `isNot(x)`, `notIn([x])`, `not(is(x))`, `not(in([…]))`
+  and `above()`/`below()`/`atLeast()`/`atMost()` leave it out, and
+  `isDistinctFrom(null)` no longer holds for it.
+  `delete({ where: (row) => row.meta.isNot(0) })` no longer deletes rows that
+  hold JSON null, and an update filtered by `meta.isDistinctFrom(null)` is no
+  longer refused as a write to every row. These comparisons keep the column
+  bare, so its indexes serve them, and add constant-NULL parts that make JSON
+  null answer NULL wherever the comparison stands, also inside a `sql` template,
+  below a NOT written in it, or in a selected `sql<boolean>`
+  (`("meta" > $1 OR ("meta" = 'null'::jsonb AND NULL))`,
+  `("meta" < $1 AND ("meta" <> 'null'::jsonb OR NULL))`). A `between()` on a
+  jsonb column or path whose bound is a prepared parameter, a column or `[]` is
+  written the same way. `is()`, `in([…])`, `between()` and `contains()` of a
+  jsonb column (NOT NULL or nullable) or of a JSON path get the same
+  constant-NULL part (`("meta" = $1 OR ("meta" = 'null'::jsonb AND NULL))`):
+  JSON null answers NULL there instead of FALSE, so
+  ``sql<boolean>`NOT ${meta.is(3)}` `` leaves it out as `not(meta.is(3))` does,
+  and a selected ``sql<boolean>`${meta.is(3)}` `` reads null for it. `is(p)`
+  with a prepared parameter bound to JSON null still finds JSON null; `in()` of
+  a subquery is written as before. In a filter PostgreSQL drops the constant
+  NULL, so a btree or GIN index and a partial index declared with the same
+  condition serve them, as in 3.5.0 (custom and generic plans, PostgreSQL 16 and
+  18); `not()` of them is a plain NOT. `isDistinctFrom()` of a jsonb column or
+  path reads JSON null as null on both sides: two JSON nulls are not distinct,
+  and a prepared parameter bound to null (JSON null, or SQL NULL for a
+  `.nullable` one) is `isDistinctFrom(null)`, for the rows and for the every-row
+  check of a prepared UPDATE or DELETE. Schema DDL and page cursors keep both
+  sides bare, as in 3.5.0.
+- `between()` on a JSON value no longer finds JSON null when the lower bound is
+  an empty array (`between([], [1, 2])`), which jsonb sorts below null. A
+  prepared or column lower bound treats JSON null as null as well.
+- **Changed:** `notIn(subquery)` on a JSON value leaves out JSON null, as
+  `notIn([…])` already did.
+- `not()` of `is()`, `in([…])`, `between()` or `contains()` of a JSON column or
+  path no longer runs the comparison a second time: it is a plain NOT, which
+  PostgreSQL reads as `"meta" <> $1 AND "meta" <> 'null'::jsonb`; of another
+  JSON value (a `coalesce()`, say) it checks the value's JSON type. On a JSON
+  path the negation takes about 1.5 times the server time of the plain negation
+  3.4.1 sent.
+- These JSON changes leave CHECK constraints and partial indexes made by earlier
+  releases unchanged, and page cursors issued before stay valid.
+- A value compared with a `timestamptz(n)`, `timestamp(n)`, `time(n)`,
+  `timetz(n)`, interval-with-fields, `bit(n)`, `varbit(n)`, plain `bit` or plain
+  `char` column, or searched in an array of one, is no longer rounded or cut to
+  the column's precision first: a delete whose filter asked whether a
+  `timestamptz(0)[]` column contains 12:00:00.400 deleted the row holding
+  12:00:00. Casts of bound values name the type without its modifier, as they
+  already did for `varchar(n)`, `char(n)` and `numeric(p,s)`. The column still
+  rounds what is written, and page cursors issued before stay valid. A prepared
+  value selected as `timestamptz(n)` is returned as given, not rounded. This
+  holds for every spelling of these types, `pg_catalog.bit(n)`,
+  `pg_catalog.bpchar(n)` and quoted names such as `"varchar"(n)` included.
+- A prepared `.nullable` value compared with `is()`/`isNot()` on a column whose
+  type is not PostgreSQL's own (a domain, an enum, `citext`) takes its type from
+  the comparison, as a literal does, whether or not its `customType()` declares
+  a `base`. A `numeric(30,10)` domain rounded the value first (a prepared delete
+  removed a row that did not equal it), a `varchar(5)` domain failed with "value
+  too long", and a domain's CHECK refused values no row holds.
+- **Changed:** writing an element too long for a `bit(n)`, `varbit(n)`, plain
+  `bit` (`bit(1)`) or plain `char` (`char(1)`) array column, also when the type
+  is spelled `pg_catalog.bit(n)`, `pg_catalog.bpchar(n)` or `"bit"(n)`, now
+  fails with PostgreSQL's length error instead of being cut, as `varchar(n)` and
+  `char(n)` arrays already did, in inserts, updates and upserts.
+- On Bun, when the database, role or pooler prints `bytea` in the escape form, a
+  bytea read fails with an error that says to pass
+  `postgres({ url, connection: { bytea_output: "hex" } })`, instead of Bun's
+  "Failed to read data". The error is still Bun's own, with its class and `code`
+  (`ERR_POSTGRES_UNSUPPORTED_BYTEA_FORMAT`); only its message changed. The
+  reference no longer says Bun reads that form at the top level.
+- **Changed:** when a custom `executor` or driver returns a result that does not
+  say how many rows a write without `returning()` changed (a plain array of
+  rows), the write now fails after it ran, with an error asking for
+  `{ rows, affectedRows }`. It used to resolve `{ affectedRows: 0 }`. A
+  node-postgres result (`rowCount`) and an array with `count` (Bun.SQL,
+  postgres.js) are read as they are; a node-postgres result passed whole used to
+  report `affectedRows: undefined`.
+- OpenTelemetry: a read of a CTE is named after the table the CTE reads
+  (`SELECT posts`, `db.collection.name` posts) instead of `WITH ranked_posts`,
+  also inside a subquery and under `EXPLAIN`. CTE names are matched as
+  PostgreSQL matches them (an unquoted name in any case), and a recursive CTE
+  that reads only itself names no table. A statement after a `WITH` list is
+  named by its own operation (`SELECT` for
+  `WITH … (SELECT …) UNION (SELECT …)`). A `$batch()` statement is named after
+  the table of its first subquery (`count()`, `exists()` and `aggregate()` reads
+  come before other reads), and a stream over a CTE after the table the CTE
+  reads; so is a raw statement made only of subqueries, whatever its aliases
+  (`SELECT (SELECT count(*) FROM users) AS m`). Comments and strings are never
+  read as SQL: `-- note` before a statement no longer makes it `QUERY`, and a
+  `FROM` inside a comment no longer names the table. Other statements without a
+  table of their own (`SELECT 1 WHERE EXISTS (…)`,
+  `(SELECT …) UNION (SELECT …)`) carry no table name, as before.
+- Naming an OpenTelemetry span takes time in proportion to the statement's
+  length. In 3.5.0, a statement with derived tables nested 10,000 deep (180 KB)
+  took over a second to name, and at 900 KB naming failed the query with a stack
+  overflow before it was sent.
+- **Changed:** NaN, Infinity and -Infinity anywhere inside a value (also what a
+  nested `toJSON(key)` returns) bound for a json or jsonb column, path or
+  prepared parameter fail the query before it is sent. Before, `JSON.stringify`
+  wrote them as `null`: an insert stored JSON null, and `is(Number.NaN)` found
+  the JSON-null rows. The check walks a value only when its JSON text holds a
+  `null`, so encoding such a value takes up to about 1.5 times as long as in
+  3.5.0, and other values cost what they did.
+- **Changed:** JSON `has()` and `overlaps()` are NULL for a document that is SQL
+  NULL or JSON null, as `= ANY()` of a NULL array is. `not(doc.has(1))` no
+  longer holds for those rows, in reads and writes alike. They, and JSON
+  `length()`, are NULL for an object or a scalar too, which failed the query
+  ("cannot extract elements from an object") whenever PostgreSQL evaluated them,
+  also inside an `or()` whose other side already decided the row. Page cursors
+  issued before stay valid. A JSON path's `length()` reads the path twice, so in
+  a filter over many rows it takes up to 1.5 times as long in PostgreSQL.
+- On Bun, a transaction connection whose ROLLBACK failed with a server error
+  went back to the pool; it is now closed, as with node-postgres.
+- **Changed:** on node-postgres, a write to a closed socket (`EPIPE`), or any
+  other failed socket call (`EBADF`, `EPERM`, …), is a `ConnectionError`
+  (`databaseError()` gives kind `connection` and SQLSTATE 08006), like other
+  lost connections. It was a plain `QueryError` whose `sqlState` read `EPIPE`: a
+  migration error showed "SQLSTATE EPIPE", and OpenTelemetry spans reported it
+  as the database status code.
+- `in()` / `notIn()` given a prepared parameter, a column or a single value said
+  "a subquery requires selected fields". It now says it takes an array or a
+  single-column subquery, and that a prepared list has one parameter per item.
+- Nested inserts store foreign keys exactly as PostgreSQL holds the parent's
+  key. A `timestamptz` key keeps its microseconds, so a child no longer silently
+  points at another parent whose key is the same value cut to milliseconds. A
+  parent keyed by a `now()` default can take nested children. A `customType()`,
+  numeric, interval or time key is no longer decoded and encoded again. This
+  holds for connected, created and upserted rows and for junction rows, and in
+  every session: dates and timestamps are copied in ISO form whatever the
+  `DateStyle` and time zone, also inside an array, a range or a multirange of
+  them (`timestamptz.array`, `tstzrange`, an array of such ranges), and doubles
+  with all their digits whatever `extra_float_digits`; a `customType()` over one
+  of these types does the same when it declares its `base`.
+- Several `connectOrCreate` entries of one relation are resolved in the key
+  order the docs promise for every key type: `customType()` values by their
+  encoded value, Dates by time, bigints and numeric text by value, composite
+  keys column by column. Concurrent inserts that name the same rows in opposite
+  orders no longer deadlock. Rows created this way get their generated ids in
+  key order.
+- A one-to-one `connectOrCreate` no longer looks the row up by the new parent's
+  own foreign key, which made it fail with a unique violation instead of
+  connecting the existing row. A key holding the parent's foreign key is used
+  only when the payload has no other key.
+- A row of a nested insert can connect a row written earlier in the same
+  multi-row INSERT, such as a reply to the comment before it. That INSERT is
+  written first instead of the connect failing with
+  `SYMMETRIA_RECORD_NOT_FOUND`.
+- A `connectOrCreate` payload that carries a relation field leaves it out, as
+  documented, instead of failing with "…onConflict is not a function" when the
+  row is new.
+- Nested inserts that connect several rows by one column whose value as read is
+  not the value stored (a `timestamptz` with microseconds, numeric, interval,
+  citext, a `customType()`) link each child to the row PostgreSQL compares equal
+  to the value given. Two parents stored at `12:00:00.123` and `12:00:00.123456`
+  read as the same `Date`, and a child connected by
+  `new Date("…T12:00:00.123Z")` could be linked to the `.123456` parent. This
+  also holds for a unique column that no foreign key references. PostgreSQL
+  compares the values with the table in one join; 1,000 such connects take 1.1
+  to 1.6 times as long as in 3.5.0.
+- `connect` accepts a key value that is an object in JavaScript. `connect: date`
+  on a `timestamptz` primary key, and a `Uint8Array` or `Buffer` on a `bytea`
+  primary key, were refused with "requires a complete non-null unique key". An
+  object whose fields are a unique key of the target is still read as a key
+  object.
+- The children a one-to-many relation's `connect` and `connectOrCreate` entries
+  name are all found (or created) first, then moved to the new parent together,
+  in primary-key order, whichever key or operation names them. Two inserts that
+  moved the same rows could deadlock when they named them in opposite orders, by
+  different keys (`connect: [1, 2]` and
+  `connectOrCreate: [{ code: "x" }, { code: "y" }]` for the same rows), or with
+  `connect` and `connectOrCreate` in one insert. The rows are moved where the
+  relation's last `connect` or `connectOrCreate` stands, so a `create` given
+  between two of them is written before the rows the first one names are moved.
+
+### better-auth (`symmetria/better-auth`)
+
+- `npx auth generate` keeps the single-field indexes a plugin declares on its
+  table, so device-authorization's `deviceCode` and `userCode` are unique.
+  Without them two pending devices could get the same user code, and approving
+  it could authorise the other device. Regenerate the module and generate a
+  migration; it adds two unique constraints (delete duplicate stored codes
+  first).
+- **Changed:** every reference better-auth declares becomes a foreign key with
+  better-auth's delete action. A key that does not end in `Id` (`requestedBy`)
+  becomes the relation `requestedBy` with the key column `requestedById` under
+  its own SQL name (`requested_by`); a reference to another field uses
+  `.by("email")`; `"no action"` is `.onDelete.noAction`; `"set default"` sets
+  NULL (better-auth gives the key no default): `.setNull` on an optional key, NO
+  ACTION on a required one. After regenerating, the migration adds the foreign
+  key and its index; rows pointing at deleted rows must be removed first.
+  Application code reads such a key as `requestedById`. A table with two
+  references to one table names their reverse sides (`sessionByUser`). The
+  adapter still works with modules written by 3.5.0.
+- **Changed:** a field name given to better-auth is written as `.named()`
+  (`.column()` for a key) whenever it differs from the key, and names the column
+  under either casing. The default casing produces the same SQL as before. Under
+  `casing: "preserve"`, `email_verified` now names the column (it was
+  `emailVerified`); `generate` asks for rename hints rather than dropping the
+  column. `authSchemaSource()` takes a `casing` option; `createSchema` reads it
+  from the database's schema.
+- A model name that is not a JavaScript name (`auth-user`, `default`) gives a
+  module that loads: the table keeps its key (`"auth-user": authUser` in
+  `authTables`).
+- `npx auth generate` refuses, naming both fields, a reference whose relation
+  would have the same name as another field of its table (the module had two
+  properties with the same name).
+- **Changed:** `incrementOne` changes exactly one row, as better-auth's SQL
+  adapters do, and only while its filter still holds for that row. A NULL
+  counter counts from 0.
+- A number for a string field is compared as text on Bun as on node-postgres
+  (`listUsers` with `filterValue: 1984` found no users on Bun). "true"/"false"
+  in a list for a boolean field are compared as booleans.
+- **Changed:** a where value of `undefined` (`filterField` without
+  `filterValue`) matches no row instead of throwing, as in better-auth's Kysely
+  adapter, for `ne` too. Ordering and pattern comparisons with `null` match no
+  row, `null` in an `in` list matches nothing, and a `not_in` list containing
+  `null` matches no row.
+- `findOne` and `findMany` return only the fields better-auth selects.
+- **Changed:** a field better-auth declares as a number but stores in a `bigint`
+  column (`rateLimit.lastRequest`) comes back as a number when it is a safe
+  integer, and as a `bigint` otherwise.
+- An update or delete through the adapter whose filter holds for every row is
+  refused with advice a better-auth user can follow, instead of the `.all()`
+  advice.
+
+### Kit (`symmetria-kit`)
+
+- Ctrl-C or SIGTERM during `migrate`, `rollback` or another database command in
+  a terminal cancels the running statement and waits up to five seconds for its
+  rollback before exiting with 130 or 143. Before, the spinner exited at once
+  and the server kept the statement, its ACCESS EXCLUSIVE lock and the migration
+  lock. A second Ctrl-C exits at once. When the server does not answer within
+  the five seconds, the CLI exits anyway and says whether a statement may still
+  be running (with `--json`, in the JSON error on stdout).
+- **Changed:** Ctrl-C at a CLI question (the rollback confirmation, the typed
+  database name, a rename question, the dashboard menu) exits with 130 and rolls
+  nothing back. Before, the rollback menu exited with 0, the typed-name prompt
+  with 1 ("Aborted with Ctrl+C"), and the dashboard menu with 0. Escape still
+  closes the question without the 130.
+- `symmetria profile`, the dashboard and command output on a terminal no longer
+  write escape sequences, control characters or bidirectional overrides from the
+  database (errors, names, stored values); only the CLI's own colours are
+  written. Errors on stderr, a migration's DETAIL included, are filtered too.
+  Piped output is unchanged.
+- **Changed:** `pull` declares a column of a domain type with its base type,
+  `customType<Decimal>("amount", { base: "numeric(30,10)" })`, so a domain over
+  bigint reads `bigint`, over numeric a decimal string, over timestamptz a
+  `Date`, also nested and in `$batch`. A domain over a domain takes the
+  innermost base; a domain over a type without a builder (`json`, `oid`) is
+  declared like a column of that type (`unknown`, `asNumber()`).
+- `graph` / `renderMermaid()` write valid Mermaid for column names with spaces,
+  quotes or a leading digit (`First_Name`, with the real name in the note) and
+  quote such relation labels.
+- **Changed:** `init` in a project that already has `src/database/schema.ts`
+  imports that module's schema: its `appSchema` export, or the one `schema(…)`
+  value it exports, by name or as its default (also
+  `const db = schema(…); export default db`). The module is read, not run, and
+  only plain top-level forms count. When it offers none or several, or something
+  init cannot read with certainty (`export *`, a re-export, a schema inside an
+  object or a wrapper, several declarators in one statement), init creates
+  nothing and exits with 1, saying what to add. Before, it wrote files that
+  imported a missing `appSchema`.
+- An invalid timeout from the config names the config key
+  (`lockTimeoutMs in the config`), not the `--lock-timeout` flag. An empty
+  `--lock-timeout` is refused instead of read as 0.
+- An invalid database URL (one that is not an absolute URL, which node-postgres
+  would read as the host "base") is reported as such, naming `--database-url`,
+  `databaseUrl` in the config, `DATABASE_URL`, `--verify-url` or
+  `verificationDatabaseUrl`; every URL node-postgres reads, the
+  `user:password@/db?host=/socket` form included, still connects.
+- `--profile-url` keeps a path prefix (`http://host/prefix/`) and still accepts
+  the endpoint itself (`…/requests`).
+- **Changed:** a flag that takes a value refuses an empty one. Before,
+  `migrate --to ""` applied every pending migration and `--steps ""` rolled back
+  one step.
+- **Changed:** the profiler endpoint serves bytea parameters as `\x…` hex, not
+  as an object of byte indexes.
+- `inspect` prints bigint defaults as digits.
+- An action's exit code in the dashboard no longer becomes the dashboard's exit
+  code.
+- `pull` writes database names that contain a line break (`\n`, `\r`, U+2028,
+  U+2029), another control character or a text-direction override as escapes in
+  its `// pull:` comments, strings and `sql` templates. Before, such a name
+  ended the comment, and the rest of it ran as code when the generated module
+  was imported. A carriage return in a pulled default or CHECK now comes back as
+  itself; before, it came back as a line feed.
+- Generated migrations write names, enum labels and embedding model names in
+  their `-- symmetria: caution:`, `-- symmetria: destructive:` and backfill
+  comments the same way. Before, a line break in an index name or enum label
+  turned the rest of the comment into SQL that ran with the migration; a crafted
+  name could drop tables. The review printed by `generate` and `lint` keeps each
+  finding on its own line.
+- In migration SQL, a carriage return ends a `--` comment, as it does in
+  PostgreSQL. The statement after it is now split and linted; before, lint
+  skipped it while PostgreSQL ran it.
+- **Changed:** a negative number in a schema expression (CHECK, index WHERE,
+  expression index key) is written in parentheses, `"n" > (-5)`. Written right
+  after a minus sign, `-5` started a SQL comment (`"n"--5`): CREATE TABLE
+  failed, or the check silently lost the rest of its line. `${-5}::text` failed,
+  because PostgreSQL read it as `-(5::text)` and cannot negate text. Snapshots
+  saved with the old spelling need no migration, and drift and pull treat both
+  spellings as the same. This includes a number cast through text,
+  `(-0.5)::text::real`, which Symmetria writes when it compares a `real` column
+  or array element with a negative number, and in arithmetic on array elements
+  and `match()` values; 3.5.0 wrote `-0.5::text::real`. It also includes a
+  negative number before a cast that changes it, `${-0.5}::integer` or
+  `${-0.25}::real::float8`: PostgreSQL reads 3.5.0's `-0.5::integer` as
+  `-(0.5::integer)`, which is -1 like `(-0.5)::integer`. Only SQL whose old
+  spelling PostgreSQL refused or read as another value is written again in the
+  next migration: `-5::text`, a number that reaches an integer type's most
+  negative value on the way (`-32767.5::smallint` fails, `(-32767.5)::smallint`
+  is -32768), and a float that comes out zero (`-0.4::integer::float8` is -0,
+  `(-0.4)::integer::float8` is 0).
+- `generate`, `drift` and `pull` no longer take a float's negative zero for
+  zero. `(-0::float8)::text` is `-0`, while `((-0)::float8)::text` and
+  `'0'::float8::text` are `0`. A check changed from one to the other now gets a
+  migration, and `pull` keeps the negative zero: `CHECK (f <> -0::float8)` is
+  pulled as an `sql` condition where 3.5.0 wrote `f.isNot(0)`.
+- `generate`, `drift` and `pull` keep each cast of a chain over a literal that
+  gives it another value: a number out of an inner integer type's range or a
+  numeric(p,s)'s digits (`-32768::smallint::integer` fails,
+  `(-32768)::smallint::integer` is -32768), a number with an exponent cast to an
+  integer (`2.5e0::integer` is 3), and a float cast on to an integer, which
+  rounds half to even (`2.5::float8::integer` is 2, `2.5::integer` is 3), or on
+  to double precision (`0.1::real::float8`). Before, a check changed from one
+  form to the other got no migration. Schemas saved before need no migration.
+- **Changed:** bytea defaults and literals in DDL are written as escape strings,
+  `E'\\x4142'::bytea`. Index storage options and pull's suggested fixes that
+  contain a backslash are written the same way. With
+  `standard_conforming_strings = off`, the old `'\x4142'` stored the bytes
+  `413432`. Saved snapshots need no migration.
+- **Changed:** in a `transaction: "none"` (`--online`) migration,
+  `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`,
+  `REINDEX … CONCURRENTLY` and `VALIDATE CONSTRAINT` wait without the default
+  five-second lock timeout. Their waits block no reads or writes.
+  `DETACH PARTITION … CONCURRENTLY` keeps the default: its last step takes an
+  ACCESS EXCLUSIVE lock on the partition, which every query of the partition
+  would wait behind. Before, any query in the database that ran longer made the
+  migration fail with SQLSTATE 55P03, leaving an invalid index and a migration
+  to repair. Other statements keep the default; a `lockTimeoutMs` or
+  `--lock-timeout` you set applies to every statement.
+- When the migration's connection is lost during a statement (server process
+  terminated, failover), `migrate` and `rollback` report the
+  `MigrationExecutionError` naming the migration, statement, SQL and SQLSTATE,
+  also with `--json`, instead of "Connection terminated unexpectedly". Cleanup
+  that fails afterwards adds a line to the message, and a `none` migration's
+  error is written to the journal over a fresh connection, tried again for up to
+  ten seconds while the pool still hands out connections lost with the session.
+  A new connection that the server refuses (the server is down), or Ctrl-C, ends
+  the wait at once, and the error says the journal does not record it. When the
+  wait ends, an attempt still waiting for its connection writes nothing once it
+  gets one, so the journal never shows an error the message says it lacks; if
+  its COMMIT was already under way, the message says the journal may not record
+  it. Ctrl-C cancels the migration's statement only while one runs, not after
+  its session was lost. A failed or interrupted CLI command waits at most half a
+  second for its connections to close, then prints its error and exits. In your
+  own code, `driver.close()` still waits for such an attempt until its
+  connection opens or fails: Bun.SQL gives up after its `connectionTimeout` (30
+  s by default); with node-postgres set `connectionTimeoutMillis`, or it waits
+  forever.
+- A database whose new connections take more than a second to open is no longer
+  taken for a transaction pooler. The check waits up to ten seconds for its
+  second connection, so `--online` migrations run and batch migrations keep the
+  session lock. When the check cannot tell (no free connection, or none opened
+  in ten seconds), the refusal of a `none` migration says which.
+- **Changed:** `status` reports an incomplete `none` migration that another
+  process still runs (it holds the migration lock) as running in another
+  process, with `running: true`, and exits with code 0. "repair required" and
+  exit code 1 are kept for one that stopped. A `migrate` that gives up waiting
+  for the migration lock names the PostgreSQL process holding it, and the
+  refusal of an incomplete migration says no other process is running it.
+- `drift` on a database whose last migration is incomplete names it, the error
+  it stopped with and the `repair` it needs (or that another process runs it),
+  instead of "1 migration behind … Run migrate". `--json` carries `incomplete`;
+  `--strict` exits with code 1 unless it is running.
+- **Changed:** `generate --online` and `lint --online` describe the SQL they
+  write. A concurrent index build runs outside a transaction and blocks no
+  writes. A NOT NULL set through a validated CHECK is a caution like an online
+  CHECK; `lint --online` used to exit 1 for every such change. `lint` of the
+  saved file no longer calls the temporary `DROP CONSTRAINT …_not_null_…` a
+  rebuild, passes `SET NOT NULL` behind a valid `CHECK (column IS NOT NULL)`,
+  and describes `NOT VALID`, `VALIDATE CONSTRAINT` and `UNIQUE USING INDEX`
+  instead of giving a generic caution.
+- When no verification server is configured, `repair --action retry` of the
+  latest migration checks its starting point against the snapshot from before it
+  that `meta/migration.json` keeps (`undo`), so it needs neither `--verify-url`
+  nor `--snapshot`.
+- **Changed:** SQL lint lets a `DROP INDEX` or `DROP CONSTRAINT` pass as
+  harmless only when an earlier statement surely created that object: not after
+  `CREATE INDEX … IF NOT EXISTS`, not when the CREATE names another schema, not
+  when the name was dropped before it was created, and not when a statement
+  between them changes `search_path` or the role (`SET search_path`,
+  `SET SCHEMA`, `RESET`, `set_config('search_path', …)`, `SET ROLE`,
+  `DISCARD ALL`, `set_config('role', …)`, `ALTER SCHEMA`, `DROP SCHEMA`, or a
+  `DO` block, `CALL` or `EXECUTE`, whose code lint cannot read; a `set_config()`
+  in a view's query or a function body, and these words in a name, a comment or
+  a string, do not count). The drop follows its object's renames in its own
+  schema: a rename of that name in another schema leaves it as it was, and one
+  that may or may not be of it (the name written with its schema on one side and
+  without on the other) means it may be another object, so the drop is not
+  harmless. It is destructive when another object was renamed into its name in
+  that schema in between, or when its table moved to another schema
+  (`ALTER TABLE … SET SCHEMA` takes the table's indexes along). A drop rates as
+  a rebuild (caution) only when the object is created again after it, on the
+  same table (also after the table's `RENAME TO` in its schema, not after it
+  moves to another schema) and in the same schema; otherwise it is destructive.
+  3.5.0 called it a rebuild whenever that name was created anywhere in the file,
+  even on another table.
+- **Changed:** a valid `CHECK (column IS NOT NULL)`, which lets a later
+  `SET NOT NULL` pass lint as harmless, follows its column through
+  `RENAME COLUMN`, itself through `RENAME CONSTRAINT` and its table through
+  `RENAME TO`, and goes away with `DROP COLUMN`. It proves nothing for a table
+  name another table was renamed into, nor after that name's `DROP TABLE`,
+  `SET SCHEMA` or `CREATE TABLE`/`SELECT … INTO`, nor after a `DO`, `CALL` or
+  `EXECUTE` in between, nor, for a table named without its schema, once
+  `search_path` changes in between. Before, a table swap
+  (`ALTER TABLE t RENAME TO t_old; ALTER TABLE t_new RENAME TO t`) let
+  `SET NOT NULL` on the new `t` pass as harmless, and PostgreSQL then failed on
+  its NULLs. A table created in the migration, once renamed or dropped, no
+  longer makes statements on its old name look harmless.
+- `lint` no longer takes a `-- symmetria: caution:` or
+  `-- symmetria: destructive:` line inside a quoted name or string as a note, so
+  a statement cannot lower its own rating through a name.
+- Names with line breaks (U+2028 and U+2029 included) print as escapes in
+  `graph` Mermaid output, in `diff`, and in the `-- group …` line of
+  `migrate --plan` / `rollback --plan`.
+- `lint --pending` while a migration runs in another process says so, instead of
+  asking to repair it.
+
 ## 3.5.0 — 2026-11-22
 
 Fixes from a bug hunt on 3.4.1: whole-table writes and lost data that slipped

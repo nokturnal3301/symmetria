@@ -88,6 +88,33 @@ export const canonicalJSON = (value: unknown): string => {
 /** PostgreSQL names share a 63-byte limit, not a 63-character limit; the runtime derives index and check names the same way. */
 export { objectName };
 
+/**
+ * What ends or hides a line: line breaks (`\n`, `\r`, U+2028, U+2029), the
+ * other control characters but the tab, and the bidirectional overrides and
+ * isolates that make an editor or a terminal show text in another order.
+ */
+const LINE_UNSAFE =
+  /[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+
+const LINE_ESCAPES: Readonly<Record<string, string>> = {
+  "\n": "\\n",
+  "\r": "\\r",
+};
+
+/**
+ * Text from a schema or a database (a name, a label, a model) on one line of
+ * a `--` or `//` comment or of a review: what would end the line or hide what
+ * follows is written as an escape (`\n`, `\u2028`), so the text cannot turn
+ * the rest of a comment into SQL or code. Other text stays as it is.
+ */
+export const commentText = (text: string): string =>
+  text.replace(
+    LINE_UNSAFE,
+    (character) =>
+      LINE_ESCAPES[character] ??
+      `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+
 export const quoteLiteral = (value: unknown): string => {
   if (value === null) {
     return "NULL";
@@ -109,8 +136,10 @@ export const quoteLiteral = (value: unknown): string => {
     return `${quoteLiteral(value.toISOString())}::timestamptz`;
   }
 
+  // An escape string: with standard_conforming_strings off, `'\x41'` would
+  // read `\x41` as the letter A.
   if (value instanceof Uint8Array) {
-    return `'\\x${Buffer.from(value).toString("hex")}'::bytea`;
+    return `E'\\\\x${Buffer.from(value).toString("hex")}'::bytea`;
   }
 
   if (typeof value === "string") {

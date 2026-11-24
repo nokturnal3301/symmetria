@@ -94,3 +94,52 @@ for (const size of [
     );
   }, 15000);
 }
+
+test("diff and inspect --no-interactive keep their colours on a terminal; piped output stays plain", async () => {
+  const run = async (argumentsList: string[], terminal: boolean) => {
+    let output = "";
+    const decoder = new TextDecoder();
+    const { NO_COLOR: _noColor, ...environment } = process.env;
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        resolve("packages/kit/src/cli/index.ts"),
+        ...argumentsList,
+        "--config",
+        resolve("examples/symmetria.config.ts"),
+        "--dir",
+        resolve(".build/terminal-test-empty-migrations"),
+      ],
+      terminal
+        ? {
+            env: { ...environment, DATABASE_URL: "", TERM: "xterm-256color" },
+            terminal: {
+              cols: 100,
+              rows: 30,
+              data: (_terminal, data) => {
+                output += decoder.decode(data, { stream: true });
+              },
+            },
+          }
+        : {
+            env: { ...environment, DATABASE_URL: "" },
+            stdout: "pipe",
+          },
+    );
+
+    if (!terminal) {
+      output = await new Response(child.stdout as ReadableStream).text();
+    }
+
+    await child.exited;
+
+    return output;
+  };
+
+  for (const command of [["diff"], ["inspect", "--no-interactive"]]) {
+    const shown = await run(command, true);
+    // The palette's 24-bit colours, as 3.5.0 wrote them.
+    expect(shown).toMatch(/\u001b\[(?:1;)?38;2;\d+;\d+;\d+m/);
+    expect(await run(command, false)).not.toContain("\u001b[");
+  }
+}, 15000);

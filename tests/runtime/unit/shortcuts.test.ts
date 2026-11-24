@@ -520,6 +520,7 @@ test("upsert() inserts or overwrites the row with the same key", () => {
   );
 
   expect(() =>
+    // @ts-expect-error the types know the keys too
     documents.upsert({ slug: "a", title: "A" }, { by: "title" }),
   ).toThrow(
     'symmetria: upsert() by: "title" is not the primary key or a unique key of "documents"; its keys: id, slug',

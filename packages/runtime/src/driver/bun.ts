@@ -13,12 +13,39 @@ export type PostgresOptions = Omit<
 > & { readonly profiler?: QueryProfiler | undefined };
 export type { PostgresDriver } from "./pool";
 
-/** Bun reports socket-level failures with ERR_POSTGRES_* codes; server errors carry SQLSTATE codes. */
-const transportFailure = (error: Error): boolean => {
-  const code: unknown = (error as { code?: unknown }).code;
-
-  return typeof code === "string" && code.startsWith("ERR_");
+/**
+ * Hands a reserved connection back. After a clean end it returns to the pool.
+ * With an error, from a ROLLBACK that failed, it is closed, as node-postgres
+ * closes it: the session may still hold the transaction. Bun's error codes do
+ * not tell a lost socket from a statement the server refused: every server
+ * error is ERR_POSTGRES_SERVER_ERROR (its SQLSTATE in `errno`), and a session
+ * the server ended reports one too (57P01). Closing a lost connection is as
+ * safe as returning it.
+ */
+export const releaseReserved = (
+  reserved: {
+    readonly release: () => void;
+    readonly close: () => Promise<unknown>;
+  },
+  error?: Error,
+): void => {
+  if (error) {
+    void reserved.close().catch(() => {});
+  } else {
+    reserved.release();
+  }
 };
+
+/**
+ * Bun.SQL reads a bytea column only in the hex form PostgreSQL prints by
+ * default; a database, role or pooler may set `bytea_output = escape`. The
+ * adapter has no place to run a SET on each connection, and a start-up
+ * parameter it added would make poolers that refuse unknown ones (PgBouncer
+ * by default) refuse every connection, so the setting is the caller's.
+ */
+const unreadableBytea = (error: unknown): boolean =>
+  (error as { code?: unknown } | null)?.code ===
+  "ERR_POSTGRES_UNSUPPORTED_BYTEA_FORMAT";
 
 export const postgres = (
   connection: string | PostgresOptions,
@@ -32,10 +59,24 @@ export const postgres = (
     connection: SQL,
     query: CompiledQuery,
   ): Promise<ExecutionResult> => {
-    const result = await connection.unsafe<Record<string, unknown>[]>(
-      query.sql,
-      postgresParameters(query.parameters),
-    );
+    let result: Record<string, unknown>[];
+
+    try {
+      result = await connection.unsafe<Record<string, unknown>[]>(
+        query.sql,
+        postgresParameters(query.parameters),
+      );
+    } catch (error) {
+      // The error stays Bun's own, with its class, code and stack, so code
+      // that checks them still matches; only its message changes, to say
+      // what to do.
+      if (unreadableBytea(error) && error instanceof Error) {
+        error.message =
+          'symmetria: the server sends bytea values in the escape form (bytea_output = escape), which Bun.SQL cannot read; give the adapter the default: postgres({ url, connection: { bytea_output: "hex" } })';
+      }
+
+      throw error;
+    }
 
     return {
       rows: Array.from(result),
@@ -53,22 +94,10 @@ export const postgres = (
         return {
           execute: (query) => execute(reserved, query),
           release: (error) => {
-            if (released) {
-              return;
+            if (!released) {
+              released = true;
+              releaseReserved(reserved, error);
             }
-
-            released = true;
-
-            if (!error || transportFailure(error)) {
-              reserved.release();
-
-              return;
-            }
-
-            void reserved
-              .unsafe("ROLLBACK")
-              .catch(() => {})
-              .finally(() => reserved.release());
           },
           // Closing a reserved connection frees its pool slot for a fresh one.
           discard: async () => {

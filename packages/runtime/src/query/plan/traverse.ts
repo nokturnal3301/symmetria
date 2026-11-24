@@ -2,7 +2,7 @@
  * Child traversal shared by the plan walks that only read a tree: scope
  * validation, CTE collection, pagination and aggregate analysis.
  */
-import type { ValueNode } from "../expressions";
+import type { PredicateDescription, ValueNode } from "../expressions";
 
 /** Ends a switch that names every kind: a kind added later fails to compile there. */
 export const unhandledKind = (node: never): never => {
@@ -51,6 +51,8 @@ export const childNodes = (node: ValueNode): readonly ValueNode[] => {
       ];
     case "aggregate":
       return node.value ? [node.value] : [];
+    case "condition":
+      return predicateNodes(node.predicate);
     case "column":
     case "parameter":
     case "placeholder":
@@ -62,6 +64,36 @@ export const childNodes = (node: ValueNode): readonly ValueNode[] => {
       return [];
     default:
       return unhandledKind(node);
+  }
+};
+
+/** The value nodes a condition reads; nested plans are not entered. */
+export const predicateNodes = (
+  predicate: PredicateDescription,
+): readonly ValueNode[] => {
+  switch (predicate.kind) {
+    case "comparison":
+      return [predicate.left, predicate.right];
+    case "search":
+      return [predicate.value, predicate.query];
+    case "has":
+      return [predicate.value, predicate.element];
+    case "nullCheck":
+      return [predicate.value];
+    case "between":
+      return [predicate.value, predicate.lower, predicate.upper];
+    case "membership":
+      return Array.isArray(predicate.values)
+        ? [predicate.value, ...predicate.values]
+        : [predicate.value];
+    case "group":
+      return predicate.predicates.flatMap(predicateNodes);
+    case "not":
+    case "notTrue":
+    case "scope":
+      return predicateNodes(predicate.predicate);
+    case "exists":
+      return [];
   }
 };
 

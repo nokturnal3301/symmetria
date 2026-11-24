@@ -270,7 +270,7 @@ export const collectGolden = async (): Promise<Record<string, GoldenEntry>> => {
   const execute = async (query: CompiledQuery) => {
     log.push(statement(query));
 
-    return answer(query, rows);
+    return { rows: answer(query, rows), affectedRows: rows };
   };
   const connection: TransactionDriver = {
     execute,

@@ -19,7 +19,11 @@ import {
   halfPrecision,
   typeConversion,
 } from "./conversions";
-import type { MigrationColumn, MigrationTable } from "./snapshot";
+import {
+  commentText,
+  type MigrationColumn,
+  type MigrationTable,
+} from "./snapshot";
 import { distinctDefault, VOLATILE_FUNCTION } from "./sql-lint";
 
 /**
@@ -96,6 +100,41 @@ export const lintMigration = (
           column,
         )
       : report(level, table, message, advice, column);
+
+  /**
+   * An index the plan builds CONCURRENTLY (--online): outside a transaction,
+   * while reads and writes go on.
+   */
+  const builtConcurrently = (table: string, index: string): boolean => {
+    const build = `INDEX CONCURRENTLY ${quoteIdentifier(index)} ON ${quoteIdentifier(table)} `;
+
+    return plan.up.some(
+      (statement) =>
+        statement.startsWith(`CREATE ${build}`) ||
+        statement.startsWith(`CREATE UNIQUE ${build}`),
+    );
+  };
+  const concurrentAdvice =
+    "If the build fails, it leaves an invalid index and an incomplete migration: drop the index (DROP INDEX CONCURRENTLY), then use repair.";
+
+  /**
+   * NOT NULL the plan sets through a CHECK (column IS NOT NULL) added NOT
+   * VALID and validated in its own statement (--online): SET NOT NULL then
+   * uses the check instead of scanning the table under its lock.
+   */
+  const validatedNotNull = (table: string, column: string): boolean => {
+    const prefix = `ALTER TABLE ${quoteIdentifier(table)} ADD CONSTRAINT `;
+    const suffix = ` CHECK (${quoteIdentifier(column)} IS NOT NULL) NOT VALID`;
+
+    return plan.up.some(
+      (statement) =>
+        statement.startsWith(prefix) &&
+        statement.endsWith(suffix) &&
+        plan.up.includes(
+          `ALTER TABLE ${quoteIdentifier(table)} VALIDATE CONSTRAINT ${statement.slice(prefix.length, -suffix.length)}`,
+        ),
+    );
+  };
 
   // A type that keeps its labels under a new name is renamed in place (ALTER TYPE … RENAME TO).
   const renamedEnumeration = (from?: string, to?: string): boolean => {
@@ -374,6 +413,19 @@ export const lintMigration = (
             "Add the column without UNIQUE, give existing rows distinct values, then add the constraint in a later migration.",
             column.name,
           );
+        } else if (
+          builtConcurrently(
+            after.name,
+            objectName(after.name, column.name, "key"),
+          )
+        ) {
+          report(
+            "caution",
+            after.name,
+            `Column "${column.name}" is added with a UNIQUE constraint; existing rows hold distinct values or NULL, and the index is built CONCURRENTLY, outside a transaction, while reads and writes go on.`,
+            concurrentAdvice,
+            column.name,
+          );
         } else {
           report(
             "caution",
@@ -407,15 +459,21 @@ export const lintMigration = (
         continue;
       }
 
+      const concurrent = builtConcurrently(after.name, definition.sqlName);
+
       report(
         definition.unique ? "blocking" : "caution",
         after.name,
         definition.unique
           ? `Unique index "${definition.sqlName}" fails when existing rows contain duplicates.`
-          : `Index "${definition.sqlName}" is created inside the migration transaction and blocks writes while it builds.`,
+          : concurrent
+            ? `Index "${definition.sqlName}" is built CONCURRENTLY, outside a transaction: reads and writes go on while it builds, which takes longer than a plain build.`
+            : `Index "${definition.sqlName}" is created inside the migration transaction and blocks writes while it builds.`,
         definition.unique
-          ? "Deduplicate the data first, then add the index."
-          : "For large tables create it separately with $createIndexes({ concurrently: true }).",
+          ? `Deduplicate the data first, then add the index.${concurrent ? ` ${concurrentAdvice}` : ""}`
+          : concurrent
+            ? concurrentAdvice
+            : "For large tables create it separately with $createIndexes({ concurrently: true }).",
       );
     }
 
@@ -536,13 +594,23 @@ export const lintMigration = (
     }
 
     if (!before.notNull && after.notNull) {
-      report(
-        "blocking",
-        table.name,
-        `Column "${after.name}" becomes NOT NULL; the statement fails when existing rows contain NULL.`,
-        "Backfill NULL values first, or add a default and set NOT NULL in a later migration.",
-        after.name,
-      );
+      if (validatedNotNull(table.name, after.name)) {
+        report(
+          "caution",
+          table.name,
+          `Column "${after.name}" becomes NOT NULL; a CHECK that it is not NULL is added NOT VALID and validated in a separate statement, which fails when an existing row holds NULL, and SET NOT NULL then uses it instead of scanning the table.`,
+          "Backfill NULL values before the migration runs.",
+          after.name,
+        );
+      } else {
+        report(
+          "blocking",
+          table.name,
+          `Column "${after.name}" becomes NOT NULL; the statement fails when existing rows contain NULL.`,
+          "Backfill NULL values first, or add a default and set NOT NULL in a later migration.",
+          after.name,
+        );
+      }
     }
 
     if (!before.unique && after.unique) {
@@ -550,7 +618,9 @@ export const lintMigration = (
         "blocking",
         table.name,
         `Column "${after.name}" becomes UNIQUE; the statement fails when existing rows contain duplicates.`,
-        "Deduplicate the data first, then add the constraint.",
+        builtConcurrently(table.name, objectName(table.name, after.name, "key"))
+          ? `Deduplicate the data first, then add the constraint. ${concurrentAdvice}`
+          : "Deduplicate the data first, then add the constraint.",
         after.name,
       );
     } else if (before.unique && !after.unique) {
@@ -632,12 +702,13 @@ export const lintMigration = (
   );
 };
 
+/** The review generate and lint print: names and labels in it stay on their line. */
 export const formatLintFindings = (findings: readonly LintFinding[]): string =>
   findings.length
     ? findings
         .map(
           (finding) =>
-            `${finding.level.toUpperCase().padEnd(11)} ${finding.table}${finding.column ? `.${finding.column}` : ""}: ${finding.message}\n            ${finding.advice}`,
+            `${finding.level.toUpperCase().padEnd(11)} ${commentText(`${finding.table}${finding.column ? `.${finding.column}` : ""}: ${finding.message}`)}\n            ${commentText(finding.advice)}`,
         )
         .join("\n")
     : "No risky operations found.";

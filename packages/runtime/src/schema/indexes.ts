@@ -392,7 +392,7 @@ export const applyIndexes = (
       return quoteIdentifier(column.sqlName);
     };
 
-    const expressions = ddlExpressions(columnSql);
+    const expressions = ddlExpressions(columnSql, { index: true });
     const valueSql = expressions.valueSQL;
 
     if (description.unique && description.method !== "btree") {
@@ -521,7 +521,9 @@ export const indexClausesSQL = (definition: IndexSnapshot): string =>
       ? ` WITH (${Object.entries(definition.with)
           .map(
             ([name, value]) =>
-              `${name} = ${typeof value === "number" ? value : `'${value.replaceAll("'", "''")}'`}`,
+              // Text with a backslash as an escape string, which reads the
+              // same with standard_conforming_strings off.
+              `${name} = ${typeof value === "number" ? value : value.includes("\\") ? `E'${value.replaceAll("\\", "\\\\").replaceAll("'", "''")}'` : `'${value.replaceAll("'", "''")}'`}`,
           )
           .join(", ")})`
       : ""

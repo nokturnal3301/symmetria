@@ -1,8 +1,9 @@
 /**
  * The migrator: applies and rolls back migrations against a database, tracking status in the migrations table.
  */
+import { setTimeout as delay } from "node:timers/promises";
 import { quoteIdentifier } from "symmetria/internal";
-import { sqlState, type QueryExecutor } from "symmetria";
+import { databaseError, sqlState, type QueryExecutor } from "symmetria";
 import type { Driver } from "symmetria/driver";
 import {
   checksumMatches,
@@ -17,10 +18,14 @@ import {
   type MigrationSnapshot,
 } from "./snapshot";
 import {
+  addErrorNote,
   applyStatements,
+  DEFAULT_LOCK_TIMEOUT_MS,
   DEFAULT_STATEMENT_TIMEOUT_MS,
   executeSQL,
   executionPlan,
+  migrationLockHolder,
+  waitsWithoutBlocking,
   withMigrationConnection,
   type ExecutionOptions,
   type MigrationConnection,
@@ -45,6 +50,11 @@ export type MigrationStatus = {
   direction?: "up" | "down";
   statement?: number;
   error?: string;
+  /**
+   * An incomplete migration while another session holds the migration lock:
+   * it is still running there (or being repaired), so it needs no repair yet.
+   */
+  running?: true;
 };
 type HistoryEntry = {
   id: string;
@@ -66,6 +76,17 @@ const JOURNAL_COLUMNS: Readonly<Record<string, string>> = {
 };
 /** How long status waits for a lock on the journal before reporting it as busy. */
 const STATUS_LOCK_TIMEOUT_MS = 2000;
+/**
+ * How long a failed `transaction: "none"` migration waits for a fresh
+ * connection to record its error when its own session was lost.
+ */
+const JOURNAL_FALLBACK_TIMEOUT_MS = 10000;
+/**
+ * A new connection refused or never opened (no server, or one that refuses
+ * sessions): unlike a pooled connection lost with the session, trying again
+ * soon does not help.
+ */
+const REFUSED_STATES = new Set(["08001", "08004", "57P03", "53300"]);
 
 /** Names the migrations whose identical schema hash makes a baseline ambiguous. */
 const ambiguousBaseline = (migrations: readonly Migration[]): Error =>
@@ -217,9 +238,11 @@ export const migrator = (options: MigratorOptions) => {
         );
       }
 
+      // Every caller that refuses holds the migration lock: no other process
+      // is running the migration.
       if (!incomplete && entry.state === "incomplete") {
         throw new Error(
-          `symmetria: migration "${entry.id}" is incomplete (${entry.direction}, ${entry.statement} confirmed statements${edited ? "; its files changed since it ran" : ""}); inspect the database and use repair`,
+          `symmetria: migration "${entry.id}" is incomplete (${entry.direction}, ${entry.statement} confirmed statements${edited ? "; its files changed since it ran" : ""}): it stopped part-way, and no other process is running it (none holds the migration lock). Inspect the database and use repair`,
         );
       }
 
@@ -274,13 +297,23 @@ export const migrator = (options: MigratorOptions) => {
       target < 0
         ? snapshotHash(emptySnapshot())
         : state.migrations[target]!.manifest.after;
+    // Generate keeps the snapshot from before the latest migration in
+    // meta/migration.json (`undo`): the boundary a retry of it goes back to.
+    // A verification server, which replays the SQL itself, comes first.
+    const { undo } = state as MigrationState & {
+      undo?: { snapshot: MigrationSnapshot };
+    };
     const expected =
       snapshot ??
       (target < 0
         ? emptySnapshot()
         : hash === snapshotHash(state.snapshot)
           ? state.snapshot
-          : undefined);
+          : undo &&
+              !options.verificationDatabaseUrl &&
+              hash === snapshotHash(undo.snapshot)
+            ? undo.snapshot
+            : undefined);
 
     if (expected) {
       if (snapshotHash(expected) !== hash) {
@@ -322,6 +355,142 @@ export const migrator = (options: MigratorOptions) => {
   };
 
   /**
+   * Saves the error of a failed `transaction: "none"` migration in its journal
+   * row. The session may have been lost with the statement (a terminated
+   * server process, a failover, a dropped connection): a fresh connection from
+   * the pool then writes it. If that fails too, the error says so instead of
+   * being replaced.
+   */
+  const recordFailure = async (
+    link: MigrationConnection,
+    migration: Migration,
+    error: unknown,
+  ): Promise<void> => {
+    const query = {
+      sql: `UPDATE ${qualifiedName} SET error = $2 WHERE id = $1 AND state = 'incomplete'`,
+      parameters: [
+        migration.id,
+        error instanceof Error ? error.message : String(error),
+      ],
+    };
+
+    try {
+      await executeSQL(link.session!.execute, query.sql, query.parameters);
+
+      return;
+    } catch {
+      // Tried again below, away from the session.
+    }
+
+    const { driver } = options;
+    // Aborted once the wait ends. An attempt still opening its connection
+    // then writes nothing: its transaction rolls back, so the error the
+    // message says the journal lacks does not appear there later. Only a
+    // COMMIT already under way may still record it.
+    const timer = new AbortController();
+    let committing = false;
+    const attempt = async () => {
+      if (!driver.transaction) {
+        committing = true;
+        await executeSQL(driver.execute, query.sql, query.parameters);
+
+        return;
+      }
+
+      await driver.transaction(async (tx) => {
+        timer.signal.throwIfAborted();
+        await executeSQL(
+          tx.execute,
+          "SELECT set_config('lock_timeout', $1, true)",
+          [`${options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS}ms`],
+        );
+        await executeSQL(tx.execute, query.sql, query.parameters);
+        timer.signal.throwIfAborted();
+        committing = true;
+      });
+    };
+    // A failover or network blip drops the pool's idle connections with the
+    // session's, and the pool hands them out until it notices. A pooled driver
+    // discards each that fails, so the write is tried again on the next one,
+    // and on a new connection. One the server refuses, or that cannot be
+    // opened, ends it: the server is down.
+    let lost: unknown;
+    const write = async (): Promise<void> => {
+      for (let tries = 1; ; tries++) {
+        try {
+          await attempt();
+
+          return;
+        } catch (failure) {
+          committing = false;
+          const reason = databaseError(failure);
+
+          if (
+            reason?.kind !== "connection" ||
+            REFUSED_STATES.has(reason.sqlState)
+          ) {
+            throw failure;
+          }
+
+          lost = failure;
+
+          await delay(Math.min(tries * 50, 500), undefined, {
+            signal: timer.signal,
+          }).catch(() => {});
+
+          if (timer.signal.aborted) {
+            throw failure;
+          }
+        }
+      }
+    };
+
+    // Ctrl-C ends the wait, and the migration's error is reported at once.
+    let interrupt = (): void => {};
+    const interrupted = new Promise<never>((_, reject) => {
+      interrupt = () =>
+        reject(new Error("interrupted while waiting for a connection"));
+    });
+
+    options.signal?.addEventListener("abort", interrupt, { once: true });
+
+    if (options.signal?.aborted) {
+      interrupt();
+    }
+
+    try {
+      await Promise.race([
+        write(),
+        interrupted,
+        delay(JOURNAL_FALLBACK_TIMEOUT_MS, undefined, {
+          signal: timer.signal,
+        }).then(
+          () => {
+            throw new Error(
+              `no connection answered within ${JOURNAL_FALLBACK_TIMEOUT_MS}ms${lost === undefined ? "" : ` (${lost instanceof Error ? lost.message : String(lost)})`}`,
+            );
+          },
+          () => {},
+        ),
+      ]);
+    } catch (failure) {
+      timer.abort();
+      const reason =
+        failure instanceof Error ? failure.message : String(failure);
+
+      addErrorNote(
+        error,
+        committing
+          ? `The migration journal may not record this error: ${reason}; a write of it was being committed when the wait ended.`
+          : `The migration journal does not record this error: ${reason}.`,
+      );
+    } finally {
+      options.signal?.removeEventListener("abort", interrupt);
+      timer.abort();
+    }
+  };
+
+  /**
    * Applies migrations one transactional group at a time. Each group's
    * transaction reads the journal again and asks `pending` what is left, given
    * the migrations this run already completed: a transaction-only driver
@@ -356,11 +525,14 @@ export const migrator = (options: MigratorOptions) => {
 
         if (!link.session && plan.some((step) => step.transaction === "none")) {
           const id = plan.find((step) => step.transaction === "none")!.id;
+          const needs = `symmetria: migration "${id}" uses transaction: "none", which needs`;
 
           throw new Error(
             link.pooled
-              ? `symmetria: migration "${id}" uses transaction: "none", which needs one server connection for its statements and the migration lock; this connection pools transactions (such as PgBouncer with pool_mode=transaction), or its pool has a single connection, which leaves none to check that. Run it over a direct or session-pooled connection with at least two connections (max: 2)`
-              : `symmetria: migration "${id}" uses transaction: "none", which needs a driver with sessions (driver.session); this driver only runs whole transactions`,
+              ? `${needs} one server connection for its statements and the migration lock; this connection pools transactions (such as PgBouncer with pool_mode=transaction): a second connection from the driver's pool reached the migration session's PostgreSQL process, or the session's own statements came from two. Run it over a direct or session-pooled connection`
+              : link.unchecked
+                ? `${needs} one server connection for its statements and the migration lock. A second connection from the driver's pool checks that the connection does not pool transactions (as PgBouncer with pool_mode=transaction does), and ${link.unchecked}`
+                : `${needs} a driver with sessions (driver.session); this driver only runs whole transactions`,
           );
         }
 
@@ -419,6 +591,21 @@ export const migrator = (options: MigratorOptions) => {
                 [`${milliseconds}ms`],
               )
             : undefined;
+        // The default lock timeout would cancel it too, while it waits for
+        // any older transaction in the database. Statements whose waits block
+        // no reads or writes wait without it; others keep the default, and a
+        // configured timeout applies to all.
+        let waiting = false;
+        const lockTimeout = async (wait: boolean) => {
+          if (options.lockTimeoutMs === undefined && wait !== waiting) {
+            await executeSQL(
+              session.execute,
+              "SELECT set_config('lock_timeout', $1, false)",
+              [wait ? "0" : `${DEFAULT_LOCK_TIMEOUT_MS}ms`],
+            );
+            waiting = wait;
+          }
+        };
 
         try {
           await statementTimeout(0);
@@ -434,23 +621,18 @@ export const migrator = (options: MigratorOptions) => {
                 [migration.id, statement],
               );
             },
+            ({ code }) => lockTimeout(waitsWithoutBlocking(code)),
           );
           await record(session.execute, migration, direction);
         } catch (error) {
-          await executeSQL(
-            session.execute,
-            `UPDATE ${qualifiedName} SET error = $2 WHERE id = $1`,
-            [
-              migration.id,
-              error instanceof Error ? error.message : String(error),
-            ],
-          );
+          await recordFailure(link, migration, error);
           throw error;
         } finally {
           // A session that failed cannot be set back, and is not used again.
           await Promise.resolve(
             statementTimeout(DEFAULT_STATEMENT_TIMEOUT_MS),
           ).catch(() => {});
+          await lockTimeout(false).catch(() => {});
         }
       }
 
@@ -464,9 +646,26 @@ export const migrator = (options: MigratorOptions) => {
       // A read of committed journal rows: it must not wait for a running
       // migration's advisory lock, so a deploy in progress still reports. A
       // short lock_timeout turns a journal held by DDL into an error, not a hang.
-      const read = (execute: QueryExecutor) =>
-        inspect(execute, migrations, false, true);
-      const history = await (options.driver.transaction
+      const read = async (execute: QueryExecutor) => {
+        const history = await inspect(execute, migrations, false, true);
+
+        if (!history.some((entry) => entry.state === "incomplete")) {
+          return { history, running: false };
+        }
+
+        // An incomplete migration is still running while another session
+        // holds the migration lock; one that stopped leaves the lock free.
+        if ((await migrationLockHolder(execute, lockName)) !== undefined) {
+          return { history, running: true };
+        }
+
+        // Read again: one that finished since the first read shows as applied.
+        return {
+          history: await inspect(execute, migrations, false, true),
+          running: false,
+        };
+      };
+      const { history, running } = await (options.driver.transaction
         ? options.driver.transaction(
             async (tx) => {
               await executeSQL(
@@ -504,6 +703,7 @@ export const migrator = (options: MigratorOptions) => {
                     direction: entry.direction,
                     statement: entry.statement,
                     ...(entry.error ? { error: entry.error } : {}),
+                    ...(running ? { running: true as const } : {}),
                   }
                 : {}),
             }

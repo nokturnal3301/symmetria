@@ -11,7 +11,7 @@ import {
   sql,
   varchar,
 } from "../../../packages/runtime/src";
-import { diffSchemas } from "../../../packages/kit/src";
+import { diffSchemas, emptySnapshot } from "../../../packages/kit/src";
 import {
   highlightSQL,
   inspectEntries,
@@ -23,6 +23,7 @@ import {
   formatCreated,
   formatDashboard,
   formatDiff,
+  formatPlan,
   formatSchema,
 } from "../../../packages/kit/src/cli/ui/format";
 import {
@@ -236,6 +237,81 @@ test("a modified column shows the collation, identity or enum type that changed"
     "",
     "    ~ enum users_role_enum → Role: a | b → a | b",
     "  1 tables changed · 3 SQL statements",
+  ]);
+});
+
+test("a diff lists only the checks and indexes whose SQL changes, not those another release spelled differently", () => {
+  const model = (extra: boolean, bound: number) =>
+    schema({
+      items: table({
+        id: int.auto,
+        n: int,
+        scores: int.array,
+        ...(extra ? { note: text.nullable } : {}),
+      })
+        .checks((t) => ({
+          nAbove: t.n.above(bound),
+          sub: sql<boolean>`${t.scores}[1] > ${-5}`,
+        }))
+        .indexes((t) => ({ part: index(t.n).where(t.n.above(-10)) })),
+    }).$snapshot();
+  // 3.5.0 wrote a negative number without parentheses.
+  const saved = JSON.parse(
+    JSON.stringify(model(false, -5)).replace(/\(-(\d+)\)/g, "-$1"),
+  );
+  expect(JSON.stringify(saved)).toContain('"\\"n\\" > -5"');
+
+  const plan = diffSchemas(saved, model(true, -5));
+  expect(plan.up).toEqual(['ALTER TABLE "items" ADD COLUMN "note" text']);
+  expect(formatDiff(plan).split("\n")).toEqual([
+    "  ~ items",
+    "    + note                 text · nullable",
+    "",
+    "  1 tables changed · 1 SQL statements",
+  ]);
+  expect(formatDiff(diffSchemas(saved, model(false, -5)))).toBe(
+    "No schema changes.",
+  );
+  expect(formatDiff(diffSchemas(saved, model(false, -6)))).toContain(
+    '    ~ items_n_above_check  CHECK ("n" > (-6))',
+  );
+});
+
+test("a diff writes a line break in a name as an escape, one change to a line", () => {
+  const after = schema({
+    [`odd\ntable`]: table({
+      id: int.auto,
+      [`odd column`]: text,
+      state: oneOf("a\rb", "c"),
+    }).indexes((row) => ({ [`by id`]: index(row.id) })),
+  }).$snapshot();
+
+  expect(formatDiff(diffSchemas(emptySnapshot(), after)).split("\n")).toEqual([
+    "  + odd\\ntable",
+    "    + id                   integer · identity",
+    "    + odd\\u2028column           text",
+    "    + state                enum odd\\ntable_state_enum",
+    "    + primary key          () → (id)",
+    expect.stringMatching(/^ {4}\+ odd\\ntable_by\\u2029id_idx {2}btree/),
+    "",
+    "    + enum odd\\ntable_state_enum:  → a\\rb | c",
+    expect.stringMatching(/^ {2}1 tables changed · \d+ SQL statements$/),
+  ]);
+});
+
+test("a plan writes a migration id with a line break as an escape in its comment", () => {
+  expect(
+    formatPlan([
+      {
+        id: "000002_odd\nDROP TABLE users;\u2028--",
+        group: 1,
+        transaction: "batch",
+        statements: ['CREATE TABLE "t" ()'],
+      },
+    ]).split("\n"),
+  ).toEqual([
+    "-- group 1: batch · 000002_odd\\nDROP TABLE users;\\u2028--",
+    'CREATE TABLE "t" ();',
   ]);
 });
 

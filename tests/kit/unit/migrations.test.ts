@@ -23,6 +23,8 @@ import {
   inet,
   bytea,
   smallint,
+  real,
+  doublePrecision,
   type Column,
 } from "../../../packages/runtime/src";
 import { vector, halfvec } from "../../../packages/runtime/src/entries/vector";
@@ -38,7 +40,11 @@ import {
   formatLintFindings,
   normalizeSqlType,
 } from "../../../packages/kit/src";
-import { splitMigrationSQL } from "../../../packages/kit/src/migrations/sql";
+import {
+  formatMigrationSQL,
+  parseMigrationSQL,
+  splitMigrationSQL,
+} from "../../../packages/kit/src/migrations/sql";
 import {
   expressionKey,
   readExpression,
@@ -411,6 +417,76 @@ SELECT 'one'';two', 'backslash\\', $$three;four$$; -- tail
     /unterminated/,
   );
   expect(() => splitMigrationSQL("DO $$unterminated")).toThrow(/unterminated/);
+  // A carriage return ends a comment, as in PostgreSQL: what follows is SQL,
+  // and lint sees it.
+  expect(splitMigrationSQL("-- note\rDROP TABLE victim; SELECT 1;")).toEqual([
+    "-- note\rDROP TABLE victim",
+    "SELECT 1",
+  ]);
+  expect(lintMigrationSQL("-- note\rDROP TABLE victim;")).toEqual([
+    expect.objectContaining({ level: "destructive", statement: 1 }),
+  ]);
+});
+
+test("names and labels with line breaks stay inside the comments of generated SQL and on their line of the review", () => {
+  // Each name would drop the table if it ended its comment.
+  const drop = (name: string) => `${name}\nDROP TABLE victim; --`;
+  const before = schema({
+    victim: table({ id: int.auto }),
+    items: table({
+      id: int.auto,
+      a: text,
+      mood: oneOf("kept", drop("gone")).nullable,
+      score: int.named("s\u2028DROP TABLE victim; --"),
+    }).indexes((t) => ({ [drop("old")]: index(t.a) })),
+  });
+  const after = schema({
+    victim: table({ id: int.auto }),
+    items: table({
+      id: int.auto,
+      a: text,
+      mood: oneOf("kept").nullable,
+      score: smallint.named("s\u2028DROP TABLE victim; --"),
+      added: int.named("n\rDROP TABLE victim; --"),
+    }),
+  });
+  const plan = diffSchemas(before.$snapshot(), after.$snapshot());
+  const statements = parseMigrationSQL(formatMigrationSQL(plan.up));
+  const comments = plan.up.flatMap((statement) =>
+    statement.split("\n").filter((line) => line.startsWith("--")),
+  );
+
+  // The names reach the comments of the drop, the label removal, the
+  // narrowing and the backfill, escaped; no DROP TABLE is SQL.
+  expect(comments).toEqual([
+    `-- symmetria: caution: index "items_old\\ndrop table victim; --_idx" is no longer declared; dropping it loses no data, but queries that used it can get slower.`,
+    `-- symmetria: destructive: Enum "items_mood_enum" drops 'gone\\nDROP TABLE victim; --'; rows using those labels make the rebuild fail.`,
+    `-- Backfill "items"."n\\rDROP TABLE victim; --" for existing rows before this statement.`,
+    expect.stringMatching(
+      /^-- symmetria: destructive: Column "s\\u2028DROP TABLE victim; --" narrows from integer to smallint/,
+    ),
+    expect.stringMatching(
+      /^-- symmetria: caution: type "items_mood_enum_previous_/,
+    ),
+  ]);
+  expect(statements).toHaveLength(plan.up.length);
+  expect(
+    statements.filter((statement) => statement.words[0] === "DROP"),
+  ).toEqual([
+    expect.objectContaining({ words: ["DROP", "INDEX"] }),
+    expect.objectContaining({ words: ["DROP", "TYPE"] }),
+  ]);
+
+  // The review generate and lint print: one line per finding, one for its advice.
+  const review = formatLintFindings(lintMigration(plan));
+
+  expect(review).not.toMatch(/[\r\u2028\u2029]/);
+  expect(
+    review
+      .split("\n")
+      .every((line) => /^(DESTRUCTIVE|BLOCKING|CAUTION) | {12}\S/.test(line)),
+  ).toBe(true);
+  expect(review).toContain("drops 'gone\\nDROP TABLE victim; --'");
 });
 
 test("lintMigration flags destructive, blocking and cautionary changes with advice", () => {
@@ -1046,6 +1122,106 @@ test("expression keys ignore rendering and keep meaning", () => {
   );
   // SQL the parser does not model is compared as text.
   same("x SIMILAR TO 'a'", "x  SIMILAR TO 'a'");
+  // There, a negative number and a bytea value read the same in the
+  // spellings of 3.5.0 (`-5`, `'\x01'::bytea`) and 3.6.0 (`(-5)`, `E'\\x01'::bytea`).
+  same(`"s"[1] > -5`, `"s"[1] > (-5)`);
+  same(`"s"[1] - -5 > -1e+21`, `"s"[1] - (-5) > (-1e+21)`);
+  same(`"s"[1]>-5`, `"s"[1]>(-5)`);
+  same(`f("s"[1], -5) IN (-1)`, `f("s"[1], (-5)) IN ((-1))`);
+  same(
+    `ARRAY[-1] && "s" AND "s"[-1] BETWEEN -2 AND 0`,
+    `ARRAY[(-1)] && "s" AND "s"[(-1)] BETWEEN (-2) AND 0`,
+  );
+  same(`"s"[1] >= -1::numeric(10,2)`, `"s"[1] >= (-1)::numeric(10,2)`);
+  same(
+    String.raw`"b" <> '\x0102'::bytea OR "s"[1] > 0`,
+    String.raw`"b" <> E'\\x0102'::bytea OR "s"[1] > 0`,
+  );
+  // Elsewhere the parentheses mean something.
+  different(`"s"[1]::text = -5::text`, `"s"[1]::text = (-5)::text`);
+  different(`"s"[1] - -5 > 0`, `"s"[1]--5 > 0`);
+  different(`"s"[1] @-5`, `"s"[1] @(-5)`);
+  different(`g (-5) > "s"[1]`, `g -5 > "s"[1]`);
+  different(`"s"[1] > '(-5)'`, `"s"[1] > '-5'`);
+  different(`"s"[1] > $q$(-5)$q$`, `"s"[1] > $q$-5$q$`);
+  different(
+    String.raw`"b" <> E'\\x01'::text OR "s"[1] > 0`,
+    String.raw`"b" <> '\x01'::text OR "s"[1] > 0`,
+  );
+  // A negative number cast through text to a number type, as a real[]
+  // element compared with one and arithmetic on array elements write it.
+  same(`"r"[1] > -0.5::text::real`, `"r"[1] > (-0.5)::text::real`);
+  same(
+    `("s"[1])::double precision + -1::text::double precision > 0`,
+    `("s"[1])::double precision + (-1)::text::double precision > 0`,
+  );
+  same(
+    `CASE "e" WHEN E'a' THEN -2147483647::text::integer END > "s"[1]`,
+    `CASE "e" WHEN E'a' THEN (-2147483647)::text::integer END > "s"[1]`,
+  );
+  // Not where the minus and the casts give another value: text negated,
+  // the sign of a float zero, a rounding to zero before a float, the most
+  // negative integer.
+  different(`"s"[1]::text <> -5::int::text`, `"s"[1]::text <> (-5)::int::text`);
+  different(
+    `"s"[1] > 0 OR "x" <> (-0::float8)::text`,
+    `"s"[1] > 0 OR "x" <> ((-0)::float8)::text`,
+  );
+  different(`"r"[1] > -0::text::real`, `"r"[1] > (-0)::text::real`);
+  different(`"r"[1] > -0.4::int::real`, `"r"[1] > (-0.4)::int::real`);
+  different(`"s"[1] > -2147483648::int4`, `"s"[1] > (-2147483648)::int4`);
+  different(
+    `"s"[1] > -32768::text::smallint`,
+    `"s"[1] > (-32768)::text::smallint`,
+  );
+  // The parser keeps these apart too.
+  different(`"x" <> (-0::float8)::text`, `"x" <> ((-0)::float8)::text`);
+  different(`"ratio" > -0::real`, `"ratio" > (-0)::real`);
+  different(`"code" <> -5::text`, `"code" <> (-5)::text`);
+  different(`"score" > -2147483648::int4`, `"score" > (-2147483648)::int4`);
+  same(`"ratio" > -0.5::text::real`, `"ratio" > (-0.5)::text::real`);
+  same(`"ratio" > -0::real`, `"ratio" > '-0'::real`);
+  // Each cast of a chain keeps what it does to a literal: a number out of
+  // an integer type's range or a numeric(p,s)'s digits fails, an exponent is
+  // a number like any other, and a float rounds half to even where a
+  // numeric rounds half away from zero (2.5::float8::integer is 2,
+  // 2.5::integer is 3).
+  different(
+    `"score" > -32768::smallint::integer`,
+    `"score" > (-32768)::smallint::integer`,
+  );
+  different(`"score" > 32768::smallint::integer`, `"score" > 32768::integer`);
+  different(`"score" > 32768::smallint`, `"score" > 32768`);
+  different(`"score" > 1e3::numeric(4,1)`, `"score" > 1e3`);
+  different(`"score" > 2.5e0::integer`, `"score" > 2.5e0`);
+  different(`"score" > 25e-1::smallint`, `"score" > 25e-1`);
+  different(`"score" > 2.5::float8::integer`, `"score" > 2.5::integer`);
+  different(`"score" > 2.5::real::integer`, `"score" > 2.5::integer`);
+  different(`"score" > 0.1::real::float8`, `"score" > 0.1::float8`);
+  same(`"score" > (-32768)::smallint::integer`, `"score" > -32768`);
+  same(`"score" > 1.5e1::integer`, `"score" > 1.5e1`);
+  same(`"score" > 2::float8::integer`, `"score" > 2`);
+  same(
+    `"score" > 2.5::numeric::float8::integer`,
+    `"score" > 2.5::float8::integer`,
+  );
+  // As PostgreSQL prints them back; it drops a second cast to one type.
+  same(
+    `"score" > -32768::smallint::integer`,
+    "(score > (- ((32768)::smallint)::integer))",
+  );
+  same(
+    `"score" > 2.5::float8::integer`,
+    "(score > ((2.5)::double precision)::integer)",
+  );
+  same(
+    `"score" > 2147483647::real::bigint::bigint`,
+    "(score > ((2147483647)::real)::bigint)",
+  );
+  same(
+    `"score" > '2147483649'::numeric::numeric(3,0)::smallint`,
+    "(score > ('2147483649'::numeric(3,0))::smallint)",
+  );
 });
 
 test("checks, predicates and computed keys written either way need no migration", () => {
@@ -1117,9 +1293,141 @@ test("checks, predicates and computed keys written either way need no migration"
   expect(diffSchemas(raw, changed).up).toEqual([
     'DROP INDEX "items_live_idx"',
     'ALTER TABLE "items" DROP CONSTRAINT "items_score_check"',
-    'ALTER TABLE "items" ADD CONSTRAINT "items_score_check" CHECK ("score" > -99)',
+    'ALTER TABLE "items" ADD CONSTRAINT "items_score_check" CHECK ("score" > (-99))',
     `CREATE INDEX "items_live_idx" ON "items" USING btree ("score") WHERE "state" = E'closed'`,
   ]);
+});
+
+test("a minus before a cast that changes the number is the cast of the negated number where PostgreSQL gives both one value", () => {
+  const types = new Map([
+    ["f", "double precision"],
+    ["x", "real"],
+    ["n", "integer"],
+  ]);
+  const same = (left: string, right: string) =>
+    expect(expressionKey(left, types)).toBe(expressionKey(right, types));
+  const different = (left: string, right: string) =>
+    expect(expressionKey(left, types)).not.toBe(expressionKey(right, types));
+
+  // PostgreSQL reads `-0.5::integer` (3.5.0's spelling) as `-(0.5::integer)`,
+  // -1 like `(-0.5)::integer`: an integer, numeric or float rounds the same
+  // on either side of zero.
+  for (const [number, casts] of [
+    ["0.5", "::integer"],
+    ["0.25", "::real::float8"],
+    ["5", "::real::float8"],
+    ["1.5", "::smallint"],
+    ["2.5", "::float8::integer"],
+    ["0.81743454", "::text::numeric(5,2)"],
+    ["2147483520", "::real::integer"],
+    ["1e2", "::float8::bigint"],
+    ["0.0", "::bigint"],
+  ]) {
+    same(`"f" > -${number}${casts}`, `"f" > (-${number})${casts}`);
+    // SQL the parser does not model (a subscript) is compared as text.
+    same(`"s"[1] > -${number}${casts}`, `"s"[1] > (-${number})${casts}`);
+  }
+
+  same(`("f" + -0.1::real::float8)`, `("f" + (-0.1)::real::float8)`);
+
+  // Not where the positive number reaches an integer type's most negative
+  // value on the way, which PostgreSQL refuses, nor where a float comes out
+  // zero, whose sign only the minus outside the casts keeps.
+  for (const [number, casts] of [
+    ["32767.5", "::smallint"],
+    ["2147483647", "::real::integer"],
+    ["2147483647.5", "::float8::integer"],
+    ["9223372036854775807", "::float8::bigint"],
+    ["1e-7", "::integer::float8"],
+    ["0.5", "::real::integer::float8"],
+    ["0.04", "::numeric(2,1)::float8"],
+    ["0", "::real::float8"],
+    ["1", "::numeric(2,-3)::float8"],
+  ]) {
+    different(`"f" > -${number}${casts}`, `"f" > (-${number})${casts}`);
+    different(`"s"[1] > -${number}${casts}`, `"s"[1] > (-${number})${casts}`);
+  }
+});
+
+test("checks and indexes 3.5.0 saved with a minus before a value-changing cast need no migration", () => {
+  const current = migrationSnapshot(
+    schema({
+      items: table({ id: int.auto, n: int, f: doublePrecision, x: real })
+        .checks((t) => ({
+          a: sql<boolean>`${t.f} > ${-0.5}::integer`,
+          b: sql<boolean>`${t.x} <> ${-0.25}::real::float8`,
+          c: sql<boolean>`${t.n} <> ${-5}::real::float8`,
+          refused: sql<boolean>`${t.n} > ${-32767.5}::smallint`,
+        }))
+        .indexes((t) => ({
+          p: index(t.n).where(sql<boolean>`${t.f} > ${-1.5}::smallint`),
+          e: index(sql<number>`(${t.f} + ${-0.1}::real::float8)`),
+        })),
+    }).$snapshot(),
+  );
+  // 3.5.0 wrote the numbers without parentheses.
+  const saved = parseMigrationSnapshot(
+    JSON.parse(
+      JSON.stringify(current).replace(/\((-\d[\d.]*)\)/g, "$1"),
+    ) as typeof current,
+  );
+
+  expect(saved.tables[0]!.checks!.map((check) => check.expression)).toEqual([
+    '"f" > -0.5::integer',
+    '"x" <> -0.25::real::float8',
+    '"n" <> -5::real::float8',
+    '"n" > -32767.5::smallint',
+  ]);
+  // Only the check PostgreSQL refused in 3.5.0's spelling is written again.
+  expect(diffSchemas(saved, current).up).toEqual([
+    'ALTER TABLE "items" DROP CONSTRAINT "items_refused_check"',
+    'ALTER TABLE "items" ADD CONSTRAINT "items_refused_check" CHECK ("n" > (-32767.5)::smallint)',
+  ]);
+});
+
+test("a default or index predicate 3.5.0 saved ending in a -- comment needs no migration, and SQL restoring it ends the comment", () => {
+  const current = migrationSnapshot(
+    schema({
+      items: table({
+        id: int.auto,
+        n: int.default(sql`1 -- one`).nullable,
+        m: int.nullable,
+      }).indexes((t) => ({
+        m: index(t.m).where(sql<boolean>`${t.m} > 0 -- positive`),
+      })),
+    }).$snapshot(),
+  );
+  // 3.5.0 saved them without the line break after the comment.
+  const saved = parseMigrationSnapshot(
+    JSON.parse(JSON.stringify(current).replaceAll("\\n", "")) as typeof current,
+  );
+
+  expect(saved.tables[0]!.columns[1]!.default).toBe("1 -- one");
+  expect(saved.tables[0]!.indexes[0]!.where).toBe('"m" > 0 -- positive');
+  expect(diffSchemas(saved, current)).toMatchObject({ up: [], down: [] });
+
+  // A later migration that changes both restores them on the way down, each
+  // statement apart: the comment does not take in the semicolon after it.
+  const later = migrationSnapshot(
+    schema({
+      items: table({
+        id: int.auto,
+        n: int.default(2).nullable,
+        m: int.nullable,
+      }),
+    }).$snapshot(),
+  );
+  const plan = diffSchemas(saved, later);
+  const down = splitMigrationSQL(formatMigrationSQL(plan.down));
+
+  expect(plan.before.tables[0]!.columns[1]!.default).toBe("1 -- one");
+  expect(down).toHaveLength(plan.down.length);
+  expect(down).toContain(
+    'ALTER TABLE "items" ALTER COLUMN "n" SET DEFAULT 1 -- one',
+  );
+  expect(down).toContain(
+    'CREATE INDEX "items_m_idx" ON "items" USING btree ("m") WHERE "m" > 0 -- positive',
+  );
 });
 
 test("a type change PostgreSQL has no cast for asks for the conversion", () => {

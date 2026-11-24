@@ -9,6 +9,9 @@ import {
   uuid,
   numeric,
   customType,
+  real,
+  bytea,
+  sql,
 } from "../../../packages/runtime/src";
 import {
   createSchemaSQL,
@@ -118,6 +121,68 @@ test("checks compile to DDL and diff reversibly with renamed and changed columns
         .checks((products) => ({ same: products.stock.below(10) })),
     }),
   ).toThrow(/duplicate check/);
+});
+
+test("negative numbers in schema expressions are parenthesized; other literals are written as before", () => {
+  const offset = -5;
+  const build = (shifted: boolean) =>
+    schema({
+      items: table({ id: int.auto, n: int, r: real, code: text, data: bytea })
+        .checks((t) => ({
+          // After a minus sign, -5 would start a comment: "n"--5.
+          ...(shifted ? { shifted: sql<boolean>`${t.n}-${offset} > 0` } : {}),
+          // -5::text would cast 5 and negate the text.
+          cast: sql<boolean>`${offset}::text <> ${t.code}`,
+          real: t.r.above(-1.5),
+          plus: t.n.plus(-2).above(0),
+          between: t.n.between(-10, 10),
+          positive: t.n.above(5),
+          // Escape strings read the same with standard_conforming_strings off.
+          bytes: t.data.isNot(new Uint8Array([0x41, 0x42])),
+          slash: t.code.isNot("a\\b"),
+        }))
+        .indexes((t) => ({ low: index(t.n).where(t.n.below(-1)) })),
+    }).$snapshot();
+  const declared = build(true);
+
+  expect(
+    Object.fromEntries(
+      declared.tables[0]!.checks!.map((check) => [
+        check.name,
+        check.expression,
+      ]),
+    ),
+  ).toEqual({
+    shifted: '"n"-(-5) > 0',
+    cast: '(-5)::text <> "code"',
+    real: '"r" > (-1.5)::text::real',
+    plus: '("n" + (-2)) > 0',
+    between: '"n" BETWEEN (-10) AND 10',
+    positive: '"n" > 5',
+    bytes: `"data" <> E'\\\\x4142'::bytea`,
+    slash: `"code" <> E'a\\\\b'`,
+  });
+  expect(declared.tables[0]!.indexes![0]!.where).toBe('"n" < (-1)');
+
+  // Snapshots saved before, with the numbers written -5, need no migration,
+  // except where -5 meant another thing: PostgreSQL refused -5::text (it
+  // negates text), so that check is written again.
+  const saved = parseMigrationSnapshot(
+    JSON.parse(
+      JSON.stringify(migrationSnapshot(build(false))).replaceAll(
+        /\((-[0-9.]+)\)/g,
+        "$1",
+      ),
+    ),
+  );
+
+  expect(saved.tables[0]!.checks!.map((check) => check.expression)).toContain(
+    '("n" + -2) > 0',
+  );
+  expect(diffSchemas(saved, build(false)).up).toEqual([
+    'ALTER TABLE "items" DROP CONSTRAINT "items_cast_check"',
+    'ALTER TABLE "items" ADD CONSTRAINT "items_cast_check" CHECK ((-5)::text <> "code")',
+  ]);
 });
 
 test("explicit primary keys retain ordering and support single non-id reference targets", () => {

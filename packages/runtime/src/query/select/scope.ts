@@ -1,7 +1,7 @@
 /** Runtime scopes and plan helpers shared by every query module. */
 import { freeze } from "../plan/freeze";
 import { computedFields } from "../../schema/computed";
-import { quoteIdentifier } from "../compile";
+import { keyAlias, quoteIdentifier } from "../compile/state";
 import { jsonRowCodec } from "../codecs/json";
 import {
   COLUMN_EXPRESSION,
@@ -150,7 +150,8 @@ export const bindingScope = (
     for (const [name, selected] of Object.entries(
       callback(freeze({ ...columns })),
     )) {
-      quoteIdentifier(name);
+      // A field name is a result key: a long one gets a shorter SQL alias.
+      quoteIdentifier(keyAlias(name));
 
       if (Object.hasOwn(columns, name)) {
         throw new Error(`symmetria: duplicate computed field "${name}"`);
@@ -270,7 +271,7 @@ export const readSelection = (
 
     return freeze(
       entries.map(([name, selected]) => {
-        quoteIdentifier(name);
+        quoteIdentifier(keyAlias(name));
 
         if (
           !selected ||
@@ -354,7 +355,7 @@ export const readSelection = (
   return freeze(
     (expressions as readonly SelectedColumn[]).map((expression) => {
       const description = readColumn(expression);
-      quoteIdentifier(description.outputName);
+      quoteIdentifier(keyAlias(description.outputName));
       validateNode(description.node, bindings);
 
       if (names.has(description.outputName)) {

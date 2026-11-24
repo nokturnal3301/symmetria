@@ -87,8 +87,9 @@ export const tokenize = (sql: string): Token[] => {
     if (/\s/.test(character)) {
       position += 1;
     } else if (rest.startsWith("--")) {
-      const end = sql.indexOf("\n", position);
-      position = end < 0 ? sql.length : end + 1;
+      // A line feed or a carriage return ends the comment, as in PostgreSQL.
+      const end = rest.search(/[\n\r]/);
+      position = end < 0 ? sql.length : position + end + 1;
     } else if (rest.startsWith("/*")) {
       let depth = 1;
       position += 2;

@@ -1,6 +1,6 @@
 /** JSON field and row codecs, matching PostgreSQL JSON projections. */
 import { freeze } from "../plan/freeze";
-import { createRowDecoder, encodeValue, type RuntimeCodec } from ".";
+import { createRowDecoder, encodeValue, jsonText, type RuntimeCodec } from ".";
 
 export const encodeJsonField = (
   value: unknown,
@@ -111,7 +111,7 @@ export const jsonRowCodec = (
           ]),
         );
 
-      return JSON.stringify(
+      return jsonText(
         many
           ? (value as Record<string, unknown>[]).map(encodeRow)
           : encodeRow(value as Record<string, unknown>),

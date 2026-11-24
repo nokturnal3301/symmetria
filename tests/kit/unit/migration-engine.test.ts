@@ -26,7 +26,10 @@ import {
   type Migration,
   type RenameHints,
 } from "../../../packages/kit/src";
-import { executionPlan } from "../../../packages/kit/src/migrations/execution";
+import {
+  executionPlan,
+  waitsWithoutBlocking,
+} from "../../../packages/kit/src/migrations/execution";
 import {
   formatMigrationSQL,
   parseMigrationSQL,
@@ -405,6 +408,40 @@ test("only statements PostgreSQL refuses in a transaction require transaction no
     "CREATE TABLE tablespace_notes (database text)",
   ]) {
     expect(plan(`${statement};`)[0]!.transaction).toBe("batch");
+  }
+});
+
+test("a none migration lifts the default lock timeout only for statements whose waits block no reads or writes", () => {
+  const waits = (statement: string) =>
+    waitsWithoutBlocking(parseMigrationSQL(statement)[0]!.code);
+
+  for (const statement of [
+    'CREATE INDEX CONCURRENTLY "posts_title_idx" ON "posts" ("title")',
+    "create unique index concurrently if not exists posts_slug_key on posts (slug)",
+    'DROP INDEX CONCURRENTLY IF EXISTS "posts_title_idx"',
+    "REINDEX (VERBOSE, CONCURRENTLY) TABLE posts",
+    "REINDEX INDEX CONCURRENTLY posts_title_idx",
+    'ALTER TABLE "users" VALIDATE CONSTRAINT "users_age_check"',
+    "ALTER TABLE IF EXISTS ONLY app.validate VALIDATE CONSTRAINT validate",
+  ]) {
+    expect([statement, waits(statement)]).toEqual([statement, true]);
+  }
+
+  // Locks that reads and writes queue behind keep the timeout.
+  for (const statement of [
+    'ALTER TABLE "users" ADD CONSTRAINT "users_age_check" CHECK (age > 0) NOT VALID',
+    'ALTER TABLE "users" ALTER COLUMN "age" SET NOT NULL',
+    'ALTER TABLE "users" DROP CONSTRAINT "users_age_check"',
+    "ALTER TABLE users VALIDATE CONSTRAINT a, ADD COLUMN note text",
+    "ALTER TABLE events DETACH PARTITION events_2024 FINALIZE",
+    // Its second transaction takes ACCESS EXCLUSIVE on the partition.
+    'ALTER TABLE "events" DETACH PARTITION "events_2024" CONCURRENTLY',
+    "REINDEX (CONCURRENTLY false) TABLE posts",
+    "VACUUM FULL posts",
+    "CREATE INDEX jobs_mode_idx ON jobs (concurrently)",
+    "SELECT 'CREATE INDEX CONCURRENTLY x'",
+  ]) {
+    expect([statement, waits(statement)]).toEqual([statement, false]);
   }
 });
 
@@ -987,6 +1024,464 @@ test("generate's review and lint of the saved SQL fail on the same generated cha
   });
 });
 
+test("the --online review describes the SQL it writes, and lint of the saved file agrees", () => {
+  const before = schema({
+    users: { id: int.auto, name: text, email: text, n: int.nullable },
+  });
+  const after = schema({
+    users: {
+      id: int.auto,
+      name: text.index,
+      email: text.unique,
+      n: int,
+      code: text.nullable.unique,
+    },
+  });
+  const plan = diffSchemas(before.$snapshot(), after.$snapshot(), {
+    online: true,
+  });
+  const failed =
+    "If the build fails, it leaves an invalid index and an incomplete migration: drop the index (DROP INDEX CONCURRENTLY), then use repair.";
+
+  expect(
+    lintMigration(plan).map((finding) => [
+      finding.level,
+      finding.column ?? finding.table,
+      finding.message,
+      finding.advice,
+    ]),
+  ).toEqual([
+    [
+      "blocking",
+      "email",
+      'Column "email" becomes UNIQUE; the statement fails when existing rows contain duplicates.',
+      `Deduplicate the data first, then add the constraint. ${failed}`,
+    ],
+    // Validated like an online CHECK; SET NOT NULL then scans nothing.
+    [
+      "caution",
+      "n",
+      'Column "n" becomes NOT NULL; a CHECK that it is not NULL is added NOT VALID and validated in a separate statement, which fails when an existing row holds NULL, and SET NOT NULL then uses it instead of scanning the table.',
+      "Backfill NULL values before the migration runs.",
+    ],
+    [
+      "caution",
+      "code",
+      'Column "code" is added with a UNIQUE constraint; existing rows hold distinct values or NULL, and the index is built CONCURRENTLY, outside a transaction, while reads and writes go on.',
+      failed,
+    ],
+    [
+      "caution",
+      "users",
+      'Index "users_name_idx" is built CONCURRENTLY, outside a transaction: reads and writes go on while it builds, which takes longer than a plain build.',
+      failed,
+    ],
+  ]);
+  // The temporary check is dropped, not rebuilt, and SET NOT NULL cannot fail.
+  expect(lint(plan.up.map((statement) => `${statement};`).join("\n"))).toEqual([
+    [
+      2,
+      "caution",
+      "Adds a CHECK constraint NOT VALID: rows written from now on are checked, existing rows only when VALIDATE CONSTRAINT runs; adding it takes a brief lock.",
+    ],
+    [
+      3,
+      "caution",
+      "Validates a constraint against every existing row under a SHARE UPDATE EXCLUSIVE lock, which lets reads and writes go on; the statement fails when a row violates it.",
+    ],
+    [6, "blocking", "Requires unique existing values."],
+    [
+      7,
+      "caution",
+      "Makes an existing unique index the UNIQUE constraint: a catalog change under a brief ACCESS EXCLUSIVE lock, with no table scan.",
+    ],
+    [
+      8,
+      "caution",
+      "Builds a unique index CONCURRENTLY on columns added in this migration, whose existing rows hold distinct values or NULL; reads and writes go on while it builds.",
+    ],
+    [
+      9,
+      "caution",
+      "Makes an existing unique index the UNIQUE constraint: a catalog change under a brief ACCESS EXCLUSIVE lock, with no table scan.",
+    ],
+  ]);
+  // Without --online the review describes the transactional SQL.
+  expect(
+    lintMigration(diffSchemas(before.$snapshot(), after.$snapshot())).map(
+      (finding) => [finding.level, finding.column ?? finding.table],
+    ),
+  ).toEqual([
+    ["blocking", "email"],
+    ["blocking", "n"],
+    ["caution", "code"],
+    ["caution", "users"],
+  ]);
+});
+
+test("SQL lint passes SET NOT NULL only behind a valid CHECK of that column, and a drop only of what the migration made", () => {
+  const levels = (sql: string) => lint(sql).map(([, level]) => level);
+
+  // Never validated, dropped first, or on another column: the scan can fail.
+  expect(
+    levels(`ALTER TABLE t ADD CONSTRAINT c CHECK (n IS NOT NULL) NOT VALID;
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;`),
+  ).toEqual(["caution", "blocking"]);
+  expect(
+    levels(`ALTER TABLE t ADD CONSTRAINT c CHECK (n IS NOT NULL) NOT VALID;
+ALTER TABLE t VALIDATE CONSTRAINT c;
+ALTER TABLE t DROP CONSTRAINT c;
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;`),
+  ).toEqual(["caution", "caution", "blocking"]);
+  expect(
+    levels(`ALTER TABLE t ADD CONSTRAINT c CHECK (m IS NOT NULL) NOT VALID;
+ALTER TABLE t VALIDATE CONSTRAINT c;
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;
+ALTER TABLE u ALTER COLUMN m SET NOT NULL;`),
+  ).toEqual(["caution", "caution", "blocking", "blocking"]);
+  // The CHECK follows its column through a rename, and goes with a drop.
+  expect(
+    levels(`ALTER TABLE t ADD CONSTRAINT c CHECK (n IS NOT NULL) NOT VALID;
+ALTER TABLE t VALIDATE CONSTRAINT c;
+ALTER TABLE t RENAME COLUMN n TO m;
+ALTER TABLE t ADD COLUMN n int;
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;
+ALTER TABLE t ALTER COLUMN m SET NOT NULL;`),
+  ).toEqual(["caution", "caution", "blocking"]);
+  expect(
+    levels(`ALTER TABLE t ADD CONSTRAINT c CHECK (n IS NOT NULL) NOT VALID;
+ALTER TABLE t VALIDATE CONSTRAINT c;
+ALTER TABLE t DROP COLUMN n;
+ALTER TABLE t ADD COLUMN n int;
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;`),
+  ).toEqual(["caution", "caution", "destructive", "blocking"]);
+  // A CHECK added valid proves it at once (and is itself blocking).
+  expect(
+    levels(`ALTER TABLE t ADD CONSTRAINT c CHECK ((n IS NOT NULL));
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;`),
+  ).toEqual(["blocking"]);
+  // A constraint or index made earlier in this file is dropped without loss;
+  // one from before the migration, or of another table, is not.
+  expect(
+    lint(`ALTER TABLE t DROP CONSTRAINT old;
+ALTER TABLE t ADD CONSTRAINT c CHECK (n > 0) NOT VALID;
+ALTER TABLE u DROP CONSTRAINT c;
+ALTER TABLE t DROP CONSTRAINT c;
+CREATE INDEX i ON t (n);
+DROP INDEX i;`).map(([statement, level]) => [statement, level]),
+  ).toEqual([
+    [1, "destructive"],
+    [2, "caution"],
+    [3, "destructive"],
+    [5, "caution"],
+  ]);
+  const drops = (sql: string) =>
+    lint(sql)
+      .filter(([, , message]) => /^(?:Removes|Rebuilds)/.test(String(message)))
+      .map(([statement, level]) => [statement, level]);
+  // A CREATE that does nothing when the name is taken, one in a schema that
+  // may be another, or one after a drop of that name proves nothing new: the
+  // drop may remove what was there before the migration.
+  expect(
+    drops(`CREATE INDEX CONCURRENTLY IF NOT EXISTS i ON users (email);
+DROP INDEX CONCURRENTLY i;`),
+  ).toEqual([[2, "destructive"]]);
+  for (const [create, drop] of [
+    ["archive.users", "public.i"],
+    ["users", "public.i"],
+    ["public.users", "i"],
+  ]) {
+    expect(
+      drops(`CREATE INDEX i ON ${create} (email);\nDROP INDEX ${drop};`),
+    ).toEqual([[2, "destructive"]]);
+  }
+  expect(
+    drops(`CREATE INDEX i ON users (email);
+SET search_path = archive;
+DROP INDEX i;`),
+  ).toEqual([[3, "destructive"]]);
+  expect(
+    drops(`ALTER TABLE t DROP CONSTRAINT c;
+ALTER TABLE t ADD CONSTRAINT c CHECK (n > 0) NOT VALID;
+ALTER TABLE t DROP CONSTRAINT c;
+DROP INDEX i;
+CREATE INDEX i ON t (n);
+DROP INDEX i;`),
+  ).toEqual([
+    [1, "caution"],
+    [3, "destructive"],
+    [4, "caution"],
+    [6, "destructive"],
+  ]);
+  // The same schema, written the same way, is the index made before.
+  expect(
+    drops(`CREATE INDEX "I" ON "Archive".users (email);
+DROP INDEX "Archive"."I";
+ALTER TABLE archive.t ADD CONSTRAINT c CHECK (n > 0) NOT VALID;
+ALTER TABLE ARCHIVE.t DROP CONSTRAINT c;
+ALTER TABLE t ADD CONSTRAINT d CHECK (n > 0) NOT VALID;
+ALTER TABLE archive.t DROP CONSTRAINT d;`),
+  ).toEqual([[6, "destructive"]]);
+  // Only a statement that changes search_path (or the role) counts, not the
+  // words in a name, a comment or a string; and only between the two.
+  for (const middle of [
+    `ALTER TABLE t ADD COLUMN search_path text`,
+    `COMMENT ON TABLE t IS 'search_path' -- search_path`,
+    `SELECT set_config('lock_timeout', '1s', false)`,
+    `CREATE FUNCTION f() RETURNS int LANGUAGE sql SET search_path = app AS $$ SELECT 1 $$`,
+  ]) {
+    expect(
+      drops(`CREATE INDEX i ON t (n);\n${middle};\nDROP INDEX i;`),
+    ).toEqual([]);
+  }
+  for (const middle of [
+    `SET LOCAL search_path TO app`,
+    `RESET search_path`,
+    `SET ROLE app`,
+    `SELECT pg_catalog.set_config('search_path', '', false)`,
+    `SELECT set_config($$search_path$$, 'app', false)`,
+  ]) {
+    expect(
+      drops(`CREATE INDEX i ON t (n);\n${middle};\nDROP INDEX i;`),
+    ).toEqual([[3, "destructive"]]);
+  }
+  expect(
+    drops(`SET search_path = app;\nCREATE INDEX i ON t (n);\nDROP INDEX i;`),
+  ).toEqual([]);
+  // A rebuild creates the object again on the same table, under its later name.
+  expect(
+    drops(`ALTER TABLE t DROP CONSTRAINT c;
+ALTER TABLE u ADD CONSTRAINT c CHECK (n > 0) NOT VALID;
+ALTER TABLE v DROP CONSTRAINT c;
+ALTER TABLE v RENAME TO w;
+ALTER TABLE w ADD CONSTRAINT c CHECK (n > 0) NOT VALID;
+ALTER TABLE x DROP CONSTRAINT c;
+SET search_path = app;
+ALTER TABLE x ADD CONSTRAINT c CHECK (n > 0) NOT VALID;`),
+  ).toEqual([
+    [1, "destructive"],
+    [3, "caution"],
+    [6, "destructive"],
+  ]);
+  // The NOT NULL proof follows RENAME CONSTRAINT, and holds for an
+  // unqualified table only while search_path stays as it was.
+  expect(
+    levels(`ALTER TABLE t ADD CONSTRAINT c CHECK (n IS NOT NULL);
+ALTER TABLE t RENAME CONSTRAINT c TO d;
+ALTER TABLE t DROP CONSTRAINT d;
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;`),
+  ).toEqual(["blocking", "destructive", "blocking"]);
+  expect(
+    levels(`ALTER TABLE t ADD CONSTRAINT c CHECK (n IS NOT NULL);
+ALTER TABLE t RENAME CONSTRAINT c TO d;
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;`),
+  ).toEqual(["blocking"]);
+  expect(
+    lint(`ALTER TABLE t ADD CONSTRAINT c CHECK (n IS NOT NULL);
+SET search_path = app;
+ALTER TABLE t ALTER COLUMN n SET NOT NULL;
+ALTER TABLE public.t ADD CONSTRAINT d CHECK (m IS NOT NULL);
+SET search_path = public;
+ALTER TABLE public.t ALTER COLUMN m SET NOT NULL;`)
+      .filter(([, , message]) => /non-null/.test(String(message)))
+      .map(([statement]) => statement),
+  ).toEqual([3]);
+  // The proof belongs to the table, not to its name: a table renamed takes
+  // it along, and a name another table is renamed into, or that is dropped
+  // or created again, proves nothing. Code lint cannot read (DO, CALL,
+  // EXECUTE), set_config('role', …) and a schema renamed or dropped may
+  // change where names resolve; a view's query runs no set_config().
+  const proof = `ALTER TABLE t ADD CONSTRAINT c CHECK (a IS NOT NULL) NOT VALID;
+ALTER TABLE t VALIDATE CONSTRAINT c;
+`;
+  const notNull = (sql: string) =>
+    lint(sql)
+      .filter(([, , message]) => /non-null/.test(String(message)))
+      .map(([statement]) => statement);
+  expect(
+    notNull(`${proof}ALTER TABLE t RENAME TO t_old;
+ALTER TABLE t_new RENAME TO t;
+ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+ALTER TABLE t_old ALTER COLUMN a SET NOT NULL;`),
+  ).toEqual([5]);
+  for (const middle of [
+    "DROP TABLE t;\nALTER TABLE t_new RENAME TO t",
+    "DROP VIEW IF EXISTS v, t",
+    "ALTER TABLE t SET SCHEMA archive",
+    "CREATE TEMP TABLE t (a int);\nDROP TABLE t",
+    "SELECT * INTO TEMPORARY t FROM u;\nDROP TABLE t",
+    "DO $$ BEGIN PERFORM set_config('search_path', 'app', false); END $$",
+    "DO $$ BEGIN EXECUTE 'SET search_path TO app'; END $$",
+    "CALL swap_tables()",
+    "EXECUTE swap(1)",
+    "SELECT set_config('role', 'app_owner', false)",
+    "ALTER SCHEMA public RENAME TO old",
+  ]) {
+    const sql = `${proof}${middle};\nALTER TABLE t ALTER COLUMN a SET NOT NULL;`;
+
+    expect(notNull(sql)).toEqual([sql.split(";\n").length]);
+  }
+  for (const middle of [
+    "CREATE VIEW v AS SELECT set_config('search_path', 'app', false)",
+    "CREATE TABLE u (a int)",
+    "DROP TABLE u",
+    "ALTER TABLE t RENAME COLUMN b TO c",
+  ]) {
+    expect(
+      notNull(`${proof}${middle};\nALTER TABLE t ALTER COLUMN a SET NOT NULL;`),
+    ).toEqual([]);
+  }
+  // So do a dropped constraint or index proven new, and a table created in
+  // this migration: renamed or dropped, its name stands for another.
+  expect(
+    drops(`ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0) NOT VALID;
+ALTER TABLE t RENAME TO t_old;
+ALTER TABLE t_new RENAME TO t;
+ALTER TABLE t DROP CONSTRAINT c;
+ALTER TABLE t_old DROP CONSTRAINT c;
+CREATE INDEX i ON t (a);
+ALTER INDEX i RENAME TO j;
+ALTER INDEX old RENAME TO i;
+DROP INDEX i;
+DROP INDEX j;
+CREATE INDEX k ON t (a);
+DO $$ BEGIN NULL; END $$;
+DROP INDEX k;`),
+  ).toEqual([
+    [4, "destructive"],
+    [9, "destructive"],
+    [13, "destructive"],
+  ]);
+  expect(
+    notNull(`CREATE TABLE t (a int);
+ALTER TABLE t RENAME TO t_old;
+ALTER TABLE big RENAME TO t;
+ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+ALTER TABLE t_old ALTER COLUMN a SET NOT NULL;`),
+  ).toEqual([4]);
+});
+
+test("SQL lint follows a renamed or moved object only in its own schema", () => {
+  const drops = (sql: string) =>
+    lint(sql)
+      .filter(([, , message]) => /^(?:Removes|Rebuilds)/.test(String(message)))
+      .map(([statement, level]) => [statement, level]);
+
+  // A rename in another schema leaves the table, and its constraint, as
+  // they were: s.u is another table, s.t still the one the CHECK went on.
+  expect(
+    drops(`ALTER TABLE s.t ADD CONSTRAINT c CHECK (n > 0) NOT VALID;
+ALTER TABLE r.t RENAME TO u;
+ALTER TABLE s.u DROP CONSTRAINT c;
+ALTER TABLE s.t DROP CONSTRAINT c;`),
+  ).toEqual([[3, "destructive"]]);
+  expect(
+    drops(`CREATE INDEX i ON s.t (n);
+ALTER INDEX r.i RENAME TO j;
+DROP INDEX s.j;
+DROP INDEX s.i;`),
+  ).toEqual([[3, "destructive"]]);
+  // Nor is a name another schema's object is renamed into taken.
+  expect(
+    drops(`CREATE INDEX i ON s.t (n);
+ALTER INDEX r.old RENAME TO i;
+DROP INDEX s.i;`),
+  ).toEqual([]);
+  // A table moved to another schema takes its indexes along: s.i is then
+  // another index, or none.
+  expect(
+    drops(`CREATE INDEX i ON s.t (n);
+ALTER TABLE s.t RENAME TO u;
+ALTER TABLE s.u SET SCHEMA r;
+DROP INDEX s.i;`),
+  ).toEqual([[4, "destructive"]]);
+  // A rebuild creates the constraint again on its own table.
+  expect(
+    drops(`ALTER TABLE s.t DROP CONSTRAINT c;
+ALTER TABLE r.t RENAME TO u;
+ALTER TABLE s.u ADD CONSTRAINT c CHECK (n > 0) NOT VALID;
+ALTER TABLE s.v DROP CONSTRAINT d;
+ALTER TABLE r.w RENAME TO v;
+ALTER TABLE s.v ADD CONSTRAINT d CHECK (n > 0) NOT VALID;
+ALTER TABLE s.x DROP CONSTRAINT e;
+ALTER TABLE s.x SET SCHEMA r;
+ALTER TABLE s.x ADD CONSTRAINT e CHECK (n > 0) NOT VALID;`),
+  ).toEqual([
+    [1, "destructive"],
+    [4, "caution"],
+    [7, "destructive"],
+  ]);
+  // A rename that may or may not be of the object (one name written with
+  // its schema, the other without) loses it: the drop may remove what was
+  // there before, and a creation after it may be on another table.
+  expect(
+    drops(`CREATE INDEX i ON t (n);
+ALTER INDEX public.i RENAME TO j;
+DROP INDEX j;`),
+  ).toEqual([[3, "destructive"]]);
+  expect(
+    drops(`ALTER TABLE s.t ADD CONSTRAINT c CHECK (n > 0) NOT VALID;
+ALTER TABLE t RENAME TO u;
+ALTER TABLE s.t DROP CONSTRAINT c;
+ALTER TABLE v DROP CONSTRAINT d;
+ALTER TABLE public.v RENAME TO w;
+ALTER TABLE w ADD CONSTRAINT d CHECK (n > 0) NOT VALID;`),
+  ).toEqual([
+    [3, "destructive"],
+    [4, "destructive"],
+  ]);
+});
+
+test("SQL lint takes time in step with the size of the file", () => {
+  const range = (count: number) => Array.from({ length: count }, (_, k) => k);
+  const files = [
+    // An online index swap per index: build, drop the old one, rename.
+    range(7000)
+      .map(
+        (k) =>
+          `CREATE INDEX CONCURRENTLY i_${k}_new ON t_${k % 20} (c${k});\nDROP INDEX CONCURRENTLY i_${k};\nALTER INDEX i_${k}_new RENAME TO i_${k};`,
+      )
+      .join("\n"),
+    // Indexes created, renamed, then dropped; the same CHECK name on many
+    // tables; the same names in many schemas.
+    [
+      ...range(7000).map((k) => `CREATE INDEX i_${k} ON t (c${k});`),
+      ...range(7000).map((k) => `ALTER INDEX i_${k} RENAME TO j_${k};`),
+      ...range(7000).map((k) => `DROP INDEX j_${k};`),
+    ].join("\n"),
+    [
+      ...range(10000).map(
+        (k) => `ALTER TABLE t_${k} ADD CONSTRAINT c CHECK (n > 0);`,
+      ),
+      ...range(10000).map((k) => `ALTER TABLE t_${k} DROP CONSTRAINT c;`),
+    ].join("\n"),
+    [
+      ...range(5000).map((k) => `CREATE INDEX i ON s_${k}.t (n);`),
+      ...range(5000).map((k) => `ALTER TABLE s_${k}.t RENAME TO u;`),
+      ...range(5000).map((k) => `ALTER TABLE u RENAME TO t;`),
+      ...range(5000).map((k) => `DROP INDEX s_${k}.i;`),
+    ].join("\n"),
+    // CHECKs that prove NOT NULL on a table renamed back and forth.
+    [
+      ...range(10000).map(
+        (k) =>
+          `ALTER TABLE t ADD CONSTRAINT n_${k} CHECK (c_${k} IS NOT NULL);`,
+      ),
+      ...range(10000).map((k) =>
+        k % 2 ? "ALTER TABLE u RENAME TO t;" : "ALTER TABLE t RENAME TO u;",
+      ),
+    ].join("\n"),
+  ];
+  const started = performance.now();
+
+  for (const sql of files) {
+    lintMigrationSQL(sql);
+  }
+
+  // About 0.5 s in all; in 3.6.0 candidates before this, minutes.
+  expect(performance.now() - started).toBeLessThan(5000);
+});
+
 test("SQL lint rates column constraints in ADD COLUMN, spelled-out truncating casts and USING NULL", () => {
   expect(
     lint(`ALTER TABLE t ADD COLUMN x int NOT NULL DEFAULT 99 REFERENCES u(id);
@@ -1073,6 +1568,39 @@ ${NOTE}ALTER TABLE "t" ADD CONSTRAINT "t_u_fkey" FOREIGN KEY ("u") REFERENCES "u
   expect(
     noted('ALTER TABLE "t" ALTER COLUMN "a" TYPE text USING NULL'),
   ).toEqual(["destructive"]);
+});
+
+test("a note counts only as a comment line, never inside a quoted name or a string", () => {
+  const hidden = (note: string) => `\n-- symmetria: ${note}: hidden.\n`;
+
+  // A name or a string that holds a line break and a note is no comment:
+  // these statements lowered their own rating to a caution, or rated
+  // themselves destructive with their own message.
+  for (const statement of [
+    `DROP INDEX "t_a_idx${hidden("caution")}"`,
+    `DROP TYPE "t_s_enum${hidden("caution")}"`,
+    `ALTER TABLE "t" DROP CONSTRAINT "t_a_key${hidden("caution")}"`,
+  ]) {
+    expect(lint(`${statement};`)).toEqual([
+      [1, "destructive", "Removes data or a database object."],
+    ]);
+  }
+  expect(lint(`UPDATE "t" SET "a" = '${hidden("destructive")}';`)).toEqual([
+    [1, "caution", expect.stringContaining("Contains a schema change")],
+  ]);
+  // A comment line counts, also after another comment or a statement on the
+  // line before it.
+  expect(
+    lint('-- dropped\n-- symmetria: caution: real.\nDROP INDEX "t_a_idx";'),
+  ).toEqual([[1, "caution", "real."]]);
+  expect(
+    lint('SELECT 1;\n-- symmetria: caution: real.\nDROP TYPE "t_s_enum";').at(
+      -1,
+    ),
+  ).toEqual([2, "caution", "real."]);
+  expect(
+    lint('-- symmetria: destructive: real.\nUPDATE "t" SET "a" = NULL;')[0],
+  ).toEqual([1, "destructive", "real."]);
 });
 
 test("SQL lint takes only a whole constant in USING as emptying the column", () => {

@@ -7,7 +7,10 @@ import {
   diffSchemas,
   emptySnapshot,
 } from "../../../packages/kit/src";
-import { initializeProject } from "../../../packages/kit/src/cli/scaffold";
+import {
+  importClause,
+  initializeProject,
+} from "../../../packages/kit/src/cli/scaffold";
 import {
   formatDiff,
   formatSchema,
@@ -164,6 +167,200 @@ test("init preserves existing files while creating the missing scaffold", () =>
     expect(
       await readFile(join(directory, "src/database/tables/users.ts"), "utf8"),
     ).toBe(users);
+  }));
+
+test("init wires the config to an existing schema module's export, or creates nothing when it has none", () =>
+  withMigrationDirectory(async (directory) => {
+    const wired = join(directory, "wired");
+    await mkdir(join(wired, "src/database"), { recursive: true });
+    await writeFile(
+      join(wired, "tsconfig.json"),
+      JSON.stringify({ extends: resolve("tsconfig.json") }),
+    );
+    // The application's own schema module, exported under another name.
+    const own = `import { schema, table, int, text } from "symmetria";\nexport const schemaV1 = schema({ accounts: table({ id: int.auto, name: text }) });\n`;
+    await writeFile(join(wired, "src/database/schema.ts"), own);
+
+    const result = await run(wired, "init", "--json");
+    expect(result.exitCode, result.stderr).toBe(0);
+    // The starter table only serves the starter schema: not written.
+    expect(JSON.parse(result.stdout).files).toEqual([
+      "src/database/index.ts",
+      "symmetria.config.ts",
+      ".env.example",
+    ]);
+    expect(
+      await readFile(join(wired, "symmetria.config.ts"), "utf8"),
+    ).toContain(
+      'import { schemaV1 as appSchema } from "./src/database/schema";',
+    );
+    expect(await readFile(join(wired, "src/database/schema.ts"), "utf8")).toBe(
+      own,
+    );
+    const inspected = await run(wired, "inspect", "--json");
+    expect(inspected.exitCode, inspected.stderr).toBe(0);
+    expect(JSON.parse(inspected.stdout).tables[0].name).toBe("accounts");
+
+    // No schema to import: nothing is created, and the message says what to add.
+    const unusable = join(directory, "unusable");
+    await mkdir(join(unusable, "src/database"), { recursive: true });
+    await writeFile(
+      join(unusable, "src/database/schema.ts"),
+      "export const tables = {};\n",
+    );
+    const refused = await run(unusable, "init", "--json");
+    expect(refused.exitCode).toBe(1);
+    expect(JSON.parse(refused.stdout).error.message).toContain(
+      "nothing was created. Export your schema as appSchema",
+    );
+    expect(await readdir(unusable)).toEqual(["src"]);
+    expect(await readdir(join(unusable, "src/database"))).toEqual([
+      "schema.ts",
+    ]);
+  }));
+
+test("init reads an existing schema module as code: strings and comments do not hide or invent exports", () => {
+  const clause = (source: string) =>
+    importClause(source, "appSchema", "schema");
+
+  // A string holding "/*" opens no comment.
+  expect(
+    clause(
+      'export const pattern = "tables/*.ts";\nexport const appSchema = schema({});\n/* old */\nexport const legacy = schema({});\n',
+    ),
+  ).toBe("{ appSchema }");
+  // A template mentioning the export is not the export.
+  expect(
+    clause(
+      "export const hint = `export const appSchema = schema(...)`;\nexport const db = schema({});\n",
+    ),
+  ).toBe("{ db as appSchema }");
+  expect(
+    clause("// export const appSchema\nexport const v1 = schema({});"),
+  ).toBe("{ v1 as appSchema }");
+  expect(
+    clause('const re = /\\/*"/;\nexport const appSchema = schema({});'),
+  ).toBe("{ appSchema }");
+  // A default export, also through a binding; one value exported twice is one.
+  expect(clause("const db = schema({});\nexport default db;\n")).toBe(
+    "appSchema",
+  );
+  expect(clause("export default schema({});")).toBe("appSchema");
+  expect(clause("export const db = schema({});\nexport default db;")).toBe(
+    "{ db as appSchema }",
+  );
+  expect(clause("const x = schema({});\nexport { x as main };")).toBe(
+    "{ main as appSchema }",
+  );
+  // A declaration without an initializer is not the next one's type.
+  expect(
+    clause(
+      "export let current: string | undefined;\n\nexport const db = schema({});\n",
+    ),
+  ).toBe("{ db as appSchema }");
+  // Only top-level forms count: a namespace or `declare module` holds none.
+  expect(
+    clause(
+      "export namespace legacy { export const appSchema = schema({}); }\nexport const db = schema({});",
+    ),
+  ).toBe("{ db as appSchema }");
+  expect(
+    clause(
+      'declare module "x" { export const appSchema: unknown; }\nexport const db = schema({});',
+    ),
+  ).toBe("{ db as appSchema }");
+  // Types and ambient declarations hold no value.
+  expect(
+    clause(
+      "export interface appSchema { x: 1 }\nexport declare const build: string;\nexport const db = schema({});",
+    ),
+  ).toBe("{ db as appSchema }");
+  expect(clause("export const схема = schema({});")).toBe(
+    "{ схема as appSchema }",
+  );
+  // Unsure: two schemas, or a literal that does not end.
+  expect(
+    clause("export const a = schema({}), b = schema({});"),
+  ).toBeUndefined();
+  expect(
+    clause("export const схема = schema({});\nexport const db = schema({});"),
+  ).toBeUndefined();
+  expect(
+    clause('const s = schema({});\nexport { s as "appSchema" };'),
+  ).toBeUndefined();
+  expect(
+    clause('export * from "./more";\nexport const db = schema({});'),
+  ).toBeUndefined();
+  expect(
+    clause("export const config = { appSchema: schema({}) };"),
+  ).toBeUndefined();
+  expect(
+    clause(
+      "const schema = (x: unknown) => x;\nexport const fake = schema({});",
+    ),
+  ).toBeUndefined();
+  expect(
+    clause("export enum appSchema { A }\nexport const db = schema({});"),
+  ).toBeUndefined();
+  expect(
+    clause("export const a = schema({});\nexport const b = schema({});"),
+  ).toBeUndefined();
+  expect(
+    clause("export const s = 'open\nexport const appSchema = schema({});"),
+  ).toBeUndefined();
+});
+
+test("a bad timeout or database URL names the config key or the flag it came from", () =>
+  withMigrationDirectory(async (directory) => {
+    await writeFile(
+      join(directory, "symmetria.config.ts"),
+      `export default { directory: "migrations", lockTimeoutMs: -5 };\n`,
+    );
+    const fromConfig = await run(directory, "status", "--json");
+    expect(fromConfig.exitCode).toBe(1);
+    expect(JSON.parse(fromConfig.stdout).error.message).toBe(
+      "symmetria: invalid lockTimeoutMs in the config: expected whole milliseconds from 0 to 2147483647",
+    );
+
+    await writeFile(
+      join(directory, "symmetria.config.ts"),
+      `export default { directory: "migrations" };\n`,
+    );
+    // An empty flag is not 0, which would disable the timeout.
+    const empty = await run(
+      directory,
+      "status",
+      "--lock-timeout=",
+      "--database-url",
+      "postgres://127.0.0.1:1/app",
+      "--json",
+    );
+    expect(JSON.parse(empty.stdout).error.message).toBe(
+      "symmetria: --lock-timeout needs a value",
+    );
+    // So does every flag that takes one: `--to ""` is not "no --to".
+    for (const flags of [
+      ["migrate", "--to", ""],
+      ["rollback", "--yes", "--steps", ""],
+      ["status", "--ignore-table", ""],
+    ]) {
+      const refused = await run(directory, ...flags, "--json");
+      expect(refused.exitCode).toBe(1);
+      expect(JSON.parse(refused.stdout).error.message).toBe(
+        `symmetria: ${flags.at(-2)} needs a value`,
+      );
+    }
+
+    const url = await run(
+      directory,
+      "status",
+      "--database-url",
+      "not a url",
+      "--json",
+    );
+    expect(JSON.parse(url.stdout).error.message).toBe(
+      "symmetria: invalid database URL in --database-url: expected postgres://user:password@host:5432/database",
+    );
   }));
 
 test("init does not introduce a second schema into a configured project or migration history", () =>

@@ -256,3 +256,73 @@ test("a missing key and a refusal say what to do", async () => {
     'OpenAI refused to embed with text-embedding-3-small (429): {"error":"quota"}',
   );
 });
+
+test("Ollama is found where the ollama command finds it", async () => {
+  const sent = service((body) => ({
+    embeddings: body.input.map(() => [1]),
+  }));
+
+  for (const [host, url] of [
+    // No scheme: Ollama's own port; an address for every interface is this machine.
+    ["0.0.0.0", "http://127.0.0.1:11434"],
+    ["127.0.0.1", "http://127.0.0.1:11434"],
+    ["localhost", "http://localhost:11434"],
+    ["localhost:9999", "http://localhost:9999"],
+    ["[::]", "http://[::1]:11434"],
+    ["::1", "http://[::1]:11434"],
+    ["", "http://localhost:11434"],
+    // A URL is used as it is: its own port, credentials, path.
+    ["http://127.0.0.1", "http://127.0.0.1"],
+    ["https://ollama.internal/prefix/", "https://ollama.internal/prefix"],
+    ["http://user:secret@127.0.0.1:8080", "http://user:secret@127.0.0.1:8080"],
+    ["http://[::1]:8080/ollama", "http://[::1]:8080/ollama"],
+  ] as const) {
+    process.env.OLLAMA_HOST = host;
+    await ollama("bge-m3").model.embed(["a"], "document");
+    expect(sent.at(-1)!.url).toBe(`${url}/api/embed`);
+  }
+
+  await ollama("bge-m3", {
+    baseUrl: "http://user:secret@proxy.internal:443/ollama/",
+  }).model.embed(["a"], "document");
+  expect(sent.at(-1)!.url).toBe(
+    "http://user:secret@proxy.internal:443/ollama/api/embed",
+  );
+  await expect(
+    ollama("bge-m3", { baseUrl: "http://[bad" }).model.embed(["a"], "query"),
+  ).rejects.toThrow('symmetria: Ollama\'s address "http://[bad" is not a URL');
+});
+
+test("a service that does not answer fails after timeoutMs, and a signal aborts it", async () => {
+  // A service that accepts the request and never answers.
+  globalThis.fetch = ((_url: string, init: RequestInit) =>
+    new Promise((_resolve, reject) => {
+      init.signal!.addEventListener("abort", () => reject(init.signal!.reason));
+    })) as never;
+
+  await expect(
+    voyage("voyage-4", { apiKey: "k", timeoutMs: 20 }).model.embed(
+      ["a"],
+      "query",
+    ),
+  ).rejects.toThrow(
+    "symmetria: Voyage did not answer within 20 ms when asked to embed with voyage-4",
+  );
+
+  const controller = new AbortController();
+  const pending = ollama("bge-m3", { signal: controller.signal }).model.embed(
+    ["a"],
+    "document",
+  );
+
+  controller.abort();
+  await expect(pending).rejects.toThrow(
+    "symmetria: the request to Ollama to embed with bge-m3 was aborted",
+  );
+
+  for (const timeoutMs of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+    expect(() => openai("text-embedding-3-small", { timeoutMs })).toThrow(
+      "symmetria: text-embedding-3-small timeoutMs must be a whole number of milliseconds",
+    );
+  }
+});

@@ -4,7 +4,14 @@
  * current at each execution, never the one from when they were built.
  */
 import { expect, test } from "bun:test";
-import { schema, table, int, text, prepare } from "../../packages/runtime/src";
+import {
+  schema,
+  table,
+  int,
+  text,
+  prepare,
+  and,
+} from "../../packages/runtime/src";
 import { testDatabase } from "./postgres";
 
 const members = table({ id: int, tenantId: int, name: text });
@@ -175,6 +182,112 @@ export const scopeFreshnessTests = (): void => {
       current.tenant = 2;
       expect(await withDocuments).toEqual([{ name: "Bob" }]);
       expect((await inTransaction()).length).toBe(2);
+    } finally {
+      await close();
+    }
+  });
+
+  test("a scoped table joined into another database's query keeps its current scope", async () => {
+    const { database, scoped, current, close } = await fixture();
+
+    try {
+      const joined = (source: typeof scoped.members) =>
+        database.documents(
+          (document, { innerJoin }) => ({
+            title: document.title,
+            owner: innerJoin(source, (member) => member.id.is(document.ownerId))
+              .name,
+          }),
+          { orderBy: (document) => document.id.ascending },
+        );
+      const listing = joined(scoped.members);
+      const named = scoped.$scope({
+        members: (member) => member.name.isNot("Bob"),
+      });
+
+      expect(await listing).toEqual([{ title: "A1", owner: "Ann" }]);
+      expect(
+        await database.$batch((batch) => [
+          batch.documents(
+            (document, { crossJoin }) => ({
+              title: document.title,
+              member: crossJoin(scoped.members).name,
+            }),
+            { orderBy: (document) => document.id.ascending },
+          ),
+        ]),
+      ).toEqual([
+        [
+          { title: "A1", member: "Ann" },
+          { title: "B1", member: "Ann" },
+          { title: "B2", member: "Ann" },
+        ],
+      ]);
+      current.tenant = 2;
+      expect(await listing).toEqual([
+        { title: "B1", owner: "Bob" },
+        { title: "B2", owner: "Bob" },
+      ]);
+      // A narrower scope of the joined table adds its own condition.
+      expect(await joined(named.members)).toEqual([]);
+      expect(
+        await database.$transaction((transaction) =>
+          transaction.documents(
+            (document, { leftJoin }) => ({
+              title: document.title,
+              owner: leftJoin(named.members.as("owner"), (member) =>
+                member.id.is(document.ownerId),
+              ).name,
+            }),
+            { orderBy: (document) => document.id.ascending },
+          ),
+        ),
+      ).toEqual([
+        { title: "A1", owner: null },
+        { title: "B1", owner: null },
+        { title: "B2", owner: null },
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  test("a $scope() filter that holds for every row at execution reads and writes nothing", async () => {
+    const { database, titles, close } = await fixture();
+    const request: { tenant: number | undefined } = { tenant: 1 };
+    const scoped = database.$scope({
+      documents: (document) =>
+        and(request.tenant && document.tenantId.is(request.tenant)),
+    });
+    const refused = {
+      message: expect.stringContaining(
+        'the $scope() filter of "documents" holds for every row',
+      ),
+    };
+
+    try {
+      const listing = scoped.documents((document) => ({
+        title: document.title,
+      }));
+
+      expect(await listing).toEqual([{ title: "A1" }]);
+      request.tenant = undefined;
+      await expect(listing.execute()).rejects.toMatchObject(refused);
+      await expect(scoped.documents.count()).rejects.toMatchObject(refused);
+      await expect(
+        scoped.documents.update({ title: "x" }).all().execute(),
+      ).rejects.toMatchObject(refused);
+      await expect(
+        scoped.documents
+          .insert({ id: 9, tenantId: 2, title: "C1", ownerId: 2 })
+          .execute(),
+      ).rejects.toMatchObject(refused);
+      await expect(
+        scoped.$transaction((transaction) =>
+          transaction.documents.delete().all(),
+        ),
+      ).rejects.toMatchObject(refused);
+      expect(await titles()).toEqual(["A1", "B1", "B2"]);
     } finally {
       await close();
     }

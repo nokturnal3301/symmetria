@@ -55,11 +55,23 @@ test("count() and exists() work on tables, filtered sources and lookups", async 
   expect(last().sql).toContain(
     'FROM (SELECT DISTINCT "posts"."title" AS "title"\nFROM "posts" AS "posts") AS "__symmetria_count"',
   );
+  // A locking source locks every row it counts, in its order.
   await database
     .posts({ orderBy: (post) => post.id.descending, forUpdate: true })
     .count();
-  expect(last().sql).not.toContain("ORDER BY");
-  expect(last().sql).not.toContain("FOR UPDATE");
+  expect(last().sql).toBe(
+    'SELECT COUNT(*) AS "count"\nFROM (SELECT 1 AS "present"\nFROM "posts" AS "posts"\nORDER BY "posts"."id" DESC\nFOR UPDATE) AS "__symmetria_count"',
+  );
+  await database
+    .posts({ forUpdate: { skipLocked: true, of: ["posts"] } })
+    .exists();
+  expect(last().sql).toBe(
+    'SELECT 1 AS "present"\nFROM (SELECT 1 AS "present"\nFROM "posts" AS "posts"\nFOR UPDATE OF "posts" SKIP LOCKED) AS "__symmetria_exists"\nHAVING COUNT(*) > (0)',
+  );
+  await database.posts({ orderBy: (post) => post.id.descending }).count();
+  expect(last().sql).toBe(
+    'SELECT COUNT(*) AS "count"\nFROM "posts" AS "posts"',
+  );
 
   // Scoped databases keep their filters.
   await database
@@ -288,4 +300,27 @@ test("returning() callbacks receive scalar tools", () => {
   expect(sql).toContain(
     'RETURNING "users"."id" AS "id", COALESCE("users"."name", $2) AS "label", upper("users"."name") AS "upper"',
   );
+});
+
+test("a query called with no arguments, as node:assert's rejects() calls it, runs", async () => {
+  const { rejects, doesNotReject } = await import("node:assert/strict");
+  const { database, calls } = recording([{ id: 1 }]);
+  const query = database.users((user) => ({ id: user.id }));
+  const call = query as unknown as () => unknown;
+
+  // A promise of the query's own result, not a new shape.
+  expect(call()).toBeInstanceOf(Promise);
+  expect(await call()).toEqual([{ id: 1 }]);
+  await doesNotReject(query);
+  await rejects(rejects(query), /Missing expected rejection/);
+  // The table handle selects nothing yet, so it rejects as when awaited.
+  await rejects(
+    database.users as unknown as () => Promise<unknown>,
+    /select fields in a shape/,
+  );
+  // An explicit undefined shape is still refused where it is written.
+  expect(() =>
+    (query as unknown as (shape: unknown) => unknown)(undefined),
+  ).toThrow("a shape requires a synchronous callback");
+  expect(calls.length).toBe(4);
 });

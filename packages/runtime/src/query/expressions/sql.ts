@@ -12,15 +12,19 @@ import {
 } from "../../schema/column";
 import {
   COLUMN_EXPRESSION,
+  ORDERING_EXPRESSION,
   PREDICATE_EXPRESSION,
   type ValueNode,
   type ExpressionDescription,
+  type Ordering,
   type Predicate,
   type PredicateDescription,
 } from "./nodes";
 import type { QueryColumn } from "./column-types";
 import { valueNode, ColumnHandle, chained } from "./core";
 import type { OptionalPredicate } from "./functions";
+import { readTemplate } from "./raw-text";
+import { QUERY_PLAN } from "../plan/types";
 
 const TRUE: ValueNode = freeze({ kind: "raw", parts: freeze(["TRUE"]) });
 
@@ -69,9 +73,105 @@ export class SqlHandle extends ColumnHandle {
       throw new Error("symmetria: SQL defaults cannot contain interpolations");
     }
 
-    return this[SQL_TEMPLATE].strings.join("");
+    return readTemplate(this[SQL_TEMPLATE].strings).strings.join("");
   }
 }
+
+/** Whether drivers bind the value: a primitive, a Date, bytes, a plain JSON object, or an array of these. */
+const isBindable = (value: unknown): boolean => {
+  if (typeof value === "function" || typeof value === "symbol") {
+    return false;
+  }
+
+  if (value === null || typeof value !== "object") {
+    return true;
+  }
+
+  if (Array.isArray(value)) {
+    return value.every(isBindable);
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+
+  return (
+    prototype === Object.prototype ||
+    prototype === null ||
+    value instanceof Date ||
+    ArrayBuffer.isView(value) ||
+    value instanceof ArrayBuffer
+  );
+};
+
+/** What a non-value interpolation is, for the message that refuses it. */
+const describeInterpolation = (value: unknown): string => {
+  if (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    QUERY_PLAN in value
+  ) {
+    return "a query; interpolate query.scalar() for its one value, or use exists(query) or column.in(query)";
+  }
+
+  if (Array.isArray(value)) {
+    return "an array that holds a column, SQL expression, condition or other non-value; interpolate each element on its own, as in (${a}, ${b})";
+  }
+
+  if (typeof value === "function") {
+    return "a function; call it and interpolate its result";
+  }
+
+  if (typeof value === "symbol") {
+    return "a symbol";
+  }
+
+  const name = (value as object).constructor?.name;
+
+  return `${name ? `a ${name}` : "an object"} that is no value a driver binds; interpolate a string, number, bigint, boolean, Date, Buffer, plain JSON object or array of these (for example String(value))`;
+};
+
+/**
+ * What a value in sql`` stands for: a column, expression, condition or
+ * ordering renders as its SQL; anything else must be a value to bind.
+ */
+const interpolation = (value: unknown): ValueNode => {
+  if (value !== null && typeof value === "object") {
+    if (COLUMN_EXPRESSION in value) {
+      return valueNode(value);
+    }
+
+    if (PREDICATE_EXPRESSION in value) {
+      return freeze({
+        kind: "condition",
+        predicate: (value as Predicate)[PREDICATE_EXPRESSION],
+      });
+    }
+
+    if (ORDERING_EXPRESSION in value) {
+      const { expression, direction, nulls } = (value as Ordering)[
+        ORDERING_EXPRESSION
+      ];
+
+      // `column DESC NULLS LAST`, as an ORDER BY inside the template takes it.
+      return freeze({
+        kind: "raw",
+        parts: freeze([
+          expression.node,
+          ` ${direction}${nulls ? ` NULLS ${nulls}` : ""}`,
+        ]),
+        composed: true,
+        delimited: true,
+      });
+    }
+  }
+
+  if (value !== undefined && !isBindable(value)) {
+    throw new Error(
+      `symmetria: a sql\`\` template cannot interpolate ${describeInterpolation(value)}`,
+    );
+  }
+
+  return valueNode(value);
+};
 
 /** A `sql<Value>` template: its SQL type is whatever the SQL says, unknown to Symmetria. */
 export type RawTraits = { readonly numeric: "raw" };
@@ -107,12 +207,13 @@ export const sqlTemplate = <Value, Traits = RawTraits>(
     );
   }
 
+  const text = readTemplate(strings);
   const parts: (string | ValueNode)[] = [];
-  strings.forEach((text, index) => {
-    parts.push(text);
+  text.strings.forEach((part, index) => {
+    parts.push(part);
 
     if (index < values.length) {
-      parts.push(valueNode(values[index]));
+      parts.push(interpolation(values[index]));
     }
   });
 
@@ -123,6 +224,12 @@ export const sqlTemplate = <Value, Traits = RawTraits>(
           kind: "raw",
           parts: freeze(parts),
           ...(sqlType ? { sqlType } : {}),
+          // The value after the template's string `index` is part 2·index+1.
+          ...(text.enclosed
+            ? {
+                enclosed: freeze(text.enclosed.map((index) => index * 2 + 1)),
+              }
+            : {}),
         }),
         outputName: "expression",
         ...(codec ? { codec } : {}),
@@ -162,7 +269,11 @@ export interface SqlTag {
   ) => SqlTemplate<ColumnResult<Definition>, DefinitionTraits<Definition>>;
 }
 
-/** Interpolations are parameters or expression nodes; only the template's literal text is SQL. */
+/**
+ * Raw SQL with bound values: an interpolated value is sent as a parameter, and
+ * a column, expression, condition or ordering is written as its SQL; only the
+ * template's literal text is SQL. `sql<boolean>` is also a condition.
+ */
 export const sql: SqlTag = Object.assign(
   <Value = unknown>(
     strings: TemplateStringsArray,

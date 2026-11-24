@@ -7,7 +7,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { currentFrame, currentHolders, runHolding } from "../../driver/serial";
 import { NotFoundError, TooManyRowsError } from "../../errors";
 import { freeze } from "../plan/freeze";
-import { count, readColumn } from "../expressions";
+import { count, readColumn, type PredicateDescription } from "../expressions";
 import { derivedBinding } from "../plan/derived";
 import { batchCollectors } from "../plan/batching";
 import { containsNode } from "../plan/traverse";
@@ -22,12 +22,6 @@ import {
 
 const countPlans = new WeakMap<SelectPlan, SelectPlan>();
 const existsPlans = new WeakMap<SelectPlan, (SelectPlan | undefined)[]>();
-
-const withoutLocking = (plan: SelectPlan): SelectPlan => {
-  const { locking: _locking, ...rest } = plan;
-
-  return rest;
-};
 
 /**
  * A projection of aggregates without GROUP BY (`{ n: count() }`): the query
@@ -67,7 +61,13 @@ const innerSelection = (plan: SelectPlan): SelectPlan["selection"] => {
       );
 };
 
-/** A plan whose single row carries `count`, decoded as a number. */
+/**
+ * A plan whose single row carries `count`, decoded as a number. A source with
+ * `forUpdate`/`forShare` locks the rows it counts: they stay a derived table
+ * with the lock (`SELECT count(*) FROM (SELECT 1 … FOR UPDATE)`), so with
+ * `skipLocked` the count is of the rows it could lock; its ordering stays,
+ * as the order the rows are locked in.
+ */
 export const countPlan = (plan: SelectPlan): SelectPlan => {
   let derived = countPlans.get(plan);
 
@@ -76,6 +76,7 @@ export const countPlan = (plan: SelectPlan): SelectPlan => {
   }
 
   const counted =
+    plan.locking !== undefined ||
     plan.limit !== undefined ||
     plan.offset !== undefined ||
     plan.grouping.length > 0 ||
@@ -94,7 +95,7 @@ export const countPlan = (plan: SelectPlan): SelectPlan => {
         selection: freeze([readColumn(count())]),
       })
     : freeze({
-        ...withoutLocking(plan),
+        ...plan,
         selection: freeze([readColumn(count())]),
         ordering: EMPTY,
       });
@@ -103,9 +104,23 @@ export const countPlan = (plan: SelectPlan): SelectPlan => {
   return derived;
 };
 
+/** `count(*) > 0`: as HAVING without GROUP BY, one row when there are rows. */
+const anyRows = (): readonly PredicateDescription[] =>
+  freeze([
+    freeze({
+      kind: "comparison" as const,
+      left: readColumn(count()).node,
+      operator: ">" as const,
+      right: freeze({ kind: "raw" as const, parts: freeze(["0"]) }),
+    }),
+  ]);
+
 /**
  * A plan returning at most one `present` row. A parameterized LIMIT is refused
  * unless `allowPlaceholderLimit` (prepared queries), which wraps the plan instead.
+ * A source with `forUpdate`/`forShare` locks every row it selects, as reading
+ * or counting it does: LIMIT 1 over it would lock only the first, so its rows
+ * are counted instead.
  */
 export const existsPlan = (
   plan: SelectPlan,
@@ -113,8 +128,11 @@ export const existsPlan = (
 ): SelectPlan => {
   const parameterized =
     typeof plan.limit === "object" || typeof plan.offset === "object";
-  // Its one row exists whatever the source holds; it is read as it is.
-  const wrapped = parameterized || aggregatesAll(plan);
+  const locking = plan.locking !== undefined;
+  // Wrapped in a derived table: a parameterized LIMIT or OFFSET, a row lock,
+  // or aggregates without GROUP BY, whose one row exists whatever the source
+  // holds, so it is read as it is.
+  const wrapped = parameterized || aggregatesAll(plan) || locking;
 
   if (parameterized && !allowPlaceholderLimit) {
     throw new Error("symmetria: bind a parameterized LIMIT with prepare()");
@@ -133,17 +151,17 @@ export const existsPlan = (
           ...initialPlan(
             derivedBinding(
               freeze({
-                ...withoutLocking(plan),
+                ...plan,
                 selection: innerSelection(plan),
               }),
               "__symmetria_exists",
             ),
           ),
           selection: presentSelection,
-          limit: 1,
+          ...(locking ? { having: anyRows() } : { limit: 1 }),
         }
       : {
-          ...withoutLocking(plan),
+          ...plan,
           selection: innerSelection(plan),
           ordering: EMPTY,
           limit: typeof plan.limit === "number" ? Math.min(plan.limit, 1) : 1,
@@ -174,9 +192,9 @@ export const rowCountError = (
  * row. It is a real `Promise`, so test runners and `instanceof` treat it as
  * one; nothing reads its result without calling `then()`.
  *
- * It runs in the async context where it was made, as it did when reads
- * started when called: `$scope()` callbacks, a profiler's request and a
- * tracer's span see that context. What the code that starts it holds (the
+ * It runs in the async context where it was made, not where it is awaited:
+ * `$scope()` callbacks, a profiler's request and a tracer's span see that
+ * context. What the code that starts it holds (the
  * savepoint it runs in, pool connections) comes from where it starts, so a
  * read awaited where it would wait for itself is refused, never left waiting.
  * A read made while a `$batch()` collects starts at once and joins it.

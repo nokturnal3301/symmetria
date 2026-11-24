@@ -17,6 +17,7 @@ import {
 } from "../plan/types";
 import {
   aliasSql,
+  keyAlias,
   quoteIdentifier,
   type Bindings,
   type Compilation,
@@ -28,6 +29,14 @@ import {
   valueSql,
 } from "./values";
 import { predicateSql } from "./predicates";
+
+/**
+ * The primary-key subqueries that relation paths in an UPDATE or DELETE
+ * filter move into (`WHERE "posts"."id" IN (SELECT "posts"."id" FROM
+ * "posts" AS "posts" JOIN …)`): their root is the written table's binding,
+ * and every column of it there means the subquery's row.
+ */
+export const writeKeySubqueries = new WeakSet<SelectPlan>();
 
 export const tableSql = (
   compilation: Compilation,
@@ -85,9 +94,13 @@ export const selectSql = (
       ...query.joins.map((join) => join.binding),
     ]) {
       if (containsBinding(outerBindings, binding)) {
+        // A write's primary-key subquery reads the written table under its
+        // own name. Any other subquery on the written row's binding would
+        // rename the written row's columns along with its own.
         if (
           compilation.plan.kind !== "select" &&
-          binding === compilation.plan.root
+          binding === compilation.plan.root &&
+          writeKeySubqueries.has(query)
         ) {
           continue;
         }
@@ -133,8 +146,8 @@ const DISTANCES = new Set(["<->", "<=>", "<#>", "<+>"]);
  * A condition for "the nearest N rows": true, and it reads no column, so
  * PostgreSQL evaluates it once, before the scan it guards. pgvector's HNSW
  * index hands back `hnsw.ef_search` rows (40 unless set) and meets the other
- * filters only afterwards, so a filtered or a long LIMIT would come up short
- * without an error. For this statement the index returns as many rows as are
+ * filters only afterwards, so a filtered query or a LIMIT above that would
+ * come up short without an error. For this statement the index returns as many rows as are
  * asked for (1000 is its ceiling) and, from pgvector 0.8, keeps scanning until
  * enough rows pass the filters, with as much memory as that takes (up to
  * pgvector's limit of 1000 × work_mem). `set_config(…, true)` lasts for the
@@ -175,8 +188,8 @@ const nearestScanSql = (
     setting("hnsw.iterative_scan", "'strict_order'"),
     setting("hnsw.max_scan_tuples", "'2147483647'"),
     // The scan also stops at work_mem × this multiplier (1 unless set):
-    // about 23,000 index tuples at 4MB, after which rows that pass the
-    // filters further away were lost without an error.
+    // about 23,000 index tuples at 4MB, after which rows further away that
+    // pass the filters would be lost without an error.
     setting("hnsw.scan_mem_multiplier", "'1000'"),
     ...(relaxed ? [setting("ivfflat.iterative_scan", "'relaxed_order'")] : []),
   ].join(" || ")}) IS NOT NULL`;
@@ -284,13 +297,13 @@ const renderSelect = (
 
     if (fields.every(Boolean)) {
       const field = (name: string) =>
-        `"__symmetria_distinct".${quoteIdentifier(name)}`;
+        `"__symmetria_distinct".${quoteIdentifier(keyAlias(name))}`;
 
       return [
         `SELECT ${query.selection
           .map(
             (expression) =>
-              `${jsonPrecisionSql(compilation, expression, field(expression.outputName))} AS ${quoteIdentifier(expression.outputName)}`,
+              `${jsonPrecisionSql(compilation, expression, field(expression.outputName))} AS ${quoteIdentifier(keyAlias(expression.outputName))}`,
           )
           .join(", ")}`,
         `FROM (${renderSelect(compilation, query, outerBindings, false, false)}) AS "__symmetria_distinct"`,
@@ -497,12 +510,24 @@ const renderSelect = (
       return [projection, source, ...body, ...fragments].join("\n");
     }
 
-    // The ordering keys travel as extra columns. PostgreSQL trusts the inner
-    // ORDER BY, so the first key is sorted as `key + 0`, an order it has to
-    // establish itself.
+    // The ordering keys travel as extra columns, named like no selected
+    // field. PostgreSQL trusts the inner ORDER BY, so the first key is sorted
+    // as `key + 0`, an order it has to establish itself.
+    const columns = query.selection.map((expression) =>
+      quoteIdentifier(keyAlias(expression.outputName)),
+    );
+    const names = query.ordering.map((_ordering, position) => {
+      let name = quoteIdentifier(`__symmetria_order_${position}`);
+
+      while (columns.includes(name)) {
+        name = `${name.slice(0, -1)}_"`;
+      }
+
+      return name;
+    });
     const keys = query.ordering.map(
       (ordering, position) =>
-        `${valueSql(compilation, ordering.expression.node, bindings)} AS ${quoteIdentifier(`__symmetria_order_${position}`)}`,
+        `${valueSql(compilation, ordering.expression.node, bindings)} AS ${names[position]}`,
     );
     const inner = [
       `${projection}, ${keys.join(", ")}`,
@@ -512,12 +537,12 @@ const renderSelect = (
     ].join("\n");
 
     return [
-      `SELECT ${query.selection.map((expression) => quoteIdentifier(expression.outputName)).join(", ")}`,
+      `SELECT ${columns.join(", ")}`,
       `FROM (${inner}) AS "__symmetria_nearest"`,
       `ORDER BY ${query.ordering
         .map(
           (ordering, position) =>
-            `${quoteIdentifier(`__symmetria_order_${position}`)}${position ? "" : " + 0"} ${ordering.direction}${ordering.nulls ? ` NULLS ${ordering.nulls}` : ""}`,
+            `${names[position]}${position ? "" : " + 0"} ${ordering.direction}${ordering.nulls ? ` NULLS ${ordering.nulls}` : ""}`,
         )
         .join(", ")}`,
     ].join("\n");

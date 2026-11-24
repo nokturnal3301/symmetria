@@ -4,6 +4,7 @@
  */
 import type { SchemaSnapshot } from "symmetria";
 import {
+  commentText,
   migrationSnapshot,
   parseMigrationSnapshot,
   type MigrationSnapshot,
@@ -134,14 +135,27 @@ export const schemaGraph = (
   return { tables, edges };
 };
 
+/**
+ * Line breaks (U+2028 and U+2029 too) and other control characters would end
+ * a line of the diagram: written as escapes, as in a comment.
+ */
+const oneLine = commentText;
+
 const entityName = (name: string): string =>
   /^[A-Za-z_][A-Za-z0-9_-]*$/.test(name)
     ? name
-    : `"${name.replaceAll('"', "#quot;")}"`;
+    : `"${oneLine(name).replaceAll('"', "#quot;")}"`;
 
-/** Mermaid attribute types allow letters, digits, `_`, `-`, brackets and parentheses. */
-const attributeType = (type: string): string =>
-  type.replace(/[^A-Za-z0-9_()[\]-]/g, "_");
+/**
+ * Mermaid attribute types and names are one word: a letter or `_` first, then
+ * letters, digits, `_`, `-`, brackets and parentheses. Anything else becomes
+ * `_` (`First Name` → `First_Name`, `2fa` → `_2fa`).
+ */
+const attributeWord = (text: string): string => {
+  const word = text.replace(/[^A-Za-z0-9_()[\]-]/g, "_");
+
+  return /^[A-Za-z_]/.test(word) ? word : `_${word}`;
+};
 
 const attributeKeys = (column: GraphColumn): string => {
   const keys = [
@@ -153,14 +167,27 @@ const attributeKeys = (column: GraphColumn): string => {
   return keys.length ? ` ${keys.join(", ")}` : "";
 };
 
-const attributeComment = (column: GraphColumn): string => {
+/**
+ * An attribute's comment, a quoted string with no `"` inside: the real name
+ * of an attribute written as another word, and the notes.
+ */
+const attributeComment = (column: GraphColumn, word: string): string => {
   const notes = [
+    ...(word === column.name
+      ? []
+      : [`name: ${oneLine(column.name).replaceAll('"', "'")}`]),
     ...(column.nullable ? ["nullable"] : []),
     ...(column.identity ? ["identity"] : []),
   ];
 
   return notes.length ? ` "${notes.join(", ")}"` : "";
 };
+
+/** A relationship label: one word, or a quoted string with no `"` inside. */
+const relationshipLabel = (label: string): string =>
+  /^[A-Za-z_][A-Za-z0-9_-]*$/.test(label)
+    ? label
+    : `"${oneLine(label).replaceAll('"', "'")}"`;
 
 const cardinality = (edge: GraphEdge): string => {
   const parent = edge.optional ? "|o" : "||";
@@ -170,6 +197,12 @@ const cardinality = (edge: GraphEdge): string => {
   return `${parent}${line}${child}`;
 };
 
+/**
+ * A schema graph as a Mermaid `erDiagram`. A column name Mermaid cannot take
+ * as an attribute is written with `_` in place of what it cannot take
+ * (`First Name` as `First_Name`, `2fa` as `_2fa`), with its real name in the
+ * note; other names and relation labels are quoted when they need it.
+ */
 export const renderMermaid = (
   graph: SchemaGraph,
   options: MermaidOptions = {},
@@ -183,10 +216,21 @@ export const renderMermaid = (
     }
 
     lines.push(`  ${entityName(table.name)} {`);
+    // Names that become the same word stay apart: `First Name` and
+    // `First_Name` are written First_Name and First_Name_2.
+    const words = new Set<string>();
 
     for (const column of table.columns) {
+      const base = attributeWord(column.name);
+      let word = base;
+
+      for (let suffix = 2; words.has(word); suffix += 1) {
+        word = `${base}_${suffix}`;
+      }
+
+      words.add(word);
       lines.push(
-        `    ${attributeType(column.type)} ${column.name}${attributeKeys(column)}${attributeComment(column)}`,
+        `    ${attributeWord(column.type)} ${word}${attributeKeys(column)}${attributeComment(column, word)}`,
       );
     }
 
@@ -199,7 +243,7 @@ export const renderMermaid = (
 
   for (const edge of graph.edges) {
     lines.push(
-      `  ${entityName(edge.from)} ${cardinality(edge)} ${entityName(edge.to)} : ${edge.label}`,
+      `  ${entityName(edge.from)} ${cardinality(edge)} ${entityName(edge.to)} : ${relationshipLabel(edge.label)}`,
     );
   }
 

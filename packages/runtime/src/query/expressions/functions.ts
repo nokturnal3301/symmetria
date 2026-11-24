@@ -4,7 +4,7 @@
 import { freeze } from "../plan/freeze";
 import { countCodec, codecFor, numericCodec } from "../codecs";
 import type { QueryReference } from "../plan/types";
-import { expressionSqlType } from "../plan/metadata";
+import { expressionSqlType, valueSqlType } from "../plan/metadata";
 import type { TsVector } from "../../schema/column";
 import {
   COLUMN_EXPRESSION,
@@ -63,7 +63,7 @@ export const presentPredicates = (
       .map((condition) => readPredicate(condition as Predicate)),
   );
 
-/** AND of the given predicates; falsy entries (`undefined`, `null`, `false`, `""`, `0`) are skipped. Empty is TRUE. */
+/** AND of the given predicates; falsy entries (`undefined`, `null`, `false`, `""`, `0`, `0n`) are skipped. Empty is TRUE. */
 export const and = (...conditions: OptionalPredicate[]): Predicate =>
   predicate({
     kind: "group",
@@ -143,18 +143,20 @@ export const average = <
   });
 
 /** Types PostgreSQL orders without a MIN or MAX of their own, besides JSON and boolean. */
-export const ELEMENT_ORDERED = /^(uuid|bytea|tsvector|vector|halfvec)(\(|$)/;
+export const ELEMENT_ORDERED =
+  /^(uuid|bytea|tsvector|vector|halfvec|(?:int4|int8|num|ts|tstz|date)(?:multi)?range)(\(|$)/;
 
 /** A JSON value as jsonb: `json` has no equality or ordering. */
 export const jsonbNode = (description: ExpressionDescription): ValueNode =>
-  expressionSqlType(description) === "json"
+  valueSqlType(description) === "json"
     ? castNode(description.node, "jsonb")
     : description.node;
 
 /**
  * MIN or MAX in PostgreSQL's ordering of the value's type. Booleans use
- * bool_and / bool_or. JSON, uuid, bytea and tsvector have no MIN or MAX, so
- * the first element of the aggregated one-element arrays stands in, ordered by
+ * bool_and / bool_or. JSON and the types of `ELEMENT_ORDERED` (uuid, bytea,
+ * tsvector, vectors, ranges) have no MIN or MAX, so the first element of the
+ * aggregated one-element arrays stands in, ordered by
  * the type's comparison: JSON orders objects above arrays above booleans above
  * numbers (numerically) above strings (textually), and skips JSON null like
  * SQL NULL.
@@ -164,7 +166,7 @@ export const ordered = <Name extends "minimum" | "maximum">(
   name: Name,
 ): WindowExpression<unknown, Name> => {
   const description = readColumn(expression);
-  const sqlType = expressionSqlType(description);
+  const sqlType = valueSqlType(description);
   const json = isJsonValue(description);
 
   return windowExpression({
@@ -218,9 +220,7 @@ export const withoutJsonNull = (
     sqlType: "jsonb",
   });
 
-  return expressionSqlType(description) === "json"
-    ? castNode(value, "json")
-    : value;
+  return valueSqlType(description) === "json" ? castNode(value, "json") : value;
 };
 
 /**
@@ -256,7 +256,7 @@ export const coalesce = <Expression extends SelectedColumn>(
     fallback !== null &&
     typeof fallback === "object" &&
     COLUMN_EXPRESSION in fallback &&
-    isTextType(expressionSqlType(description)) &&
+    isTextType(valueSqlType(description)) &&
     readsAsString(readColumn(fallback as SelectedColumn));
 
   return createExpression({
@@ -322,7 +322,9 @@ export const dateTrunc = <
 
   const description = readColumn(value);
   const sqlType = expressionSqlType(description);
-  const input = /^(timestamptz|timestamp|date)(\(\d\))?$/.exec(sqlType)?.[1];
+  const input = /^(timestamptz|timestamp|date)(\(\d\))?$/.exec(
+    valueSqlType(description),
+  )?.[1];
 
   if (!input) {
     throw new Error(
@@ -370,10 +372,13 @@ export const SEARCH_WEIGHTS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * A full-text document built from one or more text expressions, optionally grouped by
+ * A full-text document built from one or more expressions, optionally grouped by
  * weight: `searchDocument({ A: post.title, B: [post.body] }, { language: "english" })`.
- * Compiles to `setweight(to_tsvector(language, coalesce(expr, '')), 'A') || ...`; the
- * same expression declares a GIN index in `.indexes()`, so the planner can use it.
+ * Compiles to `setweight(to_tsvector(language, coalesce(expr, '')), 'A') || ...`; a
+ * JSON part is `coalesce(expr, '{}')`, and a part of a type known not to be text (an
+ * enum, uuid, date, …) is read as its text. The same expression declares a GIN index
+ * in `.indexes()`, so the planner can use it; such an index refuses an enum, date,
+ * timestamp, interval, money, range or array part.
  */
 export const searchDocument = (
   parts: SearchDocumentParts,

@@ -471,6 +471,70 @@ describe.skipIf(!databaseUrl)("indexes and transactions on PostgreSQL", () => {
     });
   });
 
+  test("count(), exists() and aggregate() of a FOR UPDATE source lock every row it selects", async () => {
+    const lockedElsewhere = (id: number) =>
+      observer
+        .$transaction(async (other) =>
+          other
+            .accounts((accounts) => ({ id: accounts.id }), {
+              where: (accounts) => accounts.id.is(id),
+              forUpdate: { noWait: true },
+            })
+            .execute(),
+        )
+        .then(
+          () => false,
+          () => true,
+        );
+
+    type Transaction = Parameters<Parameters<typeof model.$transaction>[0]>[0];
+
+    for (const read of [
+      (transaction: Transaction) =>
+        transaction.accounts({ forUpdate: true }).count(),
+      (transaction: Transaction) =>
+        transaction.accounts({ forUpdate: true }).exists(),
+      (transaction: Transaction) =>
+        transaction
+          .accounts({ forShare: true })
+          .aggregate((_, { count }) => ({ n: count() })),
+    ]) {
+      await model.$transaction(async (transaction) => {
+        await read(transaction);
+        expect([await lockedElsewhere(1), await lockedElsewhere(2)]).toEqual([
+          true,
+          true,
+        ]);
+      });
+    }
+
+    // skipLocked counts, and finds, the rows it could lock.
+    await model.$transaction(async (transaction) => {
+      await transaction
+        .accounts((accounts) => ({ id: accounts.id }), {
+          where: (accounts) => accounts.id.is(1),
+          forUpdate: true,
+        })
+        .execute();
+      expect(
+        await observer.$transaction((other) =>
+          other.accounts({ forUpdate: { skipLocked: true } }).count(),
+        ),
+      ).toBe(1);
+      expect(
+        await observer.$transaction((other) =>
+          other
+            .accounts({
+              where: (accounts) => accounts.id.is(1),
+              forUpdate: { skipLocked: true },
+            })
+            .exists(),
+        ),
+      ).toBe(false);
+    });
+    expect(await model.accounts({ forUpdate: true }).count()).toBe(2);
+  });
+
   test("a repeatable-read transaction retains its snapshot across another connection's commit", async () => {
     await model.$transaction(
       async (transaction) => {
@@ -820,5 +884,37 @@ describe.skipIf(!databaseUrl)("indexes and transactions on PostgreSQL", () => {
         return "committed";
       }),
     ).toBe("committed");
+  });
+
+  test("a connection whose ROLLBACK failed is closed, not returned to the pool", async () => {
+    const single = postgres({ url: databaseUrl!, max: 1 });
+
+    try {
+      const pid = async () => {
+        const result = await single.execute({
+          sql: "SELECT pg_backend_pid() AS pid",
+          parameters: [],
+        });
+
+        return Number((Array.isArray(result) ? result : result.rows)[0]!.pid);
+      };
+      const before = await pid();
+
+      // The server ends the session: the ROLLBACK after the callback fails
+      // with 57P01, a server error on Bun as on node-postgres.
+      await expect(
+        single.transaction(async (transaction) => {
+          await observerDriver.execute({
+            sql: "SELECT pg_terminate_backend($1)",
+            parameters: [before],
+          });
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          await transaction.execute({ sql: "SELECT 1", parameters: [] });
+        }),
+      ).rejects.toThrow();
+      expect(await pid()).not.toBe(before);
+    } finally {
+      await single.close();
+    }
   });
 });

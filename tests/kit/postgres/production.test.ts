@@ -347,6 +347,12 @@ describe.skipIf(!url)("production migrations", () => {
           sql: "DELETE FROM records WHERE id = 2",
           parameters: [],
         });
+        // meta/migration.json keeps the snapshot from before the latest
+        // migration (`undo`); one written by an earlier release has none.
+        const journalFile = join(directory, "meta", "migration.json");
+        const journal = await readFile(journalFile, "utf8");
+        const { undo: _undo, ...withoutUndo } = JSON.parse(journal);
+        await writeFile(journalFile, JSON.stringify(withoutUndo, null, 2));
         // Without the snapshot or a server, the error names both ways out.
         await expect(
           runner.repair({ id: migration.id, action: "retry" }),
@@ -364,6 +370,32 @@ describe.skipIf(!url)("production migrations", () => {
           action: "retry",
           snapshot: migrationSnapshot(first.$snapshot()),
         });
+        expect(await runner.migrate()).toEqual([migration.id]);
+
+        // With the journal's `undo`, a retry of the latest migration needs
+        // neither: the boundary before it is verified against that snapshot.
+        await writeFile(journalFile, journal);
+        await runner.rollback();
+        await driver.execute({
+          sql: "INSERT INTO records(name) VALUES ('again'), ('again')",
+          parameters: [],
+        });
+        await expect(runner.migrate()).rejects.toMatchObject({
+          sqlState: "23505",
+        });
+        // The leftover invalid index is still drift from that boundary.
+        await expect(
+          runner.repair({ id: migration.id, action: "retry" }),
+        ).rejects.toThrow(/invalid-index .*found records_name_idx/);
+        await driver.execute({
+          sql: "DROP INDEX records_name_idx",
+          parameters: [],
+        });
+        await driver.execute({
+          sql: "DELETE FROM records WHERE name = 'again'",
+          parameters: [],
+        });
+        await runner.repair({ id: migration.id, action: "retry" });
         expect(await runner.migrate()).toEqual([migration.id]);
       }),
   );

@@ -4,6 +4,7 @@
 import { indexClausesSQL, quoteIdentifier } from "symmetria/internal";
 import type { IndexSnapshot, CheckSnapshot } from "symmetria";
 import {
+  commentText,
   objectName,
   quoteLiteral,
   type MigrationColumn,
@@ -172,4 +173,4 @@ export const extensionSQL = (name: string): string =>
 
 /** Removing an extension from the schema never drops it: other schemas may depend on it. */
 export const keptExtensionSQL = (name: string): string =>
-  `-- extension ${quoteIdentifier(name)} is kept; drop it manually once nothing else uses it`;
+  `-- ${commentText(`extension ${quoteIdentifier(name)} is kept; drop it manually once nothing else uses it`)}`;

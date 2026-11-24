@@ -5,9 +5,17 @@ import {
   wrapExplainLines,
 } from "../../../packages/kit/src/cli/screens/query-inspector";
 import {
+  profilerEndpoint,
   profilerHttpError,
   requestLines,
 } from "../../../packages/kit/src/cli/screens/profiler";
+import {
+  formatError,
+  terminalOutput,
+  terminalText,
+  theme,
+} from "../../../packages/kit/src/cli/ui/style";
+import { formatStatus } from "../../../packages/kit/src/cli/ui/format";
 import type { ProfiledRequest } from "../../../packages/runtime/src";
 
 test("inspector formatting preserves bigint, nested values and plan tree diagnostics", () => {
@@ -169,4 +177,71 @@ test("the profiler's request view shows why the request failed", () => {
   );
   expect(scrolled).toHaveLength(12);
   expect(scrolled.at(-1)).toStartWith("<selected>› select    #30");
+});
+
+test("text from the database reaches a terminal without escape sequences", () => {
+  // OSC 0 (window title), clear screen, an 8-bit CSI and a bare C1 OSC.
+  const stored =
+    "a\u001b]0;PWNED\u0007b\u001b[2Jc\u009b31md\u009d8;;x\u0007e\r\nf\tg";
+
+  expect(terminalText(stored)).toBe("abcde\nf\tg");
+  // Colon parameters, bidirectional overrides and isolates go too.
+  expect(terminalText("x\u001b[38:5:196my")).toBe("xy");
+  expect(terminalText("report\u202eexe.txt\u2066a\u2069")).toBe(
+    "reportexe.txta",
+  );
+  expect(
+    formatError(`symmetria: invalid input syntax: "${stored}"`),
+  ).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+  expect(
+    formatError(`symmetria: invalid input syntax: "${stored}"`, true),
+  ).not.toContain("PWNED\u0007");
+  // The CLI's own colours stay; everything else goes, conceal included.
+  const { style } = theme(true);
+  const own = `${style("✓", "success")} ${style("ok", "selected")}`;
+  expect(terminalOutput(`${own} ${stored}`)).toBe(`${own} abcde\nf\tg`);
+  expect(terminalOutput("shown\u001b[8mHIDDEN\u001b[1m!")).toBe("shownHIDDEN!");
+  // A name read from the database brings no colour of its own.
+  expect(
+    formatStatus(
+      [{ id: "000001_x\u001b[38;2;0;0;0mhidden", status: "pending" }],
+      true,
+    ),
+  ).not.toContain("38;2;0;0;0");
+
+  const [label] = requestLines(
+    {
+      id: 1,
+      label: "GET /notes?q=\u001b]0;PWNED\u0007",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      durationMs: 1,
+      buildMs: 1,
+      queries: [],
+    },
+    0,
+    { width: 80, height: 10, style: (text: string) => text },
+  );
+  expect(label).toBe("GET /notes?q= · build 1.000 ms · total 1.000 ms");
+});
+
+test("the profiler endpoint keeps the path of --profile-url", () => {
+  expect(profilerEndpoint("http://127.0.0.1:7331", "requests").href).toBe(
+    "http://127.0.0.1:7331/requests",
+  );
+  expect(profilerEndpoint("http://host/prefix/", "requests").href).toBe(
+    "http://host/prefix/requests",
+  );
+  expect(
+    profilerEndpoint("http://host/prefix", "explain?id=3&analyze=false").href,
+  ).toBe("http://host/prefix/explain?id=3&analyze=false");
+  // The endpoint itself, as before.
+  expect(
+    profilerEndpoint("http://127.0.0.1:7331/requests", "requests").href,
+  ).toBe("http://127.0.0.1:7331/requests");
+  expect(
+    profilerEndpoint("http://host/prefix/requests/", "explain?id=1").href,
+  ).toBe("http://host/prefix/explain?id=1");
+  expect(() => profilerEndpoint("not a url", "requests")).toThrow(
+    'symmetria: invalid --profile-url "not a url"',
+  );
 });

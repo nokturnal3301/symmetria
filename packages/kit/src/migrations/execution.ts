@@ -11,7 +11,7 @@ import type {
   TransactionDriver,
 } from "symmetria/driver";
 import type { Migration } from "./files";
-import { parseMigrationSQL, splitMigrationSQL } from "./sql";
+import { parseMigrationSQL, type ParsedStatement } from "./sql";
 
 export type ExecutionOptions = {
   advisoryLockTimeoutMs?: number;
@@ -45,12 +45,15 @@ const addsEnumLabel = (words: readonly string[]): boolean =>
   );
 
 const NAME = String.raw`(?:"|[A-Z_][A-Z_0-9$]*)`;
-const NONTRANSACTIONAL = [
+const CONCURRENT = [
   /^CREATE (?:UNIQUE )?INDEX CONCURRENTLY(?: |$)/,
   /^DROP INDEX CONCURRENTLY(?: |$)/,
   // REINDEX (VERBOSE, CONCURRENTLY) … and REINDEX TABLE CONCURRENTLY …
   /^REINDEX \( (?:[^)]* , )?CONCURRENTLY(?! (?:FALSE|OFF) )/,
   /^REINDEX (?:\( [^)]*\) )?(?:INDEX|TABLE|SCHEMA|DATABASE|SYSTEM) CONCURRENTLY(?: |$)/,
+];
+const NONTRANSACTIONAL = [
+  ...CONCURRENT,
   new RegExp(
     String.raw`^ALTER TABLE .* DETACH PARTITION ${NAME}(?: \. ${NAME})* CONCURRENTLY$`,
   ),
@@ -60,18 +63,52 @@ const NONTRANSACTIONAL = [
 ];
 
 /**
+ * The statements whose lock waits hold up no reads or writes. CONCURRENTLY
+ * index builds, drops and reindexes wait under a SHARE UPDATE EXCLUSIVE lock
+ * for every older transaction that could use the table, anywhere in the
+ * database for a build. VALIDATE CONSTRAINT, as the only action of its ALTER
+ * TABLE, waits only for that lock (and ROW SHARE on a foreign key's target).
+ * Neither lock conflicts with reads or writes, so queries do not queue behind
+ * the wait. Not among them: DETACH PARTITION … CONCURRENTLY, whose second
+ * transaction takes an ACCESS EXCLUSIVE lock on the partition, so every query
+ * of the partition would queue behind its wait; VACUUM, as VACUUM FULL takes
+ * an ACCESS EXCLUSIVE lock.
+ */
+const WAIT_WITHOUT_BLOCKING = [
+  ...CONCURRENT,
+  new RegExp(
+    String.raw`^ALTER TABLE (?:IF EXISTS )?(?:ONLY )?${NAME}(?: \. ${NAME})* VALIDATE CONSTRAINT ${NAME}$`,
+  ),
+];
+
+/** The tokens of a statement; quoted identifiers become a bare `"`, so no name reads as a keyword. */
+const tokens = (code: string): string =>
+  (code.match(/"(?:[^"]|"")*"|[A-Za-z_][\w$]*|[().,]/g) ?? [])
+    .map((token) => (token.startsWith('"') ? '"' : token.toUpperCase()))
+    .join(" ");
+
+/**
  * A statement PostgreSQL refuses inside a transaction block. The keyword has
  * to stand where the grammar puts it: a column, table or index may be called
  * `concurrently`, and REFRESH MATERIALIZED VIEW CONCURRENTLY runs in a
  * transaction. `code` is a statement without comments and string literals.
  */
 const nontransactional = (code: string): boolean => {
-  // Quoted identifiers become a bare `"`, so no name reads as a keyword.
-  const text = (code.match(/"(?:[^"]|"")*"|[A-Za-z_][\w$]*|[().,]/g) ?? [])
-    .map((token) => (token.startsWith('"') ? '"' : token.toUpperCase()))
-    .join(" ");
+  const text = tokens(code);
 
   return NONTRANSACTIONAL.some((pattern) => pattern.test(text));
+};
+
+/**
+ * Whether a statement of a `transaction: "none"` migration may wait for locks
+ * without a timeout: its waits block nobody (see WAIT_WITHOUT_BLOCKING), and
+ * the default lock timeout would cancel a CREATE INDEX CONCURRENTLY whenever
+ * any transaction in the database runs longer, leaving an invalid index.
+ */
+export const waitsWithoutBlocking = (code: string): boolean => {
+  const text = tokens(code);
+
+  return WAIT_WITHOUT_BLOCKING.some((pattern) => pattern.test(text));
 };
 
 /**
@@ -159,6 +196,27 @@ export class MigrationExecutionError extends Error {
   }
 }
 
+/**
+ * Adds a line to the message of a migration error: what went wrong after it,
+ * such as cleanup on a session that was lost with the statement. The error
+ * stays the one the caller gets, its SQL last. Other errors (a connection
+ * lost before any statement, an abort reason the caller passed) are left as
+ * they are.
+ */
+export const addErrorNote = (error: unknown, note: string): void => {
+  if (!(error instanceof MigrationExecutionError)) {
+    return;
+  }
+
+  const tail = `\n\nSQL:\n${error.sql}`;
+  error.message = error.message.endsWith(tail)
+    ? `${error.message.slice(0, -tail.length)}\n${note}${tail}`
+    : `${error.message}\n${note}`;
+};
+
+const reason = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
 export const executeSQL = async (
   executor: QueryExecutor,
   sql: string,
@@ -178,10 +236,13 @@ export const applyStatements = async (
   direction: "up" | "down",
   options: ExecutionOptions,
   completed?: (statement: number) => Promise<void>,
+  /** Runs before each statement, such as to set the session's lock timeout for it. */
+  prepare?: (statement: ParsedStatement) => Promise<void>,
 ): Promise<void> => {
-  for (const [position, sql] of splitMigrationSQL(
+  for (const [position, statement] of parseMigrationSQL(
     migration[direction],
   ).entries()) {
+    const { sql } = statement;
     const event = {
       migration: migration.id,
       direction,
@@ -192,6 +253,7 @@ export const applyStatements = async (
     options.onEvent?.({ ...event, type: "statement-start" });
 
     try {
+      await prepare?.(statement);
       await executeSQL(executor, sql, [], options.signal);
       await completed?.(position + 1);
     } catch (cause) {
@@ -238,7 +300,9 @@ export type MigrationConnection = {
   /** The pinned session for `transaction: "none"` migrations; absent on transaction-only drivers. */
   readonly session?: SessionDriver;
   /** The driver has sessions, but its connection pools transactions, so they cannot pin a server. */
-  readonly pooled?: boolean;
+  readonly pooled?: true;
+  /** The driver has sessions, but the pooling check could not tell whether they pin a server: why, and what to do. */
+  readonly unchecked?: string;
 };
 
 /**
@@ -248,13 +312,63 @@ export type MigrationConnection = {
  */
 export const DEFAULT_STATEMENT_TIMEOUT_MS = 600000;
 
+/**
+ * The lock timeout when none is configured. The runner lifts it for the
+ * statements of a `transaction: "none"` migration whose waits block nobody
+ * (see `waitsWithoutBlocking`).
+ */
+export const DEFAULT_LOCK_TIMEOUT_MS = 5000;
+
 const LOCK_SETTINGS =
   "SELECT set_config('lock_timeout', $1, $4), set_config('statement_timeout', $2, $4), set_config('standard_conforming_strings', $3, $4)";
 
-/** How long the pooling check waits for a second pool connection to answer. */
-const POOLING_PROBE_TIMEOUT_MS = 1000;
+/**
+ * How long the pooling check waits for a second pool connection to answer. A
+ * new connection to a distant server can take seconds to open (TLS and a
+ * password exchange over a long round trip); the wait ends at once when the
+ * connection is open, and a pool with no free connection refuses at once.
+ */
+const POOLING_PROBE_TIMEOUT_MS = 10000;
 
 const POOLED = Symbol("symmetria.pooled");
+
+/** What the pooling check found: the session's pinned server process, or why there is none. */
+type PoolingCheck =
+  | { readonly pid: number }
+  | { readonly pooled: true }
+  | { readonly unchecked: string };
+
+/**
+ * The session other than the caller's that holds the migration lock, if any:
+ * a migrate, rollback, adopt or repair running in another process, or the
+ * server process of one whose client went away while PostgreSQL still runs
+ * its statement. `state` and `seconds` (in that state) are visible to the
+ * same role, superusers and pg_read_all_stats only.
+ */
+export const migrationLockHolder = async (
+  execute: QueryExecutor,
+  lock: string,
+): Promise<
+  { pid: number | undefined; state?: string; seconds?: number } | undefined
+> => {
+  const [row] = (
+    await executeSQL(
+      execute,
+      "SELECT holder.pid, activity.state, floor(extract(epoch FROM clock_timestamp() - activity.state_change))::integer AS seconds FROM pg_locks holder LEFT JOIN pg_stat_activity activity ON activity.pid = holder.pid WHERE holder.locktype = 'advisory' AND holder.granted AND holder.database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND holder.classid = 1937339476::oid AND holder.objid = hashtext($1)::oid AND holder.objsubid = 2 AND holder.pid IS DISTINCT FROM pg_backend_pid() LIMIT 1",
+      [lock],
+    )
+  ).rows;
+
+  if (!row) {
+    return undefined;
+  }
+
+  return {
+    pid: row.pid === null ? undefined : Number(row.pid),
+    ...(typeof row.state === "string" ? { state: row.state } : {}),
+    ...(row.seconds === null ? {} : { seconds: Number(row.seconds) }),
+  };
+};
 
 const backendPid = async (
   execute: QueryExecutor,
@@ -266,21 +380,23 @@ const backendPid = async (
   );
 
 /**
- * The server process a session runs on, or undefined when the connection pools
- * transactions (PgBouncer with pool_mode=transaction, for example): then one
- * client connection's statements move between server processes and two client
- * connections share one, so a session lock or setting protects nothing. A
- * direct or session-pooled connection never does either. The second client
- * connection comes from the driver's pool. A pool with no free connection
- * (`max: 1`) cannot answer, and a session alone cannot tell: a pooler hands a
- * lone client the same server every time. Such a session counts as unpinned,
- * so the lock is taken per transaction, which is safe either way.
+ * The server process a session runs on, or what kept the check from finding
+ * one. A connection that pools transactions (PgBouncer with
+ * pool_mode=transaction, for example) moves one client connection's
+ * statements between server processes and lets two client connections share
+ * one, so a session lock or setting protects nothing. A direct or
+ * session-pooled connection never does either. The second client connection
+ * comes from the driver's pool. A pool with no free connection (`max: 1`)
+ * cannot answer, nor can one whose new connection does not open in time, and
+ * a session alone cannot tell: a pooler hands a lone client the same server
+ * every time. Such a session counts as unchecked, so the lock is taken per
+ * transaction, which is safe either way.
  */
 const pinnedBackend = async (
   driver: Driver,
   session: SessionDriver,
   signal?: AbortSignal,
-): Promise<number | undefined> => {
+): Promise<PoolingCheck> => {
   const first = await backendPid(session.execute, signal);
   let latest = first;
 
@@ -289,26 +405,44 @@ const pinnedBackend = async (
   for (let round = 0; round < 3; round++) {
     const timer = new AbortController();
     const other = await Promise.race([
-      backendPid(driver.execute).catch(() => undefined),
+      backendPid(driver.execute).then(
+        (pid) => ({ pid }),
+        (error: unknown) => ({ error }),
+      ),
       delay(POOLING_PROBE_TIMEOUT_MS, undefined, {
-        signal: timer.signal,
-      }).catch(() => undefined),
+        signal: signal ? AbortSignal.any([timer.signal, signal]) : timer.signal,
+      }).then(
+        () => ({ late: true }),
+        () => ({ late: true }),
+      ),
     ]);
     timer.abort();
+    signal?.throwIfAborted();
     const next = await backendPid(session.execute, signal);
 
-    if (next !== first || other === latest || other === next) {
-      return undefined;
+    if (
+      next !== first ||
+      ("pid" in other && (other.pid === latest || other.pid === next))
+    ) {
+      return { pooled: true };
     }
 
-    if (other === undefined) {
-      return undefined;
+    if ("error" in other) {
+      return {
+        unchecked: `the pool gave it no connection: its pool has a single connection, or other work holds the others ("${reason(other.error).replace(/^symmetria: /, "")}"). Give the driver a connection to spare for the check (at least max: 2)`,
+      };
+    }
+
+    if ("late" in other) {
+      return {
+        unchecked: `it did not answer within ${POOLING_PROBE_TIMEOUT_MS}ms: opening a connection to the database takes longer than that, or other work holds every connection of the pool. Retry when connections open faster, or with one to spare for the check (raise max)`,
+      };
     }
 
     latest = next;
   }
 
-  return first;
+  return { pid: first };
 };
 
 /** A session transaction must run on the session's server process, which holds the lock. */
@@ -329,8 +463,9 @@ const assertPinned = async (
  * Session locks survive commits, so a session driver locks once. A driver that
  * only offers whole transactions locks each transaction with
  * pg_advisory_xact_lock and the same timeouts, so every driver gets the same
- * transaction boundaries. A session driver whose connection pools transactions
- * works like a transaction-only driver, since its sessions cannot hold a lock.
+ * transaction boundaries. A session driver whose connection pools
+ * transactions, or whose pooling check cannot tell, works like a
+ * transaction-only driver, since its sessions may not hold a lock.
  */
 export const withMigrationConnection = async <Result>(
   driver: Driver,
@@ -339,7 +474,7 @@ export const withMigrationConnection = async <Result>(
   callback: (connection: MigrationConnection) => Promise<Result>,
 ): Promise<Result> => {
   const advisory = options.advisoryLockTimeoutMs ?? 10000;
-  const ddl = options.lockTimeoutMs ?? 5000;
+  const ddl = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
   const statement = options.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS;
 
   for (const value of [advisory, ddl, statement]) {
@@ -373,8 +508,22 @@ export const withMigrationConnection = async <Result>(
       }
 
       if (performance.now() - started >= advisory) {
+        // Who holds it tells a running migration from a client that went
+        // away while its server process still runs a statement.
+        const holder = await migrationLockHolder(execute, lock).catch(
+          () => undefined,
+        );
+        const process =
+          holder?.pid === undefined
+            ? undefined
+            : `PostgreSQL process ${holder.pid}${holder.state ? ` (${holder.state}${holder.seconds === undefined ? "" : ` for ${holder.seconds}s`})` : ""}`;
+
         throw new Error(
-          `symmetria: migration advisory lock timeout after ${advisory}ms`,
+          `symmetria: migration advisory lock timeout after ${advisory}ms${
+            process
+              ? `: ${process} holds the migration lock. A migrate, rollback, adopt or repair is running there, or its client went away while PostgreSQL still runs its statement; wait for it to finish (status shows a migration it runs as running), or, if nothing should be running, end that process with pg_terminate_backend(${holder!.pid})`
+              : ""
+          }`,
         );
       }
 
@@ -390,21 +539,49 @@ export const withMigrationConnection = async <Result>(
     }
   };
 
+  let unpinned: Exclude<PoolingCheck, { pid: number }> | undefined;
+
   if (driver.session) {
     const outcome = await driver.session<Result | typeof POOLED>(
-      async (session) => {
-        options.signal?.throwIfAborted();
-        const pid = await pinnedBackend(driver, session, options.signal);
+      async (pinned) => {
+        // The statements under way on the session. An abort (Ctrl-C) cancels
+        // only while one runs: between them, as after the session was lost
+        // with its statement, there is nothing to cancel, and the
+        // cancellation's new connection would hold the session open for as
+        // long as a server that does not answer keeps it waiting.
+        let running = 0;
+        const busy = <Value>(work: Promise<Value>): Promise<Value> => {
+          running += 1;
 
-        if (pid === undefined) {
+          return work.finally(() => {
+            running -= 1;
+          });
+        };
+        const session: SessionDriver = {
+          ...pinned,
+          execute: (query) => busy(pinned.execute(query)),
+          transaction: (work, settings) =>
+            busy(pinned.transaction(work, settings)),
+        };
+
+        options.signal?.throwIfAborted();
+        const check = await pinnedBackend(driver, session, options.signal);
+
+        if (!("pid" in check)) {
+          unpinned = check;
+
           return POOLED;
         }
+
+        const { pid } = check;
 
         let cancellation: Promise<void> | undefined;
 
         const abort = () => {
-          cancellation = session.cancel?.();
-          void cancellation?.catch(() => {});
+          if (running > 0) {
+            cancellation = session.cancel?.();
+            void cancellation?.catch(() => {});
+          }
         };
 
         options.signal?.addEventListener("abort", abort, { once: true });
@@ -432,6 +609,11 @@ export const withMigrationConnection = async <Result>(
             await delay(10);
           }
         };
+
+        // The failure the callback ends with, if any: cleanup that fails
+        // after it, as on a session lost with the statement, must not
+        // replace the error that names the migration and statement.
+        let failure: { error: unknown } | undefined;
 
         try {
           original = (
@@ -467,11 +649,13 @@ export const withMigrationConnection = async <Result>(
               ),
             session,
           });
+        } catch (error) {
+          failure = { error };
+          throw error;
         } finally {
           options.signal?.removeEventListener("abort", abort);
           await cancellation?.catch(() => {});
-
-          try {
+          const restore = async () => {
             if (original) {
               await executeSQL(
                 session.execute,
@@ -483,11 +667,39 @@ export const withMigrationConnection = async <Result>(
                 ],
               );
             }
-          } finally {
-            // A cancellation can arrive after PostgreSQL acquires the lock but
-            // before its result reaches us. Release even when acquisition is uncertain.
+          };
+          // A cancellation can arrive after PostgreSQL acquires the lock but
+          // before its result reaches us. Release even when acquisition is uncertain.
+          const unlock = async () => {
             if (lockAttempted) {
               await release();
+            }
+          };
+
+          if (failure) {
+            const failed: { step: string; error: unknown }[] = [];
+            const attempt = (step: string, cleanup: () => Promise<void>) =>
+              cleanup().catch((error: unknown) => {
+                failed.push({ step, error });
+              });
+
+            await attempt("restoring the session settings", restore);
+            const settingsFailed = failed.length;
+            await attempt("releasing the migration lock", unlock);
+
+            if (failed.length) {
+              const reasons = new Set(failed.map(({ error }) => reason(error)));
+
+              addErrorNote(
+                failure.error,
+                `Afterwards, ${failed.map(({ step }) => step).join(" and ")} failed too: ${[...reasons].join("; ")}${failed.length > settingsFailed ? ". PostgreSQL releases the session's lock when the session ends" : ""}.`,
+              );
+            }
+          } else {
+            try {
+              await restore();
+            } finally {
+              await unlock();
             }
           }
         }
@@ -523,6 +735,6 @@ export const withMigrationConnection = async <Result>(
         },
         { isolationLevel: "read committed" },
       ),
-    ...(driver.session ? { pooled: true } : {}),
+    ...(driver.session ? (unpinned ?? { pooled: true }) : {}),
   });
 };

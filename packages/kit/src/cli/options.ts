@@ -40,7 +40,7 @@ export const help = `symmetria <command>
   --verify-url <url>   Administrative PostgreSQL URL for disposable verification databases
   --snapshot <file>    repair: meta/snapshot.json of the boundary to verify, instead of --verify-url
   --advisory-lock-timeout <ms>  Migration lock wait (default: 10000)
-  --lock-timeout <ms>   DDL lock wait (default: 5000; 0 disables)
+  --lock-timeout <ms>   DDL lock wait (default: 5000, none for concurrent index builds, drops and reindexes and VALIDATE in transaction none migrations; 0 disables)
   --statement-timeout <ms>  Statement duration (default: 600000, no default in transaction none migrations; 0 disables)
   --to <migration-id>   Apply up to a migration
   --ignore-table <name> pull/drift/adopt/repair/verify: leave an undeclared table out (repeatable)
@@ -118,13 +118,27 @@ export const FLAGS = {
   "no-interactive": { type: "boolean" },
 } as const;
 
-export const parseCommandLine = (argumentsList: string[]) =>
-  parseArgs({
+export const parseCommandLine = (argumentsList: string[]) => {
+  const parsed = parseArgs({
     args: argumentsList,
     allowPositionals: true,
     strict: true,
     options: FLAGS,
   });
+
+  // An empty value is no value: `migrate --to ""` would apply every pending
+  // migration, `--lock-timeout ""` read as 0 would disable the timeout.
+  for (const [flag, value] of Object.entries(parsed.values)) {
+    if (
+      (typeof value === "string" && !value.trim()) ||
+      (Array.isArray(value) && value.some((entry) => !entry.trim()))
+    ) {
+      throw new Error(`symmetria: --${flag} needs a value`);
+    }
+  }
+
+  return parsed;
+};
 
 type CommandLine = ReturnType<typeof parseCommandLine>;
 export type CliValues = CommandLine["values"];

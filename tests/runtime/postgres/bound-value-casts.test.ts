@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
+  createDatabase,
   schema,
   table,
   customType,
@@ -22,7 +23,8 @@ import {
 } from "../../../packages/runtime/src";
 import { postgres as pg } from "../../../packages/runtime/src/entries/pg";
 import { testDatabase as isolatedDatabase } from "../../../packages/kit/src/testing";
-import { testDatabase } from "../../support/postgres";
+import { postgres, testDatabase } from "../../support/postgres";
+import { hasExtension } from "../../support/extensions";
 
 const things = table({
   id: int.auto,
@@ -442,6 +444,450 @@ describe.skipIf(!databaseUrl)(
         const second = await query.page({ size: 1, after: first.nextCursor! });
 
         expect(second.items).toEqual([written]);
+      } finally {
+        await isolated.close();
+      }
+    });
+  },
+);
+
+describe.skipIf(!databaseUrl)(
+  "an upsert split into several statements compares keys as the unique index does",
+  () => {
+    test("keys equal under the column's nondeterministic collation are one key", async () => {
+      const columns = {
+        id: int,
+        sku: text.unique,
+        stage,
+        qty: int,
+      };
+      const isolated = await isolatedDatabase({
+        url: databaseUrl!,
+        schema: schema({ items: table(columns) }),
+        prefix: "symmetria_collated_keys",
+        driver: postgres,
+      });
+
+      try {
+        const run = (statement: string) =>
+          isolated.driver.execute({ sql: statement, parameters: [] });
+        await run(
+          `CREATE COLLATION "${isolated.namespace}".case_blind (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`,
+        );
+        await run(
+          `ALTER TABLE items ALTER COLUMN sku TYPE text COLLATE "${isolated.namespace}".case_blind`,
+        );
+        const database = createDatabase({
+          schema: schema({
+            items: table({
+              ...columns,
+              sku: text.collate("case_blind").unique,
+            }),
+          }),
+          driver: isolated.driver,
+        });
+        // 20,000 rows of 4 values: two statements, the enum keeps VALUES.
+        const rows = Array.from({ length: 20_000 }, (_, index) => ({
+          id: index + 1,
+          sku: `sku-${index}`,
+          stage: "draft" as const,
+          qty: 0,
+        }));
+        rows[0] = { ...rows[0]!, sku: "Alpha", qty: 1 };
+        rows[19_999] = { ...rows[19_999]!, sku: "ALPHA", qty: 2 };
+
+        for (const size of [2, 20_000]) {
+          await expect(
+            database.items
+              .upsert(size === 2 ? [rows[0]!, rows[19_999]!] : rows, {
+                by: "sku",
+              })
+              .execute(),
+          ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
+        }
+
+        expect(await database.items.count()).toBe(0);
+        rows[19_999] = { ...rows[19_999]!, sku: "Beta" };
+        expect(
+          (await database.items.upsert(rows, { by: "sku" })).affectedRows,
+        ).toBe(20_000);
+      } finally {
+        await isolated.close();
+      }
+    });
+
+    test("an array key is sent in PostgreSQL's array form", async () => {
+      const isolated = await isolatedDatabase({
+        url: databaseUrl!,
+        schema: schema({
+          marks: table({
+            id: int,
+            tags: text.array.unique,
+            at: timestamptz.array.unique.nullable,
+            amounts: numeric(10, 2).array.unique.nullable,
+            note: text,
+          }),
+        }),
+        prefix: "symmetria_array_keys",
+        driver: postgres,
+      });
+
+      try {
+        const { marks } = isolated.database;
+        // 17,000 rows of 5 values: arrays keep VALUES, so several statements.
+        const rows = Array.from({ length: 17_000 }, (_, index) => ({
+          id: index,
+          tags: [`a${index}`, 'b,"c"\\', "{d}"],
+          at: [new Date(Date.UTC(2000, 0, 1, 0, 0, index))],
+          amounts: [`${index}.5`, "1"],
+          note: "x",
+        }));
+
+        for (const by of ["tags", "at", "amounts"] as const) {
+          expect((await marks.upsert(rows, { by })).affectedRows).toBe(17_000);
+        }
+
+        expect(await marks.find(5)).toEqual({
+          id: 5,
+          tags: ["a5", 'b,"c"\\', "{d}"],
+          at: [new Date("2000-01-01T00:00:05.000Z")],
+          amounts: ["5.50", "1.00"],
+          note: "x",
+        });
+        // One key to PostgreSQL in another spelling, rows apart.
+        await marks.delete().all();
+        rows[16_999] = { ...rows[16_999]!, amounts: ["0.50", "1.0"] };
+        await expect(
+          marks.upsert(rows, { by: "amounts" }).execute(),
+        ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
+        expect(await marks.count()).toBe(0);
+      } finally {
+        await isolated.close();
+      }
+    });
+  },
+);
+
+describe.skipIf(!databaseUrl)(
+  "a compared value keeps its precision for every modifier and domain",
+  () => {
+    const as = (sqlType: string) =>
+      customType<string>(sqlType, {
+        encode: (value) => value,
+        decode: (value) => String(value),
+      });
+    const amount = customType<string>("amount", { base: "numeric(30,10)" });
+    const code = customType<string>("code5", { base: "varchar(5)" });
+    const events = table({
+      id: int.auto,
+      ats: timestamptz(0).array,
+      local: timestamp(0).array,
+      bits: as("bit(3)").array,
+      spans: as("interval day").array,
+      amount: amount.nullable,
+      // The same domains declared without their base.
+      plain: as("amount").nullable,
+      code: code.nullable,
+      plainCode: as("code5").nullable,
+      positive: as("positive").nullable,
+    });
+    const model = schema({ events });
+    const connect = (driver: ReturnType<typeof postgres>) =>
+      createDatabase({ schema: model, driver });
+    let isolated: Awaited<ReturnType<typeof isolatedDatabase>>;
+    let database: ReturnType<typeof connect>;
+
+    beforeAll(async () => {
+      isolated = await isolatedDatabase({
+        url: databaseUrl!,
+        schema: schema({ placeholder: table({ id: int.auto }) }),
+        prefix: "symmetria_modifiers",
+        driver: postgres,
+        max: 1,
+      });
+
+      for (const statement of [
+        "CREATE DOMAIN amount AS numeric(30,10)",
+        "CREATE DOMAIN code5 AS varchar(5)",
+        "CREATE DOMAIN positive AS integer CHECK (VALUE > 0)",
+        `CREATE TABLE events (
+          id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          ats timestamptz(0)[] NOT NULL, local timestamp(0)[] NOT NULL,
+          bits bit(3)[] NOT NULL, spans interval day[] NOT NULL,
+          amount amount, plain amount, code code5, plain_code code5,
+          positive positive)`,
+      ]) {
+        await isolated.driver.execute({ sql: statement, parameters: [] });
+      }
+
+      database = connect(isolated.driver);
+      const noon = new Date("2020-01-01T12:00:00Z");
+
+      await database.events.insert({
+        ats: [noon],
+        local: [noon],
+        bits: ["101"],
+        spans: ["1 day"],
+        amount: "1.5",
+        plain: "1.5",
+        code: "abcde",
+        plainCode: "abcde",
+        positive: "3",
+      });
+    });
+
+    afterAll(async () => {
+      await isolated?.close();
+    });
+
+    const ids = async (rows: PromiseLike<{ id: number }[]>) =>
+      (await rows).map((row) => row.id);
+    // Rows a write would touch, rolled back.
+    const touched = async (
+      write: (
+        transaction: Parameters<Parameters<typeof database.$transaction>[0]>[0],
+      ) => PromiseLike<{ id: number }[]>,
+    ) => {
+      let found: number[] = [];
+
+      await database
+        .$transaction(async (transaction) => {
+          found = await ids(write(transaction));
+          throw new Error("rolled back");
+        })
+        .catch((error: Error) => {
+          if (error.message !== "rolled back") {
+            throw error;
+          }
+        });
+
+      return found;
+    };
+
+    test("an array of timestamps, bit strings or intervals is searched with the values asked", async () => {
+      // 12:00:00.400 would round to the stored 12:00:00, '10111' cut to '101',
+      // '1 day 02:00' to '1 day'.
+      const asked = new Date("2020-01-01T12:00:00.400Z");
+      const select = (where: Parameters<typeof database.events>[1]) =>
+        ids(database.events((event) => ({ id: event.id }), where));
+
+      for (const operator of ["contains", "overlaps"] as const) {
+        expect(
+          await select({ where: (event) => event.ats[operator]([asked]) }),
+        ).toEqual([]);
+        expect(
+          await select({ where: (event) => event.local[operator]([asked]) }),
+        ).toEqual([]);
+        expect(
+          await select({ where: (event) => event.bits[operator](["10111"]) }),
+        ).toEqual([]);
+        expect(
+          await select({
+            where: (event) => event.spans[operator](["1 day 02:00"]),
+          }),
+        ).toEqual([]);
+        expect(
+          await touched((transaction) =>
+            transaction.events
+              .delete({ where: (event) => event.ats[operator]([asked]) })
+              .returning((event) => ({ id: event.id })),
+          ),
+        ).toEqual([]);
+      }
+
+      expect(
+        await touched((transaction) =>
+          transaction.events
+            .update({ spans: [] }, { where: (event) => event.ats.is([asked]) })
+            .returning((event) => ({ id: event.id })),
+        ),
+      ).toEqual([]);
+      const contains = prepare({ at: timestamptz(0).array }, (parameters) =>
+        database.events((event) => ({ id: event.id }), {
+          where: (event) => event.ats.contains(parameters.at),
+        }),
+      );
+      expect(await ids(contains({ at: [asked] }))).toEqual([]);
+      expect(
+        await ids(contains({ at: [new Date("2020-01-01T12:00:00Z")] })),
+      ).toEqual([1]);
+      // The values written still take the column's precision.
+      expect(
+        await touched(async (transaction) => {
+          await transaction.events
+            .byId(1)
+            .update({ ats: [asked], bits: ["111"] });
+
+          return transaction.events((event) => ({ id: event.id }), {
+            where: (event) =>
+              event.ats.contains([new Date("2020-01-01T12:00:00Z")]),
+          });
+        }),
+      ).toEqual([1]);
+    });
+
+    test("a nullable parameter compared with a domain is not rounded, cut or checked by the domain", async () => {
+      const find = <
+        Column extends "amount" | "plain" | "code" | "plainCode" | "positive",
+      >(
+        column: Column,
+        definition: Parameters<typeof prepare>[0][string],
+      ) =>
+        prepare({ value: definition }, (parameters) =>
+          database.events((event) => ({ id: event.id }), {
+            where: (event) => event[column].is(parameters.value as never),
+          }),
+        );
+      const other = <Column extends "amount" | "plain">(column: Column) =>
+        prepare({ value: amount.nullable }, (parameters) =>
+          database.events((event) => ({ id: event.id }), {
+            where: (event) => event[column].isNot(parameters.value),
+          }),
+        );
+
+      for (const column of ["amount", "plain"] as const) {
+        const query = find(column, amount.nullable);
+
+        expect(await ids(query({ value: "1.50000000001" }))).toEqual([]);
+        expect(await ids(query({ value: "1.5" }))).toEqual([1]);
+        expect(await ids(query({ value: null }))).toEqual([]);
+        expect(await ids(other(column)({ value: "1.50000000001" }))).toEqual([
+          1,
+        ]);
+        expect(
+          await touched((transaction) =>
+            prepare({ value: amount.nullable }, (parameters) =>
+              transaction.events
+                .delete()
+                .where((event) => event[column].is(parameters.value))
+                .returning((event) => ({ id: event.id })),
+            )({ value: "1.50000000001" }),
+          ),
+        ).toEqual([]);
+      }
+
+      for (const column of ["code", "plainCode"] as const) {
+        const query = find(column, code.nullable);
+
+        expect(await ids(query({ value: "abcdefgh" }))).toEqual([]);
+        expect(await ids(query({ value: "abcde" }))).toEqual([1]);
+      }
+
+      // -5 would fail the domain's CHECK; it is a value no row holds.
+      const positive = find("positive", as("positive").nullable);
+
+      expect(await ids(positive({ value: "-5" }))).toEqual([]);
+      expect(await ids(positive({ value: "3" }))).toEqual([1]);
+      expect(await ids(positive({ value: null }))).toEqual([]);
+      // A list long enough to bind as one array reads the base type as well.
+      expect(
+        await ids(
+          database.events((event) => ({ id: event.id }), {
+            where: (event) =>
+              event.plain.in(
+                Array.from({ length: 1001 }, (_, i) => `1.5000000000${i + 1}`),
+              ),
+          }),
+        ),
+      ).toEqual([]);
+    });
+  },
+);
+
+const withCitext = await hasExtension(databaseUrl, "citext");
+
+describe.skipIf(!databaseUrl)(
+  "a nullable parameter takes its type from a column that is not PostgreSQL's own",
+  () => {
+    // A type declared with a `base` is still compared as itself: an enum
+    // has no `=` with text, and citext compared with text is case-sensitive.
+    const isolate = async (statements: string[]) => {
+      const isolated = await isolatedDatabase({
+        url: databaseUrl!,
+        schema: schema({ placeholder: table({ id: int.auto }) }),
+        prefix: "symmetria_typed_parameters",
+        driver: postgres,
+        searchPath: ["public"],
+        max: 1,
+      });
+
+      for (const statement of statements) {
+        await isolated.driver.execute({ sql: statement, parameters: [] });
+      }
+
+      return isolated;
+    };
+    const ids = async (rows: PromiseLike<{ id: number }[]>) =>
+      (await rows).map((row) => row.id).sort();
+
+    test("an enum declared with a text base", async () => {
+      const mood = customType<string>("mood", { base: "text" });
+      const people = table({ id: int.auto, mood: mood.nullable });
+      const isolated = await isolate([
+        "CREATE TYPE mood AS ENUM ('sad', 'ok')",
+        "CREATE TABLE people (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, mood mood)",
+        "INSERT INTO people (mood) VALUES ('ok'), (NULL)",
+      ]);
+      const database = createDatabase({
+        schema: schema({ people }),
+        driver: isolated.driver,
+      });
+
+      try {
+        const same = prepare({ value: mood.nullable }, (parameters) =>
+          database.people((person) => ({ id: person.id }), {
+            where: (person) => person.mood.is(parameters.value),
+          }),
+        );
+        const other = prepare({ value: mood.nullable }, (parameters) =>
+          database.people((person) => ({ id: person.id }), {
+            where: (person) => person.mood.isNot(parameters.value),
+          }),
+        );
+
+        expect(await ids(same({ value: "ok" }))).toEqual([1]);
+        expect(await ids(same({ value: "sad" }))).toEqual([]);
+        expect(await ids(same({ value: null }))).toEqual([2]);
+        expect(await ids(other({ value: "sad" }))).toEqual([1]);
+        expect(await ids(other({ value: null }))).toEqual([1]);
+      } finally {
+        await isolated.close();
+      }
+    });
+
+    test.skipIf(!withCitext)("citext declared with a text base", async () => {
+      const name = customType<string>("citext", { base: "text" });
+      const people = table({ id: int.auto, name: name.nullable });
+      const isolated = await isolate([
+        "CREATE TABLE people (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name citext)",
+        "INSERT INTO people (name) VALUES ('Hello'), (NULL)",
+      ]);
+      const database = createDatabase({
+        schema: schema({ people }),
+        driver: isolated.driver,
+      });
+
+      try {
+        const select = (where: Parameters<typeof database.people>[1]) =>
+          ids(database.people((person) => ({ id: person.id }), where));
+        const same = prepare({ value: name.nullable }, (parameters) =>
+          database.people((person) => ({ id: person.id }), {
+            where: (person) => person.name.is(parameters.value),
+          }),
+        );
+        const other = prepare({ value: name.nullable }, (parameters) =>
+          database.people((person) => ({ id: person.id }), {
+            where: (person) => person.name.isNot(parameters.value),
+          }),
+        );
+
+        expect(
+          await select({ where: (person) => person.name.is("HELLO") }),
+        ).toEqual([1]);
+        expect(await ids(same({ value: "HELLO" }))).toEqual([1]);
+        expect(await ids(same({ value: null }))).toEqual([2]);
+        expect(await ids(other({ value: "HELLO" }))).toEqual([]);
+        expect(await ids(other({ value: "Bye" }))).toEqual([1]);
       } finally {
         await isolated.close();
       }

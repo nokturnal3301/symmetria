@@ -71,9 +71,23 @@ export const inheritProfiling = (
   }
 };
 
+/**
+ * JSON for the endpoint: bigints as text and bytes (bytea parameters) as
+ * PostgreSQL writes them, `\xdeadbeef`, not as an object of indexes.
+ */
 const serialize = (value: unknown) =>
-  JSON.stringify(value, (_name, entry) =>
-    typeof entry === "bigint" ? entry.toString() : entry,
+  JSON.stringify(
+    value,
+    function (this: Record<string, unknown>, name: string, entry: unknown) {
+      // Buffer's toJSON has run already; the holder still has the bytes.
+      const original = this[name];
+
+      if (original instanceof Uint8Array) {
+        return `\\x${Buffer.from(original.buffer, original.byteOffset, original.byteLength).toString("hex")}`;
+      }
+
+      return typeof entry === "bigint" ? entry.toString() : entry;
+    },
   );
 
 const constantTimeEqual = (

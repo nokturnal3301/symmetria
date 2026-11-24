@@ -125,9 +125,29 @@ export type ValueNode =
       /**
        * `(SELECT value)`: the bound value in `parts[1]`, read once per
        * statement. A shape (a page cursor's fingerprint) renders the value
-       * alone, as releases before 3.4.1 did.
+       * alone, the form earlier versions sent, so page cursors they issued
+       * stay valid; schema DDL does too, since PostgreSQL refuses a subquery
+       * in a CHECK or an index predicate.
        */
       readonly readOnce?: true;
+      /**
+       * `NULLIF(value, 'null'::jsonb)` around the operand in `parts[1]`, where
+       * earlier versions compared the operand bare. A shape and schema DDL
+       * render the operand alone, as those versions did, so page cursors they
+       * issued stay valid and existing checks and indexes do not change.
+       */
+      readonly wraps?: true;
+      /**
+       * Positions in `parts` of the values a sql`` template interpolates
+       * inside a comment or quoted text: they must bind no parameter, and
+       * the rendered SQL must still end in plain SQL.
+       */
+      readonly enclosed?: readonly number[];
+    }
+  | {
+      /** A condition interpolated into a sql`` template: its SQL, in parentheses. */
+      readonly kind: "condition";
+      readonly predicate: PredicateDescription;
     }
   | {
       readonly kind: "binary";
@@ -277,6 +297,16 @@ export type PredicateDescription =
        * parameter is bound to null: a JSON path also counts JSON null.
        */
       readonly nullCheck?: PredicateDescription;
+      /**
+       * The statement compares the left side bare (the column inside its
+       * `NULLIF(column, 'null'::jsonb)` with `wraps`; a jsonb column or path
+       * under `=` and `@>`), which its indexes and the partial indexes
+       * declared with the same condition serve, with constant-NULL parts
+       * that make JSON null answer NULL (see `bareJsonSql`). `compared`: the
+       * bare comparison is FALSE for JSON null, except `=` and `@>` against
+       * JSON null; `excluded`: it may be TRUE for JSON null.
+       */
+      readonly bareJson?: "compared" | "excluded";
     }
   | {
       readonly kind: "search";
@@ -309,12 +339,24 @@ export type PredicateDescription =
       readonly value: ValueNode;
       readonly values: readonly ValueNode[] | SelectPlan;
       readonly negated: boolean;
+      /**
+       * An IN list of a jsonb column or path, which the statement compares
+       * bare with constant-NULL parts beside it, as a comparison's
+       * `bareJson`: JSON null answers NULL.
+       */
+      readonly bareJson?: "compared";
     }
   | {
       readonly kind: "between";
       readonly value: ValueNode;
       readonly lower: ValueNode;
       readonly upper: ValueNode;
+      /**
+       * The statement reads the value bare, as for a comparison's
+       * `bareJson`; `excluded`: the value is `NULLIF(value, 'null'::jsonb)`
+       * with `wraps`, from a bound that may sort below JSON null.
+       */
+      readonly bareJson?: "compared" | "excluded";
     }
   | {
       readonly kind: "exists";
@@ -325,8 +367,10 @@ export type PredicateDescription =
 
 /**
  * A `$scope()` filter on one table occurrence. `predicate` is the callback's
- * result when the query was built and decides the compiled SQL; `evaluate`
- * runs the callback again, so every execution binds its current values.
+ * result when the query was built, which the statement is first compiled
+ * with; `evaluate` runs the callback again, so every execution binds its
+ * current values, and compiles the statement again when they render
+ * different SQL (a longer IN list).
  */
 export type ScopePredicate = {
   readonly kind: "scope";

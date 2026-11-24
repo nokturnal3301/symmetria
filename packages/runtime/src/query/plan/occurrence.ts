@@ -92,6 +92,11 @@ const rebinder = (
             ),
           ),
         });
+      case "condition":
+        return freeze({
+          ...original,
+          predicate: predicate(original.predicate),
+        });
       case "binary":
         return freeze({
           ...original,

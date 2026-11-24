@@ -6,6 +6,7 @@ import {
   int,
   text,
   bigint,
+  bytea,
   type CompiledQuery,
 } from "../../../packages/runtime/src";
 import type { Driver } from "../../../packages/runtime/src/entries/driver";
@@ -101,6 +102,38 @@ test("profiler bounds history, records errors and never analyzes a query implici
   expect(calls.at(-1)!.sql).toStartWith(
     "EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS)",
   );
+});
+
+test("profiler endpoint serves bytea parameters as hex, not as an object of indexes", async () => {
+  const profiler = createProfiler();
+  const database = schema(
+    { files: { id: int, data: bytea } },
+    {
+      driver: profiler.driver({
+        execute: async () => ({ rows: [], affectedRows: 1 }),
+        close: async () => {},
+      }),
+    },
+  );
+  await profiler.trace("upload", () =>
+    database.files.insert({
+      id: 1,
+      data: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    }),
+  );
+  const server = await profiler.serve({ port: 0 });
+
+  try {
+    const result = await fetch(new URL("/requests", server.url), {
+      headers: { "x-symmetria-token": server.token },
+    });
+    const [upload] = (await result.json()) as ReturnType<
+      typeof profiler.snapshot
+    >;
+    expect(upload!.queries[0]!.parameters).toContain("\\xdeadbeef");
+  } finally {
+    await server.stop(true);
+  }
 });
 
 test("profiler fetch wrapper and loopback endpoint expose request SQL", async () => {

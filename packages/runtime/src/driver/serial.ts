@@ -50,6 +50,15 @@ export type Holder = {
   readonly pool: object;
   open: boolean;
   readonly stream?: true;
+  /**
+   * The stream claim this entry stands for in the code that started the
+   * stream, which may or may not be the code that reads it (see `free()`).
+   */
+  readonly started?: Holder;
+  /** How many rows the stream's reader has asked for so far. */
+  progress?: () => number;
+  /** Whether the stream is busy: its reader asked for a row it fetches or hands out. */
+  busy?: () => boolean;
 };
 
 /** The holders of the running code, of every pool, carried as its async context. */

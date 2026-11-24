@@ -158,4 +158,24 @@ const model = schema({ users, posts, tags, postTags, handles, wallets });
     // @ts-expect-error not a key of the table
     { by: "nope" },
   );
+  model.handles.upsert(
+    { tenant: "team", handle: "ada", active: 1 },
+    { by: ["tenant", "handle"] },
+  );
+  model.handles.upsert(
+    { tenant: "team", handle: "ada", active: 1 },
+    // @ts-expect-error a column that is part of no key
+    { by: "active" },
+  );
+  model.handles
+    .insert({ tenant: "team", handle: "ada", active: 1 })
+    // @ts-expect-error a column that is part of no key
+    .onConflict("active");
+  model.users.upsert({ email: "a@b.c", name: "Ada" }, { by: "email" });
+  model.users
+    .insert({ email: "a@b.c", name: "Ada" })
+    .onConflict("id")
+    .doNothing();
+  // @ts-expect-error name is not unique
+  model.users.upsert({ email: "a@b.c", name: "Ada" }, { by: "name" });
 }

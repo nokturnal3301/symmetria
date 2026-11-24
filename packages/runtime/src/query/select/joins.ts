@@ -34,7 +34,12 @@ import {
   conditionRelations,
   declaredConditions,
 } from "../../schema/conditions";
-import type { QueryContext, TableRegistry } from "./registry";
+import {
+  coversScope,
+  type QueryContext,
+  type ScopedSource,
+  type TableRegistry,
+} from "./registry";
 import {
   RELATION_SOURCE,
   type JoinReference,
@@ -123,6 +128,79 @@ const firstMatch = (
         operator: "AND",
         predicates: freeze(comparisons),
       });
+};
+
+/**
+ * The inverse of a one() condition relation agrees with firstMatch(): a row
+ * of the declaring table belongs to `owner` only when no other match the
+ * scope admits sorts before `owner` by primary key. PostgreSQL can hash such
+ * an anti-join, where a subquery would run once per row. A missing owner (a
+ * LEFT JOIN's NULLs) has no rows, whatever the condition says.
+ */
+const firstMatchOwner = (
+  registry: TableRegistry,
+  declaring: TableBinding,
+  relationName: string,
+  owner: TableBinding,
+  condition: (owner: TableBinding) => PredicateDescription,
+): readonly PredicateDescription[] => {
+  const keys = primaryKeyColumns(owner.table);
+
+  if (!keys.length) {
+    throw new Error(
+      `symmetria: relation "${declaring.table.name}.${relationName}" is one() and resolves to the first match by the primary key of "${owner.table.name}", which has none; declare a primary key or use many()`,
+    );
+  }
+
+  const candidate = registry.bindingFor(owner.table.name, owner.alias);
+  const compared = (
+    column: ColumnSnapshot,
+    operator: "<" | "=",
+  ): PredicateDescription =>
+    freeze({
+      kind: "comparison",
+      left: columnNode(candidate, column.name),
+      operator,
+      right: columnNode(owner, column.name),
+    });
+  // The candidate's key sorts before the owner's: (a, b) < (a', b').
+  const before = keys.slice(0, -1).reduceRight<PredicateDescription>(
+    (later, column) =>
+      freeze({
+        kind: "group",
+        operator: "OR",
+        predicates: freeze([
+          compared(column, "<"),
+          freeze({
+            kind: "group",
+            operator: "AND",
+            predicates: freeze([compared(column, "="), later]),
+          }),
+        ]),
+      }),
+    compared(keys.at(-1)!, "<"),
+  );
+
+  return [
+    freeze({
+      kind: "nullCheck",
+      value: columnNode(owner, keys[0]!.name),
+      negated: true,
+    }),
+    freeze({
+      kind: "exists",
+      negated: true,
+      query: freeze({
+        ...initialPlan(candidate),
+        predicates: freeze([
+          condition(candidate),
+          ...registry.scopePredicates(candidate),
+          before,
+        ]),
+        selection: presentSelection,
+      }),
+    }),
+  ];
 };
 
 const relationNameSets = new WeakMap<
@@ -231,9 +309,11 @@ export const joinRelation = (
     // the predicate refers to the real source and target aliases.
     const declaredCondition = (
       targetBinding: TableBinding,
+      sourceBinding: TableBinding = source,
     ): PredicateDescription => {
-      const declaring = relation.reverse === true ? targetBinding : source;
-      const other = relation.reverse === true ? source : targetBinding;
+      const declaring =
+        relation.reverse === true ? targetBinding : sourceBinding;
+      const other = relation.reverse === true ? sourceBinding : targetBinding;
       const name =
         relation.reverse === true ? relation.inverseOf : relation.name;
       const scope = createScope({
@@ -265,23 +345,57 @@ export const joinRelation = (
 
       try {
         validatePredicate(condition, {
-          [source.alias]: source,
+          [sourceBinding.alias]: sourceBinding,
           [targetBinding.alias]: targetBinding,
         });
       } catch (error) {
         throw new Error(
-          `symmetria: relation "${declaring.table.name}.${name}" may only compare columns of "${source.table.name}" and "${targetBinding.table.name}" (${(error as Error).message.replace(/^symmetria: /, "")})`,
+          `symmetria: relation "${declaring.table.name}.${name}" may only compare columns of "${sourceBinding.table.name}" and "${targetBinding.table.name}" (${(error as Error).message.replace(/^symmetria: /, "")})`,
         );
       }
 
       return condition;
     };
+    // The inverse of a one(): a row of this table lists the rows whose first
+    // match it is, as the forward relation resolves them.
+    const forward =
+      relation.reverse === true
+        ? target.table.relations.find(
+            (candidate) =>
+              candidate.kind === "condition" &&
+              candidate.reverse !== true &&
+              candidate.name === relation.inverseOf,
+          )
+        : undefined;
+    const ownedOne =
+      forward?.kind === "condition" && !forward.many ? forward.name : undefined;
 
     addJoin(
       target,
-      relation.many
-        ? declaredCondition(target)
-        : firstMatch(registry, source, relationName, target, declaredCondition),
+      ownedOne !== undefined
+        ? freeze({
+            kind: "group",
+            operator: "AND",
+            predicates: freeze([
+              declaredCondition(target),
+              ...firstMatchOwner(
+                registry,
+                target,
+                ownedOne,
+                source,
+                (candidate) => declaredCondition(target, candidate),
+              ),
+            ]),
+          })
+        : relation.many
+          ? declaredCondition(target)
+          : firstMatch(
+              registry,
+              source,
+              relationName,
+              target,
+              declaredCondition,
+            ),
     );
   } else if (relation.kind === "through") {
     const relationNames = schemaRelationNames(registry);
@@ -370,6 +484,40 @@ export const joinRelation = (
   });
 };
 
+/**
+ * The `$scope()` filters of a joined table: this query's for that table and
+ * those of the database the source came from (`tenant.users` joined into a
+ * `db.posts` query, or a narrower `$scope()` of it), each once. A derived
+ * table or CTE carries its source's filters inside.
+ */
+const sourceScope = (
+  registry: TableRegistry,
+  source: ScopedSource,
+  binding: TableBinding,
+): readonly PredicateDescription[] => {
+  const name = binding.table.name;
+  const outer = Object.hasOwn(registry.scopes, name)
+    ? registry.scopes[name]
+    : undefined;
+  const own =
+    source.registry &&
+    !binding.derived &&
+    !binding.cteReference &&
+    Object.hasOwn(source.registry.scopes, name)
+      ? source.registry.scopes[name]
+      : undefined;
+
+  if (!own || (outer && coversScope(outer, own))) {
+    return registry.scopePredicates(binding);
+  }
+
+  const ownPredicates = source.registry!.scopePredicates(binding);
+
+  return !outer || coversScope(own, outer)
+    ? ownPredicates
+    : [...registry.scopePredicates(binding), ...ownPredicates];
+};
+
 const joinSource = (
   registry: TableRegistry,
   state: SelectPlan,
@@ -397,7 +545,11 @@ const joinSource = (
   }
 
   const binding = freeze({ ...source });
-  const scope = registry.scopePredicates(binding);
+  const scope = sourceScope(
+    registry,
+    input[TABLE_SOURCE] as ScopedSource,
+    binding,
+  );
   const joinCondition = condition
     ? readPredicate(
         condition(createScope({ ...state.bindings, [binding.alias]: binding })),

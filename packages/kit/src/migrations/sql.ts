@@ -10,6 +10,13 @@ export type ParsedStatement = {
   words: string[];
   /** The statement with comments removed and every string literal or dollar body replaced by ''. */
   code: string;
+  /**
+   * Its `--` comments, each from `--` to the end of its line, that start a
+   * line: never text inside a string, a quoted name or a dollar body.
+   */
+  lineComments: string[];
+  /** Its string literals and dollar bodies as written, in order: each is one '' in `code`. */
+  literals: string[];
 };
 
 const TRANSACTION_CONTROL = [
@@ -37,6 +44,8 @@ export const parseMigrationSQL = (script: string): ParsedStatement[] => {
   let hasCode = false;
   let words: string[] = [];
   let code = "";
+  let lineComments: string[] = [];
+  let literals: string[] = [];
   // Semicolons inside parentheses or a BEGIN ATOMIC body belong to the statement.
   let parentheses = 0;
   let blocks = 0;
@@ -71,12 +80,16 @@ export const parseMigrationSQL = (script: string): ParsedStatement[] => {
         sql: script.slice(start, end).trim(),
         words,
         code: code.trim(),
+        lineComments,
+        literals,
       });
     }
 
     hasCode = false;
     words = [];
     code = "";
+    lineComments = [];
+    literals = [];
     parentheses = 0;
     blocks = 0;
     start = end + 1;
@@ -91,9 +104,29 @@ export const parseMigrationSQL = (script: string): ParsedStatement[] => {
       continue;
     }
 
+    // Like PostgreSQL, a carriage return ends the comment too: what follows
+    // one is SQL, and it is split and linted as SQL.
     if (script.startsWith("--", position)) {
-      const newline = script.indexOf("\n", position + 2);
-      position = newline < 0 ? script.length : newline + 1;
+      const opening = position;
+      // At the start of a line, or of the text after the previous statement.
+      const startsLine =
+        !script.slice(start, opening).trim() ||
+        /[\n\r]/.test(script[opening - 1] ?? "\n");
+      position += 2;
+
+      while (
+        position < script.length &&
+        script[position] !== "\n" &&
+        script[position] !== "\r"
+      ) {
+        position += 1;
+      }
+
+      if (startsLine) {
+        lineComments.push(script.slice(opening, position));
+      }
+
+      position = Math.min(position + 1, script.length);
       code += " ";
       continue;
     }
@@ -164,6 +197,10 @@ export const parseMigrationSQL = (script: string): ParsedStatement[] => {
       }
 
       // Identifiers stay as written; literals never take part in classification.
+      if (character === "'") {
+        literals.push(script.slice(opening, position));
+      }
+
       code += character === '"' ? script.slice(opening, position) : "''";
       continue;
     }
@@ -180,6 +217,7 @@ export const parseMigrationSQL = (script: string): ParsedStatement[] => {
           throw new Error("symmetria: unterminated SQL dollar quote");
         }
 
+        literals.push(script.slice(position, end + tag.length));
         position = end + tag.length;
         code += "''";
         continue;

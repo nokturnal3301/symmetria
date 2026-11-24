@@ -1,4 +1,8 @@
-import { profileScreen, profilerHttpError } from "../screens/profiler";
+import {
+  profileScreen,
+  profilerEndpoint,
+  profilerHttpError,
+} from "../screens/profiler";
 import type { CliContext } from "../context";
 
 /** `profile`: the live profiler screen, or its JSON feed when not interactive. */
@@ -13,11 +17,14 @@ export const profile = async (context: CliContext): Promise<void> => {
     );
   }
 
+  // Checked before the screen opens.
+  const requests = profilerEndpoint(address, "requests");
+
   if (interactive) {
     return profileScreen(address, token, color);
   }
 
-  const response = await fetch(new URL("/requests", address), {
+  const response = await fetch(requests, {
     headers: { "x-symmetria-token": token },
   });
 

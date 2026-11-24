@@ -4,13 +4,14 @@
  */
 import stringWidth from "string-width";
 import { emitKeypressEvents } from "node:readline";
-import { inspect, stripVTControlCharacters } from "node:util";
+import { inspect } from "node:util";
 import type { QueryInspectionController } from "symmetria/internal";
 import { highlightSQL } from "./schema-browser-data";
 import {
   fitLine,
   numberedLines,
   supportsColor,
+  terminalText,
   theme,
   wrapLines,
 } from "../ui/style";
@@ -18,9 +19,6 @@ import { withScreen } from "../ui/terminal";
 
 const tabs = ["SQL", "Parameters", "Results", "Explain"] as const;
 type Tab = (typeof tabs)[number];
-
-export const terminalText = (text: string): string =>
-  stripVTControlCharacters(text).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
 
 export const inspectValue = (value: unknown, expanded = false): string =>
   terminalText(

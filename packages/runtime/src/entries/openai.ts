@@ -4,7 +4,14 @@
  * from `OPENAI_API_KEY` unless given. `baseUrl` points the same requests at
  * any server that speaks OpenAI's embeddings API (LM Studio, vLLM, a gateway).
  */
-import { apiKey, byIndex, inBatches, postJson } from "../embedders/http";
+import {
+  apiKey,
+  byIndex,
+  inBatches,
+  postJson,
+  requestOptions,
+  type RequestOptions,
+} from "../embedders/http";
 import { embedder } from "../schema/search";
 
 const BATCH = 128;
@@ -14,7 +21,7 @@ const BATCH = 128;
  */
 const DEFAULT_SIZE = 1536;
 
-export type OpenAIOptions = {
+export type OpenAIOptions = RequestOptions & {
   readonly apiKey?: string;
   /** Embedding length; sent as `dimensions`, which text-embedding-3 models accept. */
   readonly size?: number;
@@ -25,6 +32,8 @@ export const openai = (model: string, options: OpenAIOptions = {}) => {
   const size = options.size ?? DEFAULT_SIZE;
   // Older and third-party models have one length and refuse the parameter.
   const sized = options.size !== undefined || /^text-embedding-3/.test(model);
+
+  const request = requestOptions(model, options);
 
   return embedder(
     size,
@@ -45,6 +54,7 @@ export const openai = (model: string, options: OpenAIOptions = {}) => {
                 encoding_format: "float",
                 ...(sized ? { dimensions: size } : {}),
               },
+              request,
             )
           ).data,
         ),

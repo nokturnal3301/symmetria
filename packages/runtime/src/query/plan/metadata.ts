@@ -1,5 +1,30 @@
 import type { ExpressionDescription } from "../expressions";
+import { canonicalType } from "../codecs/type-names";
 import { unhandledKind } from "./traverse";
+
+/**
+ * The type an expression's values have, for the decisions that depend on it
+ * (JSON precision, MIN/MAX, arithmetic, JSON checks): a customType's declared
+ * `base`, else its SQL type, in one spelling (`int8` and `BIGINT` are
+ * `bigint`). SQL keeps `expressionSqlType()`, the declared spelling.
+ */
+export const valueSqlType = (expression: ExpressionDescription): string => {
+  const codec = expression.codec;
+
+  if (codec?.base !== undefined) {
+    return codec.base;
+  }
+
+  // An array of a customType with a base: the base's array.
+  if (
+    codec?.element?.base !== undefined &&
+    codec.parameterCast?.endsWith("[]")
+  ) {
+    return `${codec.element.base}[]`;
+  }
+
+  return canonicalType(expressionSqlType(expression));
+};
 
 export const expressionSqlType = (
   expression: ExpressionDescription,
@@ -43,6 +68,8 @@ export const expressionSqlType = (
       return "text";
     case "arrayLength":
       return "integer";
+    case "condition":
+      return "boolean";
     case "window":
       return expressionSqlType({ ...expression, node: node.expression });
     case "relativeWindow":

@@ -8,6 +8,7 @@ import type {
   PredicateDescription,
   SelectedColumn,
 } from "../expressions";
+import type { COLUMN_TRAITS } from "../expressions/nodes";
 import type {
   Awaitable,
   CompiledQuery,
@@ -25,11 +26,19 @@ import type { Preparable, PreparedQuery } from "../select/prepared";
 import type { ReturningTools, ReusableShape } from "../select/projections";
 import type { EqualityFilter, PredicateList } from "../select/types";
 
+/**
+ * An expression that stores what a column takes: a jsonb(schema) column or
+ * prepared parameter holds the schema's input, though it reads as the output.
+ */
+type StoredColumn<Stored> = SelectedColumn & {
+  readonly [COLUMN_TRAITS]: { readonly stored: Stored };
+};
 /** Optional write fields accept `undefined` as "omitted", even under exactOptionalPropertyTypes. */
 type InputValues<Insert extends Record<string, unknown>> = {
   [ColumnName in keyof Insert]:
     | Insert[ColumnName]
     | SelectedColumn<Exclude<Insert[ColumnName], undefined>>
+    | StoredColumn<Exclude<Insert[ColumnName], undefined>>
     | ({} extends Pick<Insert, ColumnName>
         ? typeof DEFAULT_VALUE | undefined
         : never);
@@ -39,6 +48,7 @@ export type UpdateValues<Insert extends Record<string, unknown>> = {
   [ColumnName in keyof Insert]?:
     | Exclude<Insert[ColumnName], undefined>
     | SelectedColumn<Exclude<Insert[ColumnName], undefined>>
+    | StoredColumn<Exclude<Insert[ColumnName], undefined>>
     | ({} extends Pick<Insert, ColumnName> ? typeof DEFAULT_VALUE : never)
     | undefined;
 };
@@ -72,15 +82,14 @@ export type UpsertOptions<
   Row extends Record<string, unknown>,
   Insert,
   KeyNames extends string = never,
+  /** The columns of the primary key and the unique keys. */
+  KeyColumns extends string = ColumnNames<Row>,
 > = {
   /**
    * The primary key or a unique key: one column, all columns of a composite
    * key, or the key's name (`by.<name>`).
    */
-  readonly by:
-    | ColumnNames<Row>
-    | KeyNames
-    | readonly [ColumnNames<Row>, ...ColumnNames<Row>[]];
+  readonly by: KeyColumns | KeyNames | readonly [KeyColumns, ...KeyColumns[]];
   /** Columns to overwrite on conflict; by default every column the rows carry except the key. */
   readonly update?: readonly WritableColumnNames<Insert>[] | undefined;
 };
@@ -159,6 +168,8 @@ type Mutation<
   WhereScope = Columns<Row>,
   /** Names of the table's unique keys, which onConflict() takes as well as columns. */
   KeyNames extends string = never,
+  /** The columns of the primary key and the unique keys, which onConflict() takes. */
+  KeyColumns extends string = keyof Row & string,
 > = Preparable<MutationResult<Selection, Single, Optional>, "mutation"> & {
   readonly prepare: () => PreparedQuery<
     MutationResult<Selection, Single, Optional>,
@@ -176,7 +187,8 @@ type Mutation<
       Single,
       Optional,
       WhereScope,
-      KeyNames
+      KeyNames,
+      KeyColumns
     >;
     /** The named columns. */
     <const Names extends readonly [ColumnNames<Row>, ...ColumnNames<Row>[]]>(
@@ -190,7 +202,8 @@ type Mutation<
       Single,
       Optional,
       WhereScope,
-      KeyNames
+      KeyNames,
+      KeyColumns
     >;
     <const NextSelection extends Projection>(
       selector:
@@ -205,7 +218,8 @@ type Mutation<
       Single,
       Optional,
       WhereScope,
-      KeyNames
+      KeyNames,
+      KeyColumns
     >;
   };
   readonly toSQL: () => CompiledQuery;
@@ -214,9 +228,7 @@ type Mutation<
   (Kind extends "insert"
     ? {
         /** The conflict target: its columns, or the name of a unique key (`by.<name>`). */
-        readonly onConflict: (
-          ...target: (keyof Row & string)[] | [KeyNames]
-        ) => {
+        readonly onConflict: (...target: KeyColumns[] | [KeyNames]) => {
           readonly doNothing: () => Mutation<
             Row,
             Insert,
@@ -274,7 +286,12 @@ type Mutation<
         };
       }
     : {
-        /** Relation paths and quantifiers compile to a primary-key subquery. */
+        /**
+         * The rows to write. Relation paths and quantifiers compile to a
+         * primary-key subquery. A filter that holds for every row (an empty
+         * list, `and()`, `notIn([])`) is refused like a missing one; call
+         * `all()` to write every row.
+         */
         readonly where: (
           predicate: (scope: WhereScope) => Predicate | PredicateList,
         ) => Mutation<
@@ -286,7 +303,8 @@ type Mutation<
           Single,
           Optional,
           WhereScope,
-          KeyNames
+          KeyNames,
+          KeyColumns
         >;
         /** Confirms a whole-table UPDATE or DELETE; without where() or all() the statement is refused. */
         readonly all: () => Mutation<
@@ -298,7 +316,8 @@ type Mutation<
           Single,
           Optional,
           WhereScope,
-          KeyNames
+          KeyNames,
+          KeyColumns
         >;
       });
 
@@ -310,6 +329,8 @@ export type TableMutations<
   WhereScope = Columns<Row>,
   /** Names of the table's unique keys, as `by.<name>` lists them. */
   KeyNames extends string = never,
+  /** The columns of the primary key and the unique keys: what a conflict target names. */
+  KeyColumns extends string = keyof Row & string,
 > = {
   readonly insert: {
     (
@@ -323,7 +344,8 @@ export type TableMutations<
       false,
       false,
       Columns<Row>,
-      KeyNames
+      KeyNames,
+      KeyColumns
     >;
     (
       values: FlatInsert<Insert, RelationNames>,
@@ -336,18 +358,19 @@ export type TableMutations<
       true,
       false,
       Columns<Row>,
-      KeyNames
+      KeyNames,
+      KeyColumns
     >;
   };
   /** Insert, or overwrite the row that has the same key: `upsert(row, { by: "sku" })`. */
   readonly upsert: {
     (
       values: readonly FlatInsert<Insert, RelationNames>[],
-      options: UpsertOptions<Row, Insert, KeyNames>,
+      options: UpsertOptions<Row, Insert, KeyNames, KeyColumns>,
     ): Mutation<Row, Insert, TableName, "insert", undefined, false>;
     (
       values: FlatInsert<Insert, RelationNames>,
-      options: UpsertOptions<Row, Insert, KeyNames>,
+      options: UpsertOptions<Row, Insert, KeyNames, KeyColumns>,
     ): Mutation<Row, Insert, TableName, "insert", undefined, true>;
   };
   readonly update: (

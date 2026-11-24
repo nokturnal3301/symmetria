@@ -27,6 +27,11 @@ import {
   index,
   uuid,
   date,
+  prepare,
+  timestamp,
+  varchar,
+  many,
+  one,
   type CompiledQuery,
   type Decimal,
   type InferInsert,
@@ -418,6 +423,197 @@ test("only a sql template is a raw SQL default; an object shaped like one is a J
   expect(columns[2]?.default).toEqual({ kind: "sql", sql: "now()" });
 });
 
+test("a raw fragment's comment, string or quoted name cannot reach the SQL written after it", () => {
+  const local = schema({
+    posts: {
+      id: int.auto,
+      title: text,
+      views: int,
+      deletedAt: timestamptz.nullable,
+    },
+  });
+  const live = local.$scope({ posts: (post) => post.deletedAt.is(null) });
+
+  // A `--` comment ends with a line break, before ` AS`, ` DESC`, the next
+  // assignment or the $scope() check of RETURNING.
+  expect(
+    local
+      .posts((post) => ({ score: sql<number>`${post.views} * 2 -- double` }), {
+        orderBy: (post) => sql<number>`${post.views} -- by views`.descending,
+      })
+      .toSQL().sql,
+  ).toBe(
+    'SELECT "posts"."views" * 2 -- double\n AS "score"\nFROM "posts" AS "posts"\nORDER BY "posts"."views" -- by views\n DESC',
+  );
+  expect(
+    local.posts
+      .update(
+        (post) => ({
+          views: sql<number>`${post.views} + 1 -- one more`,
+          deletedAt: sql<Date>`now()`,
+        }),
+        { where: (post) => post.id.is(1) },
+      )
+      .toSQL().sql,
+  ).toStartWith(
+    'UPDATE "posts" AS "posts" SET "views" = "posts"."views" + 1 -- one more\n, "deleted_at" = now()',
+  );
+  expect(
+    live.posts
+      .insert({ title: "x", views: 0 })
+      .returning((post) => ({ note: sql<string>`${post.title} -- shown` }))
+      .toSQL().sql,
+  ).toContain('"posts"."title" -- shown\n AS "note", CASE WHEN');
+
+  // Without a comment marker the SQL is the template's text, as before.
+  const plain = (fragment: ReturnType<typeof sql<string>>) =>
+    local.posts(() => ({ value: fragment })).toSQL().sql;
+
+  expect(plain(sql<string>`upper(${"a"}) || ' -- quoted' || "x"`)).toBe(
+    `SELECT upper($1) || ' -- quoted' || "x" AS "value"\nFROM "posts" AS "posts"`,
+  );
+  for (const text of [
+    sql<string>`'a' /* closed /* nested */ */`,
+    sql<string>`E'it\\'s -- not a comment'`,
+    sql<string>`replace('C:\\temp', '\\', '/')`,
+    sql<string>`$tag$ -- $tag$ || $$'$$`,
+  ]) {
+    expect(plain(text)).not.toContain("\n AS");
+  }
+
+  // Left open, they would take in the SQL after them: refused where written.
+  expect(() => sql`now() /* open`).toThrow(/leaves a \/\* comment open/);
+  expect(() => sql`'open`).toThrow(/leaves a '…' string open/);
+  expect(() => sql`"open`).toThrow(/leaves a "…" quoted name open/);
+  expect(() => sql`$body$ open`).toThrow(/dollar-quoted string open/);
+  expect(() => sql`E'it\\'`).toThrow(/string open/);
+
+  // A value inside a comment or quoted text: PostgreSQL reads no parameter
+  // there, and its SQL must not end the comment early.
+  expect(() => plain(sql<string>`'%${"term"}%'`)).toThrow(
+    /inside a comment or quoted text, where PostgreSQL reads no parameter/,
+  );
+  expect(() =>
+    local
+      .posts((post) => ({ value: sql<string>`${post.title} -- ${post.views}` }))
+      .toSQL(),
+  ).not.toThrow();
+  expect(() =>
+    local
+      .posts((post) => ({
+        value: sql<string>`${post.title} /* ${sql`'*/'`} */`,
+      }))
+      .toSQL(),
+  ).toThrow(/leaves a '…' string open/);
+
+  // Schema expressions and defaults get the same line break.
+  const ddl = schema({
+    events: table({
+      id: int.auto,
+      n: int.default(sql`1 -- one`),
+    }).checks((event) => ({ positive: sql`${event.n} > 0 -- positive` })),
+  });
+  const [events] = ddl.$snapshot().tables;
+
+  expect(events?.columns[1]?.default).toEqual({
+    kind: "sql",
+    sql: "1 -- one\n",
+  });
+  expect(events?.checks?.[0]?.expression).toBe('"n" > 0 -- positive\n');
+});
+
+test("a template escape without a value is refused with the escape it names", () => {
+  for (const build of [
+    () => sql<boolean>`${"x"} LIKE 'C:\users%'`,
+    () => text.default(sql`'C:\users'`),
+    () => sql`'\xZ'`,
+    () => sql`'\1'`,
+  ]) {
+    expect(build).toThrow(
+      /has the escape \\[ux1], which JavaScript reads as no text at all; write \\\\ for a backslash/,
+    );
+  }
+
+  expect(text.default(sql`'C:\\users'`).definition.default as unknown).toEqual({
+    kind: "sql",
+    sql: "'C:\\users'",
+  });
+});
+
+test("a condition or ordering in sql`` is its SQL; a query, a Map or an array of columns is refused", () => {
+  const local = schema({
+    items: { id: int.auto, name: text },
+  });
+
+  expect(
+    local
+      .items(
+        (item) => ({
+          matches: sql<string>`(${item.name.is("a")})::text`,
+          rank: sql<number>`row_number() OVER (ORDER BY ${item.name.descending.nullsLast}, ${item.id.ascending})`,
+        }),
+        {
+          where: (item) => sql<boolean>`${item.name.is("b")} OR ${item.id} > 1`,
+        },
+      )
+      .toSQL(),
+  ).toEqual({
+    sql: 'SELECT (("items"."name" = $1))::text AS "matches", row_number() OVER (ORDER BY "items"."name" DESC NULLS LAST, "items"."id" ASC) AS "rank"\nFROM "items" AS "items"\nWHERE (("items"."name" = $2) OR "items"."id" > 1) = (TRUE)',
+    parameters: ["a", "b"],
+  });
+
+  const refused = (value: unknown, message: RegExp) =>
+    expect(() =>
+      local.items(() => ({ value: sql<string>`${value}` })).toSQL(),
+    ).toThrow(message);
+
+  local.items((item) => {
+    refused(
+      [item.id, item.name],
+      /cannot interpolate an array that holds a column/,
+    );
+    return { id: item.id };
+  });
+  refused(
+    local.items((item) => ({ id: item.id })),
+    /cannot interpolate a query; interpolate query.scalar\(\)/,
+  );
+  refused(
+    new Map(),
+    /cannot interpolate a Map that is no value a driver binds/,
+  );
+  refused(() => 1, /cannot interpolate a function/);
+
+  // Values still bind as before.
+  expect(
+    local
+      .items(() => ({
+        value: sql<string>`${{ a: 1 }}::text::jsonb || ${[1, 2]} || ${new Date(0)} || ${Buffer.from("a")}`,
+      }))
+      .toSQL().parameters,
+  ).toEqual([{ a: 1 }, [1, 2], new Date(0), Buffer.from("a")]);
+
+  // A schema expression writes the condition into its DDL.
+  expect(
+    schema({
+      checked: table({ id: int.auto, n: int.nullable }).checks((row) => ({
+        positive: sql<boolean>`${row.n.above(0)} OR ${row.n.is(null)}`,
+      })),
+    }).$snapshot().tables[0]?.checks?.[0]?.expression,
+  ).toBe('("n" > 0) OR ("n" IS NULL)');
+
+  // Elsewhere a condition, an ordering or a query is no bound value either.
+  expect(() =>
+    local.items({ where: (item) => item.name.is(item.id.is(1) as never) }),
+  ).toThrow(/a condition is not a value/);
+  expect(() =>
+    local.items({
+      where: (item) =>
+        item.name.is(local.items((other) => ({ n: other.name })) as never),
+    }),
+  ).toThrow(/a query is not a value/);
+});
+
 test("custom codecs propagate through modifiers, aliases, predicates and writes", async () => {
   const calls: CompiledQuery[] = [];
   const amount = customType<{ cents: bigint }>("bigint", {
@@ -491,6 +687,45 @@ test("execution returns affected rows, decodes results, and first preserves LIMI
       .execute(),
   ).toEqual([]);
   expect(queries.length).toBe(executed);
+});
+
+test("a write's count comes from the executor's result, and a write without returning() needs one", async () => {
+  const run = (result: unknown) =>
+    schema(
+      { events: { id: int.auto, value: bigint } },
+      { executor: async () => result as never },
+    );
+
+  // Bun.SQL and postgres.js count on the array, node-postgres as rowCount.
+  expect(
+    await run(Object.assign([], { count: 3 }))
+      .events.delete()
+      .all(),
+  ).toEqual({ affectedRows: 3 });
+  expect(
+    await run({ rows: [], rowCount: 4, command: "UPDATE" })
+      .events.update({ value: 1n })
+      .all(),
+  ).toEqual({ affectedRows: 4 });
+  // Rows a write returns count themselves, and so do the rows of a read.
+  expect(
+    await run([{ id: 1 }, { id: 2 }])
+      .events.delete()
+      .all()
+      .returning((event) => [event.id]),
+  ).toEqual([{ id: 1 }, { id: 2 }]);
+  expect(await run([{ id: 1 }]).events((event) => ({ id: event.id }))).toEqual([
+    { id: 1 },
+  ]);
+  // A write without RETURNING returns no rows: an array alone cannot tell
+  // how many it changed, so the write is refused rather than reporting 0.
+  for (const result of [[], { rows: [] }, { rows: [], rowCount: null }]) {
+    await expect(
+      Promise.resolve(run(result).events.insert({ value: 1n })),
+    ).rejects.toThrow(
+      "symmetria: the executor's result does not say how many rows the write changed (the statement ran); return { rows, affectedRows }",
+    );
+  }
 });
 
 test("findMany compiles nested relations into one query and decodes nested values", async () => {
@@ -868,6 +1103,124 @@ test("$scope filters reads, writes, paths, joins and collections of scoped table
   );
 });
 
+test("a scoped table joined into another database's query keeps its scope", () => {
+  const owners = model.$scope({ users: (users) => users.active.is(true) });
+  const ada = model.$scope({ users: (users) => users.name.is("Ada") });
+  const busy = owners.$scope({ users: (users) => users.visits.above(3) });
+  const joined = (
+    database: typeof model,
+    source: typeof model.users | ReturnType<typeof model.users.as<"writer">>,
+  ) =>
+    database.posts((posts, { innerJoin }) => ({
+      id: posts.id,
+      name: innerJoin(source, (users) => users.id.is(posts.authorId)).name,
+    }));
+  const on = (alias: string, scope: string) =>
+    `INNER JOIN "users" AS "${alias}" ON (("${alias}"."id" = "posts"."author_id") AND ${scope})`;
+
+  expect(joined(model, owners.users).toSQL()).toEqual({
+    sql: `SELECT "posts"."id" AS "id", "users"."name" AS "name"\nFROM "posts" AS "posts"\n${on("users", '"users"."active" = $1')}`,
+    parameters: [true],
+  });
+  expect(joined(model, owners.users.as("writer")).toSQL().sql).toContain(
+    on("writer", '"writer"."active" = $1'),
+  );
+  // Without a condition the scope filters the CROSS JOIN's rows.
+  expect(
+    model
+      .posts((posts, { crossJoin }) => ({
+        id: posts.id,
+        name: crossJoin(owners.users).name,
+      }))
+      .toSQL().sql,
+  ).toContain('CROSS JOIN "users" AS "users"\nWHERE "users"."active" = $1');
+  // The same scope, or one the query's own scope contains, is applied once.
+  expect(joined(owners, owners.users).toSQL().sql).toContain(
+    on("users", '"users"."active" = $1'),
+  );
+  expect(joined(busy, owners.users).toSQL().sql).toContain(
+    on("users", '("users"."active" = $1 AND "users"."visits" > $2)'),
+  );
+  // A narrower scope of the source, or another database's, is added.
+  expect(joined(owners, busy.users).toSQL().sql).toContain(
+    on("users", '("users"."active" = $1 AND "users"."visits" > $2)'),
+  );
+  expect(joined(owners, ada.users).toSQL().sql).toContain(
+    on("users", '"users"."active" = $1 AND "users"."name" = $2'),
+  );
+  // A built query's filter or limit would be lost in a JOIN of its table.
+  for (const source of [
+    model.users({ where: (users) => users.active.is(true) }),
+    model.users({ limit: 1 }),
+    model.users((users) => ({ id: users.id })),
+    model.users.byId(1),
+  ]) {
+    expect(() => joined(model, source as never)).toThrow(
+      /a join source is a table .*would be lost in a JOIN of its table/,
+    );
+  }
+});
+
+test("$scope() reads each table's callback as a property of any object", () => {
+  type Active = { active: { is: (value: boolean) => never } };
+  const active = (users: Active) => users.active.is(true);
+
+  class ActiveUsers {
+    // Data a class keeps for its methods is no misspelt table.
+    constructor(readonly flag: boolean) {}
+
+    users(users: Active) {
+      return users.active.is(this.flag);
+    }
+  }
+  const where = (scopes: object) =>
+    model
+      .$scope(scopes as never)
+      .users((users) => ({ id: users.id }))
+      .toSQL();
+  const expected = {
+    sql: 'SELECT "users"."id" AS "id"\nFROM "users" AS "users"\nWHERE "users"."active" = $1',
+    parameters: [true],
+  };
+
+  expect(where(new ActiveUsers(true))).toEqual(expected);
+  expect(where(Object.create({ users: active }))).toEqual(expected);
+  expect(where(Object.defineProperty({}, "users", { value: active }))).toEqual(
+    expected,
+  );
+  // Arguments whose callbacks it cannot read are refused, never ignored.
+  for (const [input, received] of [
+    [new Map([["users", () => undefined]]), "a Map"],
+    [[], "an array"],
+    [() => undefined, "a function"],
+    [undefined, "undefined"],
+  ] as const) {
+    expect(() => model.$scope(input as never)).toThrow(
+      `$scope() expects an object of predicate callbacks by table name, such as { posts: (post) => post.tenantId.is(tenantId) }; received ${received}`,
+    );
+  }
+  // A misspelt table is refused, also as a class's own function field.
+  expect(() =>
+    model.$scope(
+      new (class {
+        user = () => undefined;
+      })() as never,
+    ),
+  ).toThrow('$scope() received unknown table "user"');
+  // A table named like a member of every object has no scope of its own.
+  const named = schema({ toString: { id: int, label: text } });
+  const select = (database: typeof named) =>
+    database.toString((row) => ({ id: row.id })).toSQL().sql;
+
+  expect(select(named)).toBe(
+    'SELECT "toString"."id" AS "id"\nFROM "to_string" AS "toString"',
+  );
+  expect(select(named.$scope({}))).toBe(select(named));
+  expect(
+    select(named.$scope({ toString: (row) => row.label.is("x") })),
+  ).toEndWith('WHERE "toString"."label" = $1');
+});
+
 test("UPDATE and DELETE where() combines predicate arrays with AND, like the where option", () => {
   expect(
     model.posts
@@ -1141,6 +1494,458 @@ test("UPDATE and DELETE refuse membership in a query that finds nothing and aggr
   }
 });
 
+test("UPDATE and DELETE refuse an emptied contains(), a condition with its opposite and a coalesce() that is never NULL", () => {
+  const { items } = schema({
+    items: {
+      id: int.auto,
+      tags: text.array,
+      labels: text.array.nullable,
+      score: int.nullable,
+      note: text.nullable,
+      active: bool,
+      meta: jsonb<Record<string, unknown>>(),
+      data: jsonb<unknown>().nullable,
+    },
+  });
+  const requested: string[] = [];
+
+  for (const everyRow of [
+    // An empty list asks for nothing, as notIn([]) does.
+    () => items.delete({ where: (item) => item.tags.contains(requested) }),
+    () => items.delete({ where: (item) => item.labels.contains([]) }),
+    () => items.delete({ where: (item) => item.meta.contains({}) }),
+    () => items.delete({ where: (item) => item.data.contains([]) }),
+    () => items.delete({ where: (item) => not(item.tags.overlaps(requested)) }),
+    // A condition and its opposite.
+    () =>
+      items.delete({
+        where: (item) => or(item.score.is(null), item.score.isNot(null)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => not(and(item.score.is(null), item.score.isNot(null))),
+      }),
+    () =>
+      items.delete({
+        where: (item) => or(item.data.is(null), item.data.isNot(null)),
+      }),
+    () =>
+      items.delete({
+        where: (item) =>
+          or(item.score.is(null), item.score.above(0), item.score.atMost(0)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => or(item.active.is(true), item.active.is(false)),
+      }),
+    () =>
+      items.update(
+        { note: "x" },
+        { where: (item) => or(item.id.below(5), item.id.atLeast(5)) },
+      ),
+    // A coalesce() with a value that is never NULL.
+    () =>
+      items.delete({ where: (item) => coalesce(item.score, 0).isNot(null) }),
+    () =>
+      items.delete({
+        where: (item) => coalesce(item.score, item.id).isNot(null),
+      }),
+  ]) {
+    expect(() => everyRow().toSQL()).toThrow("where() leaves no condition");
+  }
+
+  // The refusal of an emptied contains() says what it would match, on an
+  // array, a jsonb column and a JSON path alike.
+  for (const emptied of [
+    () => items.delete({ where: (item) => item.labels.contains([]) }),
+    () => items.delete({ where: (item) => item.meta.contains({}) }),
+    () => items.delete({ where: (item) => item.meta.path("a").contains([]) }),
+  ]) {
+    expect(() => emptied().toSQL()).toThrow(
+      "delete() where() leaves no condition: contains() of an empty list or object matches every row that holds a value, as notIn([]) matches every row; use isNot(null) for the rows that hold one, or call .all() to delete every row",
+    );
+  }
+
+  for (const filtered of [
+    () => items.delete({ where: (item) => item.tags.contains(["a"]) }),
+    () => items.delete({ where: (item) => item.meta.contains({ a: 1 }) }),
+    // No row overlaps an empty list: it writes nothing.
+    () => items.delete({ where: (item) => item.tags.overlaps(requested) }),
+    () => items.delete({ where: (item) => item.tags.is([]) }),
+    () => items.delete({ where: (item) => item.score.is(null) }),
+    // A NULL score passes neither side.
+    () =>
+      items.delete({
+        where: (item) => or(item.score.is(1), item.score.isNot(1)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => or(item.score.above(0), item.score.atMost(0)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => or(item.note.is(null), item.score.isNot(null)),
+      }),
+    () => items.delete({ where: (item) => coalesce(item.score, 0).is(0) }),
+    // A missing key and JSON null pass neither side.
+    () =>
+      items.delete({
+        where: (item) =>
+          or(item.meta.path("a").is(1), not(item.meta.path("a").is(1))),
+      }),
+  ]) {
+    expect(() => filtered().toSQL()).not.toThrow();
+  }
+});
+
+test("UPDATE and DELETE refuse opposites in other spellings, ranges over every value, an emptied like() and a condition alone in sql<boolean>", () => {
+  const { items } = schema({
+    items: {
+      id: int.auto,
+      name: text,
+      nick: text.nullable,
+      score: int.nullable,
+      amount: numeric(12, 2),
+      nums: int.array,
+      meta: jsonb<unknown>(),
+    },
+  });
+  const prefix = "" as string;
+
+  for (const everyRow of [
+    // is(null) and isNot(null) of a NOT NULL jsonb column count JSON null.
+    () =>
+      items.delete({
+        where: (item) => or(item.meta.is(null), item.meta.isNot(null)),
+      }),
+    () =>
+      items.update(
+        { name: "x" },
+        {
+          where: (item) => not(and(item.meta.is(null), item.meta.isNot(null))),
+        },
+      ),
+    // isDistinctFrom(2) is the opposite of is(2), NULL included; notIn([2])
+    // is isNot(2); in() of the same list in any order.
+    () =>
+      items.delete({
+        where: (item) => or(item.id.isDistinctFrom(2), item.id.is(2)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => or(item.score.isDistinctFrom(2), item.score.is(2)),
+      }),
+    () =>
+      items.delete({ where: (item) => or(item.id.notIn([2]), item.id.is(2)) }),
+    () =>
+      items.delete({
+        where: (item) => or(not(item.id.in([1, 2])), item.id.in([2, 1])),
+      }),
+    // Ranges that together cover every value, or in an AND none.
+    () =>
+      items.delete({
+        where: (item) => or(item.id.atLeast(5), item.id.below(6)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => or(item.amount.above("1"), item.amount.atMost("1")),
+      }),
+    () =>
+      items.delete({
+        where: (item) => not(and(item.id.above(6), item.id.below(5))),
+      }),
+    () => items.delete({ where: (item) => not(item.id.between(5, 1)) }),
+    // A length is a count: never NULL, never below 0.
+    () => items.delete({ where: (item) => item.nums.length().atLeast(0) }),
+    // A pattern of only % matches every text.
+    () => items.delete({ where: (item) => item.name.like(`${prefix}%`) }),
+    () => items.delete({ where: (item) => item.nick.ilike("%%") }),
+    // A condition interpolated alone into sql<boolean> is that condition.
+    () =>
+      items.update(
+        { name: "x" },
+        { where: (item) => sql<boolean>`${item.id.notIn([])}` },
+      ),
+    () =>
+      items.delete({
+        where: (item) =>
+          sql<boolean>` ${or(item.score.is(null), item.score.isNot(null))} `,
+      }),
+  ]) {
+    expect(() => everyRow().toSQL()).toThrow("where() leaves no condition");
+  }
+
+  expect(() =>
+    items.delete({ where: (item) => item.nick.like("%") }).toSQL(),
+  ).toThrow(
+    "delete() where() leaves no condition: like() or ilike() of a pattern of only % (an empty prefix) matches every row that holds a text, as notIn([]) matches every row; use isNot(null) for the rows that hold one, or call .all() to delete every row",
+  );
+
+  for (const filtered of [
+    // A value lies between the bounds, or a NULL passes neither side.
+    () =>
+      items.delete({
+        where: (item) => or(item.id.below(5), item.id.above(5)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => or(item.id.below(5), item.id.atLeast(6)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => or(item.score.atLeast(5), item.score.below(6)),
+      }),
+    () =>
+      items.delete({
+        where: (item) => not(and(item.id.atLeast(5), item.id.atMost(5))),
+      }),
+    () => items.delete({ where: (item) => not(item.id.between(1, 5)) }),
+    // Text orders as text, not as numbers.
+    () =>
+      items.delete({
+        where: (item) => or(item.name.atLeast("9"), item.name.below("10")),
+      }),
+    // JSON null passes neither side.
+    () =>
+      items.delete({
+        where: (item) => or(item.meta.above(5), item.meta.atMost(5)),
+      }),
+    () => items.delete({ where: (item) => item.name.like("a%") }),
+    () => items.delete({ where: (item) => item.name.like("_%") }),
+    () =>
+      items.delete({ where: (item) => sql<boolean>`${item.id.notIn([1])}` }),
+  ]) {
+    expect(() => filtered().toSQL()).not.toThrow();
+  }
+});
+
+test("UPDATE and DELETE refuse JSON null tests in either spelling, points and pieces of number ranges, negated groups and conditions in redundant sql<boolean>", () => {
+  const { items } = schema({
+    items: {
+      id: int.auto,
+      name: text,
+      score: int.nullable,
+      born: date,
+      meta: jsonb<unknown>(),
+      data: jsonb<unknown>().nullable,
+      doc: jsonb<{ k?: number }>(),
+    },
+  });
+  type Where = NonNullable<Parameters<typeof items.delete>[0]>["where"];
+
+  const everyRow: Where[] = [
+    // isDistinctFrom(null) of a jsonb column is isNot(null), in either order.
+    (item) => or(item.meta.isDistinctFrom(null), item.meta.is(null)),
+    (item) => or(item.meta.is(null), item.meta.isDistinctFrom(null)),
+    (item) => or(item.data.isDistinctFrom(null), item.data.is(null)),
+    // IS DISTINCT FROM a value holds where the operand is JSON null or missing.
+    (item) => or(item.meta.isDistinctFrom(2), item.meta.is(2)),
+    (item) =>
+      or(item.doc.path("k").isDistinctFrom(1), item.doc.path("k").is(1)),
+    // An equality between a lower and an upper bound, isNot() beside a range
+    // that holds its value, between() as a piece, a list of one value twice.
+    (item) => or(item.id.below(5), item.id.is(5), item.id.above(5)),
+    (item) => or(item.id.isNot(5), item.id.atLeast(5)),
+    (item) => or(item.id.isNot(1), item.id.isNot(2)),
+    (item) => or(item.id.below(3), item.id.between(3, 5), item.id.above(5)),
+    (item) => or(item.id.in([1, 1]), item.id.notIn([1])),
+    (item) => not(and(item.id.is(1), item.id.is(2))),
+    // An AND whose numbers the points it leaves out use up, also a long one.
+    (item) => not(and(item.id.atLeast(5), item.id.atMost(5), item.id.isNot(5))),
+    (item) =>
+      not(
+        and(
+          item.id.between(0, 0),
+          ...Array.from({ length: 1000 }, (_unused, k) => item.id.isNot(k)),
+        ),
+      ),
+    // A group below a not() is read by De Morgan.
+    (item) => or(item.id.below(5), not(or(item.id.below(5), item.id.below(4)))),
+    (item) => or(item.id.below(5), and(item.id.atLeast(5), item.id.atLeast(5))),
+    // Parentheses and `= true` around a condition alone in sql<boolean>.
+    (item) => sql<boolean>`(${item.id.notIn([])})`,
+    (item) => sql<boolean>`((${item.id.notIn([])}) = true)`,
+    (item) => sql<boolean>`${item.id.notIn([])} IS TRUE`,
+    // A NOT NULL id: `id <> 1 IS TRUE` or `id = 1` holds for every row.
+    (item) => or(sql<boolean>`${item.id.isNot(1)} IS TRUE`, item.id.is(1)),
+    // like() of only % of a value cast to text.
+    (item) => item.born.like("%"),
+  ];
+
+  for (const where of everyRow) {
+    expect(() => items.delete({ where }).toSQL()).toThrow(
+      "where() leaves no condition",
+    );
+  }
+
+  const filtered: Where[] = [
+    // A NULL score, JSON null and a missing key pass neither side.
+    (item) => or(item.score.below(5), item.score.is(5), item.score.above(5)),
+    (item) => or(item.score.isNot(1), item.score.isNot(2)),
+    (item) => or(item.meta.is(2), item.meta.isNot(2)),
+    (item) => or(item.meta.is(2), not(item.meta.is(2))),
+    (item) => or(item.meta.isDistinctFrom(2), item.meta.isNot(2)),
+    (item) => or(item.id.below(5), item.id.above(5)),
+    (item) => or(item.id.below(3), item.id.between(4, 5), item.id.above(5)),
+    (item) => or(item.id.in([1, 2]), item.id.notIn([1])),
+    (item) => or(item.id.below(5), not(or(item.id.below(6), item.id.below(7)))),
+    (item) => not(and(item.id.atLeast(5), item.id.atMost(6), item.id.isNot(5))),
+    (item) =>
+      not(
+        and(
+          item.id.between(0, 1000),
+          ...Array.from({ length: 1000 }, (_unused, k) => item.id.isNot(k)),
+        ),
+      ),
+    // IS TRUE reads NULL as FALSE, so NOT (P IS TRUE) is not not(P): this
+    // subquery finds the rows whose score is NULL.
+    () =>
+      notExists(
+        items((other) => ({ id: other.id }), {
+          where: (other) => [
+            other.score.is(null),
+            not(sql<boolean>`${other.score.below(5)} IS TRUE`),
+          ],
+        }),
+      ),
+    (item) =>
+      item.id.notIn(
+        items((other) => ({ id: other.id }), {
+          where: (other) =>
+            and(
+              other.score.is(null),
+              not(sql<boolean>`(${other.score.below(5)}) IS TRUE`),
+            ),
+        }),
+      ),
+    // A NULL score passes neither side.
+    (item) =>
+      or(sql<boolean>`${item.score.isNot(1)} IS TRUE`, item.score.is(1)),
+    // Other SQL around a condition keeps it opaque.
+    (item) => sql<boolean>`NOT (${item.id.notIn([])})`,
+    (item) => sql<boolean>`${item.id.notIn([])} = false`,
+    (item) => sql<boolean>`(${item.id.notIn([])}) OR false`,
+    (item) => item.born.like("2024%"),
+  ];
+
+  for (const where of filtered) {
+    expect(() => items.delete({ where }).toSQL()).not.toThrow();
+  }
+});
+
+test("UPDATE and DELETE check deep and()/or()/not() filters in time that grows with their size, with the same refusals", () => {
+  const { items } = schema({
+    items: { id: int.auto, name: text, age: int.nullable },
+  });
+  type Where = NonNullable<Parameters<typeof items.delete>[0]>["where"];
+  type Row = Parameters<Extract<Where, (row: never) => unknown>>[0];
+  const depth = 1000;
+  // A filter built step by step: `where = or(where, …)` / `and(where, …)`.
+  const folded = (item: Row) => {
+    let where = item.id.is(0);
+
+    for (let k = 1; k < depth; k += 1) {
+      where = k % 2 ? or(where, item.id.is(k)) : and(where, item.id.isNot(k));
+    }
+
+    return where;
+  };
+  // not(or(id < k, not(and(id > k - 1, …)))), from a first condition.
+  const negated = (item: Row, first: ReturnType<typeof or>) => {
+    let where = first;
+
+    for (let k = 1; k <= depth; k += 1) {
+      where =
+        k % 2
+          ? not(or(item.age.below(k), where))
+          : not(and(item.age.above(k), where));
+    }
+
+    return where;
+  };
+  const started = performance.now();
+
+  for (const where of [
+    folded,
+    (item: Row) => negated(item, item.id.is(0)),
+    (item: Row) => and(item.id.is(1), negated(item, item.name.is("x"))),
+  ]) {
+    expect(() => items.delete({ where }).toSQL()).not.toThrow();
+  }
+
+  // In 3.6.0 candidates before this, each took seconds to minutes.
+  expect(performance.now() - started).toBeLessThan(1000);
+
+  // The not()s turn a condition with its opposite, deep inside, into the
+  // answer of the whole: past the 1,024 terms searched at once, it is still
+  // found where it is.
+  expect(() =>
+    items
+      .delete({
+        where: (item) => negated(item, or(item.id.is(1), item.id.isNot(1))),
+      })
+      .toSQL(),
+  ).toThrow("where() leaves no condition");
+  expect(() =>
+    items
+      .delete({
+        where: (item) => negated(item, or(item.age.is(1), item.age.isNot(1))),
+      })
+      .toSQL(),
+  ).not.toThrow();
+});
+
+test("a write's subquery over its own table, built from the same handle, keeps its correlation with the written row", () => {
+  const namesake = (user: { id: unknown; name: unknown }) =>
+    notExists(
+      model.users((other) => ({ id: other.id }), {
+        where: (other) => [
+          other.name.is(user.name as never),
+          other.id.isNot(user.id as never),
+        ],
+      }),
+    );
+  const correlated =
+    'WHERE NOT EXISTS (SELECT "users_2"."id" AS "id"\nFROM "users" AS "users_2"\nWHERE "users_2"."name" = "users"."name" AND "users_2"."id" <> "users"."id")';
+
+  expect(model.users.delete({ where: namesake }).toSQL().sql).toBe(
+    `DELETE FROM "users" AS "users"\n${correlated}`,
+  );
+  expect(
+    model.users.update({ active: false }).where(namesake).toSQL().sql,
+  ).toBe(`UPDATE "users" AS "users" SET "active" = $1\n${correlated}`);
+  expect(
+    model.users
+      .insert({ name: "Ada" })
+      .onConflict("name")
+      .doUpdate({ active: false }, { where: (current) => namesake(current) })
+      .toSQL().sql,
+  ).toContain(`DO UPDATE SET "active" = $2\n${correlated}`);
+
+  // The value of SET and of RETURNING, too.
+  const namesakes = (user: { name: unknown }) =>
+    model
+      .users(() => ({ total: count() }), {
+        where: (other) => other.name.is(user.name as never),
+      })
+      .scalar();
+  const counted =
+    '(SELECT COUNT(*) AS "total"\nFROM "users" AS "users_2"\nWHERE "users_2"."name" = "users"."name")';
+
+  expect(
+    model.users
+      .update((user) => ({ visits: coalesce(namesakes(user), 0) }))
+      .all()
+      .toSQL().sql,
+  ).toBe(`UPDATE "users" AS "users" SET "visits" = COALESCE(${counted}, $1)`);
+  expect(
+    model.users
+      .delete({ where: (user) => user.id.is(1) })
+      .returning((user) => ({ id: user.id, namesakes: namesakes(user) }))
+      .toSQL().sql,
+  ).toContain(`RETURNING "users"."id" AS "id", ${counted} AS "namesakes"`);
+});
+
 test("not() over JSON leaves JSON null out of a query, and DDL keeps the condition as written", () => {
   const documents = table({
     id: int.auto,
@@ -1163,8 +1968,9 @@ test("not() over JSON leaves JSON null out of a query, and DDL keeps the conditi
 
   expect(snapshot!.checks![0]!.expression).toBe(plain);
   expect(snapshot!.indexes![0]!.where).toBe(plain);
-  // The plain negation stays a conjunct, which a partial index declared with
-  // it matches; the second leaves JSON null out.
+  // The path is compared bare, with a part that makes JSON null answer NULL,
+  // so the negation is plain. A filter drops that constant-NULL part, which
+  // leaves the condition a partial index declared with it matches.
   expect(
     declared
       .documents((document) => ({ id: document.id }), {
@@ -1172,7 +1978,203 @@ test("not() over JSON leaves JSON null out of a query, and DDL keeps the conditi
       })
       .toSQL().sql,
   ).toEndWith(
-    `WHERE (NOT (("documents"."meta" #> ARRAY[$1::text]) = $2::text::jsonb) AND NOT ((NULLIF(("documents"."meta" #> ARRAY[$3::text]), 'null'::jsonb)) = $4::text::jsonb))`,
+    `WHERE NOT ((("documents"."meta" #> ARRAY[$1::text]) = $2::text::jsonb OR (("documents"."meta" #> ARRAY[$1::text]) = 'null'::jsonb AND NULL)))`,
+  );
+  // So it is with several conditions.
+  expect(
+    declared
+      .documents((document) => ({ id: document.id }), {
+        where: (document) =>
+          not(or(document.meta.path("state").is("a"), document.tag.is(1))),
+      })
+      .toSQL().sql,
+  ).toEndWith(
+    `WHERE NOT (((("documents"."meta" #> ARRAY[$1::text]) = $2::text::jsonb OR (("documents"."meta" #> ARRAY[$1::text]) = 'null'::jsonb AND NULL)) OR "documents"."tag" = $3))`,
+  );
+  // A JSON expression that is no column or path still keeps both forms.
+  expect(
+    declared
+      .documents((document) => ({ id: document.id }), {
+        where: (document) =>
+          not(
+            or(
+              coalesce(document.meta.path("state"), "b").is("a"),
+              document.tag.is(1),
+            ),
+          ),
+      })
+      .toSQL().sql,
+  ).toContain(" AND NOT (((NULLIF(COALESCE(");
+});
+
+test("JSON null in a NOT NULL jsonb column is null in a query, while DDL and page cursors keep the earlier SQL", async () => {
+  const notes = table({
+    id: int.auto,
+    body: jsonb<unknown>(),
+    list: jsonb<unknown>().nullable,
+    extra: jsonb<{ a?: unknown }>().nullable,
+  });
+  const declared = schema({
+    notes: notes
+      .checks((note) => ({ small: note.body.isNot(0) }))
+      .indexes((note) => ({
+        wide: index(note.id).where(note.extra.path("a").between([], [9])),
+      })),
+  });
+  const [snapshot] = declared.$snapshot().tables;
+
+  expect(snapshot!.checks![0]!.expression).toBe(`"body" <> E'0'::text::jsonb`);
+  expect(snapshot!.indexes![0]!.where).toBe(
+    `("extra" #> ARRAY[E'a'::text]) BETWEEN E'[]'::text::jsonb AND E'[9]'::text::jsonb`,
+  );
+
+  const where = (options: Parameters<typeof declared.notes>[1]) =>
+    declared
+      .notes((note) => ({ id: note.id }), options)
+      .toSQL()
+      .sql.split("WHERE ")[1];
+
+  // The column stays bare, as an index and a partial index declared with the
+  // same condition need, and JSON null answers NULL beside it, in any context.
+  expect(where({ where: (note) => note.body.isNot(0) })).toBe(
+    `("notes"."body" <> $1::text::jsonb AND ("notes"."body" <> 'null'::jsonb OR NULL))`,
+  );
+  expect(where({ where: (note) => note.body.below(5) })).toBe(
+    `("notes"."body" < $1::text::jsonb AND ("notes"."body" <> 'null'::jsonb OR NULL))`,
+  );
+  // JSON null sorts below every value but `[]`: above 5 is FALSE for it.
+  expect(where({ where: (note) => note.body.above(5) })).toBe(
+    `("notes"."body" > $1::text::jsonb OR ("notes"."body" = 'null'::jsonb AND NULL))`,
+  );
+  expect(where({ where: (note) => note.body.atLeast([]) })).toBe(
+    `("notes"."body" >= $1::text::jsonb AND ("notes"."body" <> 'null'::jsonb OR NULL))`,
+  );
+  expect(where({ where: (note) => note.body.above(note.list) })).toBe(
+    `(("notes"."body" > "notes"."list" OR ("notes"."body" = 'null'::jsonb AND NULL)) AND ("notes"."body" <> 'null'::jsonb OR NULL))`,
+  );
+  // Below a not(), JSON null is null and stays out.
+  expect(where({ where: (note) => not(note.body.above(5)) })).toBe(
+    `NOT (("notes"."body" > $1::text::jsonb OR ("notes"."body" = 'null'::jsonb AND NULL)))`,
+  );
+  // So it does inside sql``, where only the comparison reads it.
+  expect(
+    where({ where: (note) => sql<boolean>`NOT ${note.body.below(5)}` }),
+  ).toBe(
+    `(NOT (("notes"."body" < $1::text::jsonb AND ("notes"."body" <> 'null'::jsonb OR NULL)))) = (TRUE)`,
+  );
+  // IS DISTINCT FROM a value holds for JSON null as for NULL.
+  expect(where({ where: (note) => note.body.isDistinctFrom(1) })).toBe(
+    `"notes"."body" IS DISTINCT FROM $1::text::jsonb`,
+  );
+  expect(where({ where: (note) => note.body.isDistinctFrom(null) })).toBe(
+    `NULLIF("notes"."body", 'null'::jsonb) IS DISTINCT FROM $1::text::jsonb`,
+  );
+  // Both sides read JSON null as null: two JSON nulls are not distinct.
+  expect(where({ where: (note) => note.body.isDistinctFrom(note.list) })).toBe(
+    `NULLIF("notes"."body", 'null'::jsonb) IS DISTINCT FROM NULLIF("notes"."list", 'null'::jsonb)`,
+  );
+  expect(where({ where: (note) => note.body.notIn([0]) })).toBe(
+    `NULLIF("notes"."body", 'null'::jsonb) NOT IN ($1::text::jsonb)`,
+  );
+  // An empty top-level array sorts below JSON null; from another bound,
+  // BETWEEN is FALSE for JSON null, which the statement makes NULL.
+  expect(where({ where: (note) => note.list.between([], [9]) })).toBe(
+    `("notes"."list" BETWEEN $1::text::jsonb AND $2::text::jsonb AND ("notes"."list" <> 'null'::jsonb OR NULL))`,
+  );
+  expect(where({ where: (note) => note.list.between(0, [9]) })).toBe(
+    `("notes"."list" BETWEEN $1::text::jsonb AND $2::text::jsonb OR ("notes"."list" = 'null'::jsonb AND NULL))`,
+  );
+  // Equality, IN lists and containment keep the plain column an index
+  // serves; they are TRUE for JSON null only against JSON null, and their
+  // FALSE for it is NULL, also below a NOT written in sql``.
+  expect(where({ where: (note) => note.body.is(0) })).toBe(
+    `("notes"."body" = $1::text::jsonb OR ("notes"."body" = 'null'::jsonb AND NULL))`,
+  );
+  expect(where({ where: (note) => note.list.in([1, 2]) })).toBe(
+    `("notes"."list" IN ($1::text::jsonb, $2::text::jsonb) OR ("notes"."list" = 'null'::jsonb AND NULL))`,
+  );
+  expect(where({ where: (note) => note.body.contains({ a: 1 }) })).toBe(
+    `("notes"."body" @> $1::text::jsonb OR ("notes"."body" = 'null'::jsonb AND NULL))`,
+  );
+  expect(where({ where: (note) => not(note.extra.path("a").is(1)) })).toBe(
+    `NOT ((("notes"."extra" #> ARRAY[$1::text]) = $2::text::jsonb OR (("notes"."extra" #> ARRAY[$1::text]) = 'null'::jsonb AND NULL)))`,
+  );
+  expect(where({ where: (note) => sql<boolean>`NOT ${note.body.is(0)}` })).toBe(
+    `(NOT (("notes"."body" = $1::text::jsonb OR ("notes"."body" = 'null'::jsonb AND NULL)))) = (TRUE)`,
+  );
+  // A subquery keeps IN as written, and not() reads it with JSON null as null.
+  expect(
+    where({
+      where: (note) =>
+        note.body.in(declared.notes((other) => ({ v: other.list }))),
+    }),
+  ).toBe(
+    `"notes"."body" IN (SELECT "notes_2"."list" AS "v"\nFROM "notes" AS "notes_2")`,
+  );
+  expect(where({ where: (note) => not(note.body.is(null)) })).toBe(
+    `NOT (("notes"."body" IS NULL OR "notes"."body" = ('null'::jsonb)))`,
+  );
+
+  const rows = [
+    { id: 1, __symmetria_cursor_0: "1" },
+    { id: 2, __symmetria_cursor_0: "2" },
+    { id: 3, __symmetria_cursor_0: "3" },
+  ];
+  const database = schema({ notes }, { executor: async () => rows });
+  const page = await database
+    .notes((note) => ({ id: note.id }), {
+      where: (note) => [
+        note.body.isNot(0),
+        note.body.notIn([1, 2]),
+        note.body.isDistinctFrom(null),
+        note.body.below(5),
+        not(note.body.is(3)),
+        note.list.between([], [9]),
+        note.extra.path("a").between([], [9]),
+        not(note.extra.path("a").in([1, 2])),
+        note.extra
+          .path("a")
+          .notIn(database.notes((other) => ({ v: other.extra.path("a") }))),
+        note.body.is(4),
+        note.list.in([5, 6]),
+        note.body.between(1, 9),
+        note.body.contains({ a: 1 }),
+        not(note.extra.path("a").contains([1])),
+      ],
+      orderBy: (note) => note.id.asc,
+    })
+    .page({ size: 2 });
+
+  // The cursor 3.5.0 issued, before these conditions read JSON null as null.
+  expect(String(page.nextCursor)).toBe(
+    "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6Ijk3MjMyY2E0ODUwZDRkZDVjNmE0NDc0MTQ5MmQxNmNhNmVlNWRlYTBmNDljYjM4ZTU0Y2FjOWQxNjg2ZGEwOTkiLCJ2YWx1ZXMiOlsiMiJdfQ",
+  );
+
+  const compared = await database
+    .notes((note) => ({ id: note.id }), {
+      where: (note) => [
+        note.body.isDistinctFrom(note.list),
+        note.list.isDistinctFrom(note.body),
+        note.body.above(5),
+        not(note.body.below(note.list)),
+      ],
+      orderBy: (note) => note.id.asc,
+    })
+    .page({ size: 2 });
+
+  expect(String(compared.nextCursor)).toBe(
+    "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6ImY2ODljYmFhMDI4ZDkwN2JkNjExYjI5MDg5ZDdkMWJhMmQ2ZjBmMmM1YzYxNzU4MGNjNjVmNTE1MDliZWQ5ZTEiLCJ2YWx1ZXMiOlsiMiJdfQ",
+  );
+
+  // Schema DDL keeps both sides bare, as 3.5.0 wrote them.
+  const [distinct] = schema({
+    notes: notes.checks((note) => ({
+      apart: note.body.isDistinctFrom(note.list),
+    })),
+  }).$snapshot().tables;
+
+  expect(distinct!.checks![0]!.expression).toBe(
+    `"body" IS DISTINCT FROM "list"`,
   );
 });
 
@@ -1334,7 +2336,7 @@ test("search() and searchRank() compile to PostgreSQL full-text search", () => {
     )
     .toSQL();
   expect(query.sql).toContain(
-    `ts_rank(to_tsvector('english', "posts"."title"), websearch_to_tsquery('english', $1)) AS "searchRank"`,
+    `ts_rank(to_tsvector('english', "posts"."title"), (SELECT websearch_to_tsquery('english', $1))) AS "searchRank"`,
   );
   expect(query.sql).toContain(
     `WHERE to_tsvector('simple', "posts"."title") @@ websearch_to_tsquery('simple', $2)`,
@@ -1403,7 +2405,7 @@ test("jsonb(schema).contains() takes a partial value without schema validation",
       )
       .toSQL(),
   ).toEqual({
-    sql: 'SELECT "events"."id" AS "id"\nFROM "events" AS "events"\nWHERE "events"."payload" @> $1::text::jsonb',
+    sql: `SELECT "events"."id" AS "id"\nFROM "events" AS "events"\nWHERE ("events"."payload" @> $1::text::jsonb OR ("events"."payload" = 'null'::jsonb AND NULL))`,
     parameters: ['{"type":"created"}'],
   });
   expect(() =>
@@ -1458,7 +2460,7 @@ test("long literal IN lists bind one array parameter on PostgreSQL", () => {
       })
       .toSQL(),
   ).toEqual({
-    sql: 'SELECT "events"."id" AS "id"\nFROM "events" AS "events"\nWHERE "events"."kind" = ANY($1) AND "events"."at" <> ALL($2) AND ("events"."meta" #> ARRAY[$3::text]) = ANY($4::text[]::jsonb[])',
+    sql: `SELECT "events"."id" AS "id"\nFROM "events" AS "events"\nWHERE "events"."kind" = ANY($1) AND "events"."at" <> ALL($2) AND (("events"."meta" #> ARRAY[$3::text]) = ANY($4::text[]::jsonb[]) OR (("events"."meta" #> ARRAY[$3::text]) = 'null'::jsonb AND NULL))`,
     parameters: [kinds, moments, "n", ids.map(String)],
   });
 });
@@ -1685,10 +2687,12 @@ test("JSON null is null in comparisons that tell NULL from a value", () => {
   expect(
     sqlOf({ where: (posts) => posts.metadata.path("tags").notIn([["a"]]) }),
   ).toContain(`(NULLIF(${path}, 'null'::jsonb)) NOT IN`);
-  // Equality never matches JSON null to a value; it keeps the plain path.
+  // Equality keeps the plain path, with JSON null answering NULL beside it.
   expect(
     sqlOf({ where: (posts) => posts.metadata.path("tags").is(["a"]) }),
-  ).toContain(`WHERE ${path} =`);
+  ).toContain(
+    `WHERE (${path} = $2::text::jsonb OR (${path} = 'null'::jsonb AND NULL))`,
+  );
 });
 
 test("text operations on an enum, uuid or date read it as text", () => {
@@ -1764,4 +2768,196 @@ test("jsonb(schema).array reads, writes and filters with the schema's input", ()
       where: (logs) => logs.list.has(stored),
     }),
   ).toBeDefined();
+});
+
+test("casts of bound values drop every type modifier, so a compared value is never rounded or cut", async () => {
+  const as = (sqlType: string) =>
+    customType<string>(sqlType, {
+      encode: (value) => value,
+      decode: (value) => String(value),
+    });
+  const local = schema({
+    events: {
+      id: int.auto,
+      ats: timestamptz(0).array,
+      local: timestamp(3).array,
+      zoned: as("time(0) with time zone").array,
+      spans: as("interval day to second(2)").array,
+      bits: as("bit(3)").array,
+      bit: as("bit").array,
+      varying: as("bit varying(3)").array,
+      letters: as("char").array,
+      codes: varchar(5).array,
+      prices: numeric(5, 2).array,
+      // pg_catalog-qualified and quoted names of the same types.
+      qualifiedBits: as("pg_catalog.bit(3)").array,
+      qualifiedLetters: as("pg_catalog.bpchar(3)").array,
+      quotedBits: as('"bit"(3)').array,
+      quotedCodes: as('"varchar"(5)').array,
+      amount: customType<string>("amount", { base: "numeric(30,10)" }),
+      code: as("code5"),
+      at: timestamptz(0),
+    },
+  });
+  const where = (
+    condition: Parameters<typeof local.events>[1] & object,
+  ): string =>
+    local
+      .events((event) => ({ id: event.id }), condition)
+      .toSQL()
+      .sql.split("WHERE ")[1]!;
+  const at = new Date("2020-01-01T12:00:00.400Z");
+
+  expect(
+    where({
+      where: (event) => [
+        event.ats.contains([at]),
+        event.local.overlaps([at]),
+        event.zoned.contains(["12:00:00.4+00"]),
+        event.spans.contains(["1 day 02:00"]),
+        event.bits.is(["10101"]),
+        event.bit.contains(["10"]),
+        event.varying.contains(["10101"]),
+        event.letters.contains(["ab"]),
+        event.codes.contains(["abcdefg"]),
+        event.prices.contains(["1.501"]),
+        event.qualifiedBits.contains(["1011"]),
+        event.qualifiedLetters.contains(["abcd"]),
+        event.quotedBits.contains(["1011"]),
+        event.quotedCodes.contains(["abcdefg"]),
+      ],
+    }),
+  ).toBe(
+    [
+      `"events"."ats" @> $1::text::timestamptz[]`,
+      `"events"."local" && $2::text::timestamp[]`,
+      `"events"."zoned" @> $3::text::time with time zone[]`,
+      `"events"."spans" @> $4::text::interval[]`,
+      `"events"."bits" = $5::text::"bit"[]`,
+      `"events"."bit" @> $6::text::"bit"[]`,
+      `"events"."varying" @> $7::text::bit varying[]`,
+      `"events"."letters" @> $8::text::bpchar[]`,
+      `"events"."codes" @> $9::text::varchar[]`,
+      `"events"."prices" @> $10::text::numeric[]`,
+      `"events"."qualified_bits" @> $11::text::pg_catalog.bit[]`,
+      `"events"."qualified_letters" @> $12::text::pg_catalog.bpchar[]`,
+      `"events"."quoted_bits" @> $13::text::"bit"[]`,
+      `"events"."quoted_codes" @> $14::text::"varchar"[]`,
+    ].join(" AND "),
+  );
+
+  // A prepared .nullable value: PostgreSQL's own types are named without
+  // the precision; a domain, with or without a declared base, takes its type
+  // from the comparison, never the domain's own (nor the base's, which for
+  // citext declared with base "text" would compare case-sensitively).
+  const nullable = (column: "amount" | "code" | "at") =>
+    prepare(
+      {
+        value:
+          column === "amount"
+            ? customType<string>("amount", { base: "numeric(30,10)" }).nullable
+            : column === "code"
+              ? as("code5").nullable
+              : timestamptz(0).nullable,
+      },
+      (parameters) =>
+        local.events((event) => ({ id: event.id }), {
+          where: (event) => event[column].is(parameters.value as never),
+        }),
+    )
+      .toSQL({ value: null })
+      .sql.split("WHERE ")[1];
+
+  expect(nullable("amount")).toBe(
+    `(("events"."amount" = $1 AND $1 IS NOT NULL) OR ($1 IS NULL AND "events"."amount" IS NULL))`,
+  );
+  expect(nullable("code")).toBe(
+    `(("events"."code" = $1 AND $1 IS NOT NULL) OR ($1 IS NULL AND "events"."code" IS NULL))`,
+  );
+  expect(nullable("at")).toBe(
+    `(CASE WHEN ($1)::timestamptz IS NULL THEN "events"."at" IS NULL ELSE "events"."at" = $1 END)`,
+  );
+
+  const rows = [
+    { id: 1, __symmetria_cursor_0: "1" },
+    { id: 2, __symmetria_cursor_0: "2" },
+    { id: 3, __symmetria_cursor_0: "3" },
+  ];
+  const events = {
+    id: int.auto,
+    ats: timestamptz(0).array,
+    local: timestamp(3).array,
+    bits: as("bit(3)").array,
+    spans: as("interval day").array,
+    times: as("time(0)").array,
+    // Other names of bigint and numeric, which nested values now keep exact.
+    big: as("int8"),
+    exact: as("decimal(30,10)"),
+    dec: as("dec(30,10)"),
+    bigs: customType<string[]>("_int8", {
+      encode: (value) => value,
+      decode: (value) => value as string[],
+    }),
+  };
+  const paged = schema({ events }, { executor: async () => rows });
+  const page = await paged
+    .events(
+      (event) => ({
+        id: event.id,
+        values: {
+          big: event.big,
+          exact: event.exact,
+          dec: event.dec,
+          bigs: event.bigs,
+        },
+      }),
+      {
+        where: (event) => [
+          event.ats.contains([at]),
+          event.local.overlaps([at]),
+          event.bits.contains(["101"]),
+          event.spans.contains(["1 day"]),
+          event.times.is(["12:00:00"]),
+        ],
+        orderBy: (event) => event.id.asc,
+      },
+    )
+    .page({ size: 2 });
+
+  // The cursor 3.5.0 issued, whose casts kept the modifiers and whose nested
+  // values were read by the declared spelling.
+  expect(String(page.nextCursor)).toBe(
+    "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6ImJhZGQwOTFiZTZhZDc5ZWJjNmFjNjIyNTY4ZWFlOGQ3NTdkYWY5NzExMTEyMDY0ZmM5MWE4NjUzYmVlZTY4ZGIiLCJ2YWx1ZXMiOlsiMiJdfQ",
+  );
+});
+
+test("page cursors 3.5.0 issued for nested-object keys with a backslash and a nested field named __symmetria_row stay valid", async () => {
+  const rows = [1, 2, 3].map((id) => ({
+    id,
+    __symmetria_cursor_0: String(id),
+  }));
+  const users = table({ id: int.auto, name: text, posts: many });
+  const posts = table({ id: int.auto, title: text, author: one(users.posts) });
+  const paged = schema({ users, posts }, { executor: async () => rows });
+  const query = paged.users(
+    (user) => ({
+      id: user.id,
+      names: { "first\\last": user.name, "it's\\": user.id },
+      posts: user.posts((post) => ({
+        __symmetria_row: post.title,
+        keys: { "a\\b": post.id },
+      })),
+    }),
+    { orderBy: (user) => user.id.asc },
+  );
+
+  // The query writes such a key as an escape string, and renames the rows'
+  // alias away from the field.
+  expect(query.toSQL().sql).toContain(`E'first\\\\last', "users"."name"`);
+  expect(query.toSQL().sql).toContain(`json_agg("__symmetria_row_")`);
+  // The cursor 3.5.0 issued, when keys were plain literals and the rows'
+  // alias was always "__symmetria_row".
+  expect(String((await query.page({ size: 2 })).nextCursor)).toBe(
+    "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6IjQ4N2E2ZjdkYjJiNjVlMjM2ODViZjBhZmIxOWExNWNkOGQzMTZhMDQ5MTFjNTE3OWY5NDU4NmJjYTg1YjFiOTkiLCJ2YWx1ZXMiOlsiMiJdfQ",
+  );
 });

@@ -4,7 +4,6 @@
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { postgres } from "symmetria/driver";
 import {
   discardMigration,
   loadMigrationState,
@@ -12,7 +11,7 @@ import {
   recoverMigrationFiles,
   squashMigrations,
 } from "../../index";
-import type { CliContext, Project } from "../context";
+import { databaseDriver, type CliContext, type Project } from "../context";
 
 /** `recover`: finish or roll back a publication left behind by a crashed generator. */
 export const recover = async (
@@ -84,7 +83,7 @@ export const discard = async (
 
   if (latest !== undefined) {
     if (project.databaseUrl) {
-      const driver = postgres(project.databaseUrl);
+      const driver = databaseDriver(project);
 
       try {
         const entry = (

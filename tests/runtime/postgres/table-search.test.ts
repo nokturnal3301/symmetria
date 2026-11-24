@@ -6,6 +6,12 @@ import {
   many,
   int,
   text,
+  uuid,
+  date,
+  numeric,
+  inet,
+  jsonb,
+  oneOf,
   sql,
   type Predicate,
 } from "../../../packages/runtime/src";
@@ -14,6 +20,7 @@ import {
   embedder,
   fullText,
 } from "../../../packages/runtime/src/entries/search";
+import { voyage } from "../../../packages/runtime/src/entries/voyage";
 import { testDatabase } from "../../../packages/kit/src/testing";
 import { hasExtension } from "../../support/extensions";
 
@@ -404,7 +411,7 @@ const worded = schema({
 });
 
 describe.skipIf(!databaseUrl)("search by words in any script", () => {
-  test("words with combining marks, and e-mail addresses, are found", async () => {
+  test("words with combining marks, e-mail addresses, paths and signs are found, cased as PostgreSQL cases them", async () => {
     const isolated = await testDatabase({
       url: databaseUrl!,
       schema: worded,
@@ -418,6 +425,18 @@ describe.skipIf(!databaseUrl)("search by words in any script", () => {
         ["กุญแจ รถ อยู่ ที่ไหน", "กุญแจ"],
         ["le café est fermé".normalize("NFD"), "café".normalize("NFD")],
         ["write to ada@example.com today", "ada@example.com"],
+        // PostgreSQL lowercases the question as it lowercased the document.
+        ["Flights to İstanbul", "İstanbul"],
+        ["ΟΔΟΣ ΑΘΗΝΑΣ", "ΟΔΟΣ"],
+        // The parser keeps a path's slash, a number's sign, a URL's query.
+        ["Edit /etc/hosts and restart", "/etc/hosts"],
+        ["set it to -5 degrees", "-5"],
+        ["then run ./run.sh again", "./run.sh"],
+        ["open https://x.org/a/b?c=1 now", "https://x.org/a/b?c=1"],
+        // Every word is also asked bare, as 3.5.0 asked it: what that found
+        // is still found.
+        ["we talk about postgres here", "/postgres"],
+        ["version v1.2 shipped", "v1.2-"],
       ] as const) {
         const { id } = await isolated.database.pages
           .insert({ body })
@@ -429,8 +448,249 @@ describe.skipIf(!databaseUrl)("search by words in any script", () => {
           }),
         ).toContainEqual({ id });
       }
+
+      // Punctuation that PostgreSQL's parser drops asks for nothing more:
+      // the same rows come, ranked the same.
+      const found = (question: string) =>
+        isolated.database.pages.search((page) => ({ id: page.id }), {
+          find: question,
+        });
+
+      expect(await found(`"Edit" (the) /etc/hosts, to -5? v1.2!`)).toEqual(
+        await found("Edit the /etc/hosts to -5 v1.2"),
+      );
     } finally {
       await isolated.close();
     }
+  });
+
+  test("a jsonb and an integer column are stored as searchDocument() reads them", async () => {
+    // Before, the generated column read them as coalesce(meta, ''), which
+    // PostgreSQL refused: '' is no JSON and no integer.
+    const isolated = await testDatabase({
+      url: databaseUrl!,
+      schema: schema({
+        notes: table({
+          id: int.auto,
+          title: text,
+          meta: jsonb<{ note: string }>().nullable,
+          floor: int,
+        }).search((note) => ({
+          find: {
+            words: fullText({
+              A: note.title,
+              B: [note.meta as never as typeof note.title, note.floor as never],
+            }),
+          },
+        })),
+      }),
+      prefix: "symmetria_search_words_json",
+      max: 1,
+    });
+
+    try {
+      await isolated.database.notes.insert([
+        { title: "first", meta: { note: "gamma ray" }, floor: 42 },
+        { title: "second", meta: null, floor: 7 },
+      ]);
+      const found = (question: string) =>
+        isolated.database.notes.search((note) => ({ id: note.id }), {
+          find: question,
+        });
+
+      expect(await found("gamma")).toEqual([{ id: 1 }]);
+      // A key of the document is no word.
+      expect(await found("note")).toEqual([]);
+      expect(await found("7")).toEqual([{ id: 2 }]);
+    } finally {
+      await isolated.close();
+    }
+  });
+});
+
+/** A model that takes a while, as any network model does. */
+const slow = embedder(
+  2,
+  async (texts) => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    return texts.map((value) => [value.length, 1]);
+  },
+  { name: "slow" },
+);
+// A service that accepts a request and never answers.
+const silent = Bun.serve({
+  port: 0,
+  fetch: () => new Promise<Response>(() => {}),
+});
+const unanswered = voyage("voyage-4", {
+  apiKey: "k",
+  baseUrl: `http://127.0.0.1:${silent.port}/v1`,
+  size: 2,
+  timeoutMs: 100,
+});
+const ordered = schema({
+  logs: table({ id: int.auto, body: text }),
+  chunks: table({
+    id: int.auto,
+    tenant: text,
+    body: text,
+    kind: oneOf("note", "faq").nullable,
+    ref: uuid.nullable,
+    day: date.nullable,
+    price: numeric(10, 2).nullable,
+    host: inet.nullable,
+  }).search((chunk) => ({
+    about: {
+      words: fullText([chunk.body, chunk.ref, chunk.price, chunk.host]),
+      meaning: slow(
+        chunk.body,
+        chunk.kind,
+        chunk.ref,
+        chunk.day,
+        chunk.price,
+        chunk.host,
+      ),
+    },
+  })),
+  hung: table({ id: int.auto, body: text }).search((row) => ({
+    about: { meaning: unanswered(row.body) },
+  })),
+});
+
+describe.skipIf(!withVector)("models in transactions on PostgreSQL", () => {
+  let isolated: Awaited<ReturnType<typeof testDatabase<typeof ordered>>>;
+  let database: typeof isolated.database;
+
+  beforeAll(async () => {
+    isolated = await testDatabase({
+      url: databaseUrl!,
+      schema: ordered,
+      prefix: "symmetria_search_ordered",
+      max: 2,
+      searchPath: ["public"],
+    });
+    database = isolated.database;
+  });
+
+  afterAll(async () => {
+    await isolated?.close();
+    silent.stop(true);
+  });
+
+  test("a write or a search that waits for a model keeps its place in the transaction's order", async () => {
+    const [counted, seen, found] = await database.$transaction(async (tx) => {
+      const [, count] = await Promise.all([
+        tx.chunks.insert({ tenant: "a", body: "first" }),
+        tx.chunks.count(),
+      ]);
+      const [, rows] = await Promise.all([
+        tx.chunks.insert({ tenant: "a", body: "second" }),
+        tx.chunks((chunk) => ({ body: chunk.body }), {
+          orderBy: (chunk) => chunk.id.ascending,
+        }),
+      ]);
+      // Started first, the search does not see the row written after it.
+      const [results] = await Promise.all([
+        tx.chunks.search((chunk) => ({ body: chunk.body }), {
+          about: "third",
+          limit: 10,
+        }),
+        tx.chunks.insert({ tenant: "a", body: "third" }),
+      ]);
+
+      return [count, rows.map((row) => row.body), results.length];
+    });
+
+    expect(counted).toBe(1);
+    expect(seen).toEqual(["first", "second"]);
+    expect(found).toBe(2);
+  });
+
+  test("a search kept and awaited again sees new rows and the current tenant", async () => {
+    let tenant = "x";
+    const scoped = database.$scope({
+      chunks: (chunk) => chunk.tenant.is(tenant),
+    });
+    const kept = scoped.chunks.search((chunk) => ({ tenant: chunk.tenant }), {
+      about: "kept",
+      limit: 10,
+    });
+
+    expect(await kept).toEqual([]);
+    await database.chunks.insert([
+      { tenant: "x", body: "kept x" },
+      { tenant: "y", body: "kept y" },
+    ]);
+    expect(await kept).toEqual([{ tenant: "x" }]);
+    tenant = "y";
+    expect(await kept).toEqual([{ tenant: "y" }]);
+  });
+
+  test("a model that does not answer fails the write after its timeout and leaves the transaction usable", async () => {
+    const started = Date.now();
+    const outcome = await database.$transaction(async (tx) => {
+      const write = await tx.hung.insert({ body: "never embedded" }).then(
+        () => "written",
+        (error: Error) => error.message,
+      );
+
+      await tx.logs.insert({ body: "after the timeout" });
+
+      return write;
+    });
+
+    expect(outcome).toBe(
+      "symmetria: Voyage did not answer within 100 ms when asked to embed with voyage-4 (timeoutMs sets how long to wait)",
+    );
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(await database.hung.count()).toBe(0);
+    expect(await database.logs.count()).toBe(1);
+  });
+
+  test("sources that are not text are read as their text by words, missing() and reindex()", async () => {
+    const ref = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+    const { id } = await database.chunks
+      .insert({
+        tenant: "t",
+        body: "Opening hours",
+        kind: "faq",
+        ref,
+        day: "2024-01-31",
+        price: "12.50",
+        host: "10.0.0.1",
+      })
+      .returning("id");
+    // Only spaces, as JavaScript's \s counts them: nothing to embed, and
+    // nothing missing() counts.
+    await database.chunks.insert({ tenant: "t", body: "\u00a0\ufeff " });
+
+    for (const word of [ref, "12.50", "10.0.0.1"]) {
+      expect(
+        await database.chunks.search((chunk) => ({ id: chunk.id }), {
+          about: { text: word, vector: [1, 1] },
+          limit: 50,
+        }),
+      ).toContainEqual({ id });
+    }
+
+    await database.chunks.update(
+      { body: "Opening hours on Sunday" },
+      { where: (chunk) => chunk.id.is(id) },
+    );
+    expect(await database.chunks.search.missing()).toBe(1);
+    expect(await database.chunks.search.reindex()).toBe(1);
+    expect(await database.chunks.search.missing()).toBe(0);
+
+    const [stored] = (
+      (await isolated.driver.execute({
+        sql: "SELECT about::text AS about FROM chunks WHERE id = $1",
+        parameters: [id],
+      })) as unknown as { rows: { about: string }[] }
+    ).rows;
+
+    expect(stored!.about).toBe(
+      `[${["Opening hours on Sunday", "faq", ref, "2024-01-31", "12.50", "10.0.0.1"].join("\n\n").length},1]`,
+    );
   });
 });

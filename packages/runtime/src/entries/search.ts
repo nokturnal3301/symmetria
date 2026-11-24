@@ -1,7 +1,9 @@
 /**
  * `symmetria/search`: what a table's `.search()` is declared with. `bm25()`
  * and `fullText()` match words; `embedder()` wraps a model that matches
- * meaning (`symmetria/voyage` and `symmetria/ollama` have ready ones).
+ * meaning (`symmetria/voyage`, `symmetria/openai`, `symmetria/cohere`,
+ * `symmetria/google`, `symmetria/mistral`, `symmetria/jina` and
+ * `symmetria/ollama` have ready ones).
  */
 export {
   bm25,

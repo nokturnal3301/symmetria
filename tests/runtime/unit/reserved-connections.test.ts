@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  ConnectionError,
   createDatabase,
   databaseError,
   int,
@@ -11,7 +12,12 @@ import {
   type PostgresConnection,
 } from "../../../packages/runtime/src/driver/pool";
 import { postgresParameters } from "../../../packages/runtime/src/driver/parameters";
-import { scopeViolation } from "../../../packages/runtime/src/driver/errors";
+import { releaseReserved } from "../../../packages/runtime/src/driver/bun";
+import {
+  queryError,
+  scopeViolation,
+  sqlState,
+} from "../../../packages/runtime/src/driver/errors";
 
 const statement = (sql: string): CompiledQuery => ({ sql, parameters: [] });
 
@@ -324,6 +330,18 @@ test("databaseError() describes lost and refused connections on both drivers", (
       code: "ERR_POSTGRES_CONNECTION_CLOSED",
     }),
     Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+    // node-postgres writing to a closed socket: EPIPE looks like a SQLSTATE.
+    Object.assign(new Error("write EPIPE"), {
+      errno: -32,
+      syscall: "write",
+      code: "EPIPE",
+    }),
+    // Any other failed socket call too, such as a write on a closed descriptor.
+    Object.assign(new Error("write EBADF"), {
+      errno: -9,
+      syscall: "write",
+      code: "EBADF",
+    }),
   ];
 
   for (const error of lost) {
@@ -332,6 +350,8 @@ test("databaseError() describes lost and refused connections on both drivers", (
       sqlState: "08006",
       message: error.message,
     });
+    expect(queryError(error)).toBeInstanceOf(ConnectionError);
+    expect(sqlState(queryError(error))).toBeUndefined();
   }
 
   for (const error of [
@@ -360,6 +380,17 @@ test("databaseError() describes lost and refused connections on both drivers", (
   expect(
     databaseError({ code: "ERR_POSTGRES_SERVER_ERROR", errno: "08P01" }),
   ).toMatchObject({ kind: "connection" });
+  // No connection slot left (server, role or database) or a server that
+  // starts or stops: the connection could not be opened, and a retry may.
+  for (const error of [
+    { code: "53300" },
+    { code: "ERR_POSTGRES_SERVER_ERROR", errno: "53300" },
+    { code: "57P03" },
+  ]) {
+    expect(databaseError(error)?.kind).toBe("connection");
+    expect(queryError(error)).toBeInstanceOf(ConnectionError);
+  }
+  expect(databaseError({ code: "53200" })).toMatchObject({ kind: "other" });
   // A cancelled statement leaves the connection usable.
   expect(databaseError({ code: "57014" })).toMatchObject({ kind: "other" });
   expect(databaseError(new Error("symmetria: invalid"))).toBeUndefined();
@@ -473,4 +504,36 @@ test("a session ended for a transaction's time limit is a lost connection", () =
       Object.assign(new Error("read-only transaction"), { code: "25006" }),
     ),
   ).toMatchObject({ kind: "other" });
+});
+
+test("a reserved Bun.SQL connection released with an error is closed, whatever its code", async () => {
+  const calls: string[] = [];
+  const reserved = {
+    release: () => {
+      calls.push("release");
+    },
+    close: async () => {
+      calls.push("close");
+    },
+  };
+
+  releaseReserved(reserved);
+  // Every server error has this code on Bun; it was taken for a lost socket,
+  // and the connection went back to the pool.
+  releaseReserved(
+    reserved,
+    Object.assign(new Error("could not roll back"), {
+      code: "ERR_POSTGRES_SERVER_ERROR",
+      errno: "XX000",
+    }),
+  );
+  releaseReserved(
+    reserved,
+    Object.assign(new Error("connection closed"), {
+      code: "ERR_POSTGRES_CONNECTION_CLOSED",
+    }),
+  );
+  releaseReserved(reserved, new Error("anything else"));
+
+  expect(calls).toEqual(["release", "close", "close", "close"]);
 });

@@ -16,10 +16,17 @@ import {
   timestamptz,
   numeric,
   prepare,
+  customType,
 } from "../../../packages/runtime/src";
 import { codecFor } from "../../../packages/runtime/src/query/codecs";
 import { postgresArrayLiteral } from "../../../packages/runtime/src/query/compile/postgres/values";
-import { createSchemaSQL, normalizeSqlType } from "../../../packages/kit/src";
+import {
+  createSchemaSQL,
+  diffSchemas,
+  migrationSnapshot,
+  normalizeSqlType,
+  parseMigrationSnapshot,
+} from "../../../packages/kit/src";
 import { expectDataError } from "../../support/data-errors";
 import { quoteLiteral } from "../../../packages/kit/src/migrations/snapshot";
 
@@ -44,6 +51,21 @@ test("the builders declare their PostgreSQL types and modifiers", () => {
   });
   expect(inet.array.definition.sqlType).toBe("inet[]");
   expect(bytea.nullable.definition.notNull).toBe(false);
+  // Plain JavaScript may declare a custom type without options; its values
+  // go to the driver as a column of that SQL type sends them.
+  const period = (customType as (sqlType: string) => typeof int)("int4range");
+  const spans = schema({ spans: { id: int, period } });
+  expect(spans.$snapshot()).toBeDefined();
+  expect(period.definition.sqlType).toBe("int4range");
+  expect(
+    (customType as unknown as (sqlType: string, options: null) => typeof int)(
+      "ltree",
+      null,
+    ).definition.sqlType,
+  ).toBe("ltree");
+  expect(
+    spans.spans.insert({ id: 1, period: "[1,5)" as never }).toSQL().parameters,
+  ).toEqual([1, "[1,5)"]);
 });
 
 test("codecs normalize driver, JSON and text forms", () => {
@@ -79,7 +101,8 @@ test("binary values render as hex in array literals and defaults", () => {
   expect(postgresArrayLiteral([new Uint8Array([0xde, 0xad]), null])).toBe(
     '{"\\\\xdead",NULL}',
   );
-  expect(quoteLiteral(new Uint8Array([0, 255]))).toBe("'\\x00ff'::bytea");
+  // An escape string: `'\x00ff'` reads otherwise with standard_conforming_strings off.
+  expect(quoteLiteral(new Uint8Array([0, 255]))).toBe("E'\\\\x00ff'::bytea");
 
   const files = table({
     id: int.auto,
@@ -98,11 +121,28 @@ test("binary values render as hex in array literals and defaults", () => {
     )
     .join("\n");
 
-  expect(ddl).toContain(`"content" bytea DEFAULT '\\x0102'::bytea NOT NULL`);
+  expect(ddl).toContain(`"content" bytea DEFAULT E'\\\\x0102'::bytea NOT NULL`);
   expect(ddl).toContain(`"since" date DEFAULT E'2024-01-01' NOT NULL`);
   expect(ddl).toContain(`"ttl" interval DEFAULT E'1 day' NOT NULL`);
   expect(ddl).toContain(`"address" inet,`);
   expect(ddl).toContain(`"ratio" real DEFAULT 0.5 NOT NULL`);
+
+  // A snapshot saved with the earlier '\x0102'::bytea needs no migration.
+  const snapshot = migrationSnapshot(schema({ files }).$snapshot());
+  const saved = parseMigrationSnapshot(
+    JSON.parse(
+      JSON.stringify(snapshot).replace(
+        JSON.stringify("E'\\\\x0102'::bytea").slice(1, -1),
+        JSON.stringify("'\\x0102'::bytea").slice(1, -1),
+      ),
+    ),
+  );
+
+  expect(
+    saved.tables[0]!.columns.find((column) => column.name === "content")
+      ?.default,
+  ).toBe("'\\x0102'::bytea");
+  expect(diffSchemas(saved, snapshot)).toMatchObject({ up: [], down: [] });
 });
 
 test("type normalization treats time precision and aliases alike", () => {

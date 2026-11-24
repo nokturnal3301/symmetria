@@ -11,6 +11,8 @@ import {
   oneOf,
   sql,
   timestamptz,
+  customType,
+  type Decimal,
   type Infer,
   type InferInsert,
 } from "../../../packages/runtime/src";
@@ -100,4 +102,33 @@ type Assert<Condition extends true> = Condition;
       priced: index(products.price).where(products.price),
     })),
   });
+}
+
+{
+  // A domain declared with its base type: values as the base's builder reads them.
+  const ledger = table({
+    id: int.auto,
+    amount: customType<Decimal>("amount", { base: "numeric(30,10)" }),
+    big: customType<bigint>("big_id", { base: "bigint" }).nullable,
+    cents: customType<{ cents: bigint }>("money_cents", {
+      base: "bigint",
+      encode: (value) => value.cents,
+      decode: (value) => ({ cents: value as bigint }),
+    }),
+  });
+  type Row = Assert<
+    Equal<
+      Infer<typeof ledger>,
+      {
+        id: number;
+        amount: Decimal;
+        big: bigint | null;
+        cents: { cents: bigint };
+      }
+    >
+  >;
+  // @ts-expect-error encode and decode go together
+  customType<string>("amount", { base: "numeric", encode: (value) => value });
+  // @ts-expect-error a codec or a base
+  customType<string>("amount", {});
 }

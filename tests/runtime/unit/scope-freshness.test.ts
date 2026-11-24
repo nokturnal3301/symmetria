@@ -5,7 +5,13 @@ import {
   table,
   int,
   text,
+  uuid,
+  date,
+  oneOf,
   prepare,
+  and,
+  or,
+  sql,
   type CompiledQuery,
 } from "../../../packages/runtime/src";
 
@@ -141,7 +147,7 @@ const recordingScope = () => {
           ? [{ count: "0" }]
           : query.sql.startsWith("INSERT")
             ? { rows: [], affectedRows: 1 }
-            : [];
+            : { rows: [], affectedRows: 0 };
       },
     },
   );
@@ -391,4 +397,134 @@ test("a read made in one async context binds that context's $scope() values wher
     [1],
     [2],
   ]);
+});
+
+test("a $scope() filter that holds for every row fails closed, at $scope() and at each execution", async () => {
+  const statements: CompiledQuery[] = [];
+  const database = schema(
+    { posts },
+    {
+      executor: async (query) => {
+        statements.push(query);
+
+        return { rows: [], affectedRows: 0 };
+      },
+    },
+  );
+  const request: { tenant: number | undefined } = { tenant: undefined };
+  const optional = {
+    posts: (post: { tenantId: { is: (value: number) => never } }) =>
+      and(request.tenant && post.tenantId.is(request.tenant)),
+  };
+  const refusal =
+    'symmetria: the $scope() filter of "posts" holds for every row, so it restricts nothing (such as and() or a list whose conditions were all skipped, like `tenant && …` without a tenant, isNot(null) of a NOT NULL column, or a condition together with its opposite); nothing is read or written through it';
+
+  // Its callback runs at $scope(), which refuses a result that admits every row.
+  expect(() => database.$scope(optional as never)).toThrow(refusal);
+  expect(() =>
+    database.$scope({ posts: (post) => post.tenantId.isNot(null) }),
+  ).toThrow(refusal);
+  // So does that condition interpolated alone into sql<boolean>, a
+  // condition together with its opposite, and a pattern every title matches.
+  expect(() =>
+    database.$scope({
+      posts: (post) =>
+        sql<boolean>`${and(request.tenant && post.tenantId.is(request.tenant))}`,
+    }),
+  ).toThrow(refusal);
+  expect(() =>
+    database.$scope({
+      posts: (post) => or(post.tenantId.is(1), post.tenantId.isNot(1)),
+    }),
+  ).toThrow(refusal);
+  expect(() =>
+    database.$scope({ posts: (post) => post.title.like("%") }),
+  ).toThrow(refusal);
+  // In parentheses or compared with true, and like() of a value cast to text.
+  expect(() =>
+    database.$scope({
+      posts: (post) =>
+        sql<boolean>`(${and(request.tenant && post.tenantId.is(request.tenant))})`,
+    }),
+  ).toThrow(refusal);
+  expect(() =>
+    database.$scope({
+      posts: (post) =>
+        sql<boolean>`${and(request.tenant && post.tenantId.is(request.tenant))} = true`,
+    }),
+  ).toThrow(refusal);
+  const codes = schema({
+    codes: table({ id: int, ref: uuid, day: date, kind: oneOf("a", "b") }),
+  });
+  const prefix = "" as string;
+  for (const scope of [
+    (code: { ref: { like: (pattern: string) => never } }) =>
+      code.ref.like(`${prefix}%`),
+    (code: { day: { like: (pattern: string) => never } }) =>
+      code.day.like(`${prefix}%`),
+    (code: { kind: { like: (pattern: string) => never } }) =>
+      code.kind.like(`${prefix}%`),
+  ]) {
+    expect(() => codes.$scope({ codes: scope as never })).toThrow(
+      'the $scope() filter of "codes" holds for every row',
+    );
+  }
+  expect(() =>
+    codes.$scope({ codes: (code) => code.day.like("2024%") }),
+  ).not.toThrow();
+  // An emptied list is the condition it asks for: with nobody blocked, a
+  // denylist admits every post.
+  const blocked: number[] = [];
+  expect(
+    database
+      .$scope({ posts: (post) => post.tenantId.notIn(blocked) })
+      .posts((post) => ({ id: post.id }))
+      .toSQL().sql,
+  ).toBe('SELECT "posts"."id" AS "id"\nFROM "posts" AS "posts"\nWHERE TRUE');
+
+  request.tenant = 1;
+  const scoped = database.$scope(optional as never);
+  const read = scoped.posts((post) => ({ id: post.id }));
+  const prepared = prepare({ id: int }, (parameters) =>
+    scoped.posts((post) => ({ id: post.id }), {
+      where: (post) => post.id.is(parameters.id),
+    }),
+  );
+  const writes = () => [
+    scoped.posts.update({ title: "x" }).all(),
+    scoped.posts.delete().all(),
+    scoped.posts.insert({ tenantId: 2, title: "x" }),
+    scoped.posts.byId(1).update({ title: "x" }),
+  ];
+
+  await read;
+  await prepared({ id: 1 });
+  expect(statements.map((statement) => statement.parameters)).toEqual([
+    [1],
+    [1, 1],
+  ]);
+
+  // The same callbacks bind no tenant now: reads and writes are refused.
+  request.tenant = undefined;
+  statements.length = 0;
+  await expect(read.execute()).rejects.toThrow(refusal);
+  await expect(prepared({ id: 1 })).rejects.toThrow(refusal);
+  await expect(scoped.posts.count()).rejects.toThrow(refusal);
+  expect(() => read.toSQL()).toThrow(refusal);
+  for (const write of writes()) {
+    await expect(write.execute()).rejects.toThrow(refusal);
+  }
+  expect(statements).toEqual([]);
+
+  // A narrower scope that adds nothing still leaves the scope it narrows.
+  const tenant = database.$scope({ posts: (post) => post.tenantId.is(1) });
+  expect(
+    tenant
+      .$scope(optional as never)
+      .posts((post) => ({ id: post.id }))
+      .toSQL(),
+  ).toEqual({
+    sql: 'SELECT "posts"."id" AS "id"\nFROM "posts" AS "posts"\nWHERE ("posts"."tenant_id" = $1 AND TRUE)',
+    parameters: [1],
+  });
 });

@@ -169,3 +169,70 @@ test("edges of by() and column() references are labelled by their relation name"
   expect(renderMermaid(graph)).toContain("accounts ||..o{ notes : author");
   expect(renderMermaid(graph)).toContain("accounts |o..o{ notes : owner");
 });
+
+test("names Mermaid cannot take as attributes become words with the real name in the note; labels are quoted", () => {
+  const people = table({
+    id: int.auto,
+    firstName: text.named("First Name"),
+    firstUnderscore: text.named("First_Name").nullable,
+    quoted: text.named('quote"col').nullable,
+    twoFactor: text.named("2fa").nullable,
+    manager: users.column("manager id").nullable,
+  });
+  const graph = schemaGraph(schema({ users, people }).$snapshot());
+  const diagram = renderMermaid(graph);
+
+  expect(diagram).toContain('    text First_Name "name: First Name"\n');
+  // Two names that become the same word stay apart.
+  expect(diagram).toContain(
+    '    text First_Name_2 "name: First_Name, nullable"\n',
+  );
+  expect(diagram).toContain(`    text quote_col "name: quote'col, nullable"\n`);
+  expect(diagram).toContain('    text _2fa "name: 2fa, nullable"\n');
+  expect(diagram).toContain(
+    '    integer manager_id FK "name: manager id, nullable"\n',
+  );
+  expect(diagram).toContain("  users |o..o{ people : manager\n");
+  // A migration snapshot labels the edge with the column name: quoted.
+  expect(
+    renderMermaid(
+      schemaGraph(migrationSnapshot(schema({ users, people }).$snapshot())),
+      {
+        compact: true,
+      },
+    ),
+  ).toContain('  users |o..o{ people : "manager id"\n');
+
+  // Every attribute line is `type name [keys] ["comment"]` with Mermaid words.
+  for (const line of diagram
+    .split("\n")
+    .filter((entry) => entry.startsWith("    "))) {
+    expect(line).toMatch(
+      /^ {4}[A-Za-z_][A-Za-z0-9_()[\]-]* [A-Za-z_][A-Za-z0-9_()[\]-]*(?: (?:PK|FK|UK)(?:, (?:PK|FK|UK))*)?(?: "[^"]*")?$/,
+    );
+  }
+});
+
+test("a line break in a name, U+2028 and U+2029 too, is an escape that keeps the diagram's lines", () => {
+  const odd = table({
+    id: int.auto,
+    a: text.named("one two"),
+    b: text.named("three four"),
+    owner: users.column("owner\nid"),
+  });
+  const diagram = renderMermaid(
+    schemaGraph(
+      migrationSnapshot(schema({ users, [`odd\rtable`]: odd }).$snapshot()),
+    ),
+  );
+
+  expect(diagram).toContain('"name: one\\u2028two"');
+  expect(diagram).toContain('"name: three\\u2029four"');
+  expect(diagram).toContain('  "odd\\rtable" {\n');
+  expect(diagram).toContain('  users ||..o{ "odd\\rtable" : "owner\\nid"\n');
+  for (const breaking of ["\r", 0x2028, 0x2029]) {
+    expect(diagram).not.toContain(
+      typeof breaking === "number" ? String.fromCharCode(breaking) : breaking,
+    );
+  }
+});

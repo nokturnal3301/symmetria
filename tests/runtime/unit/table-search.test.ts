@@ -7,6 +7,13 @@ import {
   int,
   text,
   uuid,
+  date,
+  timestamptz,
+  numeric,
+  inet,
+  jsonb,
+  oneOf,
+  customType,
   type CompiledQuery,
   type InferInsert,
 } from "../../../packages/runtime/src";
@@ -61,7 +68,7 @@ const recording = (
     executor: async (query) => {
       calls.push(query);
 
-      return rows;
+      return { rows, affectedRows: rows.length };
     },
   });
 
@@ -270,7 +277,7 @@ test("insert and upsert ask the model once for the rows that need it", async () 
       executor: async (query) => {
         upserts.push(query);
 
-        return [];
+        return { rows: [], affectedRows: 1 };
       },
     },
   );
@@ -399,10 +406,10 @@ test("search() ranks by words and meaning in one statement", async () => {
       '"search_fused" AS (SELECT coalesce("search_about_meaning_exact"."id", "search_about_meaning"."id") AS "id", (coalesce(1.0 / (60 + "search_about_meaning_exact"."position"), 0)) + (coalesce(1.0 / (60 + "search_about_meaning"."position"), 0)) AS "score"',
       'FROM "search_about_meaning_exact" AS "search_about_meaning_exact"',
       'FULL JOIN "search_about_meaning" AS "search_about_meaning" ON ("search_about_meaning_exact"."id" = "search_about_meaning"."id")),',
-      `"search_about_words" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ts_rank("chunks"."about_words", to_tsquery('simple', $8)) DESC, "chunks"."id" ASC) AS "position", ts_rank("chunks"."about_words", to_tsquery('simple', $8)) AS "rank"`,
+      `"search_about_words" AS (SELECT "chunks"."id" AS "id", ROW_NUMBER() OVER (ORDER BY ts_rank("chunks"."about_words", (SELECT to_tsquery('simple', $8))) DESC, "chunks"."id" ASC) AS "position", ts_rank("chunks"."about_words", (SELECT to_tsquery('simple', $8))) AS "rank"`,
       'FROM "chunks" AS "chunks"',
       `WHERE "chunks"."owner" = $9 AND "chunks"."about_words" @@ to_tsquery('simple', $10)`,
-      `ORDER BY ts_rank("chunks"."about_words", to_tsquery('simple', $8)) DESC, "chunks"."id" ASC`,
+      `ORDER BY ts_rank("chunks"."about_words", (SELECT to_tsquery('simple', $8))) DESC, "chunks"."id" ASC`,
       "LIMIT 40),",
       '"search_fused_2" AS (SELECT coalesce("search_fused"."id", "search_about_words"."id") AS "id", coalesce("search_fused"."score", 0) + (coalesce(1.0 / (60 + "search_about_words"."position"), 0)) AS "score"',
       'FROM "search_fused" AS "search_fused"',
@@ -415,7 +422,10 @@ test("search() ranks by words and meaning in one statement", async () => {
       "LIMIT 3",
     ].join("\n"),
   );
-  // Any of the question's words matches; punctuation cannot reach the query syntax.
+  // Any of the question's words matches, each a quoted operand PostgreSQL's
+  // parser reads as written (and lowercases), so punctuation cannot reach
+  // the query syntax: the bare word as 3.5.0 sent it, then the word with what
+  // surrounds it.
   expect(parameters).toEqual([
     "u",
     "[19,1]",
@@ -424,9 +434,9 @@ test("search() ranks by words and meaning in one statement", async () => {
     "[19,1]",
     10000,
     "u",
-    "where | are | the | keys",
+    "' Where' | ' are' | ' the' | ' keys'",
     "u",
-    "where | are | the | keys",
+    "' Where' | ' are' | ' the' | ' keys'",
   ]);
   expect(await run).toEqual([{ title: "found" } as never]);
   // The question was embedded once, for toSQL() and the run together.
@@ -529,7 +539,7 @@ test("an empty question and a vector of the wrong size never reach PostgreSQL", 
     .search({ about: { text: "data\0base", vector: [1, 0] } })
     .toSQL();
 
-  expect(zero.parameters).toContain("database");
+  expect(zero.parameters).toContain("' database'");
 });
 
 test("a model that fails at search time leaves the words, and says so", async () => {
@@ -584,6 +594,20 @@ test("search() refuses what it cannot answer", async () => {
   expect(calls).toHaveLength(0);
 });
 
+/** The characters JavaScript's `\s` counts as spaces, as a regular expression in SQL. */
+const NOT_SPACE = `E'[^\\\\t\\\\n\\\\v\\\\f\\\\r \\\\u00a0\\\\u1680\\\\u2000-\\\\u200a\\\\u2028\\\\u2029\\\\u202f\\\\u205f\\\\u3000\\\\ufeff]'`;
+/**
+ * reindex() and missing() leave out a row unless a source column has a
+ * character that is not a space: a printable ASCII first character, another
+ * first character that is no space, or one anywhere. Under the "C" collation,
+ * and without ascii(), which raises beyond ASCII in EUC_JP.
+ */
+const hasTextSQL = (column: string) => {
+  const text = `${column} COLLATE "C"`;
+
+  return `(${text} <> '' AND (left(${text}, 1) BETWEEN '!' AND '~' OR left(${text}, 1) ~ ${NOT_SPACE} OR ${text} ~ ${NOT_SPACE}))`;
+};
+
 test("reindex() embeds the rows that have no embedding, a batch at a time", async () => {
   const { model, asked } = counting();
   const pages = [
@@ -601,7 +625,7 @@ test("reindex() embeds the rows that have no embedding, a batch at a time", asyn
 
       return query.sql.startsWith("SELECT")
         ? pages.shift()!
-        : { rows: [], affectedRows: query.parameters.length === 5 ? 2 : 1 };
+        : { rows: [], affectedRows: query.parameters.length === 4 ? 2 : 1 };
     },
   });
 
@@ -614,28 +638,31 @@ test("reindex() embeds the rows that have no embedding, a batch at a time", asyn
   const selects = calls.filter((call) => call.sql.startsWith("SELECT"));
 
   expect(selects).toHaveLength(3);
-  // Rows without text are left out by the query itself, so no call reads them again.
+  // Rows without text (or only spaces, as JavaScript's \s counts them) are
+  // left out by the query itself, so no call reads them again. Each column
+  // is tested on its own, by its first character unless that is a space, so
+  // that a long text is not converted for a regular expression.
   expect(selects[0]!.sql).toContain(
-    `WHERE "chunks"."about" IS NULL AND ((concat_ws($1, NULLIF("chunks"."title", ''), NULLIF("chunks"."content", ''))) <> '') = (TRUE)`,
+    `WHERE "chunks"."about" IS NULL AND ((${hasTextSQL('"chunks"."title"')} OR ${hasTextSQL('"chunks"."content"')})) = (TRUE)`,
   );
   // Pages continue after the last key.
-  expect(selects[1]!.sql).toContain('AND "chunks"."id" > $2');
-  expect(selects[1]!.parameters).toEqual(["\n\n", 2]);
+  expect(selects[1]!.sql).toContain('AND "chunks"."id" > $1');
+  expect(selects[1]!.parameters).toEqual([2]);
 
   // One UPDATE per batch, which keeps an embedding written meanwhile and
-  // skips a row whose text changed while the model was asked.
+  // skips a row whose sources changed while the model was asked: they are
+  // compared as stored, as PostgreSQL writes them out ('' for NULL).
   const updates = calls.filter((call) => call.sql.startsWith("UPDATE"));
 
   expect(updates).toHaveLength(2);
   expect(updates[0]!.sql).toBe(
-    `UPDATE "chunks" AS "chunks" SET "about" = (($1::text::jsonb) ->> ("chunks"."id")::text)::vector(2)\nWHERE ("chunks"."id" IN ($2, $3) AND "chunks"."about" IS NULL AND ((concat_ws($4, NULLIF("chunks"."title", ''), NULLIF("chunks"."content", ''))) = (($5::text::jsonb) ->> ("chunks"."id")::text)) = (TRUE))`,
+    `UPDATE "chunks" AS "chunks" SET "about" = (($1::text::jsonb) ->> ("chunks"."id")::text)::vector(2)\nWHERE ("chunks"."id" IN ($2, $3) AND "chunks"."about" IS NULL AND (jsonb_build_array(concat("chunks"."title"), concat("chunks"."content")) = (($4::text::jsonb) -> ("chunks"."id")::text)) = (TRUE))`,
   );
   expect(updates[0]!.parameters).toEqual([
     JSON.stringify({ 1: "[6,1]", 2: "[1,1]" }),
     1,
     2,
-    "\n\n",
-    JSON.stringify({ 1: "A\n\none", 2: "C" }),
+    JSON.stringify({ 1: ["A", "one"], 2: ["C", ""] }),
   ]);
 });
 
@@ -655,7 +682,7 @@ test("reindex() goes by descending key and missing() counts what is left", async
     await database.chunks.search.missing({ where: { owner: "ada" } }),
   ).toBe(7);
   expect(calls[1]!.sql).toContain(
-    `WHERE "chunks"."owner" = $1 AND "chunks"."about" IS NULL AND ((concat_ws(`,
+    `WHERE "chunks"."owner" = $1 AND "chunks"."about" IS NULL AND ((${hasTextSQL('"chunks"."title"')} OR`,
   );
   await expect(
     database.chunks.search.reindex({ order: "newest" as never }),
@@ -701,4 +728,451 @@ test("an insert may leave an embedding undefined, under exactOptionalPropertyTyp
   };
 
   expect(row.about).toBeUndefined();
+});
+
+test("a search runs each time it is awaited, and asks the model again only after a failure", async () => {
+  let failures = 0;
+  const asked: string[] = [];
+  const flaky = embedder(
+    2,
+    async (texts) => {
+      asked.push(...texts);
+
+      if (failures > 0) {
+        failures -= 1;
+        throw new Error("429 Too Many Requests");
+      }
+
+      return texts.map((value) => [value.length, 1]);
+    },
+    { name: "flaky" },
+  );
+  const { database, calls } = recording(tables(flaky), [{ id: 1 }]);
+  const search = database.chunks.search({ about: "keys" });
+
+  // Rows written since, and the current $scope() tenant, are seen as by a
+  // query; the question is embedded once.
+  await search;
+  await search.execute();
+  await search.then((rows) => rows);
+  expect(calls).toHaveLength(3);
+  expect(asked).toEqual(["keys"]);
+
+  // A failure is not kept: the next await asks the model again.
+  const semantic = table({ id: int.auto, body: text }).search((row) => ({
+    about: { meaning: flaky(row.body) },
+  }));
+  const meaningOnly = schema({ semantic }, { executor: async () => [] });
+  const kept = meaningOnly.semantic.search({ about: "garage" });
+
+  failures = 1;
+  await expect(kept.execute()).rejects.toThrow("429 Too Many Requests");
+  expect(await kept).toEqual([]);
+  expect(asked).toEqual(["keys", "garage", "garage"]);
+});
+
+test("a write that waits for its embedding runs each time it is awaited", async () => {
+  const { model, asked } = counting();
+  const { database, calls } = recording(tables(model), [{ id: 1 }]);
+  const write = database.chunks.insert({
+    noteId: 1,
+    owner: "u",
+    title: "t",
+    content: "c",
+  });
+
+  await write;
+  await write.execute();
+  expect(calls.filter((call) => call.sql.startsWith("INSERT"))).toHaveLength(2);
+  expect(asked).toHaveLength(2);
+});
+
+test("a text of spaces only is not embedded, as a question of spaces finds nothing", async () => {
+  const { model, asked } = counting();
+  const { database, last } = recording(tables(model));
+
+  // Spaces as JavaScript's \s counts them, no-break spaces and a byte order
+  // mark included; missing() and reindex() count the same ones in SQL.
+  await database.chunks.insert({
+    noteId: 1,
+    owner: "u",
+    title: "  \u00a0",
+    content: "\n\t\ufeff",
+  });
+  expect(asked).toEqual([]);
+  expect(last().sql).not.toContain('"about"');
+});
+
+test("full-text questions keep what PostgreSQL's parser keeps, as quoted operands", async () => {
+  const words = schema(
+    {
+      pages: table({ id: int.auto, body: text }).search((page) => ({
+        find: { words: fullText(page.body) },
+      })),
+    },
+    { executor: async () => [] },
+  );
+  const question = async (value: string) =>
+    (await words.pages.search({ find: value }).toSQL()).parameters[0];
+
+  // Cased as written (PostgreSQL lowercases it as it lowercased the
+  // document). Every word bare, as 3.5.0 sent it, so nothing it found is
+  // lost; then the first and last word of a piece with what surrounds them,
+  // unless PostgreSQL's parser drops all of that (`keys?`): its lexemes are
+  // sent already, and each operand more costs every row the search reads.
+  expect(await question("İstanbul ΟΔΟΣ /etc/hosts -5 ./run.sh keys?")).toBe(
+    "' İstanbul' | ' ΟΔΟΣ' | ' etc/hosts' | ' 5' | ' run.sh' | ' keys' | ' /etc/hosts' | ' -5' | ' ./run.sh'",
+  );
+  expect(
+    await question(`"Where" (are) my keys?! What's that, memory: 3.14.`),
+  ).toBe(
+    "' Where' | ' are' | ' my' | ' keys' | ' What' | ' s' | ' that' | ' memory' | ' 3.14'",
+  );
+  expect(await question("...my keys... e-mail-- (e.g. the car's)")).toBe(
+    "' my' | ' keys' | ' e-mail' | ' e.g' | ' the' | ' car' | ' s'",
+  );
+  // Two dots after a word are a file name to the parser, and a sign before
+  // a number is part of it.
+  expect(await question("keys.. +5")).toBe(
+    "' keys' | ' 5' | ' keys..' | ' +5'",
+  );
+  // Characters beyond ASCII are letters to a database in the C locale.
+  expect(await question("«keys»")).toBe("' keys' | ' «keys»'");
+  // A short piece of several words is also asked as a whole (a URL with a
+  // query), after the words; quotes and backslashes stay inside their operand.
+  expect(await question("it's a\\b x.org/a?c='1' /a\\b")).toBe(
+    "' it' | ' s' | ' a' | ' b' | ' x.org/a' | ' c' | ' 1' | ' x.org/a?c=''1''' | ' /a' | ' /a\\\\b'",
+  );
+  // However long and repetitive a question, it sends a bounded query: a long
+  // piece is not sent whole, and a word of more than 16 runs of letters and
+  // digits is sent as its first, which every row holding it also holds.
+  expect(await question("foo,".repeat(20_000))).toBe("' foo'");
+  expect(await question("a-b-".repeat(1000))).toBe("' a'");
+  // Repeated words count once; the first 64 distinct words are asked.
+  expect(await question("Keys keys KEYS")).toBe("' Keys'");
+
+  const many = await question(
+    Array.from({ length: 70 }, (_value, position) => `w${position}`).join(" "),
+  );
+
+  expect(String(many).split(" | ")).toHaveLength(64);
+  expect(many).toContain("' w63'");
+  expect(many).not.toContain("' w64'");
+});
+
+test("searches read columns that are not text through a cast, or refuse them", async () => {
+  const typed = table({
+    id: int.auto,
+    body: text,
+    ref: uuid,
+    price: numeric(10, 2),
+    kind: oneOf("note", "faq"),
+    day: date,
+    host: inet,
+  });
+  const snapshot = schema({
+    docs: typed.search((doc) => ({
+      about: { words: fullText([doc.body, doc.ref, doc.price, doc.host]) },
+    })),
+  }).$snapshot();
+
+  // Text keeps the expression it always had; uuid and numeric are cast, and
+  // an inet is written as its output writes it (`10.0.0.1`, not `/32`).
+  expect(
+    snapshot.tables[0]!.columns.find((column) => column.name === "aboutWords")!
+      .generated,
+  ).toBe(
+    `setweight(to_tsvector('simple', coalesce("body", '')), 'A') || setweight(to_tsvector('simple', coalesce("ref"::text, '')), 'A') || setweight(to_tsvector('simple', coalesce("price"::text, '')), 'A') || setweight(to_tsvector('simple', coalesce(abbrev("host"), '')), 'A')`,
+  );
+
+  // A generated column cannot hold text that can change; pg_search matches
+  // words only in text.
+  expect(() =>
+    schema({
+      docs: typed.search((doc) => ({ about: { words: fullText(doc.kind) } })),
+    }),
+  ).toThrow(
+    'symmetria: fullText() cannot read "kind", which is an enum: its values can be renamed',
+  );
+  expect(() =>
+    schema({
+      docs: typed.search((doc) => ({ about: { words: fullText(doc.day) } })),
+    }),
+  ).toThrow('fullText() cannot read "day", which is of type date');
+  expect(() =>
+    schema({
+      docs: typed.search((doc) => ({ about: { words: bm25(doc.ref) } })),
+    }),
+  ).toThrow(
+    'symmetria: bm25() matches words in text columns; "ref" is of type uuid, which pg_search cannot match words in',
+  );
+
+  // A meaning reads any of them; missing() and reindex() read them as text.
+  const { model } = counting();
+  const calls: CompiledQuery[] = [];
+  const database = schema(
+    {
+      docs: typed.search((doc) => ({
+        about: { meaning: model(doc.body, doc.kind, doc.day, doc.host) },
+      })),
+    },
+    {
+      executor: async (query) => {
+        calls.push(query);
+
+        return [{ count: 1 }];
+      },
+    },
+  );
+
+  expect(await database.docs.search.missing()).toBe(1);
+  // An enum's label may be only spaces; a date's or an inet's text is never
+  // empty, so it is enough that they are not NULL.
+  expect(calls[0]!.sql).toContain(
+    [
+      hasTextSQL('"docs"."body"'),
+      hasTextSQL('concat("docs"."kind")'),
+      '("docs"."day" IS NOT NULL)',
+      '("docs"."host" IS NOT NULL)',
+    ].join(" OR "),
+  );
+});
+
+test("bm25() refuses numbers, booleans and bytes; fullText() refuses unfixed text in any spelling, with its own message", () => {
+  const custom = (sqlType: string, base?: string) =>
+    customType<string>(sqlType, {
+      encode: (value: string) => value,
+      decode: (value: unknown) => String(value),
+      ...(base ? { base } : {}),
+    } as never);
+  const declare = (
+    words: typeof bm25 | typeof fullText,
+    column: ReturnType<typeof custom>,
+  ) =>
+    schema({
+      docs: table({ id: int.auto, title: text, c: column.nullable }).search(
+        (doc) => ({ about: { words: words([doc.title, doc.c]) } }),
+      ),
+    });
+
+  // pg_search cannot match words in them: every search failed.
+  for (const type of [
+    "integer",
+    "int4",
+    "bigint",
+    "smallint",
+    "boolean",
+    "bool",
+    "real",
+    "double precision",
+    "float8",
+    "bytea",
+  ]) {
+    expect(() => declare(bm25, custom(type))).toThrow(
+      `symmetria: bm25() matches words in text columns; "c" is of type ${type}, which pg_search cannot match words in`,
+    );
+  }
+
+  expect(() => declare(bm25, custom("counter", "integer"))).toThrow(
+    '"c" is of type counter (integer), which pg_search cannot match words in',
+  );
+  // A type not known (a domain over text, without a base) is still taken.
+  expect(() => declare(bm25, custom("label"))).not.toThrow();
+  // Text, varchar and citext, JSON, and arrays of text or varchar.
+  for (const type of [
+    "text[]",
+    "_text",
+    "text[][]",
+    "varchar(9)[]",
+    "character varying(10)[]",
+    "_varchar",
+    "citext",
+    "jsonb",
+  ]) {
+    expect(() => declare(bm25, custom(type))).not.toThrow();
+  }
+  expect(() => declare(bm25, custom("citext", "text"))).not.toThrow();
+
+  // pg_search takes no other type: arrays of others and ranges failed every
+  // search, char(n), name, a tsvector or xml failed at migrate, and so did
+  // a domain or an extension's type whatever its base.
+  for (const type of [
+    "integer[]",
+    "uuid[]",
+    "numeric[]",
+    "date[]",
+    "boolean[]",
+    "timestamptz[]",
+    "citext[]",
+    "char(3)[]",
+    "jsonb[]",
+    "label[]",
+    "int4range",
+    "tstzrange",
+    "int4multirange",
+    "char(3)",
+    "character(3)",
+    "bpchar",
+    "name",
+    "tsvector",
+    "xml",
+  ]) {
+    expect(() => declare(bm25, custom(type))).toThrow(
+      `symmetria: bm25() matches words in text columns; "c" is of type ${type}, which pg_search cannot match words in`,
+    );
+  }
+
+  for (const [type, base] of [
+    ["label", "text"],
+    ["ltree", "text"],
+    ["tags", "text[]"],
+    ["counts", "integer[]"],
+    ["period", "tstzrange"],
+  ] as const) {
+    expect(() => declare(bm25, custom(type, base))).toThrow(
+      `"c" is of type ${type} (${base}), which pg_search cannot match words in`,
+    );
+  }
+
+  for (const [type, reason] of [
+    ["timestamp(3) with time zone", "its text follows the session's settings"],
+    ["interval day to second", "its text follows the session's settings"],
+    ["int4range", "PostgreSQL does not count the text of a range or an array"],
+    ["datemultirange", "PostgreSQL does not count the text of a range"],
+    ["_text", "PostgreSQL does not count the text of a range or an array"],
+    // A text type with a length, as an array.
+    [
+      "varchar(40)[]",
+      "PostgreSQL does not count the text of a range or an array",
+    ],
+    [
+      "character varying(10)[]",
+      "PostgreSQL does not count the text of a range or an array",
+    ],
+    ["char(3)[]", "PostgreSQL does not count the text of a range or an array"],
+  ] as const) {
+    expect(() => declare(fullText, custom(type))).toThrow(
+      `symmetria: fullText() cannot read "c", which is of type ${type}: ${reason}`,
+    );
+  }
+
+  expect(() => declare(fullText, custom("int4"))).not.toThrow();
+});
+
+test("a meaning over a timestamp, a custom type or its own key reads each as an insert does", async () => {
+  const path = customType<string>("ltree", {
+    encode: (value: string) => value,
+    decode: (value: unknown) => String(value),
+  });
+  const { model, asked } = counting();
+  const calls: CompiledQuery[] = [];
+  const pages: Record<string, unknown>[][] = [
+    [
+      {
+        id: 7,
+        title: "Intro",
+        at: "2026-11-23 10:00:00+00",
+        path: "docs.intro",
+        __symmetria_key: "7",
+        __symmetria_stored_1: "2026-11-23 10:00:00+00",
+        __symmetria_stored_2: "docs.intro",
+        __symmetria_stored_3: "7",
+      },
+    ],
+    [],
+  ];
+  const database = schema(
+    {
+      pages: table({
+        id: int.auto,
+        title: text,
+        at: timestamptz.nullable,
+        path: path.nullable,
+      }).search((page) => ({
+        // A meaning's types take text columns; any column reads at run time.
+        about: {
+          meaning: model(
+            page.title,
+            page.at as never,
+            page.path,
+            page.id as never,
+          ),
+        },
+      })),
+    },
+    {
+      executor: async (query) => {
+        calls.push(query);
+
+        return query.sql.startsWith("SELECT")
+          ? (pages.shift() ?? [])
+          : { rows: [], affectedRows: 1 };
+      },
+    },
+  );
+
+  expect(await database.pages.search.reindex()).toBe(1);
+  // A timestamp or a number is never empty text, so it is enough that it is
+  // not NULL; no left(ltree), so a type not known is read as its text.
+  expect(calls[0]!.sql).toContain(
+    [
+      hasTextSQL('"pages"."title"'),
+      '("pages"."at" IS NOT NULL)',
+      hasTextSQL('concat("pages"."path")'),
+      '("pages"."id" IS NOT NULL)',
+    ].join(" OR "),
+  );
+  // Each is read through its codec, as a query reads it, and as stored, to
+  // see that it did not change while the model was asked.
+  expect(calls[0]!.sql).toContain(
+    `SELECT "pages"."id" AS "id", "pages"."title" AS "title", "pages"."at" AS "at", "pages"."path" AS "path", ("pages"."id")::text AS "__symmetria_key", concat("pages"."at") AS "__symmetria_stored_1", concat("pages"."path") AS "__symmetria_stored_2", concat("pages"."id") AS "__symmetria_stored_3"`,
+  );
+  // The model gets the text an insert of those values gets.
+  expect(asked.map((entry) => entry.texts)).toEqual([
+    ["Intro\n\n2026-11-23T10:00:00.000Z\n\ndocs.intro\n\n7"],
+  ]);
+  const update = calls.find((call) => call.sql.startsWith("UPDATE"))!;
+
+  expect(update.sql).toContain(
+    `"pages"."id" IN ($2) AND "pages"."about" IS NULL AND (jsonb_build_array(concat("pages"."title"), concat("pages"."at"), concat("pages"."path"), concat("pages"."id")) = (($3::text::jsonb) -> ("pages"."id")::text)) = (TRUE)`,
+  );
+  expect(update.parameters).toEqual([
+    JSON.stringify({ 7: "[46,1]" }),
+    7,
+    JSON.stringify({
+      7: ["Intro", "2026-11-23 10:00:00+00", "docs.intro", "7"],
+    }),
+  ]);
+});
+
+test("a stored document reads a jsonb column as JSON and keeps a custom type as it was", () => {
+  const email = customType<string>("email", {
+    encode: (value: string) => value,
+    decode: (value: unknown) => String(value),
+  });
+  const snapshot = schema({
+    docs: table({
+      id: int.auto,
+      meta: jsonb<string>().nullable,
+      floor: int,
+      mail: email,
+    }).search((doc) => ({
+      about: {
+        words: fullText({
+          A: doc.meta,
+          B: doc.floor as never,
+          C: doc.mail,
+        }),
+      },
+    })),
+  }).$snapshot();
+
+  // A custom type (a domain over text) keeps the expression of the column
+  // its documents were stored with; jsonb and integer were refused before.
+  expect(
+    snapshot.tables[0]!.columns.find((column) => column.name === "aboutWords")!
+      .generated,
+  ).toBe(
+    `setweight(to_tsvector('simple', coalesce("meta", '{}')), 'A') || setweight(to_tsvector('simple', coalesce(("floor")::text, '')), 'B') || setweight(to_tsvector('simple', coalesce("mail", '')), 'C')`,
+  );
 });

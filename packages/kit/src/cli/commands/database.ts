@@ -14,7 +14,8 @@ import {
   verifyMigrations,
 } from "../../index";
 import { boundaryDifferences } from "../../migrations/verify";
-import { formatExecution, formatStatus } from "../ui/format";
+import { formatExecution, formatPlan, formatStatus } from "../ui/format";
+import { terminalOutput } from "../ui/style";
 import { ask } from "../ui/terminal";
 import {
   confirmRollback,
@@ -22,6 +23,7 @@ import {
   rollbackSummary,
 } from "../screens/rollback-prompt";
 import {
+  verificationUrl,
   withCancellation,
   withDatabase,
   type CliContext,
@@ -33,7 +35,7 @@ export const verify = async (
   context: CliContext,
   project: Project,
 ): Promise<void> => {
-  const url = project.runnerOptions.verificationDatabaseUrl;
+  const url = verificationUrl(project);
 
   if (!url) {
     throw new Error(
@@ -81,10 +83,52 @@ export const drift = async (
     }
 
     const { metadataSchema, metadataTable } = project.config;
-    const { ignoreTables, verificationDatabaseUrl } = project.runnerOptions;
+    const { ignoreTables } = project.runnerOptions;
+    const verificationDatabaseUrl = verificationUrl(project);
     const history = migrations.length
       ? await migrator({ ...project.runnerOptions, driver, signal }).status()
       : [];
+    // A migration that stopped part-way leaves the schema between two
+    // boundaries, so neither describes it, and migrate refuses until repair
+    // settles it.
+    const incomplete = history.find((entry) => entry.status === "incomplete");
+
+    if (incomplete) {
+      const { id, direction, statement, running, error } = incomplete;
+
+      context.emit({
+        json: {
+          findings: [],
+          incomplete: {
+            id,
+            direction,
+            statement,
+            ...(running ? { running } : {}),
+            ...(error ? { error } : {}),
+          },
+        },
+        indent: 2,
+        plain: () =>
+          [
+            `Migration ${id} is incomplete (${direction}, ${statement} confirmed statements): the schema is between two migrations, so drift does not compare it.`,
+            ...(error
+              ? [
+                  `It stopped with: ${error.split("\n")[0]!.replace(/^symmetria: /, "")}`,
+                ]
+              : []),
+            running
+              ? "Another process holds the migration lock and is still running it; check drift again when it finishes."
+              : `Inspect the database, then run \`symmetria repair ${id} --action retry\` after undoing what it did, or \`--action complete\` after finishing it by hand.`,
+          ].join("\n"),
+      });
+
+      if (context.values.strict && !running) {
+        process.exitCode = 1;
+      }
+
+      return;
+    }
+
     const applied = history.findLastIndex(
       (entry) => entry.status === "applied",
     );
@@ -196,13 +240,7 @@ const plan = async (
   context.emit({
     json: { steps },
     indent: 2,
-    plain: () =>
-      steps
-        .map(
-          (step) =>
-            `-- group ${step.group}: ${step.transaction} · ${step.id}\n${step.statements.map((sql) => `${sql};`).join("\n\n")}`,
-        )
-        .join("\n\n"),
+    plain: () => formatPlan(steps),
   });
 };
 
@@ -212,6 +250,8 @@ export const repair = (
   id: string,
 ): Promise<void> =>
   withRunner(project, async (runner) => {
+    // Checked before the runner may need it to verify the boundary.
+    verificationUrl(project);
     const action = context.values.action as "retry" | "complete";
     // The snapshot file of the boundary, such as meta/snapshot.json as it was
     // before the migration was generated; the runner checks its hash.
@@ -250,7 +290,10 @@ export const status = (context: CliContext, project: Project): Promise<void> =>
       runner.status(),
     );
 
-    if (statuses.some((entry) => entry.status === "incomplete")) {
+    // A migration another process is still running needs no repair yet.
+    if (
+      statuses.some((entry) => entry.status === "incomplete" && !entry.running)
+    ) {
       process.exitCode = 1;
     }
 
@@ -262,7 +305,7 @@ export const status = (context: CliContext, project: Project): Promise<void> =>
           ? statuses
               .map(
                 (entry) =>
-                  `${entry.status.padEnd(7)} ${entry.id}${entry.status === "incomplete" ? ` · ${entry.direction} · ${entry.statement} confirmed statements · repair required` : ""}`,
+                  `${entry.status.padEnd(7)} ${entry.id}${entry.status === "incomplete" ? ` · ${entry.direction} · ${entry.statement} confirmed statements · ${entry.running ? "running in another process" : "repair required"}` : ""}`,
               )
               .join("\n")
           : "No migrations.",
@@ -340,7 +383,7 @@ export const rollback = (
         rollbackSummary(planned),
         databaseName(project.databaseUrl),
         {
-          write: (text) => process.stdout.write(text),
+          write: (text) => process.stdout.write(terminalOutput(text)),
           select: context.select,
           ask: (question) => ask(question, context.color),
         },

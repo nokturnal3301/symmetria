@@ -1,6 +1,7 @@
 /**
  * Compilation state: identifier quoting, alias bindings, parameter collection and expression caching.
  */
+import { createHash } from "node:crypto";
 import type {
   CommonTableExpression,
   MutationPlan,
@@ -47,8 +48,10 @@ export type Compilation = {
   /**
    * Renders every $scope() filter as a fixed marker without parameters, so
    * the result describes the query whatever the callbacks currently return,
-   * and skips the rewrites that only make a statement faster, so the text
-   * stays the same from one release to the next.
+   * and keeps the SQL earlier versions sent wherever a statement's own SQL
+   * is different (rewrites that only make it faster, stricter casts), so the
+   * text stays the same from one release to the next and page cursors stay
+   * valid.
    */
   readonly shapeOnly: boolean;
   readonly commonTables: Map<string, CommonTableExpression>;
@@ -124,6 +127,48 @@ export const quoteIdentifier = (identifier: string): string => {
   }
 
   return `"${identifier.replaceAll('"', '""')}"`;
+};
+
+/** Bytes of a long key kept in its alias, before `_` and the hash; at most 63 in all. */
+const KEY_PREFIX_BYTES = 46;
+const keyAliases = new Map<string, string>();
+
+/**
+ * The SQL alias of a result key. A key is a JavaScript name, which may be
+ * longer than PostgreSQL's 63-byte identifiers: such a key is written as its
+ * first bytes and a hash of the whole key, and rows are read back under the
+ * key itself. A key that fits is its own alias.
+ */
+export const keyAlias = (key: string): string => {
+  // 21 UTF-16 units are at most 63 bytes of UTF-8.
+  if (key.length <= 21 || Buffer.byteLength(key) <= 63) {
+    return key;
+  }
+
+  let alias = keyAliases.get(key);
+
+  if (alias === undefined) {
+    let prefix = "";
+    let bytes = 0;
+
+    for (const character of key) {
+      bytes += Buffer.byteLength(character);
+
+      if (bytes > KEY_PREFIX_BYTES) {
+        break;
+      }
+
+      prefix += character;
+    }
+
+    alias = `${prefix}_${createHash("sha256").update(key).digest("hex").slice(0, 16)}`;
+
+    if (keyAliases.size < 4096) {
+      keyAliases.set(key, alias);
+    }
+  }
+
+  return alias;
 };
 
 export const aliasSql = (

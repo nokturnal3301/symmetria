@@ -94,6 +94,43 @@ export const customValueType = (sqlType: string): string => {
   return "string";
 };
 
+/** What the builder of each base type reads, by normalized type name. */
+const BASE_VALUE_TYPES = new Map([
+  ["integer", "number"],
+  ["smallint", "number"],
+  ["real", "number"],
+  ["double precision", "number"],
+  ["bigint", "bigint"],
+  ["numeric", "Decimal"],
+  ["boolean", "boolean"],
+  ["timestamp with time zone", "Date"],
+  ["timestamp without time zone", "Date"],
+  ["date", "string"],
+  ["time without time zone", "string"],
+  ["interval", "string"],
+  ["text", "string"],
+  ["character varying", "string"],
+  ["uuid", "string"],
+  ["inet", "string"],
+  ["bytea", "Uint8Array"],
+  ["jsonb", "unknown"],
+]);
+
+/**
+ * The JavaScript value of a domain's base type, as its builder reads it; for
+ * a base without a builder, undefined (the domain stays driver-native).
+ */
+export const domainValueType = (baseType: string): string | undefined => {
+  const normalized = normalizeSqlType(baseType);
+  const element = normalized.replace(/(?:\[\])+$/, "");
+  // normalizeSqlType puts modifiers last: `timestamp with time zone(3)`.
+  const value = BASE_VALUE_TYPES.get(element.replace(/\(.*\)$/, ""));
+
+  return value === undefined
+    ? undefined
+    : value + normalized.slice(element.length);
+};
+
 /** How many names a warning that covers many objects spells out. */
 export const LISTED_NAMES = 10;
 
@@ -150,6 +187,26 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
   const enumLabels = new Map(
     catalog.enumerations.map((entry) => [entry.name, entry.values]),
   );
+  // A domain over a domain reads as the innermost base type.
+  const domains = new Map(
+    (catalog.domains ?? []).map((domain) => [domain.name, domain.base]),
+  );
+  const domainBase = (name: string): string | undefined => {
+    let base = domains.get(name);
+
+    for (let depth = 0; base !== undefined && depth < 32; depth += 1) {
+      const element = base.replace(/(?:\[\])+$/, "");
+      const inner = domains.get(element);
+
+      if (inner === undefined) {
+        return base;
+      }
+
+      base = inner + base.slice(element.length);
+    }
+
+    return undefined;
+  };
   const ownsEnum = (column: CatalogColumn): boolean =>
     !!column.enum_name &&
     column.enum_schema === null &&
@@ -895,6 +952,7 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       const member = columnMember(column, key, table, {
         ownsEnum,
         enumValues: (name) => enumLabels.get(name),
+        domainBase,
         serialSequence,
         warn,
         uniqueFor,

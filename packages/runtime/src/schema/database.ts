@@ -293,7 +293,11 @@ export type SchemaKeys<Indexes, TableName extends string> = {
     : never;
 };
 
-/** Per-table predicates applied to every read, update and delete of a scoped database. */
+/**
+ * Per-table predicates applied to every read, update and delete of a scoped
+ * database; every row it inserts or updates must satisfy them. A predicate
+ * that holds for every row is refused.
+ */
 export type ScopeDefinitions<Definition extends SchemaDefinitions> = {
   readonly [TableName in StringKeys<Definition>]?: (
     columns: Columns<QueryRows<Definition>[TableName]>,
@@ -356,7 +360,9 @@ export type Database<
   $batch: <
     const Reads extends readonly unknown[] | Readonly<Record<string, unknown>>,
   >(
-    callback: (database: Database<Definition, Relations, Indexes>) => Reads,
+    callback: (
+      database: BatchDatabase<Definition, Relations, Indexes>,
+    ) => Reads,
   ) => Promise<{ -readonly [Key in keyof Reads]: Awaited<Reads[Key]> }>;
   $snapshot: () => SchemaSnapshot;
   $close: () => Promise<void>;
@@ -368,6 +374,45 @@ export type Database<
     options?: TransactionOptions,
   ) => Promise<Result>;
 };
+
+/**
+ * A table on the `$batch()` handle: its reads; writes and search are not part
+ * of a batch. A lookup's `update()` and `delete()` are refused when the batch
+ * runs: typing them as well would cost every schema's types.
+ */
+type BatchTable<Table> = Table & {
+  readonly insert: never;
+  readonly upsert: never;
+  readonly update: never;
+  readonly delete: never;
+  readonly search: never;
+};
+
+/**
+ * The `$batch()` callback's handle: the tables' reads, `$scope()`,
+ * `$snapshot()` and `$batch()`. Writes, transactions and the pool's methods
+ * are not reads and are typed `never`, which keeps the handle assignable to
+ * the database for helpers that take one; row locks and streams are refused
+ * when the batch runs.
+ */
+export type BatchDatabase<
+  Definition extends SchemaDefinitions,
+  Relations extends RelationMap = RelationGraph<Definition>,
+  Indexes = {},
+> = {
+  readonly [TableName in StringKeys<Definition> &
+    StringKeys<Relations>]: BatchTable<
+    Database<Definition, Relations, Indexes>[TableName]
+  >;
+} & Pick<Database<Definition, Relations, Indexes>, "$snapshot" | "$batch"> & {
+    readonly [SCHEMA_BIND]: never;
+    readonly $close: never;
+    readonly $createIndexes: never;
+    readonly $transaction: never;
+    readonly $scope: (
+      scopes: ScopeDefinitions<Definition>,
+    ) => BatchDatabase<Definition, Relations, Indexes>;
+  };
 
 export declare const TRANSACTION_SCOPE: unique symbol;
 

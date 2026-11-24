@@ -1,6 +1,13 @@
 import { normalizeResult, quoteIdentifier } from "symmetria/internal";
 import type { QueryExecutor } from "symmetria";
 
+/**
+ * An expression in parentheses. The line break ends a `--` comment at its
+ * end, which snapshots saved by earlier versions hold without one
+ * (`1 -- one`), so the comment cannot take in the closing parenthesis.
+ */
+export const enclosed = (expression: string): string => `(${expression}\n)`;
+
 /** Let PostgreSQL normalize casts, parentheses and expression rewrites without scanning data. */
 export const expressionsMatch = async (
   expected: readonly string[],
@@ -13,7 +20,7 @@ export const expressionsMatch = async (
   try {
     const result = normalizeResult(
       await options.execute({
-        sql: `EXPLAIN (VERBOSE, FORMAT JSON, COSTS OFF) SELECT ${[...expected, ...actual].map((expression) => `(${expression})`).join(", ")} FROM ${table}`,
+        sql: `EXPLAIN (VERBOSE, FORMAT JSON, COSTS OFF) SELECT ${[...expected, ...actual].map(enclosed).join(", ")} FROM ${table}`,
         parameters: [],
       }),
     );

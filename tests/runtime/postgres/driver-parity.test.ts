@@ -11,9 +11,10 @@ import {
   timestamptz,
   prepare,
   bigint,
+  bytea,
   createDatabase,
 } from "../../../packages/runtime/src";
-import { bun } from "../../support/postgres";
+import { bun, transactionPooling } from "../../support/postgres";
 import { postgres as pg } from "../../../packages/runtime/src/entries/pg";
 import { testDatabase } from "../../../packages/kit/src/testing";
 
@@ -429,3 +430,71 @@ describe.skipIf(!url)("named prepared statements on node-postgres", () => {
     }
   });
 });
+
+// A pooler in transaction mode refuses start-up parameters it does not know.
+describe.skipIf(!url || transactionPooling)(
+  "bytea on Bun.SQL where the server prints it in the escape form",
+  () => {
+    test("the connection option reads it, and without it the error names the option", async () => {
+      const files = schema({ files: { id: int.auto, body: bytea } });
+      const escaped = (
+        address: string,
+        connection?: Record<string, string>,
+      ) => {
+        const styled = new URL(address);
+
+        styled.searchParams.set(
+          "options",
+          `${styled.searchParams.get("options") ?? ""} -c bytea_output=escape`.trim(),
+        );
+
+        return bun({
+          url: styled.toString(),
+          max: 1,
+          ...(connection ? { connection } : {}),
+        });
+      };
+      const fixture = await testDatabase({
+        url: url!,
+        schema: files,
+        prefix: "symmetria_bytea_escape",
+        max: 1,
+        driver: ({ url: address }) => escaped(address, { bytea_output: "hex" }),
+      });
+      const plain = escaped(
+        `${url!}${url!.includes("?") ? "&" : "?"}options=${encodeURIComponent(`-c search_path=${fixture.namespace}`)}`,
+      );
+
+      try {
+        const body = Uint8Array.from([0, 1, 92, 39, 255]);
+
+        await fixture.database.files.insert({ body });
+        expect(
+          await fixture.database.files((file) => ({ body: file.body })),
+        ).toEqual([{ body }]);
+
+        const database = createDatabase({ schema: files, driver: plain });
+
+        const refused = await Promise.resolve(
+          database.files((file) => ({ body: file.body })),
+        ).catch((error: unknown) => error);
+
+        expect(String((refused as Error).message)).toContain(
+          'connection: { bytea_output: "hex" }',
+        );
+        // Bun's own error, with its code, as before the advice was added.
+        expect((refused as { code?: unknown }).code).toBe(
+          "ERR_POSTGRES_UNSUPPORTED_BYTEA_FORMAT",
+        );
+        // Inside nested JSON the value is PostgreSQL's text, read either way;
+        // the connection still works.
+        expect(
+          await database.files((file) => ({ nested: { body: file.body } })),
+        ).toEqual([{ nested: { body } }]);
+      } finally {
+        await plain.close();
+        await fixture.close();
+      }
+    });
+  },
+);

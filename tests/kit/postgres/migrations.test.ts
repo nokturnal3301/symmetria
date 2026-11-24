@@ -23,6 +23,7 @@ import {
   oneOf,
   index,
   sql,
+  bytea,
 } from "../../../packages/runtime/src";
 import { postgres } from "../../support/postgres";
 import {
@@ -1407,6 +1408,109 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     expect(await execute(`SELECT label FROM "toString"`)).toEqual([
       { label: "kept" },
     ]);
+  });
+
+  test("names and labels with line breaks stay in the comments of a migration: only the index and the label go", async () => {
+    const drop = (name: string) => `${name}\nDROP TABLE victim; --`;
+    const version = (before: boolean) =>
+      schema({
+        victim: table({ id: int.auto }),
+        items: table({
+          id: int.auto,
+          a: text,
+          mood: (before ? oneOf("kept", drop("gone")) : oneOf("kept")).nullable,
+        }).indexes((t) => (before ? { [drop("old")]: index(t.a) } : {})),
+      }).$snapshot();
+
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: version(true),
+    });
+    await generateMigration({
+      directory,
+      name: "labels",
+      snapshot: version(false),
+      allowDestructive: true,
+    });
+    await runner().migrate();
+
+    expect(
+      (
+        await execute(
+          "SELECT relname FROM pg_class WHERE relnamespace = $1::regnamespace AND relkind = 'r' AND relname <> '_symmetria_migrations' ORDER BY relname",
+          [namespace],
+        )
+      ).map((row) => row.relname),
+    ).toEqual(["items", "victim"]);
+    expect(
+      await detectDrift({
+        execute: driver.execute,
+        snapshot: version(false),
+        metadataSchema: namespace,
+      }),
+    ).toEqual([]);
+  });
+
+  test("DDL literals and negative numbers read the same with standard_conforming_strings off", async () => {
+    const offset = -5;
+    const declared = schema({
+      blobs: table({
+        id: int.auto,
+        n: int.default(1),
+        data: bytea.default(new Uint8Array([0x41, 0x42])),
+        path: text.default("C:\\temp\\x41"),
+      }).checks((t) => ({
+        bytes: t.data.isNot(new Uint8Array([0x5c, 0x78])),
+        slash: t.path.isNot("a\\x41"),
+        shifted: sql<boolean>`${t.n}-${offset}
+          > 0`,
+        cast: sql<boolean>`${offset}::text <> ${t.path}`,
+      })),
+    }).$snapshot();
+    const legacy = new URL(address);
+    legacy.searchParams.set(
+      "options",
+      `${address.searchParams.get("options")} -c standard_conforming_strings=off`,
+    );
+    const off = postgres({ url: legacy.toString(), max: 1 });
+
+    try {
+      const setting = await off.execute({
+        sql: "SELECT current_setting('standard_conforming_strings') AS value",
+        parameters: [],
+      });
+
+      expect(Array.isArray(setting) ? setting : setting.rows).toEqual([
+        { value: "off" },
+      ]);
+
+      for (const statement of createSchemaSQL(declared)) {
+        await off.execute(statement);
+      }
+    } finally {
+      await off.close();
+    }
+
+    await execute("INSERT INTO blobs DEFAULT VALUES");
+    expect(
+      await execute("SELECT encode(data, 'hex') AS data, path FROM blobs"),
+    ).toEqual([{ data: "4142", path: "C:\\temp\\x41" }]);
+    // The checks hold the values written: 5c78 is the bytes of "\x".
+    await expect(
+      execute("INSERT INTO blobs (data) VALUES ('\\x5c78'::bytea)"),
+    ).rejects.toThrow(/blobs_bytes_check/);
+    await expect(
+      execute("INSERT INTO blobs (path) VALUES ('a\\x41')"),
+    ).rejects.toThrow(/blobs_slash_check/);
+    // n - (-5) > 0, not n > 0: -3 is allowed.
+    await execute("INSERT INTO blobs (n) VALUES (-3)");
+    expect(
+      await detectDrift({
+        execute: driver.execute,
+        snapshot: declared,
+      }),
+    ).toEqual([]);
   });
 
   test("date and time conversions convert at UTC whatever the migrating session's zone", async () => {

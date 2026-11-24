@@ -29,7 +29,6 @@ import {
 } from "./table";
 import type { SlotState, ThroughInput } from "./slots";
 import {
-  and,
   createQueryTables,
   createSchemaTables,
   type QueryExecutor,
@@ -39,6 +38,7 @@ import {
   type TableScopes,
 } from "../query/select";
 import { endStreams } from "../query/select/query";
+import { NO_SCOPES, narrowedScope } from "../query/select/registry";
 import type { SchemaCodecs } from "../query/codecs";
 import { collectDataErrors } from "../query/codecs/deferred";
 import type { SchemaTables } from "../query/select/registry";
@@ -62,6 +62,7 @@ import {
   embedRows,
   embeddedSearches,
   needsEmbedding,
+  type InOrder,
 } from "../query/search";
 import { embeddingColumns } from "./search-columns";
 import { createScope } from "../query/select/scope";
@@ -163,40 +164,100 @@ type ScopeInput = Readonly<
   Record<string, ((columns: never) => Predicate) | undefined>
 >;
 
-/** The scopes in force after `$scope(next)`: a table filtered before keeps its filter, ANDed with the new one. */
+/** What `$scope()` was given, when it is no object of callbacks it can read. */
+const unreadableScopes = (next: unknown): string | undefined =>
+  next === null || (typeof next !== "object" && typeof next !== "function")
+    ? String(next)
+    : typeof next === "function"
+      ? "a function"
+      : Array.isArray(next)
+        ? "an array"
+        : next instanceof Map ||
+            next instanceof Set ||
+            next instanceof WeakMap ||
+            next instanceof WeakSet
+          ? `a ${next.constructor.name}`
+          : typeof (next as { then?: unknown }).then === "function"
+            ? "a promise"
+            : undefined;
+
+/**
+ * A table's callback, looked up as a property, so a class's method, an
+ * inherited or a non-enumerable property counts; a member every object has
+ * (`toString` for a table of that name) is none.
+ */
+const scopeCallback = (next: object, tableName: string): unknown => {
+  const value = (next as Record<string, unknown>)[tableName];
+
+  return value === (Object.prototype as Record<string, unknown>)[tableName]
+    ? undefined
+    : value;
+};
+
+/**
+ * The scopes in force after `$scope(next)`: a table filtered before keeps its
+ * filter, ANDed with the new one. `added` names the tables `next` filters.
+ */
 const mergeScopes = (
   tablesByName: ReadonlyMap<string, unknown>,
   scopes: TableScopes,
   next: ScopeInput,
-): TableScopes =>
-  Object.fromEntries(
-    [...new Set([...Object.keys(scopes), ...Object.keys(next)])].map(
-      (tableName) => {
-        if (!tablesByName.has(tableName)) {
-          throw new Error(
-            `symmetria: $scope() received unknown table "${tableName}"`,
-          );
-        }
+): { scopes: TableScopes; added: readonly string[] } => {
+  const unreadable = unreadableScopes(next);
 
-        const previous = scopes[tableName];
-        const added = next[tableName] as TableScopes[string] | undefined;
+  if (unreadable !== undefined) {
+    throw new Error(
+      `symmetria: $scope() expects an object of predicate callbacks by table name, such as { posts: (post) => post.tenantId.is(tenantId) }; received ${unreadable}`,
+    );
+  }
 
-        if (added !== undefined && typeof added !== "function") {
-          throw new Error(
-            `symmetria: $scope() expects a predicate callback for "${tableName}"`,
-          );
-        }
+  // A typo of a table name. A class instance may keep other data for its
+  // methods; a function under another name is still a typo there.
+  const prototype = Object.getPrototypeOf(next);
+  const plain = prototype === Object.prototype || prototype === null;
 
-        return [
-          tableName,
-          previous && added
-            ? (columns: RuntimeScope[string]) =>
-                and(previous(columns), added(columns))
-            : (previous ?? added)!,
-        ];
-      },
-    ),
+  for (const name of Object.keys(next)) {
+    if (
+      !tablesByName.has(name) &&
+      (plain || typeof next[name] === "function")
+    ) {
+      throw new Error(`symmetria: $scope() received unknown table "${name}"`);
+    }
+  }
+
+  const merged: Record<string, TableScopes[string]> = Object.assign(
+    Object.create(null),
+    scopes,
   );
+  const added: string[] = [];
+
+  for (const tableName of tablesByName.keys()) {
+    const callback = scopeCallback(next, tableName);
+
+    if (callback === undefined) {
+      continue;
+    }
+
+    if (typeof callback !== "function") {
+      throw new Error(
+        `symmetria: $scope() expects a predicate callback for "${tableName}"`,
+      );
+    }
+
+    // A method reads its object as `this`, as when called on it.
+    const scope = (columns: RuntimeScope[string]) =>
+      (callback as (columns: RuntimeScope[string]) => Predicate).call(
+        next,
+        columns,
+      );
+    const previous = scopes[tableName];
+
+    merged[tableName] = previous ? narrowedScope(previous, scope) : scope;
+    added.push(tableName);
+  }
+
+  return { scopes: merged, added };
+};
 
 /**
  * What every bound database of a schema shares. It depends on the schema
@@ -277,14 +338,27 @@ const createTableHandle = (
   queryTable: object,
   runTransaction: Parameters<typeof createNestedInsert>[3],
   scoped: boolean,
+  /** The handle belongs to a transaction or one of its savepoints. */
+  inTransaction: boolean,
 ): object => {
   const tableSnapshot = schemaTables.tablesByName.get(tableName)!;
   const relations = relationNames.get(tableName)!;
 
   const searches = tableSearches.get(tableSnapshot) ?? [];
   const embedded = searches.length
-    ? embeddedSearches(searchesOf(tableSnapshot), searchColumns, tableSnapshot)
+    ? embeddedSearches(
+        searchesOf(tableSnapshot),
+        searchColumns,
+        tableSnapshot,
+        codecs[tableName],
+      )
     : [];
+  // In a transaction, a write or a search that waits for a model takes its
+  // place in the transaction's order when it starts: a savepoint, which holds
+  // the connection until the model has answered and its statement has run.
+  const ordered: InOrder | undefined = inTransaction
+    ? (run) => runTransaction((database) => run(database[tableName] as object))
+    : undefined;
   // Rows whose searches keep an embedding wait for it before they are written.
   const embedding =
     <Values>(write: (values: Values) => object, upsert = false) =>
@@ -301,7 +375,7 @@ const createTableHandle = (
         );
       }
 
-      return deferredWrite(async (_chained, calls) => {
+      return deferredWrite((calls) => {
         // `doUpdate("title")` that sets every column an embedding reads also
         // sets the embedding computed for those values.
         const chained = (builder: object) =>
@@ -332,22 +406,46 @@ const createTableHandle = (
           throw failure.error;
         }
 
-        // An upsert keeps the columns it does not set; their text is unknown here.
-        const filled = await embedRows(
+        // The model is asked at once, while the statements started before
+        // this write still run. An upsert keeps the columns it does not set; their
+        // text is unknown here.
+        const filled = embedRows(
           embedded,
           rows,
           upsert || calls.some(([method]) => method === "onConflict"),
         );
 
-        return {
-          builder: chained(
-            (write as (...argumentsList: unknown[]) => object)(
-              Array.isArray(values) ? filled : filled[0],
-              ...(upsert ? [withEmbeddings(rest[0])] : rest),
-            ),
-          ),
-          chained: true as const,
+        // Read below; a write its transaction never reaches (it ended, or an
+        // earlier statement failed) rejects with that reason instead.
+        filled.catch(() => {});
+
+        const written = async (
+          into: (...argumentsList: unknown[]) => object,
+        ): Promise<unknown> => {
+          const withEmbedding = await filled;
+
+          return (
+            chained(
+              into(
+                Array.isArray(values) ? withEmbedding : withEmbedding[0],
+                ...(upsert ? [withEmbeddings(rest[0])] : rest),
+              ),
+            ) as { execute: () => Promise<unknown> }
+          ).execute();
         };
+
+        return ordered
+          ? ordered((table) =>
+              written((...argumentsList) =>
+                (
+                  table as Record<
+                    string,
+                    (...values: readonly unknown[]) => object
+                  >
+                )[upsert ? "upsert" : "insert"]!(...argumentsList),
+              ),
+            )
+          : written(write as (...argumentsList: unknown[]) => object);
       });
     };
 
@@ -379,6 +477,7 @@ const createTableHandle = (
               searches,
               searchesOf(tableSnapshot),
               scoped,
+              ordered,
             ),
             {
               reindex: createReindex(queryTable, tableSnapshot, embedded),
@@ -449,7 +548,7 @@ const bindDatabase = (
   executor: QueryExecutor | undefined,
   transactionDriver: TransactionDriver | undefined,
   driver: Driver | undefined,
-  scopes: TableScopes = {},
+  scopes: TableScopes = NO_SCOPES,
   addedScopes?: readonly string[],
 ): object => {
   const { snapshot, schemaTables } = runtime;
@@ -519,8 +618,9 @@ const bindDatabase = (
     }
 
     return retryTransaction((settings) => {
-      // Code the callback starts that still runs after it returned (a timer,
-      // a shutdown hook) is not inside the transaction any more.
+      // Code the callback starts that runs on after it returns (a timer, a
+      // shutdown hook) counts as outside the transaction: `open` turns false
+      // when the callback ends.
       const entry = { driver, open: true };
       const held = [
         ...(openTransactions.getStore() ?? []).filter((outer) => outer.open),
@@ -555,6 +655,7 @@ const bindDatabase = (
         queryTables.table(tableName),
         runTransaction,
         !!scopes[tableName],
+        !!transactionDriver,
       );
 
       handle = profile ? profile.trackBuilder(table) : table;
@@ -582,15 +683,18 @@ const bindDatabase = (
               ),
           }
         : {}),
-      $scope: (next: ScopeInput) =>
-        bindDatabase(
+      $scope: (next: ScopeInput) => {
+        const merged = mergeScopes(schemaTables.tablesByName, scopes, next);
+
+        return bindDatabase(
           runtime,
           executor,
           transactionDriver,
           driver,
-          mergeScopes(schemaTables.tablesByName, scopes, next),
-          Object.keys(next).filter((tableName) => next[tableName]),
-        ),
+          merged.scopes,
+          merged.added,
+        );
+      },
       // Reads only: what needs a connection of its own (a nested insert, a
       // stream, a transaction) is refused by the handle's driver.
       $batch: (callback: (database: object) => unknown) =>
@@ -633,11 +737,18 @@ const bindDatabase = (
                 );
               }
 
+              // The driver refuses new work from the call on, so nothing
+              // starts while the open streams end (a stream started then
+              // would keep the close waiting for its whole loop).
+              const closed = driver?.close();
+              // Reported by the await below, not as unhandled meanwhile.
+              closed?.catch(() => {});
+
               if (driver) {
                 await endStreams(driver);
               }
 
-              await driver?.close();
+              await closed;
             },
           }),
     }),

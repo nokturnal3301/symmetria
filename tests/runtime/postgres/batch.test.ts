@@ -278,21 +278,28 @@ describe.skipIf(!databaseUrl)("$batch on PostgreSQL", () => {
   });
 
   test("writes, locks and a callback that does not return its reads are refused", async () => {
+    // The types refuse writes and transactions on the batch's handle too.
     await expect(
+      // @ts-expect-error writes are not reads
       database.$batch((db) => [db.users.insert({ name: "X" }).execute()]),
     ).rejects.toThrow("$batch() sends reads as one statement");
     // A nested insert, a stream and a transaction need a connection of their own.
     await expect(
       database.$batch((db) => [
         db.posts
+          // @ts-expect-error writes are not reads
           .insert({ title: "X", at, author: { create: { name: "X" } } })
           .execute(),
       ]),
     ).rejects.toThrow("cannot be part of it, run it outside the batch");
     await expect(
       database.$batch((db) => [
-        db.$transaction(async (transaction) => transaction.users.count()),
+        // @ts-expect-error a transaction is not a read
+        db.$transaction(async (transaction: never) => transaction),
       ]),
+    ).rejects.toThrow("$batch() sends reads as one statement");
+    await expect(
+      database.$batch((db) => [db.users.byId(1).update({ name: "Y" })]),
     ).rejects.toThrow("$batch() sends reads as one statement");
     await expect(
       database.$batch((db) => [
@@ -306,6 +313,19 @@ describe.skipIf(!databaseUrl)("$batch on PostgreSQL", () => {
     await expect(
       database.$batch((db) => [db.users({ forUpdate: true }).execute()]),
     ).rejects.toThrow("a write, a row lock, a stream or a transaction");
+    // count(), exists() and aggregate() lock the rows of a locking source.
+    for (const read of [
+      (db: typeof database) => db.users({ forUpdate: true }).count(),
+      (db: typeof database) => db.users({ forShare: true }).exists(),
+      (db: typeof database) =>
+        db
+          .users({ forUpdate: { skipLocked: true } })
+          .aggregate((_, { count }) => ({ n: count() })),
+    ]) {
+      await expect(database.$batch((db) => [read(db)])).rejects.toThrow(
+        "a write, a row lock, a stream or a transaction",
+      );
+    }
     await expect(
       database.$batch((async (db: typeof database) => [
         await db.users.count(),

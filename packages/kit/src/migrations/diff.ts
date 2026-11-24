@@ -8,7 +8,7 @@ import {
   expressionUsesLiteral,
   renameExpressionIdentifiers,
 } from "./expression-tokens";
-import { expressionKey, indexKeyKey } from "./expressions";
+import { commentEnded, expressionKey, indexKeyKey } from "./expressions";
 import {
   conversionMessage,
   castless,
@@ -37,6 +37,7 @@ import {
 import {
   canonicalJSON,
   checksum,
+  commentText,
   emptySnapshot,
   migrationSnapshot,
   objectName,
@@ -55,7 +56,7 @@ export type RenameHints = {
 /**
  * Rename hints as maps. Table and column names are chosen by the user, and a
  * plain object answers `constructor`, `toString` or `__proto__` from its
- * prototype, which made such a table or column look renamed to nothing.
+ * prototype, which would make such a table or column look renamed to nothing.
  */
 export type RenameMaps = {
   readonly tables: ReadonlyMap<string, string>;
@@ -162,6 +163,18 @@ const comparable = (
       : {}),
   };
 };
+
+/**
+ * A check or index with its expressions in the form the diff compares,
+ * names kept: two that are equal need no SQL (`diff` lists neither).
+ */
+export const normalizedDefinition = <Definition extends object>(
+  definition: Definition,
+  columns: ReadonlyMap<string, string>,
+): Definition => ({
+  ...definition,
+  ...(comparable(definition, columns) as object),
+});
 
 /** A string as it appears inside canonical JSON, without the surrounding quotes. */
 const escapedJSON = (value: string): string =>
@@ -1000,7 +1013,7 @@ const direction = (
     }
 
     statements.push(
-      `${removed.length ? `${DESTRUCTIVE_NOTE} Enum "${enumeration.name}" drops ${removed.map((value) => `'${value}'`).join(", ")}; rows using those labels make the rebuild fail.\n` : ""}${enumerationSQL(enumeration.name, enumeration.values)}`,
+      `${removed.length ? `${DESTRUCTIVE_NOTE} ${commentText(`Enum "${enumeration.name}" drops ${removed.map((value) => `'${value}'`).join(", ")}; rows using those labels make the rebuild fail.`)}\n` : ""}${enumerationSQL(enumeration.name, enumeration.values)}`,
     );
   }
 
@@ -1025,7 +1038,7 @@ const direction = (
         // place for the backfill before NOT NULL is enforced.
         statements.push(
           `${alter} ADD COLUMN ${columnSQL({ ...column, notNull: false })}`,
-          `-- Backfill ${quoteIdentifier(pair.after.name)}.${quoteIdentifier(column.name)} for existing rows before this statement.\n${alter} ALTER COLUMN ${quoteIdentifier(column.name)} SET NOT NULL`,
+          `-- ${commentText(`Backfill ${quoteIdentifier(pair.after.name)}.${quoteIdentifier(column.name)} for existing rows before this statement.`)}\n${alter} ALTER COLUMN ${quoteIdentifier(column.name)} SET NOT NULL`,
         );
         continue;
       }
@@ -1094,7 +1107,7 @@ const direction = (
         // The saved SQL says what generate knew: lint of the file rates it
         // as generate did.
         statements.push(
-          `${change?.lossy ? `${DESTRUCTIVE_NOTE} ${supplied === undefined ? conversionMessage(previous, next, change) : `Column "${next.name}" narrows from ${previous.enumeration ?? previous.sqlType} to ${next.enumeration ?? next.sqlType} with the USING conversion given for it.`}\n` : ""}${prefix} TYPE ${columnTypeSQL(next)}${conversion === undefined ? "" : ` USING ${conversion}`}`,
+          `${change?.lossy ? `${DESTRUCTIVE_NOTE} ${commentText(supplied === undefined ? conversionMessage(previous, next, change) : `Column "${next.name}" narrows from ${previous.enumeration ?? previous.sqlType} to ${next.enumeration ?? next.sqlType} with the USING conversion given for it.`)}\n` : ""}${prefix} TYPE ${columnTypeSQL(next)}${conversion === undefined ? "" : ` USING ${conversion}`}`,
         );
 
         if (atUtc === "session") {
@@ -1184,7 +1197,7 @@ const direction = (
         !(column.typeChanged && typeConversion(previous, next)?.cleared)
       ) {
         statements.push(
-          `${DESTRUCTIVE_NOTE} the embeddings in "${next.name}" are cleared: ${stale}.\nUPDATE ${quoteIdentifier(pair.after.name)} SET ${quoteIdentifier(next.name)} = NULL WHERE ${quoteIdentifier(next.name)} IS NOT NULL`,
+          `${DESTRUCTIVE_NOTE} ${commentText(`the embeddings in "${next.name}" are cleared: ${stale}.`)}\nUPDATE ${quoteIdentifier(pair.after.name)} SET ${quoteIdentifier(next.name)} = NULL WHERE ${quoteIdentifier(next.name)} IS NOT NULL`,
         );
       }
     }
@@ -1216,7 +1229,7 @@ const direction = (
             pair.before.primaryKey.includes(column.before.name),
         );
       statements.push(
-        `${contained ? `${CAUTION_NOTE} the primary key (${pair.after.primaryKey.join(", ")}) contains the previous key (${previousKey.join(", ")}), so existing rows stay unique.\n` : ""}${alter} ADD ${primaryKeySQL(pair.after)}`,
+        `${contained ? `${CAUTION_NOTE} ${commentText(`the primary key (${pair.after.primaryKey.join(", ")}) contains the previous key (${previousKey.join(", ")}), so existing rows stay unique.`)}\n` : ""}${alter} ADD ${primaryKeySQL(pair.after)}`,
       );
     }
 
@@ -1345,12 +1358,48 @@ const direction = (
   for (const drop of drops) {
     if (drop.name === undefined || !created.has(drop.name)) {
       statements[drop.position] =
-        `${CAUTION_NOTE} ${drop.note}\n${statements[drop.position]}`;
+        `${CAUTION_NOTE} ${commentText(drop.note)}\n${statements[drop.position]}`;
     }
   }
 
   return statements;
 };
+
+/**
+ * A snapshot whose defaults, generated columns, checks and index predicates
+ * end a `--` comment at their end with a line break. Snapshots saved by
+ * earlier versions hold `1 -- one`, which a migration restoring it wrote as
+ * `SET DEFAULT 1 -- one;`, commenting out the semicolon and joining the next
+ * statement to it.
+ */
+const commentsEnded = (snapshot: MigrationSnapshot): MigrationSnapshot => ({
+  ...snapshot,
+  tables: snapshot.tables.map((table) => ({
+    ...table,
+    columns: table.columns.map((column) => ({
+      ...column,
+      ...(column.default === undefined
+        ? {}
+        : { default: commentEnded(column.default) }),
+      ...(column.generated === undefined
+        ? {}
+        : { generated: commentEnded(column.generated) }),
+    })),
+    indexes: table.indexes.map((index) =>
+      index.where === undefined
+        ? index
+        : { ...index, where: commentEnded(index.where) },
+    ),
+    ...(table.checks
+      ? {
+          checks: table.checks.map((check) => ({
+            ...check,
+            expression: commentEnded(check.expression),
+          })),
+        }
+      : {}),
+  })),
+});
 
 export const diffSchemas = (
   previous: SchemaSnapshot | MigrationSnapshot,
@@ -1419,13 +1468,18 @@ export const diffSchemas = (
     );
   }
 
+  // The SQL is written from expressions whose `--` comment at the end has a
+  // line break after it; the plan keeps the snapshots as they were saved.
+  const from = commentsEnded(before);
+  const to = commentsEnded(after);
+
   return {
     before,
     after,
-    up: direction(before, after, renames, forwardCasts, options.online),
+    up: direction(from, to, renames, forwardCasts, options.online),
     down: direction(
-      after,
-      before,
+      to,
+      from,
       { tables: reverseTables, columns: reverseColumns },
       reverseCasts,
       options.online,

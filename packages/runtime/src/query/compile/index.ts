@@ -5,7 +5,7 @@ import { createRowDecoder, cloneParameter } from "../codecs";
 import { QueryError } from "../../errors";
 import { throwDataErrors } from "../codecs/deferred";
 import { executorProfiling } from "../../observability/profiling";
-import { postgresRenderer } from "./postgres/render";
+import { postgresRenderer, shapeRenderer } from "./postgres/render";
 import { batchCollectors } from "../plan/batching";
 import type {
   PlaceholderNode,
@@ -43,7 +43,7 @@ const compileStatement = (
 ): CompiledStatement => {
   const compilation = createCompilation(
     plan,
-    postgresRenderer,
+    shapeOnly ? shapeRenderer : postgresRenderer,
     placeholder,
     (query, outerBindings, jsonValues, jsonOutput) =>
       selectSql(compilation, query, outerBindings, jsonValues, jsonOutput),
@@ -108,8 +108,8 @@ const renderScope = (
  * `$scope()` callbacks may read a changing value (the current tenant), so a
  * compiled or prepared statement never reuses their values from build time:
  * every execution runs each callback again and binds its current values in
- * place. When a callback now produces different SQL, such as a longer IN list,
- * the statement is compiled again with the current results.
+ * place. When a callback's current result renders different SQL, such as a
+ * longer IN list, the statement is compiled again with the current results.
  */
 export const currentScopes = (
   plan: SelectPlan | MutationPlan,
@@ -293,7 +293,11 @@ export const executeCompiled = async (
   let decodeMs = 0;
 
   try {
-    const result = normalizeResult(await executor(compiled));
+    // A write without RETURNING returns no rows to count.
+    const result = normalizeResult(
+      await executor(compiled),
+      plan.kind !== "select" && !plan.selection.length && !plan.checks,
+    );
     const started = profile ? performance.now() : 0;
     const rows = result.rows.map(rowDecoder(plan));
     decodeMs = profile ? performance.now() - started : 0;
@@ -319,7 +323,7 @@ export const rowDecoder = (
   let decode = rowDecoders.get(plan);
 
   if (!decode) {
-    decode = createRowDecoder(plan.selection);
+    decode = createRowDecoder(plan.selection, true);
     rowDecoders.set(plan, decode);
   }
 

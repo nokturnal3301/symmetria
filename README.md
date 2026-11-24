@@ -88,8 +88,9 @@ const { sql, parameters } = feed.toSQL();
 ```
 
 `author.name` adds its JOIN; required references use INNER JOIN, optional and
-reverse paths use LEFT JOIN. Nested collections become correlated subqueries, so
-relation loading stays in one statement.
+reverse paths, and targets a `$scope()` filters, use LEFT JOIN. Nested
+collections become correlated subqueries, so relation loading stays in one
+statement.
 
 ## Compose and reuse
 
@@ -119,8 +120,10 @@ const latest = prepare({ authorId: int, size: int }, (p) =>
 const posts = await latest({ authorId: 7, size: 3 });
 ```
 
-Projections are reusable across tables, relations and `RETURNING`. Queries are
-immutable; prepared queries compile once and bind fresh values on each call.
+A projection belongs to its table and is reused wherever that table appears:
+queries, aliases, relations and, when it reads only the row's own columns,
+`RETURNING`. Queries are immutable; prepared queries compile once and bind fresh
+values on each call.
 
 ## See what actually runs
 
@@ -257,16 +260,18 @@ server-side cursor.
 ## Search, vectors and tables without keys
 
 ```ts
-// Full-text search over a weighted document; the GIN index uses the same expression.
-const document = searchDocument(
-  { A: post.title, B: post.body },
-  { language: "english" },
-);
+// Full-text search over a weighted document; a GIN index on the same expression serves it.
 db.posts(
   ({ title, body }) => ({ title, snippet: body.searchHeadline("bun sql") }),
   {
-    where: () => document.search("bun sql"),
-    orderBy: () => document.searchRank("bun sql").descending,
+    where: ({ title, body }) =>
+      searchDocument({ A: title, B: body }, { language: "english" }).search(
+        "bun sql",
+      ),
+    orderBy: ({ title, body }) =>
+      searchDocument({ A: title, B: body }, { language: "english" }).searchRank(
+        "bun sql",
+      ).descending,
   },
 );
 

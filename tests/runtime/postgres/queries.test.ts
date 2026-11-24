@@ -24,8 +24,11 @@ import {
   minimum,
   maximum,
   exists,
+  notExists,
+  not,
   sql,
   coalesce,
+  createDatabase,
 } from "../../../packages/runtime/src";
 import { postgres, searchPathURL } from "../../support/postgres";
 
@@ -499,6 +502,116 @@ describe.skipIf(!databaseUrl)("PostgreSQL through Bun SQL", () => {
     ).toEqual([]);
   });
 
+  test("a write correlates a subquery over its own table, from the same handle, with the written row", async () => {
+    await model.categories.insert({ name: "root" }).execute();
+    await model.categories
+      .insert([{ name: "leaf", parentId: 1 }, { name: "lone" }])
+      .execute();
+    const childless = (category: { id: unknown }) =>
+      notExists(
+        model.categories((child) => ({ id: child.id }), {
+          where: (child) => child.parentId.is(category.id as never),
+        }),
+      );
+    const names = async () =>
+      (
+        await model
+          .categories((category) => ({ name: category.name }), {
+            orderBy: (category) => category.id.ascending,
+          })
+          .execute()
+      ).map((row) => row.name);
+
+    expect(
+      await model.categories
+        .update({ name: "parent" })
+        .where((category) => not(childless(category)))
+        .returning("id")
+        .execute(),
+    ).toEqual([{ id: 1 }]);
+    // Through a path, and in RETURNING.
+    expect(
+      await model.categories
+        .update({ name: "child" })
+        .where((category) => category.parent.name.is("parent"))
+        .returning((category) => ({
+          id: category.id,
+          siblings: model
+            .categories(() => ({ total: count() }), {
+              where: (other) => [
+                other.parentId.is(category.parentId),
+                other.id.isNot(category.id),
+              ],
+            })
+            .scalar(),
+        }))
+        .execute(),
+    ).toEqual([{ id: 2, siblings: 0 }]);
+    expect(await names()).toEqual(["parent", "child", "lone"]);
+    expect(
+      (
+        await model.categories
+          .delete()
+          .where(childless)
+          .returning("id")
+          .execute()
+      ).map((row) => row.id),
+    ).toEqual([2, 3]);
+    expect(await names()).toEqual(["parent"]);
+
+    // A value of SET: the users of the same role.
+    await model.users
+      .update((user) => ({
+        visits: coalesce(
+          model
+            .users(() => ({ total: count() }), {
+              where: (other) => other.role.is(user.role),
+            })
+            .scalar(),
+          0,
+        ),
+      }))
+      .all()
+      .execute();
+    expect(
+      await model
+        .users((user) => ({ name: user.name, visits: user.visits }), {
+          orderBy: (user) => user.id.ascending,
+        })
+        .execute(),
+    ).toEqual([
+      { name: "Ada", visits: 1 },
+      { name: "Grace", visits: 2 },
+      { name: "Nobody", visits: 2 },
+    ]);
+
+    // An upsert's condition on the conflicting row.
+    const visited = (name: string) =>
+      model.users
+        .insert({ name })
+        .onConflict("name")
+        .doUpdate(
+          { active: false },
+          {
+            where: (current) =>
+              notExists(
+                model.users((other) => ({ id: other.id }), {
+                  where: (other) => [
+                    other.visits.is(current.visits),
+                    other.id.isNot(current.id),
+                  ],
+                }),
+              ),
+          },
+        )
+        .returning("name", "active")
+        .execute();
+
+    // Grace shares her visits with Nobody; Ada is alone with hers.
+    expect(await visited("Grace")).toBeNull();
+    expect(await visited("Ada")).toEqual({ name: "Ada", active: false });
+  });
+
   test("findMany loads nested 1:1, 1:M, M:N and optional relations in one statement", async () => {
     const rows = await model
       .users(
@@ -670,5 +783,143 @@ describe.skipIf(!databaseUrl)("PostgreSQL through Bun SQL", () => {
         offset: 1,
       }).execute(),
     ).toEqual([{ title: "TypeScript", editorName: null }]);
+  });
+
+  test("raw fragments with comments, conditions and orderings run as written", async () => {
+    // A `--` comment ends before the SQL Symmetria writes after the fragment.
+    expect(
+      await model.posts(
+        (posts) => ({
+          score: sql.of(int)`${posts.id} * 2 -- double`,
+          first: sql<boolean>`${posts.title.is("SQL first")}`,
+          rank: sql.of(
+            int,
+          )`row_number() OVER (ORDER BY ${posts.views.descending}) -- by views`,
+        }),
+        {
+          orderBy: (posts) =>
+            sql<number>`${posts.id} -- newest first`.descending,
+        },
+      ),
+    ).toEqual([
+      { score: 4, first: false, rank: 2 },
+      { score: 2, first: true, rank: 1 },
+    ]);
+    expect(
+      await model.posts.update(
+        (posts) => ({
+          title: sql<string>`${posts.title} || '!' -- shout`,
+          views: sql<bigint>`${posts.views} + 1`,
+        }),
+        { where: (posts) => sql<boolean>`${posts.id.is(2)} -- the second` },
+      ),
+    ).toEqual({ affectedRows: 1 });
+    expect(
+      await model.posts(
+        (posts) => ({ title: posts.title, views: posts.views }),
+        {
+          where: { id: 2 },
+        },
+      ),
+    ).toEqual([{ title: "TypeScript!", views: 6n }]);
+
+    // A scoped write still checks the rows a commented RETURNING writes.
+    const visible = model.$scope({ posts: (posts) => posts.authorId.is(1) });
+    const outside = visible.posts
+      .insert({ title: "outside", authorId: 2 })
+      .returning((posts) => ({ note: sql<string>`${posts.title} -- shown` }));
+
+    await expect(outside.execute()).rejects.toMatchObject({
+      code: "SYMMETRIA_OUT_OF_SCOPE",
+    });
+    expect(await model.posts.count()).toBe(2);
+  });
+
+  test("nested-object keys with a backslash read the same with standard_conforming_strings off", async () => {
+    const url = new URL(searchPathURL(namespace));
+
+    url.searchParams.set(
+      "options",
+      `${url.searchParams.get("options")} -c standard_conforming_strings=off`,
+    );
+
+    const legacy = postgres({ url: url.toString(), max: 1 });
+    // Read as an escape, the backslash would end the key's literal early.
+    const key = `x\\', (SELECT current_user)::text) AS "o" --`;
+
+    try {
+      const bound = createDatabase({ schema: model, driver: legacy });
+
+      expect(
+        await bound.users(
+          (users) => ({ o: { "a\\": users.name, [key]: users.id } }),
+          {
+            where: { id: 1 },
+          },
+        ),
+      ).toEqual([{ o: { "a\\": "Ada", [key]: 1 } }]);
+    } finally {
+      await legacy.close();
+    }
+  });
+
+  test("result keys longer than 63 bytes or named like an internal alias come back under their names", async () => {
+    const long = "利用者の表示名と最初の投稿のタイトルの一覧表"; // 66 bytes
+    const other = "利用者の表示名と最初の投稿のタイトルの一覧裏";
+    const authors = model.users(
+      (users) => ({
+        [long]: users.name,
+        [other]: users.id,
+        posts: users.posts(
+          (posts) => ({ [long]: posts.title, __symmetria_row: posts.id }),
+          { orderBy: (posts) => posts.id.ascending },
+        ),
+        profile: users.profile((profile) => ({ [long]: profile.bio })),
+      }),
+      { orderBy: (users) => users.id.ascending, limit: 1 },
+    );
+    const expected = {
+      [long]: "Ada",
+      [other]: 1,
+      posts: [{ [long]: "TypeScript", __symmetria_row: 2 }],
+      profile: { [long]: "Engineer" },
+    };
+
+    expect(await authors).toEqual([expected]);
+    expect(
+      await model.$batch((batch) => [
+        batch.users(
+          (users) => ({
+            [long]: users.name,
+            __symmetria_row: users.id,
+          }),
+          { orderBy: (users) => users.id.ascending, limit: 1 },
+        ),
+      ]),
+    ).toEqual([[{ [long]: "Ada", __symmetria_row: 1 }]]);
+
+    const titles = model.posts(
+      (posts) => ({ id: posts.id, [long]: posts.title }),
+      {
+        orderBy: (posts) => posts.id.ascending,
+      },
+    );
+    const first = await titles.page({ size: 1 });
+    const second = await titles.page({ size: 1, after: first.nextCursor! });
+
+    expect([first.items, second.items]).toEqual([
+      [{ id: 1, [long]: "SQL first" }],
+      [{ id: 2, [long]: "TypeScript" }],
+    ]);
+    expect(
+      await model.posts
+        .update({ views: 7n }, { where: { id: 1 } })
+        .returning((posts) => ({ [long]: posts.views })),
+    ).toEqual([{ [long]: 7n }]);
+    expect(
+      await titles.as("titled")((titled) => ({ title: titled[long]! }), {
+        orderBy: (titled) => titled.id.ascending,
+      }),
+    ).toEqual([{ title: "SQL first" }, { title: "TypeScript" }]);
   });
 });

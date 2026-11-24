@@ -14,7 +14,11 @@ import {
   type QueryReference,
   type SelectPlan,
 } from "../plan/types";
-import { expressionSource, expressionSqlType } from "../plan/metadata";
+import {
+  expressionSource,
+  expressionSqlType,
+  valueSqlType,
+} from "../plan/metadata";
 import { isVectorType } from "../../schema/column";
 import {
   jsonPathDescription,
@@ -137,6 +141,21 @@ export const valueNode = (value: unknown, codec?: RuntimeCodec): ValueNode => {
     throw new Error("symmetria: undefined is not a SQL value");
   }
 
+  // Cloned as a parameter, a handle would bind as `{}`.
+  if (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    (PREDICATE_EXPRESSION in value ||
+      ORDERING_EXPRESSION in value ||
+      QUERY_PLAN in value)
+  ) {
+    throw new Error(
+      QUERY_PLAN in value
+        ? "symmetria: a query is not a value; use query.scalar() for its one value, or exists(query) or column.in(query)"
+        : `symmetria: ${PREDICATE_EXPRESSION in value ? "a condition" : "an ordering"} is not a value; use it in where or orderBy, or in a sql\`\` template`,
+    );
+  }
+
   // Literal shapes instead of spreads: a bulk insert builds one node per value.
   const encoded = cloneParameter(encodeValue(value, codec));
   const cast = codec?.parameterCast;
@@ -225,12 +244,9 @@ export const compare = (
       : undefined;
 
   if (other) {
-    if (isTextType(expressionSqlType(description)) && readsAsString(other)) {
+    if (isTextType(valueSqlType(description)) && readsAsString(other)) {
       right = castNode(right, "text");
-    } else if (
-      readsAsString(description) &&
-      isTextType(expressionSqlType(other))
-    ) {
+    } else if (readsAsString(description) && isTextType(valueSqlType(other))) {
       left = asText(description);
     }
   }
@@ -239,22 +255,53 @@ export const compare = (
     right.kind === "placeholder" &&
     right.nullable &&
     (operator === "=" || operator === "<>");
+  const nullLike = NULL_LIKE.has(operator);
+  const stored = nullLike && storesJsonNull(left);
+  // Bound to null, a nullable parameter makes `<>` a null check, which not()
+  // negates as written: its NULLIF() stays. `=` and `@>` keep the plain
+  // operand, and the statement makes JSON null answer NULL beside it.
+  const bareJson = stored
+    ? nullable
+      ? undefined
+      : jsonComparedBare(operator, right)
+    : (operator === "=" || operator === "@>") && comparedBare(left)
+      ? "compared"
+      : undefined;
+  // JSON null is null here as in is(null); `=` matches it to no value
+  // either way, so it keeps the plain operand an index can serve. So does
+  // a NOT NULL jsonb column wherever its comparison can be written bare.
+  const operand =
+    nullLike &&
+    !(stored && operator === "IS DISTINCT FROM" && distinctBare(right))
+      ? jsonNullAsNull(left)
+      : left.node;
 
-  return predicate({
-    kind: "comparison",
-    // JSON null is null here as in is(null); `=` matches it to no value
-    // either way, so it keeps the plain operand an index can serve.
-    left: NULL_LIKE.has(operator) ? jsonNullAsNull(left) : left.node,
+  const comparison = {
+    kind: "comparison" as const,
+    left: operand,
     operator,
-    right,
-    ...(nullable
+    // IS DISTINCT FROM reads JSON null on its other side as null too, so two
+    // JSON nulls are not distinct, and a parameter bound to JSON null is
+    // isDistinctFrom(null).
+    right:
+      operand !== left.node && DISTINCT.has(operator)
+        ? distinctOperand(right)
+        : right,
+  };
+
+  return predicate(
+    nullable
       ? {
+          ...comparison,
           nullableParameter: true as const,
           // Bound to null, the comparison is is(null): JSON null counts too.
           nullCheck: readPredicate(nullPredicate(description, false)),
+          ...(bareJson ? { bareJson } : {}),
         }
-      : {}),
-  });
+      : bareJson
+        ? { ...comparison, bareJson }
+        : comparison,
+  );
 };
 
 export const membership = (
@@ -263,6 +310,13 @@ export const membership = (
   negated: boolean,
 ): Predicate => {
   if (!Array.isArray(values)) {
+    // A column, an expression or a prepared parameter is one value.
+    if (values == null || !(QUERY_PLAN in Object(values))) {
+      throw new Error(
+        `symmetria: ${negated ? "notIn()" : "in()"} takes an array of values or a single-column subquery, not ${COLUMN_EXPRESSION in Object(values) ? "a column, expression or prepared parameter" : values == null ? String(values) : `a ${typeof values === "object" ? "plain object" : typeof values}`}; a prepared query's list has a fixed length, one parameter per item (in([p.first, p.second]))`,
+      );
+    }
+
     const query = readQuery(values as QueryReference);
 
     if (query.selection.length !== 1) {
@@ -271,14 +325,17 @@ export const membership = (
 
     // Text against an enum, uuid or date subquery compares as text.
     const [selected] = query.selection as [ExpressionDescription];
-    const textual = isTextType(expressionSqlType(description));
+    const textual = isTextType(valueSqlType(description));
 
     return predicate({
       kind: "membership",
+      // As for a list, notIn() reads JSON null as SQL NULL.
       value:
-        !textual && isTextType(expressionSqlType(selected))
+        !textual && isTextType(valueSqlType(selected))
           ? asText(description).node
-          : description.node,
+          : negated
+            ? jsonNullAsNull(description, true)
+            : description.node,
       values:
         textual && readsAsString(selected)
           ? freeze({
@@ -303,12 +360,18 @@ export const membership = (
     );
   }
 
-  return predicate({
-    kind: "membership",
+  const list = {
+    kind: "membership" as const,
     value: negated ? jsonNullAsNull(description) : description.node,
     values: freeze(values.map((value) => valueNode(value, description.codec))),
     negated,
-  });
+  };
+
+  return predicate(
+    !negated && comparedBare(description)
+      ? { ...list, bareJson: "compared" as const }
+      : list,
+  );
 };
 
 /**
@@ -333,26 +396,208 @@ export const storesJsonNull = (description: ExpressionDescription): boolean =>
   !description.node.description.binding.projection &&
   expressionSqlType(description) === "jsonb";
 
+/** `NULLIF(value, 'null'::jsonb)`, built by jsonNullAsNull or written so. */
+const withoutJsonNullNode = (node: ValueNode): boolean => {
+  if (node.kind !== "raw" || node.parts.length !== 3) {
+    return false;
+  }
+
+  const [open, , close] = node.parts;
+
+  return (
+    typeof open === "string" &&
+    open.startsWith("NULLIF(") &&
+    typeof close === "string" &&
+    close.endsWith(", 'null'::jsonb)")
+  );
+};
+
 /**
  * A JSON path reads a missing key as SQL NULL and a key holding JSON null as
  * a JSON value; both decode to null, so both count as null in conditions. So
- * do JSON null in a nullable column (an update can store it), a path carried
+ * do JSON null in a NOT NULL or nullable column (JS null is stored as JSON
+ * null in the first; an update can store it in the second), a path carried
  * through a CTE or a derived table, and a JSON scalar subquery.
+ *
+ * `wraps` marks the places where earlier versions compared the operand bare
+ * (a NOT NULL jsonb column, a between() from a bound that may sort below JSON
+ * null, a notIn() subquery): a page cursor's shape and schema DDL render the
+ * operand alone there, the form those versions wrote, so page cursors they
+ * issued stay valid and existing checks and indexes do not change.
  */
-const jsonNullAsNull = (description: ExpressionDescription): ValueNode =>
-  isJsonValue(description) && !storesJsonNull(description)
+const jsonNullAsNull = (
+  description: ExpressionDescription,
+  wraps?: true,
+): ValueNode => {
+  const { node } = description;
+
+  if (!isJsonValue(description) || withoutJsonNullNode(node)) {
+    return node;
+  }
+
+  const json = valueSqlType(description) === "json";
+
+  return (wraps ?? storesJsonNull(description))
     ? freeze({
         kind: "raw",
         parts: freeze([
+          json ? "NULLIF((" : "NULLIF(",
+          node,
+          json ? ")::jsonb, 'null'::jsonb)" : ", 'null'::jsonb)",
+        ]),
+        sqlType: "jsonb",
+        delimited: true,
+        wraps: true,
+      })
+    : freeze({
+        kind: "raw",
+        parts: freeze([
           "NULLIF(",
-          expressionSqlType(description) === "json"
-            ? castNode(description.node, "jsonb")
-            : description.node,
+          json ? castNode(node, "jsonb") : node,
           ", 'null'::jsonb)",
         ]),
         sqlType: "jsonb",
-      })
-    : description.node;
+      });
+};
+
+/**
+ * Whether a between() bound is a JSON value that sorts above JSON null, so
+ * that JSON null answers FALSE as a missing path answers NULL: jsonb sorts an
+ * empty top-level array below null, and a bound known only when the query
+ * runs (a prepared parameter, a column) may be one.
+ */
+const sortsAboveJsonNull = (node: ValueNode): boolean => {
+  if (node.kind !== "parameter" || node.value === null) {
+    return node.kind === "parameter";
+  }
+
+  if (typeof node.value !== "string") {
+    return false;
+  }
+
+  try {
+    const value: unknown = JSON.parse(node.value);
+
+    return value !== null && !(Array.isArray(value) && !value.length);
+  } catch {
+    return false;
+  }
+};
+
+/** JSON null written as a literal value. */
+const jsonNullParameter = (node: ValueNode): boolean =>
+  node.kind === "parameter" &&
+  typeof node.value === "string" &&
+  node.value.trim() === "null";
+
+/**
+ * `isDistinctFrom(value)` of a NOT NULL jsonb column with a literal that is
+ * neither SQL NULL nor JSON null: the column compared bare holds for JSON
+ * null already, as NULL does.
+ */
+const distinctBare = (right: ValueNode): boolean =>
+  right.kind === "parameter" &&
+  right.value !== null &&
+  !jsonNullParameter(right);
+
+const DISTINCT = new Set<ComparisonOperator>([
+  "IS DISTINCT FROM",
+  "IS NOT DISTINCT FROM",
+]);
+
+/**
+ * The other side of `IS DISTINCT FROM` beside a left side that reads JSON
+ * null as null: a JSON column, expression or parameter does too. A literal
+ * is JSON null only when written so. Earlier versions compared this side
+ * bare, so a page cursor's shape and schema DDL render it alone, as those
+ * versions wrote it (`wraps`).
+ */
+const distinctOperand = (right: ValueNode): ValueNode =>
+  (right.kind === "parameter" && !jsonNullParameter(right)) ||
+  !isJsonValue({ node: right, outputName: "value" })
+    ? right
+    : jsonNullAsNull({ node: right, outputName: "value" }, true);
+
+/**
+ * Whether a NOT NULL jsonb column can be compared bare, which its indexes
+ * serve, and how the bare comparison answers JSON null: jsonb sorts JSON
+ * null below every value but a top-level `[]`, so `>` and `>=` against a
+ * literal above it are FALSE for it (`compared`); other bounds and `<`,
+ * `<=`, `<>` may be TRUE (`excluded`). The statement makes JSON null answer
+ * NULL either way.
+ */
+const jsonComparedBare = (
+  operator: ComparisonOperator,
+  right: ValueNode,
+): "compared" | "excluded" | undefined =>
+  operator === ">" || operator === ">="
+    ? right.kind === "parameter" &&
+      right.value !== null &&
+      sortsAboveJsonNull(right)
+      ? "compared"
+      : "excluded"
+    : operator === "<" || operator === "<=" || operator === "<>"
+      ? "excluded"
+      : undefined;
+
+/**
+ * A jsonb column or JSON path, which `=`, `@>`, an IN list and between()
+ * compare bare, as an index on it or a partial index declared with the same
+ * condition is written. JSON null answers FALSE there (TRUE for `=` and `@>`
+ * only against JSON null), so the statement adds constant-NULL parts that
+ * make that FALSE NULL wherever the comparison stands, as for a missing path
+ * (see `bareJsonSql`); a filter drops them.
+ */
+const comparedBare = (description: ExpressionDescription): boolean =>
+  (description.node.kind === "column" ||
+    description.node.kind === "jsonPath") &&
+  valueSqlType(description) === "jsonb";
+
+/** The operand a `bareJson` comparison or between reads bare: the column inside its NULLIF(). */
+export const bareJsonOperand = (node: ValueNode): ValueNode =>
+  node.kind === "raw" && node.wraps ? (node.parts[1] as ValueNode) : node;
+
+/**
+ * What `'null'::jsonb <operator> literal` answers, which is what a bare
+ * comparison answers for a row holding JSON null: jsonb sorts JSON null below
+ * every value but a top-level `[]`. Undefined when the other side is known
+ * only when the query runs (a prepared parameter, a column).
+ */
+export const jsonNullAnswer = (
+  operator: string,
+  right: ValueNode,
+): boolean | undefined => {
+  if (right.kind !== "parameter" || typeof right.value !== "string") {
+    return undefined;
+  }
+
+  const text = right.value.trim();
+  // JSON null against the literal: equal (0), above `[]` (1), below the rest (-1).
+  const order = text === "null" ? 0 : /^\[\s*\]$/.test(text) ? 1 : -1;
+
+  switch (operator) {
+    case "<":
+      return order < 0;
+    case "<=":
+      return order <= 0;
+    case ">":
+      return order > 0;
+    case ">=":
+      return order >= 0;
+    case "<>":
+      return order !== 0;
+    default:
+      return undefined;
+  }
+};
+
+/** A comparison with the JSON null literal, as is(null) of a NOT NULL jsonb column writes it. */
+const comparesWithJsonNull = (
+  description: Extract<PredicateDescription, { kind: "comparison" }>,
+): boolean =>
+  description.right.kind === "raw" &&
+  description.right.parts.length === 1 &&
+  description.right.parts[0] === "'null'::jsonb";
 
 /**
  * The predicate as a query's `not()` negates it. `=`, `in()`, `between` and
@@ -360,7 +605,8 @@ const jsonNullAsNull = (description: ExpressionDescription): ValueNode =>
  * they answer FALSE where a missing path answers NULL, and a filter drops both
  * alike. NOT turns only the FALSE into TRUE, so below a not() those operands
  * read JSON null as SQL NULL, as isNot() and notIn() do, and not(is(x)) leaves
- * out what isNot(x) leaves out. The same predicate is returned when nothing
+ * out what isNot(x) leaves out. Of a jsonb column or path (`bareJson`) they
+ * answer NULL for it already. The same predicate is returned when nothing
  * changes; nested not() and subqueries are compiled on their own. Schema DDL
  * (checks, partial indexes) renders the predicate as written.
  */
@@ -381,7 +627,13 @@ export const negatable = (
         : description;
     }
     case "comparison": {
-      if (description.operator !== "=" && description.operator !== "@>") {
+      // `column = 'null'::jsonb` of is(null) is FALSE for every other value.
+      // A column compared bare (`bareJson`) answers NULL for JSON null already.
+      if (
+        description.bareJson ||
+        (description.operator !== "=" && description.operator !== "@>") ||
+        comparesWithJsonNull(description)
+      ) {
         return description;
       }
 
@@ -392,6 +644,12 @@ export const negatable = (
         : freeze({ ...description, left });
     }
     case "membership": {
+      // Compared bare beside its constant-NULL parts, it answers NULL for
+      // JSON null already.
+      if (description.bareJson) {
+        return description;
+      }
+
       const value = description.negated
         ? description.value
         : operand(description.value);
@@ -401,6 +659,12 @@ export const negatable = (
         : freeze({ ...description, value });
     }
     case "between": {
+      // Compared bare beside its constant-NULL parts, it answers NULL for
+      // JSON null already.
+      if (description.bareJson) {
+        return description;
+      }
+
       const value = operand(description.value);
 
       return value === description.value
@@ -410,6 +674,38 @@ export const negatable = (
     default:
       return description;
   }
+};
+
+/**
+ * The jsonb operand when all that negatable() changes is that one operand of
+ * one `=`, `@>`, IN list or between, or undefined. JSON null answers FALSE
+ * there and the strict form NULL, so the strict negation is the plain one
+ * where the operand is not JSON null, and NULL where it is:
+ * `NOT (P) AND (jsonb_typeof(operand) <> 'null' OR NULL)` reads the operand
+ * once more but compares it once. A subquery is left out: NULL IN (no rows)
+ * is FALSE.
+ */
+export const negatedJsonOperand = (
+  description: PredicateDescription,
+): ValueNode | undefined => {
+  const node =
+    description.kind === "comparison"
+      ? description.left
+      : description.kind === "membership"
+        ? !description.negated &&
+          Array.isArray(description.values) &&
+          description.values.length
+          ? description.value
+          : undefined
+        : description.kind === "between"
+          ? description.value
+          : undefined;
+
+  return node &&
+    valueSqlType({ node, outputName: "value" }) === "jsonb" &&
+    negatable(description) !== description
+    ? node
+    : undefined;
 };
 
 /** Comparisons that tell a NULL operand from a value. */
@@ -427,14 +723,16 @@ export const nullPredicate = (
   description: ExpressionDescription,
   negated: boolean,
 ): Predicate => {
+  const stored = storesJsonNull(description);
+  // A NOT NULL jsonb column checks JSON null by comparison, which its index serves.
   const check: PredicateDescription = {
     kind: "nullCheck",
-    value: jsonNullAsNull(description),
+    value: stored ? description.node : jsonNullAsNull(description),
     negated,
   };
 
   // SQL NULL still appears through outer joins, so both forms count as null.
-  return storesJsonNull(description)
+  return stored
     ? predicate({
         kind: "group",
         operator: negated ? "AND" : "OR",
@@ -651,7 +949,7 @@ export class ColumnHandle {
   set(path: unknown, value: unknown) {
     const description = this[COLUMN_EXPRESSION];
 
-    if (expressionSqlType(description) !== "jsonb") {
+    if (valueSqlType(description) !== "jsonb") {
       throw new Error(
         "symmetria: set() replaces a key inside a jsonb column or expression",
       );
@@ -684,7 +982,7 @@ export class ColumnHandle {
 
   contains(value: unknown) {
     const description = this[COLUMN_EXPRESSION];
-    const sqlType = expressionSqlType(description);
+    const sqlType = valueSqlType(description);
     const json = sqlType === "json" || sqlType === "jsonb";
 
     // A containment operand is a partial JSON value: serialize it without the column's schema validation.
@@ -698,7 +996,7 @@ export class ColumnHandle {
   overlaps(value: unknown) {
     const description = this[COLUMN_EXPRESSION];
 
-    if (expressionSqlType(description).endsWith("[]")) {
+    if (valueSqlType(description).endsWith("[]")) {
       return compare(description, "&&", value);
     }
 
@@ -713,7 +1011,7 @@ export class ColumnHandle {
 
   has(value: unknown) {
     const description = this[COLUMN_EXPRESSION];
-    const type = expressionSqlType(description);
+    const type = valueSqlType(description);
     const json = !type.endsWith("[]");
 
     return predicate({
@@ -737,7 +1035,7 @@ export class ColumnHandle {
       node: freeze({
         kind: "arrayLength",
         value: description.node,
-        ...(!expressionSqlType(description).endsWith("[]")
+        ...(!valueSqlType(description).endsWith("[]")
           ? { json: true as const }
           : {}),
       }),
@@ -781,7 +1079,7 @@ export class ColumnHandle {
   searchHeadline(query: unknown, options: SearchHeadlineOptions = {}) {
     const description = this[COLUMN_EXPRESSION];
 
-    if (expressionSqlType(description) === "tsvector") {
+    if (valueSqlType(description) === "tsvector") {
       throw new Error(
         "symmetria: searchHeadline() highlights text; call it on the text column, not on a tsvector",
       );
@@ -803,7 +1101,7 @@ export class ColumnHandle {
   private distance(operator: VectorOperator, name: string, query: unknown) {
     const description = this[COLUMN_EXPRESSION];
 
-    if (!isVectorType(expressionSqlType(description))) {
+    if (!isVectorType(valueSqlType(description))) {
       throw new Error(
         "symmetria: distance operators require a vector column or expression",
       );
@@ -893,12 +1191,23 @@ export class ColumnHandle {
 
   between(lower: unknown, upper: unknown) {
     const description = this[COLUMN_EXPRESSION];
+    const bound = valueNode(lower, description.codec);
+    // Only from a bound above JSON null does it answer FALSE for JSON null.
+    const json = isJsonValue(description) && !sortsAboveJsonNull(bound);
+    const value = json ? jsonNullAsNull(description, true) : description.node;
+    // A jsonb column or path is read bare, which its index serves, with JSON
+    // null left out beside it: from a bound above JSON null, BETWEEN is
+    // FALSE for it.
+    const bare = comparedBare(description);
 
     return predicate({
       kind: "between",
-      value: description.node,
-      lower: valueNode(lower, description.codec),
+      value,
+      lower: bound,
       upper: valueNode(upper, description.codec),
+      ...(bare
+        ? { bareJson: json ? ("excluded" as const) : ("compared" as const) }
+        : {}),
     });
   }
 

@@ -22,7 +22,13 @@ export const sqlState = (error: unknown): string | undefined => {
     return undefined;
   }
 
-  const value = error as { code?: unknown; errno?: unknown };
+  const value = error as { code?: unknown; errno?: unknown; syscall?: unknown };
+
+  // A Node.js socket error (it names its `syscall`) has a code such as
+  // EPIPE, five capitals like a SQLSTATE: the connection failed, not a statement.
+  if (typeof value.syscall === "string") {
+    return undefined;
+  }
 
   return [value.code, value.errno].find(
     (code): code is string =>
@@ -80,12 +86,15 @@ export const isRetryableTransactionError = (error: unknown): boolean => {
 };
 
 /**
- * Connection exceptions (class 08), the shutdowns that end a session
- * (57P01–57P05) and the timeouts that end it inside a transaction
- * (25P03 idle_in_transaction_session_timeout, 25P04 transaction_timeout).
+ * Connection exceptions (class 08), the shutdowns that end a session or
+ * refuse one (57P01–57P05, 57P03 cannot_connect_now while the server starts
+ * or stops), the timeouts that end it inside a transaction (25P03
+ * idle_in_transaction_session_timeout, 25P04 transaction_timeout) and 53300
+ * too_many_connections, which refuses a new connection while the server has
+ * no slot left: a later attempt may get one.
  */
 const connectionState = (state: string): boolean =>
-  state.startsWith("08") || /^(?:57P0[1-5]|25P0[34])$/.test(state);
+  state.startsWith("08") || /^(?:57P0[1-5]|25P0[34]|53300)$/.test(state);
 
 /** Socket and pool failures, which carry no SQLSTATE. */
 const NODE_POSTGRES_CONNECTION =
@@ -104,7 +113,8 @@ const SOCKET_CODES = new Set([
 
 /**
  * Whether the connection itself failed, rather than a statement: the server
- * ended the session (class 08, 57P01–57P05, 25P03–25P04), a socket error, or a client-side
+ * ended or refused the session (class 08, 57P01–57P05, 25P03–25P04, 53300),
+ * a failed socket call (any error that names its `syscall`), or a client-side
  * connection loss (`Connection terminated unexpectedly` on node-postgres,
  * `ERR_POSTGRES_CONNECTION_CLOSED` and similar on Bun).
  */
@@ -119,11 +129,18 @@ export const isConnectionError = (error: unknown): boolean => {
     return connectionState(state);
   }
 
-  const { code, message } = error as { code?: unknown; message?: unknown };
+  const { code, message, syscall } = error as {
+    code?: unknown;
+    message?: unknown;
+    syscall?: unknown;
+  };
 
   return (
     (typeof code === "string" &&
       (SOCKET_CODES.has(code) ||
+        // Any other failed socket call (EBADF, EPERM, …) leaves the
+        // connection as unusable as EPIPE does.
+        (typeof syscall === "string" && /^E[A-Z0-9]+$/.test(code)) ||
         /^ERR_POSTGRES_(CONNECTION|IDLE|LIFETIME|TLS)_/.test(code))) ||
     (typeof message === "string" && NODE_POSTGRES_CONNECTION.test(message))
   );

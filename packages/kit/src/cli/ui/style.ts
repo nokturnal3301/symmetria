@@ -141,7 +141,57 @@ export const heading = (
   return `\n  ${style("◇", "accent")} ${style(title, "strong")}${subtitle ? `  ${style(subtitle, "muted")}` : ""}\n`;
 };
 
+/**
+ * Escape sequences as a terminal reads them (ECMA-48): CSI with any
+ * parameters (`ESC[38:5:196m` too), the string sequences OSC, DCS, SOS, PM and
+ * APC up to their terminator, and the two-character ones; 7- and 8-bit.
+ */
+const ESCAPE_SEQUENCE =
+  /(?:\u001b\[|\u009b)[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|(?:\u001b[\]PX^_]|[\u0090\u0098\u009d\u009e\u009f])[\s\S]*?(?:\u0007|\u001b\\|\u009c)|\u001b[\x20-\x2f]*[\x30-\x7e]/g;
+
+/**
+ * Control characters other than line breaks and tabs, and the bidirectional
+ * overrides and isolates (U+202A–U+202E, U+2066–U+2069) that make a terminal
+ * show text in another order than it is.
+ */
+const CONTROL_CHARACTER =
+  /[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * Text from outside the CLI (PostgreSQL errors and DETAIL, SQL, stored
+ * values, names read from a database) made safe for a terminal: escape
+ * sequences, control characters and bidirectional overrides removed, line
+ * breaks and tabs kept.
+ */
+export const terminalText = (text: string): string =>
+  text.replace(ESCAPE_SEQUENCE, "").replace(CONTROL_CHARACTER, "");
+
+/**
+ * The colour sequences theme() writes: a reset, the palette (24-bit
+ * foreground, bold, the selected row's background) and the logo's 24-bit
+ * letters. No other attribute (conceal, blink, reverse) and no cursor or
+ * screen sequence.
+ */
+const OWN_COLOUR = new RegExp(
+  `(\u001b\\[(?:0|38;2;\\d{1,3};\\d{1,3};\\d{1,3}|${Object.values(palette).join("|")})m)`,
+);
+
+/**
+ * Command output for a terminal: the colours the CLI adds stay, every other
+ * escape sequence and control character goes (see terminalText). Commands
+ * also filter the names they read from a database before colouring them, so
+ * a name cannot bring a colour of its own either.
+ */
+export const terminalOutput = (text: string): string =>
+  text
+    .split(OWN_COLOUR)
+    .map((part, index) => (index % 2 ? part : terminalText(part)))
+    .join("");
+
+/** An error for stderr; its text can quote values from the database, so it is filtered. */
 export const formatError = (message: string, color = false): string => {
+  message = terminalText(message);
+
   if (!color) {
     return message;
   }

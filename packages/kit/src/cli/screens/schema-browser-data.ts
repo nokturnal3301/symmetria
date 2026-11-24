@@ -10,7 +10,7 @@ import {
   tableSQL,
 } from "../../migrations/ddl";
 import { migrationSnapshot } from "../../migrations/snapshot";
-import { columnTypeLabel } from "../ui/format";
+import { columnTypeLabel, defaultValueLabel } from "../ui/format";
 import { theme } from "../ui/style";
 
 export const inspectTabs = [
@@ -38,11 +38,7 @@ const defaultLabel = (column: ColumnSnapshot): string | undefined => {
     return column.default.sql;
   }
 
-  return typeof column.default.value === "bigint"
-    ? String(column.default.value)
-    : JSON.stringify(column.default.value, (_name, value) =>
-        typeof value === "bigint" ? String(value) : value,
-      );
+  return defaultValueLabel(column.default.value);
 };
 
 export const inspectEntries = (

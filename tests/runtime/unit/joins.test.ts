@@ -158,13 +158,27 @@ test("identifiers are quoted, camel case is mapped, and values stay in parameter
       .toSQL().sql,
   ).toContain(`AS "${unicodeName}"`);
 
-  for (const name of ["x".repeat(64), "я".repeat(32)]) {
-    expect(() =>
-      localModel.userAccounts((userAccounts) => ({
-        [name]: userAccounts.id.as(name),
-      })),
-    ).toThrow(/63 bytes/);
-  }
+  // A result key is a JavaScript name: one longer than PostgreSQL's 63-byte
+  // identifiers is selected under its first bytes and a hash of the whole key.
+  const aliases = ["x".repeat(64), "x".repeat(63) + "y", "я".repeat(32)].map(
+    (name) => {
+      const sql = localModel
+        .userAccounts((userAccounts) => ({
+          [name]: userAccounts.id.as(name),
+        }))
+        .toSQL().sql;
+      const alias = /AS "([^"]+)"\n/.exec(sql)![1]!;
+
+      expect(Buffer.byteLength(alias)).toBeLessThanOrEqual(63);
+      expect(name.startsWith(alias.slice(0, alias.lastIndexOf("_")))).toBe(
+        true,
+      );
+
+      return alias;
+    },
+  );
+
+  expect(new Set(aliases).size).toBe(3);
 
   expect(() =>
     localModel.userAccounts((userAccounts) => ({

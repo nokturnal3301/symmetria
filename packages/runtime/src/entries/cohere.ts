@@ -3,7 +3,13 @@
  * `meaning: embedV4(chunk.title, chunk.content)`. The key is read from
  * `COHERE_API_KEY` unless given.
  */
-import { apiKey, inBatches, postJson } from "../embedders/http";
+import {
+  apiKey,
+  inBatches,
+  postJson,
+  requestOptions,
+  type RequestOptions,
+} from "../embedders/http";
 import { embedder } from "../schema/search";
 
 /** Cohere embeds at most 96 texts per request. */
@@ -17,7 +23,7 @@ const SIZES: Readonly<Record<string, number>> = {
   "embed-english-light-v3.0": 384,
 };
 
-export type CohereOptions = {
+export type CohereOptions = RequestOptions & {
   readonly apiKey?: string;
   /** Embedding length; sent as `output_dimension`, which embed-v4.0 accepts. */
   readonly size?: number;
@@ -32,6 +38,8 @@ export const cohere = (model: string, options: CohereOptions = {}) => {
       `symmetria: the embedding length of "${model}" is not known; pass cohere("${model}", { size })`,
     );
   }
+
+  const request = requestOptions(model, options);
 
   return embedder(
     size,
@@ -58,6 +66,7 @@ export const cohere = (model: string, options: CohereOptions = {}) => {
                   ? { output_dimension: size }
                   : {}),
               },
+              request,
             )
           ).embeddings.float,
       ),

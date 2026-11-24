@@ -32,6 +32,14 @@ const BATCH_ROOT: TableBinding = freeze({
   codecs: freeze({}),
 });
 
+/**
+ * Whether a read locks rows: `count()`, `exists()` and `aggregate()` of a
+ * source with `forUpdate`/`forShare` keep its lock in a derived table.
+ */
+const locksRows = (plan: SelectPlan): boolean =>
+  plan.locking !== undefined ||
+  (plan.root.derived !== undefined && locksRows(plan.root.derived));
+
 type Pending = {
   readonly plan: SelectPlan;
   readonly resolve: (result: ExecutionResult) => void;
@@ -498,7 +506,7 @@ const collectBatch = async (
 
   batchCollectors.set(collecting, {
     add: (plan) => {
-      if (!open || plan.locking) {
+      if (!open || locksRows(plan)) {
         return undefined;
       }
 

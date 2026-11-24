@@ -132,6 +132,27 @@ test("vector indexes render operator classes, access methods and storage options
   ]);
 });
 
+test("a distance in a check or an index predicate renders its vector bare, as before 3.4.1", () => {
+  // PostgreSQL refuses `(SELECT …)` in a CHECK or an index predicate.
+  const places = table({ id: int.auto, at: vector(3) })
+    .checks((place) => ({ near: place.at.l2Distance([1, 0, 0]).below(10) }))
+    .indexes((place) => ({
+      close: index(place.id).where(
+        place.at.cosineDistance([1, 0, -1.5]).below(0.5),
+      ),
+    }));
+  const snapshot = migrationSnapshot(
+    schema({ places }, { extensions: ["vector"] }).$snapshot(),
+  );
+
+  expect(snapshot.tables[0]!.checks![0]!.expression).toBe(
+    `("at" <-> E'[1,0,0]'::text::vector) < 10`,
+  );
+  expect(snapshot.tables[0]!.indexes[0]!.where).toBe(
+    `("at" <=> E'[1,0,-1.5]'::text::vector) < 0.5`,
+  );
+});
+
 test("invalid vector declarations are rejected early", () => {
   expect(() => vector(0)).toThrow(/between 1 and 16000/);
   expect(() => vector(1.5)).toThrow(/between 1 and 16000/);
@@ -251,4 +272,22 @@ test("page cursors issued before 3.4.1 for a distance stay valid", async () => {
   expect(String(filtered.nextCursor)).toBe(
     "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6ImM1NmFjNzJmZWM0ZjBjMzE5MzkxYzY5MGRkYzhlYTE3Mjc2MzgzNzc1OGMyMDNmYzYxMzdjMjdkMTIxY2IwNmEiLCJ2YWx1ZXMiOlsiMC42Il19",
   );
+});
+
+test("the order columns of an IVFFlat scan are named like no selected field", () => {
+  const places = table({ id: int.auto, at: vector(3) }).indexes((place) => ({
+    at: index(operatorClass(place.at, "vector_l2_ops")).using("ivfflat"),
+  }));
+  const { sql } = schema({ places })
+    .places((place) => ({ __symmetria_order_0: place.id }), {
+      orderBy: (place) => place.at.l2Distance([1, 0, 0]).asc,
+      limit: 5,
+    })
+    .toSQL();
+
+  expect(sql).toContain(
+    '"places"."id" AS "__symmetria_order_0", ("places"."at" <-> (SELECT $2::text::vector)) AS "__symmetria_order_0_"',
+  );
+  expect(sql).toStartWith('SELECT "__symmetria_order_0"\n');
+  expect(sql).toEndWith('ORDER BY "__symmetria_order_0_" + 0 ASC');
 });

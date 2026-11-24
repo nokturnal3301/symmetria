@@ -3,7 +3,6 @@
  */
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { postgres } from "symmetria/driver";
 import type { SchemaSnapshot } from "symmetria";
 import {
   diffSchemas,
@@ -16,11 +15,13 @@ import {
   migrator,
   type MigrationDiffOptions,
 } from "../../index";
+import { commentText } from "../../migrations/snapshot";
 import { formatCreated, formatDiff, formatSchema } from "../ui/format";
 import { inspectSchema } from "../screens/schema-browser";
 import { resolveRenames } from "../screens/rename-prompt";
+import { interruption } from "../signals";
 import { ask, withScreen } from "../ui/terminal";
-import type { CliContext, Project } from "../context";
+import { databaseDriver, type CliContext, type Project } from "../context";
 
 /** The declared schema, required unless the command can run without one. */
 const declaredSchema = (
@@ -89,7 +90,8 @@ export const inspect = async (
     replacer: (_name, value) =>
       typeof value === "bigint" ? value.toString() : value,
     indent: 2,
-    plain: () => formatSchema(snapshot, name, values.relations, color),
+    pretty: () => formatSchema(snapshot, name, values.relations, color),
+    plain: () => formatSchema(snapshot, name, values.relations, false),
   });
 };
 
@@ -115,7 +117,7 @@ export const lint = async (
       );
     }
 
-    const driver = postgres(project.databaseUrl);
+    const driver = databaseDriver(project);
 
     try {
       const statuses = await migrator({
@@ -123,7 +125,20 @@ export const lint = async (
         ...project.runnerOptions,
       }).status();
 
-      if (statuses.some((entry) => entry.status === "incomplete")) {
+      const incomplete = statuses.filter(
+        (entry) => entry.status === "incomplete",
+      );
+      // One that another process is running needs no repair: it is not
+      // finished yet.
+      const running = incomplete.find((entry) => entry.running);
+
+      if (running) {
+        throw new Error(
+          `symmetria: migration "${commentText(running.id)}" is running in another process (it holds the migration lock); lint the pending chain when it finishes`,
+        );
+      }
+
+      if (incomplete.length) {
         throw new Error(
           "symmetria: repair incomplete migrations before linting the pending chain",
         );
@@ -178,7 +193,9 @@ export const diff = async (
   context.emit({
     json: plan,
     indent: 2,
-    plain: () => formatDiff(plan, color, diffOptions.renames),
+    // Coloured on a terminal, plain text elsewhere (and with NO_COLOR).
+    pretty: () => formatDiff(plan, color, diffOptions.renames),
+    plain: () => formatDiff(plan, false, diffOptions.renames),
   });
 };
 
@@ -208,7 +225,11 @@ export const generate = async (
   const name = requestedName ?? (await ask("Migration name:", color));
 
   if (!name) {
-    throw new Error("symmetria: generate requires a migration name");
+    throw new Error(
+      interruption()
+        ? "symmetria: interrupted"
+        : "symmetria: generate requires a migration name",
+    );
   }
 
   if (pretty && !values.json && !values.empty) {

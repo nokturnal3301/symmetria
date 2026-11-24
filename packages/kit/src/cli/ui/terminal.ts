@@ -4,9 +4,12 @@
  */
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
+import { interrupt, interruptible } from "../signals";
 import {
   fitLine,
   supportsColor,
+  terminalOutput,
+  terminalText,
   terminalWidth,
   theme,
   wrapLines,
@@ -30,6 +33,10 @@ export const choose = (
   options: ChoiceOptions = {},
 ): Promise<number | undefined> =>
   new Promise((resolve) => {
+    // Names in a question (a database, a column) are printed, not obeyed.
+    question = terminalText(question);
+    choices = choices.map(terminalText);
+
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
       throw new Error("symmetria: interactive selection requires a terminal");
     }
@@ -125,7 +132,7 @@ export const choose = (
       process.stdin.off("keypress", keypress);
       process.stdin.off("end", end);
       process.stdout.off("resize", resize);
-      process.off("SIGTERM", terminate);
+      unregister();
       process.stdin.setRawMode(wasRaw);
       process.stdin.pause();
       process.stdout.write(
@@ -139,19 +146,17 @@ export const choose = (
 
     const end = () => finish();
 
-    const terminate = () => {
-      finish();
-      process.exit(143);
-    };
-
     const keypress = (
       input: string,
       key: { name?: string; ctrl?: boolean },
     ) => {
-      if (
-        key.name === "escape" ||
-        (key.ctrl && ["c", "d"].includes(key.name ?? ""))
-      ) {
+      // Ctrl-C in raw mode is a key, not a signal: it takes the signal's path
+      // (running work cancelled, exit 130), which closes this menu too.
+      if (key.ctrl && key.name === "c") {
+        return interrupt();
+      }
+
+      if (key.name === "escape" || (key.ctrl && key.name === "d")) {
         return finish();
       }
 
@@ -180,7 +185,8 @@ export const choose = (
     process.stdin.on("keypress", keypress);
     process.stdin.once("end", end);
     process.stdout.on("resize", resize);
-    process.once("SIGTERM", terminate);
+    // A signal closes the menu as cancelled; the caller decides what that means.
+    const unregister = interruptible({ cancel: end, restore: end });
     const animationTimer =
       options.header && options.animation && (options.color ?? supportsColor())
         ? setInterval(() => {
@@ -224,21 +230,17 @@ export const withScreen = async (
     process.stdout.write("\u001b[0m\u001b[?25h\u001b[?1049l");
   };
 
-  const interrupt = () => process.exit(130);
-
-  const terminate = () => process.exit(143);
-
+  // Signals take the shared path: running work is cancelled and unwinds
+  // through here; a forced exit restores the screen on the way out.
+  const unregister = interruptible({ restore });
   process.once("exit", restore);
-  process.once("SIGINT", interrupt);
-  process.once("SIGTERM", terminate);
   process.stdout.write("\u001b[?1049h\u001b[H\u001b[2J");
 
   try {
     await operation();
   } finally {
     process.off("exit", restore);
-    process.off("SIGINT", interrupt);
-    process.off("SIGTERM", terminate);
+    unregister();
     restore();
   }
 };
@@ -257,9 +259,12 @@ export const view = (
     let pageSize = 1;
     let finished = false;
 
+    // Command output collected by the dashboard; see terminalOutput.
+    const text = terminalOutput(content);
+
     const draw = () => {
       pageSize = Math.max(1, (process.stdout.rows || 24) - 5);
-      lines = wrapLines(content);
+      lines = wrapLines(text);
       offset = Math.min(offset, Math.max(0, lines.length - pageSize));
       const page = lines.slice(offset, offset + pageSize);
       const footer = `↑ ↓ scroll · enter / esc back${lines.length > pageSize ? ` · ${offset + 1}–${offset + page.length}/${lines.length}` : ""}`;
@@ -328,26 +333,49 @@ export const view = (
     draw();
   });
 
-export const ask = async (
+/**
+ * One line of input. Closing the question (Ctrl-D, end of input, a signal)
+ * gives "", a cancel; Ctrl-C also takes the signal's path, so the run ends
+ * with 130 once the caller has unwound.
+ */
+export const ask = (
   question: string,
   color = supportsColor(),
-): Promise<string> => {
-  const terminal = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  const { style } = theme(color);
+): Promise<string> =>
+  new Promise((resolve) => {
+    const terminal = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    const { style } = theme(color);
+    let closed = false;
 
-  try {
-    return (
-      await terminal.question(
-        `  ${style("◆", "violet")} ${style(question, "strong")} `,
+    const close = () => {
+      if (!closed) {
+        closed = true;
+        terminal.close();
+      }
+    };
+
+    const unregister = interruptible({ cancel: close, restore: close });
+
+    // A closed question settles neither way on its own: answer "".
+    terminal.once("close", () => {
+      unregister();
+      resolve("");
+    });
+    // Without this listener readline closes on Ctrl-C and the run goes on.
+    terminal.on("SIGINT", () => interrupt());
+    terminal
+      .question(
+        `  ${style("◆", "violet")} ${style(terminalText(question), "strong")} `,
       )
-    ).trim();
-  } finally {
-    terminal.close();
-  }
-};
+      .then(
+        (answer) => resolve(answer.trim()),
+        () => resolve(""),
+      )
+      .finally(close);
+  });
 
 /** Animate only real work, then erase the transient line before printing its result. */
 export const withSpinner = async <Result>(
@@ -376,18 +404,9 @@ export const withSpinner = async <Result>(
 
   const restore = () => process.stdout.write("\r\u001b[2K\u001b[?25h");
 
-  const interrupt = () => {
-    restore();
-    process.exit(130);
-  };
-
-  const terminate = () => {
-    restore();
-    process.exit(143);
-  };
-
-  process.once("SIGINT", interrupt);
-  process.once("SIGTERM", terminate);
+  // No exit of its own: a signal first cancels the work this spinner waits
+  // for (withCancellation), and the spinner ends when that work unwinds.
+  const unregister = interruptible({ restore });
   process.stdout.write("\u001b[?25l");
   draw();
   const timer = options.animation ? setInterval(draw, 80) : undefined;
@@ -399,8 +418,7 @@ export const withSpinner = async <Result>(
       clearInterval(timer);
     }
 
-    process.off("SIGINT", interrupt);
-    process.off("SIGTERM", terminate);
+    unregister();
     restore();
   }
 };

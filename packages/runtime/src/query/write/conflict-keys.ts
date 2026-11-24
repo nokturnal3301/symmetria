@@ -248,22 +248,45 @@ export const duplicateKeyError = (
     cause === undefined ? undefined : { cause },
   );
 
-/** A bound value as PostgreSQL's text input of its column type reads it. */
-const textInput = (value: unknown): string =>
+/**
+ * A bound value as PostgreSQL's text input of its column type reads it; the
+ * value of an array column in the array input (`{"a0","b,c"}`).
+ */
+const textInput = (value: unknown, array = false): string =>
   typeof value === "string"
     ? value
-    : value instanceof Date
-      ? value.toISOString()
-      : value instanceof Uint8Array
-        ? `\\x${Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("")}`
-        : value !== null && typeof value === "object"
-          ? JSON.stringify(value, (_key, entry: unknown) =>
-              typeof entry === "bigint" ? String(entry) : entry,
-            )
-          : String(value);
+    : array && Array.isArray(value)
+      ? arrayInput(value)
+      : value instanceof Date
+        ? value.toISOString()
+        : value instanceof Uint8Array
+          ? `\\x${Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("")}`
+          : value !== null && typeof value === "object"
+            ? JSON.stringify(value, (_key, entry: unknown) =>
+                typeof entry === "bigint" ? String(entry) : entry,
+              )
+            : String(value);
+
+const quotedElement = (value: string): string =>
+  `"${value.replace(/[\\"]/g, (character) => `\\${character}`)}"`;
 
 const textArray = (values: readonly string[]): string =>
-  `{${values.map((value) => `"${value.replace(/[\\"]/g, (character) => `\\${character}`)}"`).join(",")}}`;
+  `{${values.map(quotedElement).join(",")}}`;
+
+/**
+ * An array value as PostgreSQL's array input reads it: `{"a0","b,c"}`, each
+ * element in its own text input, nested arrays as further dimensions.
+ */
+const arrayInput = (values: readonly unknown[]): string =>
+  `{${values
+    .map((value) =>
+      value === null || value === undefined
+        ? "NULL"
+        : Array.isArray(value)
+          ? arrayInput(value)
+          : quotedElement(textInput(value)),
+    )
+    .join(",")}}`;
 
 /**
  * A query that finds two rows with one conflict key, comparing keys as
@@ -293,7 +316,10 @@ export const duplicateKeyProbe = (
     ) {
       bound.forEach((value, position) =>
         keys[position]!.push(
-          textInput((value as Extract<ValueNode, { kind: "parameter" }>).value),
+          textInput(
+            (value as Extract<ValueNode, { kind: "parameter" }>).value,
+            columns[position]!.sqlType.endsWith("[]"),
+          ),
         ),
       );
     }
@@ -304,10 +330,12 @@ export const duplicateKeyProbe = (
   }
 
   const names = columns.map((_column, position) => `k${position}`);
-  // An enum compares as its labels; every other type as itself.
+  // An enum compares as its labels; every other type as itself, text under
+  // the column's collation, as its unique index compares it ("Alpha" and
+  // "ALPHA" are one key under a case-insensitive collation).
   const typed = columns.map(
     (column, position) =>
-      `${quoteIdentifier(names[position]!)}::${column.sqlType === "enum" ? "text" : column.sqlType}`,
+      `${quoteIdentifier(names[position]!)}::${column.sqlType === "enum" ? "text" : column.sqlType}${column.collation === undefined ? "" : ` COLLATE ${quoteIdentifier(column.collation)}`}`,
   );
 
   return {

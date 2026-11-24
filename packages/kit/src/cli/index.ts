@@ -4,10 +4,10 @@
  * the shared environment in ./context and each command in ./commands.
  */
 import { runCommand } from "./commands";
-import { createContext, type Output } from "./context";
+import { createContext, leftClosing, type Output } from "./context";
 import { formatHelp } from "./ui/format";
 import { help, parseCommandLine, resolveCommand } from "./options";
-import { formatError, supportsColor } from "./ui/style";
+import { formatError, supportsColor, terminalOutput } from "./ui/style";
 import { sqlState } from "symmetria";
 import { MigrationExecutionError } from "../migrations/execution";
 
@@ -30,9 +30,17 @@ const errorJSON = (error: unknown, message: string) => {
   return state ? { message, sqlState: state } : { message };
 };
 
+/**
+ * Results on stdout. A terminal gets them without escape sequences other than
+ * the CLI's colours: names and messages can come from the database. Piped
+ * output (files, other programs) keeps every byte.
+ */
+const print: Output = (message) =>
+  console.log(process.stdout.isTTY ? terminalOutput(message) : message);
+
 const runMigrationCLI = async (
   argumentsList: string[],
-  output: Output = (message) => console.log(message),
+  output: Output = print,
 ): Promise<void> => {
   const parsed = parseCommandLine(argumentsList);
   const context = createContext(parsed.values, output, runMigrationCLI);
@@ -108,5 +116,20 @@ if (import.meta.main) {
     if (!process.exitCode) {
       process.exitCode = 1;
     }
+  }
+
+  // A driver left closing by a failed command (see withDatabase) keeps the
+  // process alive for as long as its connection attempt waits: leave once
+  // the output is written.
+  if (leftClosing()) {
+    await Promise.all(
+      [process.stdout, process.stderr].map(
+        (stream) =>
+          new Promise<void>((resolve) => {
+            stream.write("", () => resolve());
+          }),
+      ),
+    );
+    process.exit();
   }
 }

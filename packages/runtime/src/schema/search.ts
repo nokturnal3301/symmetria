@@ -5,12 +5,19 @@
  * ordinary column and ordinary indexes, so migrations see nothing new.
  */
 import type { TableBinding } from "../query/plan/types";
+import type { ColumnSnapshot } from "./assembly";
 import {
   COLUMN_EXPRESSION,
   readColumn,
   searchDocument,
+  sql,
   type SelectedColumn,
 } from "../query/expressions";
+import { canonicalType, isBuiltInType } from "../query/codecs/type-names";
+import {
+  unfixedSearchText,
+  unindexableSearchText,
+} from "../query/compile/postgres/search";
 import { createScope } from "../query/select/scope";
 import type { RuntimeScope } from "../query/select/types";
 import { hiddenColumn, tsvector } from "./column";
@@ -94,6 +101,187 @@ const isText = (value: unknown): value is Text =>
   (typeof value === "object" || typeof value === "function") &&
   COLUMN_EXPRESSION in (value as object);
 
+/** Types PostgreSQL reads as text as they are, in the runtime's spelling. */
+const TEXT_TYPE =
+  /^(?:text|citext|name|bpchar|varchar|char|character)(?:\(\d+\))?$/;
+/** Types whose text is always the same, so a stored document can hold it through a cast. */
+const FIXED_TEXT_TYPE =
+  /^(?:uuid|inet|cidr|macaddr8?|time|timetz|numeric)(?:\([\d,]+\))?$/;
+/**
+ * The spellings a stored document reads as `column::text` (an inet as
+ * `abbrev(column)`). Another spelling of those types (`dec(4,1)`,
+ * `pg_catalog.uuid`) is left to `searchDocument()`, which reads it as
+ * `(column)::text`.
+ */
+const STORED_CAST_TYPE =
+  /^(?:uuid|inet|cidr|macaddr8?|(?:time|timetz|time with(?:out)? time zone)(?:\s*\(\s*\d\s*\))?|(?:numeric|decimal)(?:\s*\([\d\s,]+\))?)$/i;
+/** Numbers, booleans and bytes: text, but no words pg_search can match. */
+const VALUE_TYPE =
+  /^(?:integer|bigint|smallint|real|double precision|boolean|bytea)$/;
+
+/**
+ * How a search reads a column's values as text, by the type in any spelling
+ * PostgreSQL accepts (`timestamp(3) with time zone`, `int4`, `_text`):
+ * `"text"` as they are (text, varchar, char, citext), `"cast"` through
+ * `::text` (uuid, numeric, inet, time), `"value"` a number, a boolean or
+ * bytes, `"changing"` for text that is not always the same (an enum, whose
+ * values can be renamed, a date, an interval, money or a timestamp, which
+ * follow the session's settings), `"unfixed"` for a range or an array, whose
+ * text PostgreSQL does not count as fixed either, `"unknown"` for any other
+ * type (JSON, a tsvector, bits, a custom type), which a search reads as
+ * `searchDocument()` does.
+ */
+export const columnText = (column: {
+  readonly sqlType: string;
+  readonly enumerationValues?: readonly string[];
+}): "text" | "cast" | "value" | "changing" | "unfixed" | "unknown" => {
+  if (column.enumerationValues) {
+    return "changing";
+  }
+
+  const type = canonicalType(column.sqlType);
+
+  return TEXT_TYPE.test(type)
+    ? "text"
+    : FIXED_TEXT_TYPE.test(type)
+      ? "cast"
+      : VALUE_TYPE.test(type)
+        ? "value"
+        : (unfixedSearchText(type) ?? "unknown");
+};
+
+/** Built-in types whose text can be empty: a model may find nothing in it. */
+const MAYBE_EMPTY_TYPE = /^(?:tsvector|tsquery|xml|bit|varbit)(?:\(|$)/;
+
+/**
+ * How a meaning reads a source column, and how SQL finds, as `documentText`
+ * does in JavaScript, that a value has text to embed:
+ * - `"text"`: a text column (text, varchar, char, citext) holds a character
+ *   that is not a space;
+ * - `"output"`: the text PostgreSQL writes out has one, for a value whose text
+ *   can be empty or only spaces: an enum's label, a tsvector, xml, bits, a
+ *   type not known (a custom type without `base`, which may be a domain
+ *   over text), and a custom type read as text whose own type is not a
+ *   text type (ltree, hstore, an enum type, a domain), which takes no
+ *   collation;
+ * - `"json"` / `"jsonb"`: a JSON value is not JSON null, and a JSON string
+ *   holds a character that is not a space; any other JSON value's text (its
+ *   JSON) is never empty;
+ * - `"value"`: the value is not NULL. Every other type's text is never empty:
+ *   a number, a boolean, uuid, a date, a timestamp, bytes, an array.
+ *
+ * `json` marks a source read as JSON. `plain` marks a text column
+ * without a codec, whose value as read is its stored text. `real` marks a
+ * `real` column or array, whose numbers are embedded as stored.
+ */
+export type MeaningSource = {
+  readonly check: "text" | "output" | "json" | "jsonb" | "value";
+  readonly json: boolean;
+  readonly plain: boolean;
+  readonly real: boolean;
+};
+
+/** How a meaning reads a column of a type (a customType's `base`, else its SQL type). */
+export const meaningSource = (
+  column: {
+    readonly sqlType: string;
+    readonly enumerationValues?: readonly string[];
+  },
+  codec?: { readonly base?: string },
+): MeaningSource => {
+  const type = canonicalType(codec?.base ?? column.sqlType);
+  const check: MeaningSource["check"] = column.enumerationValues
+    ? "output"
+    : type.endsWith("[]")
+      ? "value"
+      : TEXT_TYPE.test(type)
+        ? // A collation applies to a text column itself; a customType read
+          // as text (ltree, hstore, an enum type, a domain) through its output.
+          TEXT_TYPE.test(canonicalType(column.sqlType))
+          ? "text"
+          : "output"
+        : type === "json" || type === "jsonb"
+          ? type
+          : isBuiltInType(type) && !MAYBE_EMPTY_TYPE.test(type)
+            ? "value"
+            : "output";
+
+  return Object.freeze({
+    check,
+    json: check === "json" || check === "jsonb",
+    plain: check === "text" && !codec,
+    real: /^real(?:\[\])*$/.test(type),
+  });
+};
+
+/**
+ * A column a words search reads, with the type it is read as: a customType's
+ * `base`, else its SQL type. `declared` names it in messages.
+ */
+const sourceColumn = (column: Text) => {
+  const { node, codec } = readColumn(column);
+  const snapshot = (node as { description: { column: ColumnSnapshot } })
+    .description.column;
+
+  return codec?.base === undefined
+    ? { ...snapshot, declared: snapshot.sqlType, own: snapshot.sqlType }
+    : {
+        ...snapshot,
+        sqlType: codec.base,
+        declared: `${snapshot.sqlType} (${codec.base})`,
+        own: snapshot.sqlType,
+      };
+};
+
+/**
+ * The types pg_search matches words in, by a column's own type: text,
+ * varchar, citext, JSON, and arrays of text or varchar. Another type fails
+ * when the index is created (char(n), name, a tsvector, xml, an array of
+ * char, name or JSON, a multirange) or in every search ("not compatible
+ * with the `|||` operator": an array of numbers or citext, a range, a
+ * domain or an extension's type such as ltree, whatever its `base`).
+ */
+const BM25_TYPE =
+  /^(?:(?:text|varchar(?:\(\d+\))?)(?:\[\])*|citext|json|jsonb)$/;
+
+/**
+ * A words search reads text: `bm25()` columns pg_search matches words in,
+ * `fullText()` columns whose text a generated column can store.
+ */
+const checkWordsColumn = (name: string, column: Text): void => {
+  const snapshot = sourceColumn(column);
+  const kind = columnText(snapshot);
+  // While a table is declared, an enum's type is "enum", its values not yet known.
+  const enumeration =
+    !!snapshot.enumerationValues || canonicalType(snapshot.sqlType) === "enum";
+  const what = enumeration ? "an enum" : `of type ${snapshot.declared}`;
+
+  const own = canonicalType(snapshot.own);
+
+  if (
+    name === "bm25" &&
+    (kind === "cast" ||
+      kind === "value" ||
+      kind === "changing" ||
+      // A type not known (a customType without `base`) may be one it
+      // takes; an array of one is not.
+      (!BM25_TYPE.test(own) &&
+        (isBuiltInType(own) ||
+          own.endsWith("[]") ||
+          snapshot.own !== snapshot.sqlType)))
+  ) {
+    throw new Error(
+      `symmetria: bm25() matches words in text columns; "${snapshot.name}" is ${what}, which pg_search cannot match words in`,
+    );
+  }
+
+  if (name === "fullText" && (kind === "changing" || kind === "unfixed")) {
+    throw new Error(
+      `symmetria: fullText() cannot read "${snapshot.name}", which is ${what}: ${unindexableSearchText(enumeration ? "enum" : canonicalType(snapshot.sqlType))}, so the generated column that stores the document cannot hold it; keep that text in a text column, or filter by it with where`,
+    );
+  }
+};
+
 const weighted = (
   name: string,
   parts: SearchParts,
@@ -133,6 +321,8 @@ const weighted = (
         );
       }
 
+      checkWordsColumn(name, column);
+
       return Object.freeze({ column, weight });
     }),
   );
@@ -140,7 +330,10 @@ const weighted = (
 
 /**
  * Words ranked with BM25, which weighs rare words more than common ones. It
- * needs the `pg_search` extension (ParadeDB); migrations create it.
+ * needs the `pg_search` extension (ParadeDB); migrations create it. It reads
+ * text, varchar, citext and JSON columns, arrays of text or varchar, and a
+ * `customType()` of an extension's type or a domain declared without `base`;
+ * other types are refused, since pg_search cannot match words in them.
  */
 export const bm25 = (parts: SearchParts): WordsSearch =>
   Object.freeze({
@@ -154,7 +347,11 @@ export const bm25 = (parts: SearchParts): WordsSearch =>
 /**
  * Words matched with PostgreSQL's own full-text search, which every server
  * has. `language` is a text search configuration; the default, "simple",
- * does no stemming and so works for any language.
+ * does no stemming and so works for any language. Text columns are read as
+ * they are, uuid, numeric, inet and time columns as their text. An enum, a
+ * date, an interval, money, a timestamp, a range or an array is refused:
+ * its text can change, or PostgreSQL does not count it as fixed, so the
+ * generated column that stores the document cannot keep it.
  */
 export const fullText = (
   parts: SearchParts,
@@ -333,14 +530,35 @@ export const declaredSearches = (
 /** The hidden column that stores a full-text search's document. */
 export const wordsColumn = (search: string): string => `${search}Words`;
 
-/** The document a full-text search matches; a generated column stores it. */
+/**
+ * The document a full-text search matches; a generated column stores it. A
+ * column of a type that is not text (uuid, numeric, inet, time) is read as
+ * its text. Text columns are read as they are, the expression earlier
+ * versions stored, so their documents need no migration. A type this module
+ * does not know (a custom type without `base`, which may be a domain over
+ * text) is read as it is, as raw SQL.
+ */
 export const wordsDocument = (words: NonNullable<Search["words"]>) =>
   searchDocument(
     Object.fromEntries(
       WEIGHTS.flatMap((weight) => {
         const columns = words.parts
           .filter((part) => part.weight === weight)
-          .map((part) => part.column);
+          .map((part) => {
+            const column = sourceColumn(part.column);
+            const kind = columnText(column);
+
+            // `abbrev()` writes an inet as its output does (`10.0.0.1`, no
+            // `/32`); a generated column cannot call the output function.
+            return kind === "unknown" &&
+              !isBuiltInType(canonicalType(column.sqlType))
+              ? (sql`${part.column}` as unknown as Text)
+              : kind !== "cast" || !STORED_CAST_TYPE.test(column.sqlType)
+                ? part.column
+                : /^inet$/i.test(column.sqlType)
+                  ? (sql`abbrev(${part.column})` as unknown as Text)
+                  : (sql`${part.column}::text` as unknown as Text);
+          });
 
         return columns.length ? [[weight, columns]] : [];
       }),

@@ -11,8 +11,9 @@ const tokens = (
     let kind: "identifier" | "literal" | "other" = "other";
 
     if (sql.startsWith("--", position)) {
-      const end = sql.indexOf("\n", position + 2);
-      position = end < 0 ? sql.length : end + 1;
+      // A line feed or a carriage return ends the comment, as in PostgreSQL.
+      const end = sql.slice(position + 2).search(/[\n\r]/);
+      position = end < 0 ? sql.length : position + 2 + end + 1;
     } else if (sql.startsWith("/*", position)) {
       let depth = 1;
       position += 2;

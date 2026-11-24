@@ -3,6 +3,7 @@ import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { betterAuth } from "better-auth";
 import { getAuthTables } from "better-auth/db";
+import { deviceAuthorization, organization } from "better-auth/plugins";
 import { schema } from "../../../packages/runtime/src";
 import {
   authSchemaSource,
@@ -480,6 +481,410 @@ describe.skipIf(!databaseUrl)(
         plan: "free",
         owned: true,
       });
+    });
+  },
+);
+
+/** A generated module, loaded as an application would import it. */
+const loadAuthTables = async (code: string, name: string) => {
+  const file = join(import.meta.dir, `.better-auth-${name}.generated.ts`);
+
+  try {
+    await Bun.write(
+      file,
+      code.replace('"symmetria"', '"../../../packages/runtime/src"'),
+    );
+
+    return (
+      (await import(file)) as { authTables: Parameters<typeof schema>[0] }
+    ).authTables;
+  } finally {
+    await rm(file, { force: true });
+  }
+};
+
+test("auth generate keeps a plugin's table indexes, every reference and the field names", async () => {
+  const declared = getAuthTables({
+    ...options,
+    plugins: [deviceAuthorization({ verificationUri: "/device" })],
+    user: { fields: { emailVerified: "email_verified" } },
+    verification: {
+      additionalFields: {
+        requestedBy: {
+          type: "string",
+          required: false,
+          references: { model: "user", field: "id", onDelete: "cascade" },
+        },
+      },
+    },
+    session: {
+      additionalFields: {
+        ownerEmail: {
+          type: "string",
+          required: false,
+          references: { model: "user", field: "email", onDelete: "set null" },
+        },
+        keptId: {
+          type: "string",
+          required: false,
+          references: { model: "user", field: "id", onDelete: "no action" },
+        },
+        clearedId: {
+          type: "string",
+          required: false,
+          references: { model: "user", field: "id", onDelete: "set default" },
+        },
+      },
+    },
+  } as never) as Record<string, { indexes?: readonly unknown[] }>;
+
+  declared.deviceCode!.indexes = [
+    ...declared.deviceCode!.indexes!,
+    { fields: ["clientId"] },
+    { fields: ["userId", "status"] },
+  ];
+
+  const written = authSchemaSource(declared as never);
+
+  // device-authorization declares its unique codes at table level.
+  expect(written).toContain("  deviceCode: text.unique,");
+  expect(written).toContain("  userCode: text.unique,");
+  expect(written).toContain("  clientId: text.nullable.index,");
+  expect(written).toContain(
+    "  userIdStatus: index(deviceCode.userId, deviceCode.status),",
+  );
+  expect(written).toContain(
+    '  emailVerified: bool.named("email_verified").default(false),',
+  );
+  expect(written).toContain(
+    '  requestedBy: maybe(user).cascade.column("requested_by"),',
+  );
+  expect(written).toContain(
+    '  ownerEmail: user.by("email").column("owner_email").nullable.index.onDelete.setNull.inverse("sessionByOwnerEmail"),',
+  );
+  expect(written).toContain(
+    '  kept: user.nullable.index.onDelete.noAction.inverse("sessionByKept"),',
+  );
+  expect(written).toContain(
+    '  cleared: user.nullable.index.onDelete.setNull.inverse("sessionByCleared"),',
+  );
+  expect(authSchemaSource(declared as never, { casing: "preserve" })).toContain(
+    '  requestedBy: maybe(user).cascade.column("requestedBy"),',
+  );
+
+  const authTables = await loadAuthTables(written, "declared");
+
+  for (const casing of ["snake_case", "preserve"] as const) {
+    const tables = schema({ ...authTables }, { casing }).$snapshot().tables;
+    const column = (table: string, name: string) =>
+      tables
+        .find((entry) => entry.name === table)!
+        .columns.find((entry) => entry.name === name);
+
+    expect(column("deviceCode", "deviceCode")?.unique).toBe(true);
+    expect(column("deviceCode", "userCode")?.unique).toBe(true);
+    expect(column("user", "emailVerified")?.sqlName).toBe("email_verified");
+    expect(column("verification", "requestedById")).toMatchObject({
+      sqlName: casing === "preserve" ? "requested_by" : "requested_by",
+      references: { table: "user", column: "id", onDelete: "cascade" },
+    });
+    expect(column("session", "ownerEmailId")?.references).toMatchObject({
+      column: "email",
+      onDelete: "set null",
+    });
+    expect(column("session", "keptId")?.references?.onDelete).toBe("no action");
+    expect(column("session", "clearedId")?.references?.onDelete).toBe(
+      "set null",
+    );
+  }
+});
+
+test("a model name that is not a JavaScript name keeps its key and gets an export name", async () => {
+  const written = authSchemaSource(
+    getAuthTables({
+      ...options,
+      user: { modelName: "auth-user" },
+      verification: { modelName: "default" },
+    } as never) as never,
+  );
+
+  expect(written).toContain("export const authUser = table({");
+  expect(written).toContain("export const defaultTable = table({");
+  expect(written).toContain("  user: one(authUser).cascade,");
+  expect(written).toContain(
+    'export const authTables = { "auth-user": authUser, session, account, "default": defaultTable };',
+  );
+
+  const tables = schema({
+    ...(await loadAuthTables(written, "names")),
+  }).$snapshot().tables;
+
+  expect(tables.map((table) => table.name).sort()).toEqual([
+    "account",
+    "auth-user",
+    "default",
+    "session",
+  ]);
+  expect(
+    tables
+      .find((table) => table.name === "session")!
+      .columns.find((column) => column.name === "userId")?.references?.table,
+  ).toBe("auth-user");
+});
+
+describe.skipIf(!databaseUrl)(
+  "better-auth plugin tables and the values better-auth passes on",
+  () => {
+    const extended = {
+      ...options,
+      plugins: [
+        deviceAuthorization({ verificationUri: "/device" }),
+        organization({ teams: { enabled: true } }),
+      ],
+      rateLimit: { storage: "database" },
+      user: {
+        additionalFields: { logins: { type: "number", required: false } },
+      },
+      verification: {
+        additionalFields: {
+          requestedBy: {
+            type: "string",
+            required: false,
+            references: { model: "user", field: "id", onDelete: "cascade" },
+          },
+        },
+      },
+    } as const;
+    let isolated: Awaited<ReturnType<typeof testDatabase>> | undefined;
+    let adapter: any;
+    const later = new Date(Date.now() + 60000);
+
+    beforeAll(async () => {
+      const authTables = await loadAuthTables(
+        authSchemaSource(getAuthTables(extended as never) as never),
+        "extended",
+      );
+
+      isolated = await testDatabase({
+        url: databaseUrl!,
+        schema: schema({ ...authTables }),
+        prefix: "symmetria_better_auth_extended",
+        max: 4,
+      });
+      adapter = (
+        await (
+          betterAuth({
+            ...extended,
+            database: symmetriaAdapter(isolated.database as object),
+          } as never) as any
+        ).$context
+      ).adapter;
+
+      for (const [id, name] of [
+        ["u1", "1984"],
+        ["u2", "Ada"],
+      ]) {
+        await adapter.create({
+          model: "user",
+          data: { id, name, email: `${id}@example.test` },
+          forceAllowId: true,
+        });
+      }
+    });
+
+    afterAll(async () => {
+      await isolated?.close();
+    });
+
+    test("a device's user code is unique, as better-auth's retry relies on", async () => {
+      const code = (deviceCode: string) =>
+        adapter.create({
+          model: "deviceCode",
+          data: {
+            deviceCode,
+            userCode: "ABCD1234",
+            expiresAt: later,
+            status: "pending",
+          },
+        });
+
+      await code("first");
+      await expect(code("second")).rejects.toThrow();
+    });
+
+    test("incrementOne changes one row, and a NULL counter counts from 0", async () => {
+      await adapter.create({
+        model: "organization",
+        data: { id: "o1", name: "Acme", slug: "acme", createdAt: new Date() },
+        forceAllowId: true,
+      });
+
+      for (const id of ["t1", "t2", "t3"]) {
+        await adapter.create({
+          model: "team",
+          data: {
+            id,
+            name: id,
+            organizationId: "o1",
+            memberCount: 0,
+            createdAt: new Date(),
+          },
+          forceAllowId: true,
+        });
+      }
+
+      const changed = await adapter.incrementOne({
+        model: "team",
+        where: [{ field: "organizationId", value: "o1" }],
+        increment: { memberCount: 1 },
+      });
+      const teams = await adapter.findMany({
+        model: "team",
+        sortBy: { field: "id", direction: "asc" },
+      });
+
+      expect(changed.memberCount).toBe(1);
+      expect(
+        teams.map((team: { memberCount: number }) => team.memberCount).sort(),
+      ).toEqual([0, 0, 1]);
+      // A filter that stops holding leaves the row alone.
+      expect(
+        await adapter.incrementOne({
+          model: "team",
+          where: [
+            { field: "id", value: changed.id },
+            { field: "memberCount", value: 0 },
+          ],
+          increment: { memberCount: 1 },
+        }),
+      ).toBeNull();
+      expect(
+        (
+          await adapter.incrementOne({
+            model: "user",
+            where: [{ field: "id", value: "u2" }],
+            increment: { logins: 1 },
+          })
+        ).logins,
+      ).toBe(1);
+    });
+
+    test("where values better-auth passes on as they come", async () => {
+      const names = async (where: unknown[]) =>
+        (
+          await adapter.findMany({
+            model: "user",
+            where,
+            sortBy: { field: "name", direction: "asc" },
+          })
+        ).map((user: { name: string }) => user.name);
+
+      // A number for a string field (the admin plugin's filterValue).
+      expect(await names([{ field: "name", value: 1984 }])).toEqual(["1984"]);
+      expect(
+        await names([{ field: "name", value: [1984], operator: "in" }]),
+      ).toEqual(["1984"]);
+      // No value matches no row, as in better-auth's SQL adapters.
+      expect(await names([{ field: "name", value: undefined }])).toEqual([]);
+      expect(
+        await names([{ field: "name", value: undefined, operator: "ne" }]),
+      ).toEqual([]);
+      expect(
+        await names([{ field: "logins", value: null, operator: "gt" }]),
+      ).toEqual([]);
+      expect(
+        await names([{ field: "image", value: null, operator: "lte" }]),
+      ).toEqual([]);
+      // NULL is in no list, and NOT IN a list with NULL holds for no row.
+      expect(
+        await names([{ field: "name", value: ["Ada", null], operator: "in" }]),
+      ).toEqual(["Ada"]);
+      expect(
+        await names([
+          { field: "name", value: ["Ada", null], operator: "not_in" },
+        ]),
+      ).toEqual([]);
+    });
+
+    test("findOne and findMany return the fields better-auth selects", async () => {
+      expect(
+        await adapter.findOne({
+          model: "user",
+          where: [{ field: "id", value: "u2" }],
+          select: ["email"],
+        }),
+      ).toEqual({ email: "u2@example.test" });
+      expect(
+        (
+          await adapter.findMany({
+            model: "user",
+            where: [{ field: "id", value: "u2" }],
+            select: ["email"],
+          })
+        )[0],
+      ).toMatchObject({ email: "u2@example.test", name: undefined });
+    });
+
+    test("a bigint field reads as a number, as better-auth types it", async () => {
+      await adapter.create({
+        model: "rateLimit",
+        data: { key: "k", count: 1, lastRequest: Date.now() },
+      });
+
+      const [row] = await adapter.findMany({
+        model: "rateLimit",
+        where: [{ field: "key", value: "k" }],
+      });
+
+      expect(typeof row.lastRequest).toBe("number");
+    });
+
+    test("a write filter that holds for every row is refused with the adapter's advice", async () => {
+      await expect(
+        adapter.updateMany({
+          model: "verification",
+          where: [{ field: "id", value: [], operator: "not_in" }],
+          update: { value: "x" },
+        }),
+      ).rejects.toThrow(
+        'better-auth\'s updateMany() on "verification" has a where that holds for every row',
+      );
+    });
+
+    test("a reference whose key does not end in Id is a foreign key with its delete action", async () => {
+      await adapter.create({
+        model: "user",
+        data: { id: "u3", name: "Gone", email: "u3@example.test" },
+        forceAllowId: true,
+      });
+      await adapter.create({
+        model: "verification",
+        data: {
+          identifier: "x",
+          value: "y",
+          expiresAt: later,
+          requestedBy: "u3",
+        },
+      });
+
+      expect(
+        await adapter.findOne({
+          model: "verification",
+          where: [{ field: "requestedBy", value: "u3" }],
+        }),
+      ).toMatchObject({ identifier: "x", requestedBy: "u3" });
+
+      await adapter.delete({
+        model: "user",
+        where: [{ field: "id", value: "u3" }],
+      });
+
+      expect(
+        await adapter.count({
+          model: "verification",
+          where: [{ field: "requestedBy", value: "u3" }],
+        }),
+      ).toBe(0);
     });
   },
 );

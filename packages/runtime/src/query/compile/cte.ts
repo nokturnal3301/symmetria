@@ -30,6 +30,13 @@ export const collectCommonTables = (compilation: Compilation): void => {
       return;
     }
 
+    // A condition interpolated into sql`` can hold subqueries of its own.
+    if (node.kind === "condition") {
+      walkPredicate(node.predicate);
+
+      return;
+    }
+
     childNodes(node).forEach(walkValue);
   };
 

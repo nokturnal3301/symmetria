@@ -1,6 +1,6 @@
 /**
- * `symmetria/opentelemetry`: spans for statements and transactions, reported
- * to a tracer of `@opentelemetry/api` that the application passes in.
+ * `symmetria/opentelemetry`: spans for statements, transactions and savepoints,
+ * reported to a tracer of `@opentelemetry/api` that the application passes in.
  */
 export {
   traced,

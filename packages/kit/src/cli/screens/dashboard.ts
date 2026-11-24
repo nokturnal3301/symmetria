@@ -3,13 +3,13 @@
  * migrate, inspect, status and rollback.
  */
 import { relative } from "node:path";
-import { postgres } from "symmetria/driver";
 import { diffSchemas, loadMigrationState, migrator } from "../../index";
 import { formatDashboard } from "../ui/format";
 import { inspectSchema } from "./schema-browser";
+import { interruption } from "../signals";
 import { formatError } from "../ui/style";
 import { choose, view, withScreen } from "../ui/terminal";
-import type { CliContext, Project } from "../context";
+import { databaseDriver, type CliContext, type Project } from "../context";
 
 const ACTIONS = [
   [
@@ -58,13 +58,18 @@ const overview = async (context: CliContext, project: Project) => {
   };
 
   if (project.databaseUrl) {
-    const url = new URL(project.databaseUrl);
-    summary.address = `PostgreSQL · ${url.hostname}:${url.port || "5432"}${url.pathname}`;
-    const driver = postgres(project.databaseUrl);
+    // A socket directory is no URL; a bad URL is reported below.
+    const url = URL.parse(project.databaseUrl);
+    summary.address = url
+      ? `PostgreSQL · ${url.hostname}:${url.port || "5432"}${url.pathname}`
+      : "PostgreSQL";
+    let driver: ReturnType<typeof databaseDriver> | undefined;
 
     try {
+      const opened = databaseDriver(project);
+      driver = opened;
       const statuses = await context.progress("Checking PostgreSQL", () =>
-        migrator({ driver, ...project.runnerOptions }).status(),
+        migrator({ driver: opened, ...project.runnerOptions }).status(),
       );
       summary.applied = statuses.filter(
         (entry) => entry.status === "applied",
@@ -77,13 +82,13 @@ const overview = async (context: CliContext, project: Project) => {
       const incomplete = statuses.length - summary.applied - summary.pending;
 
       if (incomplete) {
-        summary.migrations += ` · ${incomplete} incomplete (repair required)`;
+        summary.migrations += ` · ${incomplete} incomplete (${statuses.some((entry) => entry.running) ? "running in another process" : "repair required"})`;
       }
     } catch (error) {
       summary.connection = "unavailable";
       summary.migrations = `Unavailable: ${error instanceof Error ? error.message : String(error)}`;
     } finally {
-      await driver.close();
+      await driver?.close();
     }
   }
 
@@ -163,12 +168,21 @@ export const dashboard = async (
       }
 
       const messages: string[] = [];
+      // An action's exit code (status with an incomplete migration, say)
+      // belongs to its view, not to the dashboard's exit.
+      const exitCode = process.exitCode;
 
       try {
         await context.rerun([action, ...forwarded], (message) => {
           messages.push(message);
         });
       } catch (error) {
+        // Ctrl-C or SIGTERM during the action ends the dashboard: the error
+        // is reported, after the screen is restored, with 130 or 143.
+        if (interruption()) {
+          throw error;
+        }
+
         messages.push(
           formatError(
             error instanceof Error ? error.message : String(error),
@@ -177,6 +191,12 @@ export const dashboard = async (
         );
       }
 
+      if (interruption()) {
+        return;
+      }
+
+      // Bun ignores `process.exitCode = undefined`; 0 resets it on both.
+      process.exitCode = exitCode ?? 0;
       await view(action, messages.join("\n"), color);
       clear();
     }

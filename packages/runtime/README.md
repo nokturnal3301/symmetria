@@ -179,10 +179,11 @@ const page = feed({ limit: 10 });
 
 `join`, `innerJoin` and `leftJoin` infer the target and ON condition from a
 relation or FK column. Smart `join` uses INNER for required forward references
-and LEFT for optional/reverse relations. Repeated sources and self-JOINs receive
-automatic aliases. Explicit sources use an ON callback; `crossJoin` creates a
-Cartesian product. Options-only calls preserve the previous selection; branches
-are immutable.
+and LEFT for optional/reverse relations and for a target a `$scope()` filters.
+Repeated sources and self-JOINs receive automatic aliases. Explicit sources use
+an ON callback; a query with its own fields or options joins only as a subquery
+named with `.as("name")`. `crossJoin` creates a Cartesian product. Options-only
+calls preserve the previous selection; branches are immutable.
 
 Smart JOINs also use LEFT for junction relations and propagate optional
 ancestry. `crossJoin` can infer its target from an FK or relation, without an ON
@@ -205,8 +206,8 @@ const feed = db.posts((post) => ({
 ```
 
 `.shape()` stores a synchronous callback and evaluates it on each application. A
-projection belongs to its defining table, contains at least one selected field
-and has no `$...` controls. Apply options at use sites, for example
+projection belongs to its defining table and selects at least one field; field
+names starting with `$` are reserved. Apply options at use sites, for example
 `db.users(userCard, { limit: 20 })`. It can be defined on an offline schema and
 used on its connected or transaction-bound tables. To-one selections are typed
 as an object or `null`.
@@ -229,11 +230,11 @@ const totals = db.users(({ name, posts }) => ({
 
 Plain columns aggregate through properties (`posts.sum.views`); expressions use
 the callback form. Filters and pagination select input rows before aggregation.
-`sum` / `average` return decimal strings or `null`; `minimum` / `maximum`
-preserve the column's value type and codec, plus `null`, and order JSON values
-as jsonb does (numbers numerically), booleans, `uuid` and `bytea` too. Empty or
-all-NULL value inputs produce `null`; `count()` returns `0` and `exists()`
-returns `false` for empty inputs.
+`sum` / `average` return decimal strings or `null`. `minimum` / `maximum` keep
+the column's value type and codec, plus `null`, and take any column: booleans,
+`uuid` and `bytea` too, and JSON values, which they order as jsonb does (numbers
+by value). Empty or all-NULL value inputs produce `null`; `count()` returns `0`
+and `exists()` returns `false` for empty inputs.
 
 ## Enum mappings
 
@@ -278,7 +279,8 @@ projection of the same table. UPDATE, WHERE and RETURNING callbacks receive the
 row directly, including nested-insert RETURNING. Upserts receive the existing
 row first and the proposed `excluded` row second. `.doUpdate("name")` copies a
 field from `excluded`. An UPDATE or DELETE without `where()` is refused unless
-`.all()` confirms it.
+`.all()` confirms it, and so is one whose filter holds for every row, such as
+`and()` or `notIn([])`.
 
 ## Capabilities
 
@@ -299,10 +301,12 @@ field from `excluded`. An UPDATE or DELETE without `where()` is refused unless
   iteration; `count()` and `exists()` on any table or filtered source.
 - Transactions, nested savepoints, isolation options and row locks.
 - `Transaction<typeof db>` for schema-specific transaction helpers.
-- `$scope()` filters for reads, updates and deletes, including related tables,
-  and checks every row a scoped insert, upsert or update writes, like row-level
-  security's `WITH CHECK` (`SYMMETRIA_OUT_OF_SCOPE`); reused and prepared
-  queries bind the current tenant at every execution.
+- `$scope()` filters for reads, updates and deletes, including related and
+  joined tables, and checks every row a scoped insert, upsert or update writes,
+  like row-level security's `WITH CHECK` (`SYMMETRIA_OUT_OF_SCOPE`); reused and
+  prepared queries bind the current tenant at every execution. A scope filter
+  that holds for every row, such as `and(tenant && post.tenantId.is(tenant))`
+  without a tenant, is refused instead of reading every tenant's rows.
 - Bigint, decimal-string, Date and custom codecs, including nested JSON results;
   `smallint`, `real`, `doublePrecision`, `date`, `time`, `interval`, `bytea` and
   `inet` as first-class builders.
@@ -324,13 +328,13 @@ field from `excluded`. An UPDATE or DELETE without `where()` is refused unless
 - `table.search()`: hybrid search declared on the table, by words (full text or
   BM25) and by meaning (embeddings computed on insert), merged in one statement
   (`symmetria/search`; models from `symmetria/voyage`, `openai`, `cohere`,
-  `google`, `mistral`, `jina`, `ollama`)
-- `symmetria/better-auth`: a better-auth adapter; `auth generate` writes the
-  auth tables as part of your schema
+  `google`, `mistral`, `jina`, `ollama`).
+- `symmetria/better-auth`: a better-auth adapter; `npx auth generate` writes the
+  auth tables as part of your schema.
 - Arrays, full-text search with stored `tsvector` columns, weighted documents,
   ranking and headlines, pgvector embeddings with distance operators and HNSW
-  indexes (`symmetria/vector`), typed JSON paths and Standard Schema JSON
-  validation.
+  and IVFFlat indexes (`symmetria/vector`), typed JSON paths and Standard Schema
+  JSON validation.
 - Computed fields, branded IDs, indexes, primary keys and CHECK constraints.
 - Condition relations (`.relations()`) that join by a predicate without a
   foreign key, in both directions, invisible to migrations.
@@ -384,13 +388,15 @@ const db = createDatabase({
 underlying pool options plus `url` and `profiler`.
 
 Both adapters return `{ rows, affectedRows }`, read values the same way,
-preserve bigint/numeric precision, support nested transactions and pinned
-sessions, and drain accepted operations on close. Operations on a transaction or
-session run one at a time in call order. Session settings belong to a
-connection: use `driver.session()` for multi-statement workflows; its connection
-is closed afterwards, so its settings, locks and temporary tables never reach
-other queries. For isolated PostgreSQL test schemas, use `testDatabase()` from
-`symmetria-kit/testing`, optionally passing a `driver` factory.
+preserve bigint/numeric precision and support nested transactions and pinned
+sessions. On close they refuse new work, end the transactions of open `stream()`
+loops and wait for the other operations they accepted. Operations on a
+transaction or session run one at a time in call order. Session settings belong
+to a connection: use `driver.session()` for multi-statement workflows; its
+connection is closed afterwards, so its settings, locks and temporary tables
+never reach other queries. For isolated PostgreSQL test schemas, use
+`testDatabase()` from `symmetria-kit/testing`, optionally passing a `driver`
+factory.
 
 Behind a transaction-mode pooler such as PgBouncer, queries, transactions,
 streams and prepared queries work on both adapters; pass `prepare: false` to

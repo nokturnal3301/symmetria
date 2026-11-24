@@ -304,7 +304,7 @@ export const parenthesized = (text: string): boolean => {
  * `((expr) = true)` is how PostgreSQL prints a condition declared with `.is(true)`.
  * In a CHECK or WHERE clause the comparison changes nothing (NULL stays NULL), so
  * the inner `(expr)` is declared instead: pulling again then produces the same
- * schema, where each cycle used to wrap one more `= true`.
+ * schema, rather than one more `= true` on each cycle.
  */
 export const withoutTruthComparison = (text: string): string => {
   let current = text.trim();
@@ -424,7 +424,11 @@ export const interpolate = (
         : /^[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(position));
 
     if (!identifier) {
-      template += escapeTemplate(character);
+      // Escaped one character at a time, `$` and `{` would still meet as `${`.
+      template +=
+        character === "$" && text[position + 1] === "{"
+          ? "\\$"
+          : escapeTemplate(character);
       position += 1;
       continue;
     }

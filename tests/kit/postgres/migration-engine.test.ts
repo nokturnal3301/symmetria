@@ -42,10 +42,13 @@ type Sandbox = {
   runner: (overrides?: Partial<MigratorOptions>) => ReturnType<typeof migrator>;
 };
 
-const sandbox = async (callback: (context: Sandbox) => Promise<void>) => {
+const sandbox = async (
+  callback: (context: Sandbox) => Promise<void>,
+  database = url!,
+) => {
   const namespace = `engine_${randomUUID().replaceAll("-", "")}`;
   const directory = await migrationDirectory();
-  const address = new URL(url!);
+  const address = new URL(database);
   address.searchParams.set("options", `-c search_path=${namespace}`);
   const driver = postgres({ url: address.toString(), max: 2 });
   const other = postgres({ url: address.toString(), max: 2 });
@@ -78,6 +81,29 @@ const sandbox = async (callback: (context: Sandbox) => Promise<void>) => {
     await rows(`DROP SCHEMA "${namespace}" CASCADE`);
     await Promise.all([driver.close(), other.close()]);
     await rm(directory, { recursive: true, force: true });
+  }
+};
+
+/**
+ * A sandbox in a database of its own. A CREATE INDEX CONCURRENTLY waits for
+ * every older transaction of its database, so the long statements of these
+ * tests must not reach the database other suites build indexes in.
+ */
+const ownDatabase = async (callback: (context: Sandbox) => Promise<void>) => {
+  const name = `engine_${randomUUID().replaceAll("-", "")}`;
+  const admin = postgres({ url: url!, max: 1 });
+  const address = new URL(url!);
+  address.pathname = `/${name}`;
+
+  try {
+    await admin.execute({ sql: `CREATE DATABASE "${name}"`, parameters: [] });
+    await sandbox(callback, address.toString());
+  } finally {
+    await admin.execute({
+      sql: `DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`,
+      parameters: [],
+    });
+    await admin.close();
   }
 };
 
@@ -786,6 +812,187 @@ describe.skipIf(!url)("migration engine on PostgreSQL", () => {
     30000,
   );
 
+  // In a terminal the spinner runs; its exit must not beat the cancellation.
+  for (const [signal, code] of [
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+  ] as const) {
+    test.skipIf(transactionPooling)(
+      `${signal} in a terminal cancels the running statement before migrate exits with ${code}`,
+      () =>
+        sandbox(async ({ driver, directory, namespace, address }) => {
+          await generateMigration({
+            directory,
+            name: "initial",
+            snapshot: schema({ notes: { id: int.auto } }).$snapshot(),
+          });
+          await generateMigration({ directory, name: "slow", empty: true });
+          await writeMigration(
+            directory,
+            "000002_slow",
+            // The namespace in the statement tells this run's backend from
+            // those of other suites on the same server.
+            `ALTER TABLE notes ADD COLUMN x integer; SELECT pg_sleep(30), '${namespace}'::text;`,
+            "ALTER TABLE notes DROP COLUMN x;",
+          );
+          const config = join(directory, "symmetria.config.ts");
+          await writeFile(
+            config,
+            `export default { directory: ".", databaseUrl: ${JSON.stringify(address)}, metadataSchema: ${JSON.stringify(namespace)} };\n`,
+          );
+          await runCli(config, "migrate", "--to", "000001_initial");
+
+          const sleeping = async () => {
+            const result = await driver.execute({
+              sql: "SELECT count(*)::integer AS running FROM pg_stat_activity WHERE query LIKE '%pg_sleep(30)%' AND query LIKE '%' || $1 || '%' AND state = 'active' AND pid <> pg_backend_pid()",
+              parameters: [namespace],
+            });
+
+            return (Array.isArray(result) ? result : result.rows)[0]!
+              .running as number;
+          };
+          const child = Bun.spawn(
+            [
+              process.execPath,
+              resolve("packages/kit/src/cli/index.ts"),
+              "migrate",
+              "--config",
+              config,
+            ],
+            {
+              env: { ...process.env, TERM: "xterm-256color" },
+              terminal: { cols: 100, rows: 30, data: () => {} },
+            },
+          );
+
+          let exitCode: number | null;
+          let left: number;
+
+          try {
+            // A loaded server can take a while to start the CLI.
+            for (let attempt = 0; attempt < 400; attempt += 1) {
+              if (await sleeping()) {
+                break;
+              }
+
+              await Bun.sleep(50);
+            }
+
+            expect(await sleeping()).toBe(1);
+
+            if (signal === "SIGINT") {
+              // Ctrl-C as a terminal sends it.
+              child.terminal!.write("\u0003");
+            } else {
+              child.kill("SIGTERM");
+            }
+
+            exitCode = await child.exited;
+            // Read before the cleanup below cancels anything left.
+            left = await sleeping();
+          } finally {
+            // A failed check must not leave the statement holding the table
+            // the sandbox drops.
+            child.kill("SIGKILL");
+            await driver.execute({
+              sql: "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(30)%' AND query LIKE '%' || $1 || '%' AND pid <> pg_backend_pid()",
+              parameters: [namespace],
+            });
+          }
+
+          expect(exitCode).toBe(code);
+          // Cancelled and rolled back before the exit: no statement, no column.
+          expect(left).toBe(0);
+          const column = await driver.execute({
+            sql: `SELECT count(*)::integer AS columns FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'notes' AND column_name = 'x'`,
+            parameters: [namespace],
+          });
+          expect(
+            (Array.isArray(column) ? column : column.rows)[0]!.columns,
+          ).toBe(0);
+        }),
+      30000,
+    );
+  }
+
+  test.skipIf(transactionPooling)(
+    "Ctrl-C at either rollback question exits with 130 and rolls nothing back",
+    () =>
+      sandbox(async ({ directory, namespace, address, runner }) => {
+        await generateMigration({
+          directory,
+          name: "initial",
+          snapshot: schema({ notes: { id: int.auto } }).$snapshot(),
+        });
+        await generateMigration({
+          directory,
+          name: "extra",
+          snapshot: schema({
+            notes: { id: int.auto, extra: text.nullable },
+          }).$snapshot(),
+        });
+        const config = join(directory, "symmetria.config.ts");
+        await writeFile(
+          config,
+          `export default { directory: ".", databaseUrl: ${JSON.stringify(address)}, metadataSchema: ${JSON.stringify(namespace)} };\n`,
+        );
+        expect((await runCli(config, "migrate")).exitCode).toBe(0);
+
+        // One step drops a column: a Cancel / Roll back menu. Two steps drop
+        // the table: the database name typed out.
+        for (const [steps, prompt] of [
+          ["1", "Roll back"],
+          ["2", "to continue"],
+        ] as const) {
+          let output = "";
+          const decoder = new TextDecoder();
+          const child = Bun.spawn(
+            [
+              process.execPath,
+              resolve("packages/kit/src/cli/index.ts"),
+              "rollback",
+              "--steps",
+              steps,
+              "--no-animation",
+              "--config",
+              config,
+            ],
+            {
+              env: { ...process.env, TERM: "xterm-256color" },
+              terminal: {
+                cols: 100,
+                rows: 30,
+                data: (_terminal, data) => {
+                  output += decoder.decode(data, { stream: true });
+                },
+              },
+            },
+          );
+
+          for (let attempt = 0; attempt < 200; attempt += 1) {
+            if (output.includes(prompt)) {
+              break;
+            }
+
+            await Bun.sleep(50);
+          }
+
+          await Bun.sleep(200);
+          child.terminal!.write("\u0003");
+
+          expect(await child.exited).toBe(130);
+          expect(output).toContain("Rollback cancelled; nothing was changed.");
+          expect(output).not.toContain("Aborted");
+        }
+
+        expect((await runner().status()).map((entry) => entry.status)).toEqual([
+          "applied",
+          "applied",
+        ]);
+      }),
+    30000,
+  );
+
   test(
     "verify compares a declared table even when ignoreTables names it, as drift does",
     () =>
@@ -1129,5 +1336,807 @@ CREATE RULE records_audit AS ON INSERT TO records DO ALSO (
         });
       }),
     30000,
+  );
+  /** Waits until a statement matching `pattern` runs in another session, and returns its process. */
+  const runningBackend = async (
+    rows: Sandbox["rows"],
+    pattern: string,
+  ): Promise<number> => {
+    for (let attempt = 0; attempt < 400; attempt++) {
+      const [row] = (await rows(
+        "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND query LIKE $1 AND state = 'active' AND pid <> pg_backend_pid()",
+        [pattern],
+      )) as { pid: number }[];
+
+      if (row) {
+        return Number(row.pid);
+      }
+
+      await Bun.sleep(25);
+    }
+
+    throw new Error(`no statement like ${pattern} started`);
+  };
+
+  // Terminates the migration session's server process, which a pooler hides.
+  test.skipIf(transactionPooling)(
+    "a migration whose connection is lost mid-statement reports that migration and statement",
+    () =>
+      ownDatabase(async ({ directory, rows, runner, namespace }) => {
+        // Tagged, so that only this test's statement is terminated.
+        const sleep = `SELECT pg_sleep(30), '${namespace}'::text`;
+        await generateMigration({
+          directory,
+          name: "initial",
+          snapshot: schema({ records: { id: int.auto } }).$snapshot(),
+        });
+        await runner().migrate();
+
+        for (const transaction of ["batch", "none"] as const) {
+          const slow = (await generateMigration({
+            directory,
+            name: `slow_${transaction}`,
+            empty: true,
+            transaction,
+          }))!;
+          const up = join(directory, slow.id, "up.sql");
+          await writeFile(
+            up,
+            `ALTER TABLE records ADD COLUMN ${transaction} text;\n${sleep};\n`,
+          );
+          const run = runner().migrate();
+          await rows("SELECT pg_terminate_backend($1)", [
+            await runningBackend(rows, sleep),
+          ]);
+          const error = await run.then(
+            () => undefined,
+            (failure: unknown) => failure as MigrationExecutionError,
+          );
+
+          // The cleanup on the lost session failed too; it is a note, not the error.
+          expect(error).toBeInstanceOf(MigrationExecutionError);
+          expect(error).toMatchObject({
+            migration: slow.id,
+            direction: "up",
+            statement: 2,
+            sql: sleep,
+            sqlState: "57P01",
+          });
+          expect(error!.message).toMatch(
+            /\nAfterwards, restoring the session settings and releasing the migration lock failed too: .+\. PostgreSQL releases the session's lock when the session ends\.\n\nSQL:\n/,
+          );
+          expect(error!.message.endsWith(`\n\nSQL:\n${sleep}`)).toBe(true);
+
+          if (transaction === "batch") {
+            // Rolled back; the next run applies it once its SQL is fixed.
+            expect((await runner().status()).at(-1)).toEqual({
+              id: slow.id,
+              status: "pending",
+            });
+            await writeFile(up, "SELECT 1;\n");
+            expect(await runner().migrate()).toEqual([slow.id]);
+          } else {
+            // The first statement committed; a fresh connection recorded the error.
+            expect((await runner().status()).at(-1)).toMatchObject({
+              id: slow.id,
+              status: "incomplete",
+              statement: 1,
+              error: expect.stringContaining(
+                `migration "${slow.id}" failed (up, statement 2, SQLSTATE 57P01)`,
+              ),
+            });
+            expect((await runner().status()).at(-1)?.running).toBeUndefined();
+          }
+        }
+      }),
+    30000,
+  );
+
+  // A failover or network blip drops the pool's idle connections with the
+  // session's; the pool hands them out until each fails, here with
+  // node-postgres's EPIPE on a closed socket.
+  test.skipIf(transactionPooling)(
+    "a none migration's error reaches the journal when the pool's idle connections were lost with its session",
+    () =>
+      ownDatabase(async ({ directory, driver, rows, runner, namespace }) => {
+        const sleep = `SELECT pg_sleep(30), '${namespace}'::text`;
+        const slow = (await generateMigration({
+          directory,
+          name: "slow",
+          empty: true,
+          transaction: "none",
+        }))!;
+        await writeFile(
+          join(directory, slow.id, "up.sql"),
+          `CREATE TABLE records (id int);\n${sleep};\n`,
+        );
+        let dead = 0;
+        const flaky: Driver = {
+          ...driver,
+          transaction: (callback, options) => {
+            if (dead > 0) {
+              dead -= 1;
+
+              return Promise.reject(
+                Object.assign(new Error("write EPIPE"), {
+                  errno: -32,
+                  syscall: "write",
+                  code: "EPIPE",
+                }),
+              );
+            }
+
+            return driver.transaction!(callback, options);
+          },
+        };
+        const run = runner({ driver: flaky }).migrate();
+        const backend = await runningBackend(rows, sleep);
+        dead = 2;
+        await rows("SELECT pg_terminate_backend($1)", [backend]);
+        const error = await run.then(
+          () => undefined,
+          (failure: unknown) => failure as MigrationExecutionError,
+        );
+
+        expect(dead).toBe(0);
+        expect(error).toBeInstanceOf(MigrationExecutionError);
+        expect(error!.message).not.toContain("journal does not record");
+        expect((await runner().status()).at(-1)).toMatchObject({
+          id: slow.id,
+          status: "incomplete",
+          statement: 1,
+          error: expect.stringContaining(
+            `migration "${slow.id}" failed (up, statement 2, SQLSTATE 57P01)`,
+          ),
+        });
+      }),
+    30000,
+  );
+
+  // With the server down, a new connection is refused: the write is not
+  // tried again for ten seconds. While connections keep failing as lost
+  // ones, an abort (Ctrl-C) ends the wait.
+  test.skipIf(transactionPooling)(
+    "a none migration's error is reported at once when new connections are refused, or when the wait is aborted",
+    async () => {
+      const failedRun = (failure: () => Error, abort?: AbortController) => {
+        let attempts = 0;
+        let result: [MigrationExecutionError, number, number] | undefined;
+
+        return ownDatabase(
+          async ({ directory, driver, rows, runner, namespace }) => {
+            const sleep = `SELECT pg_sleep(30), '${namespace}'::text`;
+            const slow = (await generateMigration({
+              directory,
+              name: "slow",
+              empty: true,
+              transaction: "none",
+            }))!;
+            await writeFile(
+              join(directory, slow.id, "up.sql"),
+              `CREATE TABLE records (id int);\n${sleep};\n`,
+            );
+            const flaky: Driver = {
+              ...driver,
+              transaction: () => {
+                attempts += 1;
+
+                return Promise.reject(failure());
+              },
+            };
+            const run = runner({
+              driver: flaky,
+              ...(abort ? { signal: abort.signal } : {}),
+            }).migrate();
+            await rows("SELECT pg_terminate_backend($1)", [
+              await runningBackend(rows, sleep),
+            ]);
+            const lost = performance.now();
+
+            if (abort) {
+              setTimeout(() => abort.abort(new Error("interrupted")), 300);
+            }
+
+            const error = await run.then(
+              () => undefined,
+              (failure: unknown) => failure as MigrationExecutionError,
+            );
+            result = [error!, performance.now() - lost, attempts];
+          },
+        ).then(() => result!);
+      };
+
+      const [refused, refusedAfter, refusedAttempts] = await failedRun(() =>
+        Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), {
+          code: "ECONNREFUSED",
+        }),
+      );
+
+      expect(refusedAttempts).toBe(1);
+      expect(refusedAfter).toBeLessThan(2000);
+      expect(refused).toBeInstanceOf(MigrationExecutionError);
+      expect(refused.message).toContain(
+        "The migration journal does not record this error: connect ECONNREFUSED 127.0.0.1:5432.",
+      );
+
+      const [aborted, abortedAfter, abortedAttempts] = await failedRun(
+        () =>
+          Object.assign(new Error("write EPIPE"), {
+            errno: -32,
+            syscall: "write",
+            code: "EPIPE",
+          }),
+        new AbortController(),
+      );
+
+      expect(abortedAttempts).toBeGreaterThan(1);
+      expect(abortedAfter).toBeLessThan(2000);
+      expect(aborted).toBeInstanceOf(MigrationExecutionError);
+      expect(aborted.message).toContain(
+        "The migration journal does not record this error: interrupted while waiting for a connection.",
+      );
+    },
+    30000,
+  );
+
+  // The wait ends while a new connection is still opening (here 1.5 s late).
+  // The attempt then writes nothing, so the message holds; and the abort
+  // cancels nothing on the lost session, where a cancellation's own new
+  // connection would wait as long as the server does not answer.
+  test.skipIf(transactionPooling)(
+    "a journal write the wait gave up on writes nothing, and an abort after the session was lost cancels nothing",
+    () =>
+      ownDatabase(async ({ directory, driver, rows, runner, namespace }) => {
+        const sleep = `SELECT pg_sleep(30), '${namespace}'::text`;
+        const slow = (await generateMigration({
+          directory,
+          name: "slow",
+          empty: true,
+          transaction: "none",
+        }))!;
+        await writeFile(
+          join(directory, slow.id, "up.sql"),
+          `CREATE TABLE records (id int);\n${sleep};\n`,
+        );
+        let late = false;
+        let cancels = 0;
+        const attempts: Promise<unknown>[] = [];
+        const hanging: Driver = {
+          ...driver,
+          transaction: (callback, options) => {
+            if (!late) {
+              return driver.transaction!(callback, options);
+            }
+
+            const attempt = Bun.sleep(1500).then(() =>
+              driver.transaction!(callback, options),
+            );
+            attempts.push(attempt.catch(() => {}));
+
+            return attempt;
+          },
+          session: (callback) =>
+            driver.session!((session) =>
+              callback({
+                ...session,
+                cancel: () => {
+                  cancels += 1;
+
+                  return new Promise<void>(() => {});
+                },
+              }),
+            ),
+        };
+        const abort = new AbortController();
+        const run = runner({ driver: hanging, signal: abort.signal }).migrate();
+        const backend = await runningBackend(rows, sleep);
+        late = true;
+        await rows("SELECT pg_terminate_backend($1)", [backend]);
+        setTimeout(() => abort.abort(new Error("interrupted")), 300);
+        const started = performance.now();
+        const error = await run.then(
+          () => undefined,
+          (failure: unknown) => failure as MigrationExecutionError,
+        );
+
+        expect(performance.now() - started).toBeLessThan(1500);
+        expect(error).toBeInstanceOf(MigrationExecutionError);
+        expect(error!.message).toContain(
+          "The migration journal does not record this error: interrupted while waiting for a connection.",
+        );
+        expect(cancels).toBe(0);
+        await Promise.all(attempts);
+        const entry = (await runner().status()).at(-1);
+        expect(entry).toMatchObject({
+          id: slow.id,
+          status: "incomplete",
+          statement: 1,
+        });
+        expect(entry?.error).toBeUndefined();
+      }),
+    30000,
+  );
+
+  // New connections reach the server but get no answer (a frozen server, a
+  // pooler waiting for its backend). Ctrl-C ends the journal's wait; the CLI
+  // prints the migration's error and exits without waiting for the attempt.
+  test.skipIf(transactionPooling)(
+    "the CLI reports a none migration's error at once on Ctrl-C while new connections get no answer",
+    async () => {
+      const upstream = new URL(url!);
+      type Link = {
+        upstream?: { write: (chunk: Uint8Array) => void; end: () => void };
+        pending: Uint8Array[];
+      };
+      const links = new Set<{ end: () => void; data: Link }>();
+      let hang = false;
+      const proxy = Bun.listen<Link>({
+        hostname: "127.0.0.1",
+        port: 0,
+        socket: {
+          async open(client) {
+            client.data = { pending: [] };
+            links.add(client);
+
+            if (hang) {
+              return;
+            }
+
+            client.data.upstream = await Bun.connect({
+              hostname: upstream.hostname,
+              port: Number(upstream.port || 5432),
+              socket: {
+                data: (_server, chunk) => {
+                  client.write(chunk);
+                },
+                close: () => {
+                  client.end();
+                },
+                error: () => {
+                  client.end();
+                },
+              },
+            });
+
+            for (const chunk of client.data.pending) {
+              client.data.upstream.write(chunk);
+            }
+
+            client.data.pending = [];
+          },
+          data(client, chunk) {
+            if (client.data.upstream) {
+              client.data.upstream.write(chunk);
+            } else {
+              client.data.pending.push(new Uint8Array(chunk));
+            }
+          },
+          close(client) {
+            links.delete(client);
+            client.data.upstream?.end();
+          },
+          error(client) {
+            client.data.upstream?.end();
+          },
+        },
+      });
+
+      try {
+        await ownDatabase(async ({ directory, address, rows, namespace }) => {
+          const proxied = new URL(address);
+          proxied.hostname = "127.0.0.1";
+          proxied.port = String(proxy.port);
+          const config = join(directory, "config.ts");
+          await writeFile(
+            config,
+            `export default ${JSON.stringify({ directory: "files", databaseUrl: proxied.toString(), metadataSchema: namespace })};\n`,
+          );
+          const files = join(directory, "files");
+          const sleep = `SELECT pg_sleep(30), '${namespace}'::text`;
+          const slow = (await generateMigration({
+            directory: files,
+            name: "slow",
+            empty: true,
+            transaction: "none",
+          }))!;
+          await writeFile(
+            join(files, slow.id, "up.sql"),
+            `CREATE TABLE records (id int);\n${sleep};\n`,
+          );
+          const child = Bun.spawn(
+            [
+              process.execPath,
+              resolve("packages/kit/src/cli/index.ts"),
+              "migrate",
+              "--config",
+              config,
+            ],
+            { stdout: "pipe", stderr: "pipe" },
+          );
+          const output = Promise.all([
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+          ]);
+          const guard = setTimeout(() => child.kill("SIGKILL"), 20000);
+
+          try {
+            await runningBackend(rows, sleep);
+            hang = true;
+
+            for (const link of links) {
+              link.data.upstream?.end();
+              link.end();
+            }
+
+            await Bun.sleep(300);
+            child.kill("SIGINT");
+            const interrupted = performance.now();
+            const exitCode = await child.exited;
+            const [, stderr] = await output;
+
+            expect(performance.now() - interrupted).toBeLessThan(3000);
+            expect(exitCode).toBe(130);
+            expect(stderr).toContain(
+              `migration "${slow.id}" failed (up, statement 2`,
+            );
+            expect(stderr).toContain(
+              "The migration journal does not record this error: interrupted while waiting for a connection.",
+            );
+            expect(stderr).not.toContain("exited before");
+          } finally {
+            clearTimeout(guard);
+            child.kill("SIGKILL");
+          }
+        });
+      } finally {
+        hang = false;
+
+        for (const link of links) {
+          link.end();
+        }
+
+        proxy.stop(true);
+      }
+    },
+    40000,
+  );
+
+  // A session lock and nontransactional statements need a pinned server.
+  test.skipIf(transactionPooling)(
+    "an online index waits for older transactions without the default lock timeout; a configured one applies",
+    () =>
+      ownDatabase(async ({ directory, rows, runner, other }) => {
+        await generateMigration({
+          directory,
+          name: "initial",
+          snapshot: schema({
+            records: { id: int.auto, name: text },
+            reports: { id: int.auto },
+          }).$snapshot(),
+        });
+        await runner().migrate();
+        const online = (await generateMigration({
+          directory,
+          name: "name_index",
+          online: true,
+          snapshot: schema({
+            records: table({ id: int.auto, name: text }).indexes((record) => ({
+              name: index(record.name),
+            })),
+            reports: { id: int.auto },
+          }).$snapshot(),
+        }))!;
+        const up = join(directory, online.id, "up.sql");
+        expect(await readFile(up, "utf8")).toContain(
+          "CREATE INDEX CONCURRENTLY",
+        );
+        // Statements that may block others keep the default.
+        await writeFile(
+          up,
+          `${await readFile(up, "utf8")}\nCREATE TABLE seen AS SELECT current_setting('lock_timeout') AS value;\n`,
+        );
+        const after = (await generateMigration({
+          directory,
+          name: "after",
+          empty: true,
+        }))!;
+        await writeFile(
+          join(directory, after.id, "up.sql"),
+          "CREATE TABLE seen_after AS SELECT current_setting('lock_timeout') AS value;\n",
+        );
+
+        // A report on another table that runs longer than the 5 s default:
+        // the concurrent build waits for it, which blocks nobody.
+        const report = other.execute({
+          sql: "SELECT count(*), pg_sleep(6) FROM reports",
+          parameters: [],
+        });
+        await runningBackend(rows, "SELECT count(*), pg_sleep(6)%");
+        const started = performance.now();
+        expect(await runner().migrate()).toEqual([online.id, after.id]);
+        expect(performance.now() - started).toBeGreaterThan(4000);
+        await report;
+        expect(
+          await rows(
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('records_name_idx')",
+          ),
+        ).toEqual([{ indisvalid: true }]);
+        expect(await rows("SELECT value FROM seen")).toEqual([{ value: "5s" }]);
+        expect(await rows("SELECT value FROM seen_after")).toEqual([
+          { value: "5s" },
+        ]);
+
+        // A lock timeout you set applies to it too.
+        const pair = (await generateMigration({
+          directory,
+          name: "pair_index",
+          empty: true,
+          transaction: "none",
+        }))!;
+        await writeFile(
+          join(directory, pair.id, "up.sql"),
+          "CREATE INDEX CONCURRENTLY records_pair_idx ON records (id, name);\n",
+        );
+        const again = other.execute({
+          sql: "SELECT count(*), pg_sleep(3) FROM reports",
+          parameters: [],
+        });
+        await runningBackend(rows, "SELECT count(*), pg_sleep(3)%");
+        await expect(
+          runner({ lockTimeoutMs: 500 }).migrate(),
+        ).rejects.toMatchObject({
+          migration: pair.id,
+          statement: 1,
+          sqlState: "55P03",
+        });
+        await again;
+      }),
+    40000,
+  );
+
+  // A session lock needs a pinned server.
+  test.skipIf(transactionPooling)(
+    "a connection that opens slowly is not taken for a transaction pooler",
+    async () => {
+      const upstream = new URL(url!);
+      type Link = {
+        upstream?: { write: (chunk: Uint8Array) => void; end: () => void };
+        pending: Uint8Array[];
+        closed?: boolean;
+      };
+      // Each new connection reaches the server 1.5 s late, as over TLS and
+      // a password exchange to a distant server.
+      const proxy = Bun.listen<Link>({
+        hostname: "127.0.0.1",
+        port: 0,
+        socket: {
+          open(client) {
+            client.data = { pending: [] };
+            setTimeout(async () => {
+              if (client.data.closed) {
+                return;
+              }
+
+              client.data.upstream = await Bun.connect({
+                hostname: upstream.hostname,
+                port: Number(upstream.port || 5432),
+                socket: {
+                  data: (_server, chunk) => {
+                    client.write(chunk);
+                  },
+                  close: () => {
+                    client.end();
+                  },
+                  error: () => {
+                    client.end();
+                  },
+                },
+              });
+
+              for (const chunk of client.data.pending) {
+                client.data.upstream.write(chunk);
+              }
+
+              client.data.pending = [];
+            }, 1500);
+          },
+          data(client, chunk) {
+            if (client.data.upstream) {
+              client.data.upstream.write(chunk);
+            } else {
+              client.data.pending.push(new Uint8Array(chunk));
+            }
+          },
+          close(client) {
+            client.data.closed = true;
+            client.data.upstream?.end();
+          },
+          error(client) {
+            client.data.upstream?.end();
+          },
+        },
+      });
+
+      try {
+        await ownDatabase(async ({ directory, address, namespace }) => {
+          const slow = new URL(address);
+          slow.hostname = "127.0.0.1";
+          slow.port = String(proxy.port);
+          const pool = postgres({ url: slow.toString(), max: 3 });
+          const sessionSQL: string[] = [];
+          const recorded: Driver = {
+            ...pool,
+            session: (callback) =>
+              pool.session!((session) =>
+                callback({
+                  ...session,
+                  execute: (query) => {
+                    sessionSQL.push(query.sql);
+
+                    return session.execute(query);
+                  },
+                }),
+              ),
+          };
+
+          try {
+            const initial = (await generateMigration({
+              directory,
+              name: "initial",
+              snapshot: schema({
+                records: { id: int.auto, name: text },
+              }).$snapshot(),
+            }))!;
+            const online = (await generateMigration({
+              directory,
+              name: "name_index",
+              online: true,
+              snapshot: schema({
+                records: table({ id: int.auto, name: text }).indexes(
+                  (record) => ({ name: index(record.name) }),
+                ),
+              }).$snapshot(),
+            }))!;
+
+            expect(
+              await migrator({
+                driver: recorded,
+                directory,
+                metadataSchema: namespace,
+              }).migrate(),
+            ).toEqual([initial.id, online.id]);
+            // The batch migration ran under the session lock, as on any
+            // direct connection, not under a lock per transaction.
+            expect(sessionSQL).toContain(
+              "SELECT pg_try_advisory_lock(1937339476, hashtext($1)) AS locked",
+            );
+          } finally {
+            await pool.close();
+          }
+        });
+      } finally {
+        proxy.stop(true);
+      }
+    },
+    60000,
+  );
+
+  // A session lock and nontransactional statements need a pinned server.
+  test.skipIf(transactionPooling)(
+    "status tells an online migration another process runs from an interrupted one, and drift names the repair",
+    () =>
+      ownDatabase(
+        async ({ directory, address, namespace, rows, runner, other }) => {
+          const config = join(directory, "config.ts");
+          await writeFile(
+            config,
+            `export default ${JSON.stringify({ directory: ".", databaseUrl: address, metadataSchema: namespace })};\n`,
+          );
+          await generateMigration({
+            directory,
+            name: "initial",
+            snapshot: schema({ records: { id: int.auto } }).$snapshot(),
+          });
+          await runner().migrate();
+          const long = (await generateMigration({
+            directory,
+            name: "long",
+            empty: true,
+            transaction: "none",
+          }))!;
+          await writeFile(
+            join(directory, long.id, "up.sql"),
+            "SELECT pg_sleep(5);\nCREATE TABLE done (id integer);\n",
+          );
+          await writeFile(
+            join(directory, long.id, "down.sql"),
+            "DROP TABLE done;\n",
+          );
+
+          // Running in this process: its journal row is incomplete, and it
+          // holds the migration lock.
+          const run = runner().migrate();
+          await runningBackend(rows, "SELECT pg_sleep(5)%");
+          const status = await runCli(config, "status", "--json");
+          expect(status.exitCode).toBe(0);
+          expect(JSON.parse(status.stdout).migrations.at(-1)).toMatchObject({
+            id: long.id,
+            status: "incomplete",
+            running: true,
+          });
+          expect((await runCli(config, "status")).stdout).toContain(
+            `incomplete ${long.id} · up · 0 confirmed statements · running in another process`,
+          );
+          // It needs no repair: lint of the pending chain waits for it.
+          expect(await runCli(config, "lint", "--pending")).toMatchObject({
+            exitCode: 1,
+            stderr: expect.stringContaining(
+              `migration "${long.id}" is running in another process`,
+            ),
+          });
+          expect(await runCli(config, "drift")).toMatchObject({
+            exitCode: 0,
+            stdout: expect.stringContaining(
+              "Another process holds the migration lock and is still running it",
+            ),
+          });
+          // Another migrate waits for the lock and says who holds it.
+          await expect(
+            runner({ driver: other, advisoryLockTimeoutMs: 200 }).migrate(),
+          ).rejects.toThrow(
+            /^symmetria: migration advisory lock timeout after 200ms: PostgreSQL process \d+ \(active for \d+s\) holds the migration lock\. .*pg_terminate_backend\(\d+\)$/,
+          );
+          expect(await run).toEqual([long.id]);
+
+          // One that stopped part-way needs repair, and drift says so.
+          const broken = (await generateMigration({
+            directory,
+            name: "broken",
+            empty: true,
+            transaction: "none",
+          }))!;
+          await writeFile(
+            join(directory, broken.id, "up.sql"),
+            "CREATE TABLE half (id integer);\nSELECT 1/0;\n",
+          );
+          await expect(runner().migrate()).rejects.toMatchObject({
+            migration: broken.id,
+            statement: 2,
+            sqlState: "22012",
+          });
+          const stopped = await runCli(config, "status", "--json");
+          expect(stopped.exitCode).toBe(1);
+          expect(await runCli(config, "lint", "--pending")).toMatchObject({
+            exitCode: 1,
+            stderr: expect.stringContaining(
+              "repair incomplete migrations before linting the pending chain",
+            ),
+          });
+          expect(JSON.parse(stopped.stdout).migrations.at(-1)).toEqual({
+            id: broken.id,
+            status: "incomplete",
+            appliedAt: expect.any(String),
+            direction: "up",
+            statement: 1,
+            error: expect.stringContaining("division by zero"),
+          });
+          const drift = await runCli(config, "drift");
+          expect(drift.exitCode).toBe(0);
+          expect(drift.stdout).toBe(
+            `Migration ${broken.id} is incomplete (up, 1 confirmed statements): the schema is between two migrations, so drift does not compare it.\nIt stopped with: migration "${broken.id}" failed (up, statement 2, SQLSTATE 22012): division by zero\nInspect the database, then run \`symmetria repair ${broken.id} --action retry\` after undoing what it did, or \`--action complete\` after finishing it by hand.\n`,
+          );
+          expect((await runCli(config, "drift", "--strict")).exitCode).toBe(1);
+          expect(
+            JSON.parse((await runCli(config, "drift", "--json")).stdout),
+          ).toMatchObject({
+            findings: [],
+            incomplete: { id: broken.id, direction: "up", statement: 1 },
+          });
+          await expect(runner().migrate()).rejects.toThrow(
+            `migration "${broken.id}" is incomplete (up, 1 confirmed statements): it stopped part-way, and no other process is running it (none holds the migration lock). Inspect the database and use repair`,
+          );
+        },
+      ),
+    40000,
   );
 });

@@ -4,6 +4,7 @@
 import { freeze } from "./freeze";
 import { expressionSqlType } from "./metadata";
 import { codecMap } from "../codecs";
+import { keyAlias } from "../compile/state";
 import type { SelectPlan, TableBinding } from "./types";
 
 export const derivedBinding = (plan: SelectPlan, alias: string): TableBinding =>
@@ -15,7 +16,8 @@ export const derivedBinding = (plan: SelectPlan, alias: string): TableBinding =>
       relations: [],
       columns: plan.selection.map((expression) => ({
         name: expression.outputName,
-        sqlName: expression.outputName,
+        // A key longer than an SQL name is selected under a shorter alias.
+        sqlName: keyAlias(expression.outputName),
         sqlType: expressionSqlType(expression),
         notNull: false,
         unique: false,

@@ -376,3 +376,321 @@ test("a row that fails to decode inside $transaction closes its cursor, so the t
   expect(log.some((sql) => sql.startsWith("CLOSE"))).toBe(true);
   expect(log.at(-1)).toBe("COMMIT");
 });
+
+/**
+ * A pool that opens at most `max` connections, so a request waits for a free
+ * one; each cursor reads `rows` rows `{ id }`, each FETCH taking `fetchMs`.
+ * Every statement is logged.
+ */
+const limitedPool = (max: number, rows: number, fetchMs = 0) => {
+  const log: string[] = [];
+  const waiting: (() => void)[] = [];
+  let free = max;
+  const acquire = async () => {
+    if (free > 0) {
+      free -= 1;
+    } else {
+      await new Promise<void>((resolve) => waiting.push(resolve));
+    }
+  };
+  const giveBack = () => {
+    const next = waiting.shift();
+
+    if (next) {
+      next();
+    } else {
+      free += 1;
+    }
+  };
+  const connect = async (): Promise<PostgresConnection> => {
+    await acquire();
+    let released = false;
+    let fetched = 0;
+    const release = () => {
+      if (!released) {
+        released = true;
+        giveBack();
+      }
+    };
+
+    return {
+      execute: async (query) => {
+        log.push(query.sql);
+        const fetch = /^FETCH FORWARD (\d+)/.exec(query.sql);
+
+        if (!fetch) {
+          return { rows: [], affectedRows: 0 };
+        }
+
+        if (fetchMs) {
+          await new Promise((resolve) => setTimeout(resolve, fetchMs));
+        }
+
+        const batch = Array.from(
+          { length: Math.max(0, Math.min(Number(fetch[1]), rows - fetched)) },
+          (_, index) => ({ id: fetched + index + 1 }),
+        );
+        fetched += batch.length;
+
+        return { rows: batch, affectedRows: 0 };
+      },
+      release,
+      discard: async () => release(),
+    };
+  };
+  const driver = createPostgresDriver({
+    execute: async (query) => {
+      const connection = await connect();
+
+      try {
+        return await connection.execute(query);
+      } finally {
+        connection.release();
+      }
+    },
+    connect,
+    cancel: async () => {},
+    close: async () => {},
+    max,
+  });
+
+  return { driver, log };
+};
+
+const sleep = (milliseconds: number) =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
+const plain = { sql: "SELECT 1", parameters: [] };
+
+test("a stream loop in an async helper counts its connection as held by its body, not by the helper's caller", async () => {
+  const { driver } = limitedPool(1, 4);
+  const database = schema({ items: { id: int } }, { driver });
+  const read: number[] = [];
+  const exportAll = async () => {
+    for await (const item of database
+      .items((items) => ({ id: items.id }))
+      .stream({ size: 2 })) {
+      read.push(item.id);
+
+      // The body would wait for the connection its own loop holds.
+      if (item.id === 1) {
+        await expect(driver.execute(plain)).rejects.toThrow(
+          "from inside a stream() loop that holds the only one",
+        );
+      }
+
+      await sleep(2);
+    }
+  };
+  const job = exportAll();
+
+  // The caller is in no loop: its query waits its turn.
+  expect(await driver.execute(plain)).toEqual({ rows: [], affectedRows: 0 });
+  expect(read).toEqual([1, 2, 3, 4]);
+  await job;
+});
+
+test("an iterator dropped halfway gives its connection back once a query has waited idleTimeoutMs for it", async () => {
+  const { driver, log } = limitedPool(1, 4);
+  const database = schema({ items: { id: int } }, { driver });
+  // Read in a helper, as code that drops an iterator does.
+  const readOne = async () => {
+    const iterator = database
+      .items((items) => ({ id: items.id }))
+      .stream({ size: 2, idleTimeoutMs: 40 })
+      [Symbol.asyncIterator]();
+
+    expect((await iterator.next()).value).toEqual({ id: 1 });
+
+    return iterator;
+  };
+  const iterator = await readOne();
+  const started = performance.now();
+
+  expect(await driver.execute(plain)).toEqual({ rows: [], affectedRows: 0 });
+  expect(performance.now() - started).toBeGreaterThanOrEqual(35);
+  // The stream's transaction ended before the query ran.
+  expect(log.slice(-3).map((sql) => sql.split(" ")[0])).toEqual([
+    "CLOSE",
+    "COMMIT",
+    "SELECT",
+  ]);
+  await expect(iterator.next()).rejects.toThrow(
+    "symmetria: this stream was ended because its reader asked for no row for 40 ms while other queries waited for a connection",
+  );
+});
+
+test("a stream whose reader pauses keeps its connection while no query waits", async () => {
+  const { driver, log } = limitedPool(2, 3);
+  const database = schema({ items: { id: int } }, { driver });
+  const read: number[] = [];
+
+  for await (const item of database
+    .items((items) => ({ id: items.id }))
+    .stream({ size: 1, idleTimeoutMs: 10 })) {
+    read.push(item.id);
+    await sleep(60);
+  }
+
+  expect(read).toEqual([1, 2, 3]);
+  expect(log.at(-1)).toBe("COMMIT");
+});
+
+test("stream() validates idleTimeoutMs", () => {
+  const { driver } = limitedPool(1, 0);
+  const database = schema({ items: { id: int } }, { driver });
+  const items = database.items((items) => ({ id: items.id }));
+
+  for (const idleTimeoutMs of [0, -1, Number.NaN, "5" as never]) {
+    expect(() => items.stream({ idleTimeoutMs })).toThrow(
+      "symmetria: stream idleTimeoutMs must be a positive number of milliseconds",
+    );
+  }
+
+  expect(() =>
+    items.stream({ idleTimeoutMs: Number.POSITIVE_INFINITY }),
+  ).not.toThrow();
+});
+
+test("driver.close() ends a stream paused between rows instead of waiting for its loop", async () => {
+  const { driver, log } = limitedPool(1, 4);
+  const database = schema({ items: { id: int } }, { driver });
+  const gate = Promise.withResolvers<void>();
+  const read: number[] = [];
+  const loop = (async () => {
+    for await (const item of database
+      .items((items) => ({ id: items.id }))
+      .stream({ size: 1 })) {
+      read.push(item.id);
+      await gate.promise;
+    }
+  })();
+
+  while (!read.length) {
+    await sleep(1);
+  }
+
+  expect(
+    await Promise.race([
+      driver.close().then(() => "closed"),
+      sleep(1000).then(() => "waiting"),
+    ]),
+  ).toBe("closed");
+  expect(log.slice(-2).map((sql) => sql.split(" ")[0])).toEqual([
+    "CLOSE",
+    "COMMIT",
+  ]);
+  gate.resolve();
+  await expect(loop).rejects.toThrow(
+    "symmetria: the database was closed while this stream was open",
+  );
+  expect(read).toEqual([1]);
+});
+
+test("$close() refuses work started after the call, a stream too", async () => {
+  const { driver } = limitedPool(2, 4);
+  const database = schema({ items: { id: int } }, { driver });
+  const closing = database.$close();
+
+  await expect(database.items.count()).rejects.toThrow(
+    "symmetria: driver is closed",
+  );
+  await expect(
+    (async () => {
+      for await (const _ of database
+        .items((items) => ({ id: items.id }))
+        .stream()) {
+        // never reached
+      }
+    })(),
+  ).rejects.toThrow("symmetria: driver is closed");
+  await closing;
+});
+
+test("a caller's query waits for a helper's stream whose fetches take longer than a second", async () => {
+  const { driver } = limitedPool(1, 2, 1200);
+  const database = schema({ items: { id: int } }, { driver });
+  const exportAll = async () => {
+    let read = 0;
+
+    for await (const _ of database
+      .items((items) => ({ id: items.id }))
+      .stream({ size: 2 })) {
+      read += 1;
+    }
+
+    return read;
+  };
+  const job = exportAll();
+
+  // The stream holds the connection; the loop's body is instant, and each of
+  // its two fetches takes 1.2 s.
+  await sleep(50);
+  const started = performance.now();
+
+  expect(await driver.execute(plain)).toEqual({ rows: [], affectedRows: 0 });
+  expect(performance.now() - started).toBeGreaterThanOrEqual(2200);
+  expect(await job).toBe(2);
+});
+
+test("a query of code that reads a stream elsewhere than in its own loop is refused once the stream has not been read for a second", async () => {
+  const { driver } = limitedPool(1, 4);
+  const database = schema({ items: { id: int } }, { driver });
+  const query = () => database.items((items) => ({ id: items.id }));
+  const refusal =
+    "symmetria: this query asks the pool for a connection from inside a stream() loop that holds the only one, and would wait forever";
+
+  // Read through ReadableStream.from(): the rows are read inside it.
+  const from = (
+    ReadableStream as unknown as {
+      from: <Row>(rows: AsyncIterable<Row>) => ReadableStream<Row>;
+    }
+  ).from;
+  const reader = from(query().stream({ size: 2 })).getReader();
+  expect((await reader.read()).value).toEqual({ id: 1 });
+  let started = performance.now();
+  await expect(driver.execute(plain)).rejects.toThrow(refusal);
+  expect(performance.now() - started).toBeGreaterThanOrEqual(900);
+  await reader.cancel();
+
+  // By hand, with the row read after the query.
+  const iterator = query()
+    .stream({ size: 2 })
+    [Symbol.asyncIterator]() as AsyncGenerator<{ id: number }>;
+  const first = await iterator.next();
+  started = performance.now();
+  await expect(driver.execute(plain)).rejects.toThrow(refusal);
+  expect(performance.now() - started).toBeLessThan(2000);
+  expect(first.value).toEqual({ id: 1 });
+  await iterator.return(undefined);
+
+  // Nothing holds the connection any more.
+  expect(await driver.execute(plain)).toEqual({ rows: [], affectedRows: 0 });
+});
+
+test("a stream's iterator is an async generator: await using closes it", async () => {
+  const { driver, log } = limitedPool(1, 4);
+  const database = schema({ items: { id: int } }, { driver });
+  const query = database.items((items) => ({ id: items.id }));
+  // Typed as an AsyncIterable; the iterator is an async generator.
+  const iterator = query.stream()[Symbol.asyncIterator]() as AsyncGenerator<{
+    id: number;
+  }>;
+
+  expect(Object.prototype.toString.call(iterator)).toBe(
+    "[object AsyncGenerator]",
+  );
+  expect(iterator[Symbol.asyncIterator]()).toBe(iterator);
+  await iterator.return(undefined);
+
+  {
+    await using rows = query
+      .stream({ size: 1 })
+      [Symbol.asyncIterator]() as AsyncGenerator<{ id: number }>;
+    expect((await rows.next()).value).toEqual({ id: 1 });
+  }
+
+  expect(log.slice(-2).map((sql) => sql.split(" ")[0])).toEqual([
+    "CLOSE",
+    "COMMIT",
+  ]);
+});

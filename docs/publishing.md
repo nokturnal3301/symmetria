@@ -7,10 +7,11 @@ The repository is a private Bun workspace with **two public npm packages**:
 | `symmetria`     | `packages/runtime/src/` | `packages/runtime/dist/` |
 | `symmetria-kit` | `packages/kit/src/`     | `packages/kit/dist/`     |
 
-The core has no runtime dependencies; its portable adapter uses an optional `pg`
-peer. Kit depends on `pg` and `string-width`, and declares an exact peer on the
-runtime version. `symmetria/internal` is their internal bridge, not an
-application API. Interactive inspection dynamically loads Kit.
+The core has no runtime dependencies. Its optional peers are `pg` for the
+portable adapter, `better-auth` for `symmetria/better-auth` and `@types/bun` for
+the Bun adapter's types. Kit depends on `pg` and `string-width`, and declares an
+exact peer on the runtime version. `symmetria/internal` is their internal
+bridge, not an application API. Interactive inspection dynamically loads Kit.
 
 The runtime exposes `symmetria` for schemas, queries and `createDatabase`,
 `symmetria/bun` for Bun.SQL and `symmetria/pg` for node-postgres.
@@ -51,8 +52,10 @@ packages/runtime/src/
 │   └── compile/    # SQL compiler (state, values, predicates, select, mutations)
 │       └── postgres/ # PostgreSQL renderer, rendering types and value encoding
 ├── driver/         # Bun.SQL/pg adapters and shared pool/transaction/session lifecycle
-├── observability/  # Profiling and query inspection
-├── entries/        # symmetria/bun, symmetria/pg, symmetria/driver, symmetria/vector, symmetria/internal
+├── embedders/      # HTTP requests shared by the ready-made embedding models
+├── observability/  # Profiling, query inspection and OpenTelemetry spans
+├── entries/        # One module per package entry: symmetria/bun, /pg, /vector, /search, /voyage, …
+├── errors.ts       # Error classes
 └── index.ts        # Public symmetria API
 ```
 

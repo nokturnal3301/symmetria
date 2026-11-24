@@ -16,6 +16,13 @@ export type JsonObjectEntry = {
   readonly key: string;
   readonly value: string;
 };
+/** Nested rows that the plain `json_agg("__symmetria_row")` would not read right. */
+export type JsonRowsShape = {
+  /** The rows' quoted alias, named like none of their fields. */
+  readonly alias: string;
+  /** Each row built from these fields, when a key's column has another name. */
+  readonly fields?: readonly JsonObjectEntry[];
+};
 type JsonPathOptions = {
   readonly scalarType: string | undefined;
 };
@@ -59,6 +66,7 @@ export type PostgresRenderer = {
     nested: string,
     many: boolean,
     jsonOutput: boolean,
+    shape?: JsonRowsShape,
   ) => string;
   readonly jsonPath: (
     value: string,

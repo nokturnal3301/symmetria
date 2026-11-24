@@ -7,10 +7,9 @@ import {
   isColumn,
   type Column,
   type ColumnInputType,
-  type IsDecimalText,
   type MetadataTraits,
-  type Vector,
 } from "../../schema/column";
+import type { WriteValue } from "../../schema/infer";
 import { codecFor, encodeValue, cloneParameter } from "../codecs";
 import { throwDataErrors } from "../codecs/deferred";
 import {
@@ -64,18 +63,10 @@ type ParameterInputs<Definitions extends Record<string, Column>> = {
 };
 /**
  * Values passed at execution, encoded like writes: vectors accept plain number
- * arrays, decimals any string and a jsonb(schema) its input.
+ * arrays, decimals any string, bigints safe integers and a jsonb(schema) its input.
  */
 type ParameterValues<Definitions extends Record<string, Column>> = {
-  [Name in keyof Definitions]: NonNullable<
-    ParameterInputs<Definitions>[Name]
-  > extends Vector
-    ? ParameterInputs<Definitions>[Name] | readonly number[]
-    : IsDecimalText<
-          NonNullable<ParameterInputs<Definitions>[Name]>
-        > extends true
-      ? ParameterInputs<Definitions>[Name] | string
-      : ParameterInputs<Definitions>[Name];
+  [Name in keyof Definitions]: WriteValue<ParameterInputs<Definitions>[Name]>;
 };
 type PreparedArguments<Values> = keyof Values extends never
   ? []

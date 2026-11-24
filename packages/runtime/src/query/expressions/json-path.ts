@@ -2,10 +2,20 @@
  * JSON path expressions: typed access into jsonb columns with the matching codecs.
  */
 import { freeze } from "../plan/freeze";
-import { booleanCodec, decodeValue, type RuntimeCodec } from "../codecs";
+import {
+  booleanCodec,
+  decodeValue,
+  jsonText,
+  type RuntimeCodec,
+} from "../codecs";
 import { encodeJsonField, jsonRowCodec } from "../codecs/json";
 import type { ExpressionDescription } from ".";
-import { expressionSource, expressionSqlType } from "../plan/metadata";
+import {
+  expressionSource,
+  expressionSqlType,
+  valueSqlType,
+} from "../plan/metadata";
+import { canonicalType } from "../codecs/type-names";
 
 const arrayElement = (
   expression: ExpressionDescription,
@@ -14,7 +24,7 @@ const arrayElement = (
   const elementType = expressionSqlType(expression).slice(0, -2);
   const codec =
     expression.codec?.element ??
-    (["boolean", "bool"].includes(elementType) ? booleanCodec : undefined);
+    (canonicalType(elementType) === "boolean" ? booleanCodec : undefined);
 
   return {
     outputName: expression.outputName,
@@ -62,13 +72,13 @@ export const jsonValueCodec = (
   parameterCast: "jsonb",
   encode: (value: unknown) => {
     const encoded = encodeJsonField(value, target?.codec);
-    const type = target ? expressionSqlType(target) : "jsonb";
+    // As jsonPrecisionSql nests it: bigint and numeric values as JSON strings.
+    const type = target ? valueSqlType(target) : "jsonb";
 
-    return JSON.stringify(
+    return jsonText(
       encoded == null
         ? encoded
-        : ["boolean", "bool"].includes(type) &&
-            target?.node.kind !== "arrayIndex"
+        : type === "boolean" && target?.node.kind !== "arrayIndex"
           ? Boolean(encoded)
           : type === "bigint" ||
               (type.startsWith("numeric") && !type.endsWith("[]"))
@@ -93,14 +103,15 @@ export const jsonPathDescription = (
 
     const target = jsonPathTarget(current, key);
     const type = target ? expressionSqlType(target) : "jsonb";
+    const kind = target ? valueSqlType(target) : "jsonb";
     // An enum's type name is not known here: its label reads as text.
     const scalarType =
       type === "enum"
         ? "text"
         : type !== "derived" &&
-            type !== "json" &&
-            type !== "jsonb" &&
-            !type.endsWith("[]")
+            kind !== "json" &&
+            kind !== "jsonb" &&
+            !kind.endsWith("[]")
           ? type
           : undefined;
     const codec = scalarType ? target?.codec : jsonValueCodec(target);

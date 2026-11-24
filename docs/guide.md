@@ -135,9 +135,13 @@ The paths add SQL JOINs. The required author uses INNER JOIN; the optional
 editor uses LEFT JOIN. A post without an editor remains in the result with
 `editorName: null`.
 
-INNER JOIN only returns matching rows. If a scope or PostgreSQL row-level
-security hides the author, that post is omitted by the author JOIN. This is how
-the returned `authorName` can remain a non-null `string`.
+INNER JOIN only returns matching rows. If PostgreSQL row-level security hides
+the author, the author JOIN leaves that post out. This is how the returned
+`authorName` can remain a non-null `string`. A `$scope()` on `users` works
+differently: the path becomes a LEFT JOIN, so the post stays and `authorName`
+reads `null` there, although its type still says `string`
+([scoped databases](reference.md#scoped-databases)). Use
+`innerJoin(post.author)` to keep only the posts whose author the scope admits.
 
 ### An object or collection inside the current row
 
@@ -180,12 +184,12 @@ A post written by Grace remains in `filtered`, with `author: null`. Scopes and
 row-level security can also hide related rows. Nested to-one types therefore
 conservatively include `null`, even for required foreign keys.
 
-| Shape                                            | Missing related result             | Effect on parent rows                |
-| ------------------------------------------------ | ---------------------------------- | ------------------------------------ |
-| `post.author.name`                               | Required INNER JOIN finds no match | Parent is omitted                    |
-| `post.editor.name`                               | `null`                             | LEFT JOIN retains the parent         |
-| `post.author(author => ({ name: author.name }))` | `null`                             | Nested projection retains the parent |
-| `user.posts(post => ({ title: post.title }))`    | `[]`                               | Nested projection retains the parent |
+| Shape                                            | Missing related result             | Effect on parent rows                             |
+| ------------------------------------------------ | ---------------------------------- | ------------------------------------------------- |
+| `post.author.name`                               | Required INNER JOIN finds no match | Parent is omitted (a scope keeps it, with `null`) |
+| `post.editor.name`                               | `null`                             | LEFT JOIN retains the parent                      |
+| `post.author(author => ({ name: author.name }))` | `null`                             | Nested projection retains the parent              |
+| `user.posts(post => ({ title: post.title }))`    | `[]`                               | Nested projection retains the parent              |
 
 ## 4. Use an explicit JOIN when its behavior matters
 
@@ -210,6 +214,7 @@ key. The shorthand `join` chooses a kind from the relationship:
 | Optional forward foreign key                  | LEFT             |
 | Reverse or many-to-many relationship          | LEFT             |
 | A source reached through an optional ancestor | LEFT propagates  |
+| A target table a `$scope()` filters           | LEFT             |
 
 An INNER JOIN preserves each column's own nullability; a nullable column stays
 nullable. Joining a collection can produce several rows per parent. Choose a
@@ -321,10 +326,14 @@ added to the database or to migrations.
 
 Large results do not have to fit in memory:
 `for await (const row of query.stream({ size: 1000 }))` reads through a
-server-side cursor inside one transaction. `$transaction(fn, { retries: 3 })`
-repeats the callback after serialization failures and deadlocks.
-`Infer<typeof db.users>`, `InferInsert<typeof db.users>` and
-`InferUpdate<typeof db.users>` name the row, insert and update types when a
+server-side cursor inside one transaction. The loop holds one of the pool's
+connections: when it asks for no row for a minute while other queries wait for a
+connection, the stream ends, gives its connection back and fails when read on
+(`idleTimeoutMs` changes the minute; see
+[streaming rows](reference.md#streaming-rows)).
+`$transaction(fn, { retries: 3 })` repeats the callback after serialization
+failures and deadlocks. `Infer<typeof db.users>`, `InferInsert<typeof db.users>`
+and `InferUpdate<typeof db.users>` name the row, insert and update types when a
 function signature needs them.
 
 ## Where to go next
@@ -341,7 +350,9 @@ function signature needs them.
 - [API reference](reference.md) for precise rules and advanced SQL.
 - [Kit](../packages/kit/README.md) for migrations and interactive tools.
 
-Application imports come from `symmetria`, `symmetria/bun` or `symmetria/pg`,
-and `symmetria-kit`. `symmetria/driver` aliases the `pg` adapter;
+Application imports come from `symmetria`, a driver (`symmetria/bun` or
+`symmetria/pg`), the feature entries used above (`symmetria/vector`,
+`symmetria/search` and the embedding models such as `symmetria/voyage`) and
+`symmetria-kit`. `symmetria/driver` aliases the `pg` adapter;
 `symmetria/internal` is the private integration bridge used by the matching Kit
 release.

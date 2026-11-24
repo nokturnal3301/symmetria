@@ -146,4 +146,55 @@ describe.skipIf(!available)("pgvector in migrations, drift and pull", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  test("a distance in a check and a partial index migrates, matches and pulls back", async () => {
+    const places = table({ id: int.auto, at: vector(3) })
+      .checks((place) => ({ near: place.at.l2Distance([1, 0, 0]).below(10) }))
+      .indexes((place) => ({
+        close: index(place.id).where(
+          place.at.cosineDistance([1, 0, -1.5]).below(0.5),
+        ),
+      }));
+    const distances = schema({ places }, { extensions: ["vector"] });
+    const lab = await testDatabase({
+      url: databaseUrl!,
+      schema: distances,
+      prefix: "symmetria_vector_check",
+      max: 1,
+      searchPath: ["public"],
+    });
+    const directory = await migrationDirectory();
+
+    try {
+      await lab.database.places.insert({ at: [1, 0, 0] });
+      await expect(
+        lab.database.places.insert({ at: [20, 0, 0] }).execute(),
+      ).rejects.toThrow(/places_near_check/);
+      expect(
+        await detectDrift({
+          execute: lab.driver.execute,
+          snapshot: distances.$snapshot(),
+        }),
+      ).toEqual([]);
+
+      const result = await pullSchema({
+        execute: lab.driver.execute,
+        module: resolve("packages/runtime/src/index.ts"),
+        vectorModule: resolve("packages/runtime/src/entries/vector.ts"),
+      });
+      const path = join(directory, "schema.ts");
+      await writeFile(path, result.source);
+      const loaded = await import(pathToFileURL(path).href);
+
+      expect(
+        await detectDrift({
+          execute: lab.driver.execute,
+          snapshot: loaded.appSchema.$snapshot(),
+        }),
+      ).toEqual([]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+      await lab.close();
+    }
+  });
 });

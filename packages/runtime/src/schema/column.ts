@@ -8,9 +8,11 @@
 import {
   arrayCodec,
   codecFor,
+  jsonText,
   type Codec,
   type RuntimeCodec,
 } from "../query/codecs";
+import { canonicalType } from "../query/codecs/type-names";
 
 export const COLUMN_CODEC = Symbol("symmetria.column.codec");
 
@@ -711,7 +713,7 @@ export const jsonb: {
       encode: (value: unknown) => {
         validate(value);
 
-        return JSON.stringify(value);
+        return jsonText(value);
       },
       decode: validate,
       parameterCast: "jsonb" as const,
@@ -800,15 +802,100 @@ export const numeric: NumericColumn = makeColumn(
   },
 ) as NumericColumn;
 
+/**
+ * How `customType()` values are read and written: an application codec, the
+ * `base` type the values have (a domain's base type, such as
+ * `"numeric(30,10)"`), or both. With `base` alone, values read and write as
+ * that type's builder does them; with both, `decode` receives the value as the
+ * base type reads it and `encode`'s result is written as the base type. The
+ * base is not part of the DDL: the column keeps the type it is declared with.
+ */
+export type CustomTypeOptions<Value> =
+  | (Codec<Value> & { readonly base?: string | undefined })
+  | {
+      readonly base: string;
+      readonly encode?: undefined;
+      readonly decode?: undefined;
+    };
+
+const sameValue = (value: unknown): unknown => value;
+
+/** A customType codec over a base type: the base's codec, then the application's. */
+const baseCodec = (
+  sqlType: string,
+  declaredBase: unknown,
+  codec: Partial<Codec<unknown>>,
+): RuntimeCodec => {
+  if (typeof declaredBase !== "string" || !declaredBase.trim()) {
+    throw new Error(
+      `symmetria: customType("${sqlType}") base must be a SQL type name such as "numeric(30,10)"`,
+    );
+  }
+
+  if (!codec.encode !== !codec.decode) {
+    throw new Error(
+      `symmetria: customType("${sqlType}") takes encode and decode together, or neither with a base`,
+    );
+  }
+
+  const base = canonicalType(declaredBase);
+  const inner = codecFor(base);
+  const { encode, decode } = codec;
+
+  if (!encode || !decode) {
+    return Object.freeze(
+      inner
+        ? { ...inner, sqlType, base }
+        : {
+            encode: sameValue,
+            decode: sameValue,
+            passthrough: true,
+            sqlType,
+            base,
+          },
+    );
+  }
+
+  return Object.freeze({
+    ...inner,
+    sqlType,
+    base,
+    encode: inner
+      ? (value: unknown) => {
+          const encoded = encode(value);
+
+          return encoded == null ? encoded : inner.encode(encoded as never);
+        }
+      : encode,
+    decode: inner ? (value: unknown) => decode(inner.decode(value)) : decode,
+  });
+};
+
 export const customType = <Value>(
   sqlType: string,
-  codec: Codec<Value>,
-): Column<{ valueType: Value; notNull: true; hasDefault: false }> =>
-  makeColumn(
+  options: CustomTypeOptions<Value>,
+): Column<{ valueType: Value; notNull: true; hasDefault: false }> => {
+  // Plain JavaScript may leave the options out (or pass null): the column
+  // then reads and writes values as any column of that SQL type does.
+  if (options === undefined || options === null) {
+    return makeColumn({
+      sqlType,
+      notNull: true,
+      unique: false,
+      primaryKey: false,
+    }) as Column<{ valueType: Value; notNull: true; hasDefault: false }>;
+  }
+
+  const { base, ...codec } = options;
+
+  return makeColumn(
     { sqlType, notNull: true, unique: false, primaryKey: false },
     {},
-    Object.freeze({ ...codec, sqlType }),
+    base === undefined
+      ? Object.freeze({ ...(codec as Codec<Value>), sqlType })
+      : baseCodec(sqlType, base, codec as Partial<Codec<unknown>>),
   ) as Column<{ valueType: Value; notNull: true; hasDefault: false }>;
+};
 
 /** A stored full-text document; `search()` and `searchRank()` use it directly, without `to_tsvector()`. */
 export type TsVector = Branded<string, "tsvector">;
@@ -829,11 +916,6 @@ export const isVectorType = (sqlType: string): boolean =>
 /** A pgvector embedding; declared with `vector(n)` from `symmetria/vector`, written as `number[]`. */
 export type Vector = Branded<number[], "vector">;
 
-/**
- * A column whose codec also controls parameter casts; for package entries such as
- * `symmetria/vector`. Not part of the public API.
- * @internal
- */
 /** The same column, kept out of whole-row reads; see `ColumnDefinition.hidden`. */
 export const hiddenColumn = (column: Column): Column =>
   makeColumn(
@@ -842,6 +924,11 @@ export const hiddenColumn = (column: Column): Column =>
     (column as { [COLUMN_CODEC]?: RuntimeCodec })[COLUMN_CODEC],
   );
 
+/**
+ * A column whose codec also controls parameter casts; for package entries such as
+ * `symmetria/vector`. Not part of the public API.
+ * @internal
+ */
 export const typedColumn = <Value>(
   sqlType: string,
   codec: RuntimeCodec,

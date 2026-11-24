@@ -27,13 +27,14 @@ import {
   type SelectPlan,
   type SourceDescription,
   type ConnectionHold,
+  type StreamClaim,
 } from "../plan/types";
 import type { InspectQueryOptions } from "../../observability/inspection";
 import type { executorProfiling } from "../../observability/profiling";
 import { boundMethodDescriptors } from "../expressions/callable";
 import { createContext } from "./context";
 import type { ShapeCallback } from "./joins";
-import type { TableRegistry } from "./registry";
+import type { ScopedSource, TableRegistry } from "./registry";
 import { applyShape } from "./shape";
 import {
   EMPTY,
@@ -55,7 +56,7 @@ import {
   rowCountError,
 } from "./terminal";
 
-/** Query handles share one prototype per database so methods stay cached. */
+/** Numbers the cursors of streams, so two open streams never share a name. */
 let streamOrdinal = 0;
 
 const streams = new WeakMap<object, Set<() => Promise<void>>>();
@@ -78,17 +79,95 @@ const endedStream = () =>
     "symmetria: the transaction of this stream ended while the stream was open and was rolled back; finish or break out of a stream() before its transaction callback returns",
   );
 
+const idleStream = (milliseconds: number) => () =>
+  new Error(
+    `symmetria: this stream was ended because its reader asked for no row for ${milliseconds} ms while other queries waited for a connection; read on sooner, or raise the stream's idleTimeoutMs`,
+  );
+
+/** How long a stream's reader may ask for no row while others wait for a connection. */
+const IDLE_TIMEOUT_MS = 60_000;
+
 /** How a dropped stream gives its connection back: see `dropped`. */
 type StreamLink = { release?: () => void };
 
 /**
  * An iterator read partly and then dropped without `return()` never reaches
  * its `finally`; once it is garbage, its transaction ends and the connection
- * goes back to the pool.
+ * goes back to the pool. Node.js may not collect it for a long time in a
+ * quiet process, so a stream of the pool also ends once its reader has asked
+ * for no row for its idle timeout while other work waits for a connection,
+ * and `$close()` (or the driver's `close()`) ends it.
  */
 const dropped = new FinalizationRegistry<StreamLink>((link) =>
   link.release?.(),
 );
+
+/** What async generators inherit: `[Symbol.asyncIterator]`, `[Symbol.asyncDispose]`, their tag. */
+const asyncGeneratorPrototype: object = Object.getPrototypeOf(
+  async function* () {},
+).prototype;
+const asyncDispose = (Symbol as { asyncDispose?: symbol }).asyncDispose;
+
+/**
+ * The iterator of a stream that holds one of the pool's connections. The
+ * connection counts as held by the code that reads the rows: a `for await`
+ * loop reads each result's `done` and `value` where its body goes on, so the
+ * claim enters there, and a query of the body that would wait for the
+ * connection is refused at once. Where the loop starts is no place for it:
+ * an async helper's loop starts in its caller's context, and the caller,
+ * which waits for no row, would count the connection as its own. That code
+ * only counts as having started the stream (see `gate()` in driver/pool.ts).
+ * It is an async generator to the code that uses it (`await using`, its
+ * tag), as the stream's own generator is.
+ */
+const claimedIterator = (
+  rows: AsyncGenerator<Record<string, unknown>>,
+  claim: StreamClaim,
+): AsyncGenerator<Record<string, unknown>> => {
+  const entering = (
+    result: IteratorResult<Record<string, unknown>>,
+  ): IteratorResult<Record<string, unknown>> => {
+    if (result.done) {
+      return result;
+    }
+
+    const { value } = result;
+
+    // `value` first, as a generator's own result lists it.
+    return {
+      get value() {
+        claim.enter();
+
+        return value;
+      },
+      get done(): false {
+        claim.enter();
+
+        return false;
+      },
+    };
+  };
+  const iterator = Object.create(asyncGeneratorPrototype, {
+    // A reader whose context counts the connection already gets the rows as
+    // they are.
+    next: {
+      value: () => (claim.entered() ? rows.next() : rows.next().then(entering)),
+    },
+    return: { value: (value?: unknown) => rows.return(value as never) },
+    throw: { value: (error?: unknown) => rows.throw(error) },
+    ...(asyncDispose
+      ? {
+          [asyncDispose]: {
+            value: async () => {
+              await rows.return(undefined as never);
+            },
+          },
+        }
+      : {}),
+  }) as AsyncGenerator<Record<string, unknown>>;
+
+  return iterator;
+};
 
 /**
  * Rows through a server-side cursor on a reserved connection. The hold callback
@@ -99,7 +178,8 @@ async function* streamRows(
   hold: ConnectionHold,
   plan: SelectPlan,
   size: number,
-  claim: { open: boolean } | undefined,
+  idleTimeoutMs: number,
+  claim: StreamClaim | undefined,
   link: StreamLink,
 ): AsyncGenerator<Record<string, unknown>> {
   const compiled = compilePlan(plan);
@@ -136,16 +216,31 @@ async function* streamRows(
   // Between two rows the stream waits for its reader and owns no statement,
   // so it can be ended there at once; a fetch in flight ends when it returns.
   let waiting = false;
-  let closing = false;
+  // How many times the reader asked for a row, for the idle check.
+  let pulls = 0;
+  // Why the stream was ended under its reader, which reading on reports.
+  let closing: (() => Error) | undefined;
   let ended: Promise<void> | undefined;
+  let idleCheck: ReturnType<typeof setInterval> | undefined;
   // The transaction or savepoint ended under the open stream and rolled back
   // with its cursor: rows fetched before must not be handed out.
   let rolledBack = false;
   const stopListening = whenCursorEnds(cursor, () => {
     rolledBack = true;
   });
-  const end = async () => {
-    closing = true;
+  // Ended under its reader ($close(), the idle check): reading on fails.
+  const stopIfEnded = () => {
+    if (closing) {
+      throw closing();
+    }
+  };
+  const stopIdleCheck = () => {
+    clearInterval(idleCheck);
+    idleCheck = undefined;
+  };
+  const end = async (reason: () => Error = closedStream) => {
+    closing ??= reason;
+    stopIdleCheck();
 
     if (waiting && execute) {
       const run = execute;
@@ -157,6 +252,12 @@ async function* streamRows(
 
         finished.resolve();
         await held.catch(() => {});
+        // Its reader may never come back to the finally below.
+        claim?.release();
+
+        if (owner) {
+          streams.get(owner)?.delete(end);
+        }
       })());
     }
   };
@@ -179,14 +280,9 @@ async function* streamRows(
       }),
     ]);
 
-    if (claim) {
-      claim.open = true;
-    }
-
     link.release = () => {
-      if (claim) {
-        claim.open = false;
-      }
+      stopIdleCheck();
+      claim?.release();
 
       if (owner) {
         streams.get(owner)?.delete(end);
@@ -194,6 +290,47 @@ async function* streamRows(
 
       finished.resolve();
     };
+
+    if (claim) {
+      claim.hold(
+        end,
+        () => pulls,
+        () => !waiting,
+      );
+
+      // A reader that asks for no row (a slow body, or an iterator dropped
+      // halfway that Node.js may not collect for a long time) holds the
+      // connection; while other work waits for one, the stream ends after
+      // `idleTimeoutMs`. A few checks per period count the whole intervals
+      // the stream spent waiting for its reader (`idle`), from a check that
+      // found it waiting; one that found it fetching does not count the
+      // interval after it.
+      if (idleTimeoutMs !== Number.POSITIVE_INFINITY) {
+        const every = Math.min(Math.max(1, idleTimeoutMs / 4), 2 ** 31 - 1);
+        const periods = Math.ceil(idleTimeoutMs / every);
+        let seen = -1;
+        let idle = -1;
+
+        idleCheck = setInterval(() => {
+          if (!waiting || pulls !== seen) {
+            seen = pulls;
+            idle = waiting ? 0 : -1;
+
+            return;
+          }
+
+          idle += 1;
+
+          if (idle >= periods && claim.contended()) {
+            void end(idleStream(idleTimeoutMs));
+          }
+        }, every);
+        // Node.js and Bun timers; a stream alone keeps no process alive.
+        (idleCheck as { unref?: () => void }).unref?.();
+      }
+    }
+
+    stopIfEnded();
 
     // A stream reads to the end, so its cursor is planned like the plain
     // query. PostgreSQL otherwise plans a cursor to start fast, and may pick
@@ -238,9 +375,7 @@ async function* streamRows(
         }),
       );
 
-      if (closing) {
-        throw closedStream();
-      }
+      stopIfEnded();
 
       if (rolledBack) {
         throw endedStream();
@@ -250,10 +385,9 @@ async function* streamRows(
         waiting = true;
         yield decode(row);
         waiting = false;
+        pulls += 1;
 
-        if (closing) {
-          throw closedStream();
-        }
+        stopIfEnded();
 
         if (rolledBack) {
           throw endedStream();
@@ -269,10 +403,8 @@ async function* streamRows(
     failed = true;
     throw error;
   } finally {
-    if (claim) {
-      claim.open = false;
-    }
-
+    stopIdleCheck();
+    claim?.release();
     dropped.unregister(link);
     stopListening();
 
@@ -280,8 +412,8 @@ async function* streamRows(
       streams.get(owner)?.delete(end);
     }
 
-    // $close() has ended the transaction already; only the error, if the
-    // reader went on, is left to report.
+    // Ended under its reader ($close(), the idle check): its transaction is
+    // over already; only the error, if the reader went on, is left to report.
     if (ended) {
       await ended;
 
@@ -427,7 +559,8 @@ export const createQueryFactory = (
    * LIMIT, OFFSET, DISTINCT and row locks pick the rows, which therefore stay
    * in a derived table with the source's columns under their own names and
    * the table's relations, so relation paths and relation aggregates still
-   * work; an ordering only matters there with a LIMIT or OFFSET.
+   * work; an ordering only matters there with a LIMIT or OFFSET, and with
+   * a row lock, whose rows it locks in its order (as the query does).
    */
   const aggregatePlan = (
     handle: QueryHandle,
@@ -475,7 +608,7 @@ export const createQueryFactory = (
           }),
         ),
       ),
-      ordering: limited ? plan.ordering : EMPTY,
+      ordering: limited || plan.locking ? plan.ordering : EMPTY,
     });
     const source = createQuery(
       initialPlan(freeze({ ...binding, derived: rows })),
@@ -497,10 +630,20 @@ export const createQueryFactory = (
         get [TABLE_SOURCE](): SourceDescription {
           const state = (this as unknown as QueryHandle)[QUERY_STATE];
 
+          // A JOIN reads the table itself: the fields, filters and limits of
+          // a built query would be dropped without a word.
+          if (!state.freshSource) {
+            throw new Error(
+              'symmetria: a join source is a table (db.users), a table alias (db.users.as("author")) or a derived table (a query with selected fields named with .as("name")); this query\'s own fields and options (where, orderBy, limit, …) would be lost in a JOIN of its table',
+            );
+          }
+
+          // Its database's $scope() filters follow the table into the JOIN.
           return (state.source ??= freeze({
             binding: state.plan.root,
             schema: registry.snapshot,
-          }));
+            registry,
+          } satisfies ScopedSource));
         },
         cte(
           this: QueryHandle,
@@ -778,13 +921,23 @@ export const createQueryFactory = (
             },
           };
         },
-        stream(this: QueryHandle, options: { size?: number } = {}) {
+        stream(
+          this: QueryHandle,
+          options: { size?: number; idleTimeoutMs?: number } = {},
+        ) {
           const plan = runnable(this[QUERY_STATE]);
           const size = options.size ?? 1000;
+          const idleTimeoutMs = options.idleTimeoutMs ?? IDLE_TIMEOUT_MS;
 
           if (!Number.isSafeInteger(size) || size < 1) {
             throw new Error(
               "symmetria: stream size must be a positive integer",
+            );
+          }
+
+          if (typeof idleTimeoutMs !== "number" || !(idleTimeoutMs > 0)) {
+            throw new Error(
+              "symmetria: stream idleTimeoutMs must be a positive number of milliseconds (Infinity: never end the stream for its reader)",
             );
           }
 
@@ -796,13 +949,21 @@ export const createQueryFactory = (
 
           return {
             [Symbol.asyncIterator]: () => {
-              // Called where the loop starts, so a query in the loop body
-              // sees the connection this stream holds.
+              // A stream of the pool counts its connection as held by the
+              // code that reads its rows; see claimedIterator.
               const claim = (hold as { owner?: Driver }).owner?.[
                 CONNECTION_CLAIM
               ]?.();
               const link: StreamLink = {};
-              const iterator = streamRows(hold, plan, size, claim, link);
+              const rows = streamRows(
+                hold,
+                plan,
+                size,
+                idleTimeoutMs,
+                claim,
+                link,
+              );
+              const iterator = claim ? claimedIterator(rows, claim) : rows;
 
               dropped.register(iterator, link, link);
 
@@ -873,9 +1034,22 @@ export const createQueryFactory = (
     sharedRoot = false,
   ): object => {
     const query = ((
-      callback: ShapeCallback | Record<string, unknown>,
-      options?: Record<string, unknown>,
+      ...shape: [
+        callback?: ShapeCallback | Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ]
     ) => {
+      // node:assert's rejects() and doesNotReject() call a function with no
+      // arguments and await what it returns: called so, the query runs.
+      if (shape.length === 0) {
+        return Promise.resolve(query);
+      }
+
+      // Any other call is a shape; applyShape() refuses what is not one.
+      const [callback, options] = shape as [
+        ShapeCallback | Record<string, unknown>,
+        Record<string, unknown>?,
+      ];
       const shared = freshSource && !shapeFrame.bindings;
       // Data errors in the callbacks fail the query when it runs.
       const [plan, failure] = collectDataErrors(() => {

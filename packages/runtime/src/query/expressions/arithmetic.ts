@@ -11,7 +11,7 @@ import {
   cloneParameter,
   type RuntimeCodec,
 } from "../codecs";
-import { expressionSqlType } from "../plan/metadata";
+import { valueSqlType } from "../plan/metadata";
 import {
   COLUMN_EXPRESSION,
   type ValueNode,
@@ -26,7 +26,7 @@ export type NumericClass = "decimal" | "bigint" | "float" | "integer";
 export const castNode = (node: ValueNode, sqlType: string): ValueNode =>
   freeze({ kind: "raw", parts: freeze(["(", node, `)::${sqlType}`]), sqlType });
 
-/** Types that read as strings but are not text: an enum, uuid, date or time. */
+/** Types that read as strings but are not text: an enum, uuid, date, time, interval or network address. */
 const STRING_VALUED =
   /^(?:enum|uuid|date|time|timetz|timestamp|timestamptz|interval|inet|cidr|macaddr8?)(?:\(|\s|$)/;
 const TEXT_TYPE =
@@ -36,7 +36,7 @@ export const isTextType = (sqlType: string): boolean => TEXT_TYPE.test(sqlType);
 
 /** Whether an expression reads as a string without being text. */
 export const readsAsString = (description: ExpressionDescription): boolean =>
-  STRING_VALUED.test(expressionSqlType(description));
+  STRING_VALUED.test(valueSqlType(description));
 
 /**
  * The expression as text, for what PostgreSQL defines on text only: LIKE,
@@ -57,7 +57,7 @@ export const asText = (
 
 /** A json/jsonb expression, such as a jsonb column or a path that does not reach a typed field. */
 export const isJsonValue = (description: ExpressionDescription): boolean => {
-  const sqlType = expressionSqlType(description);
+  const sqlType = valueSqlType(description);
 
   return sqlType === "json" || sqlType === "jsonb";
 };
@@ -112,7 +112,7 @@ export const numericClass = (
     return "float";
   }
 
-  const sqlType = expressionSqlType(expression);
+  const sqlType = valueSqlType(expression);
 
   if (expression.codec === numericCodec || sqlType.startsWith("numeric")) {
     return "decimal";
@@ -180,7 +180,7 @@ export const NOT_NUMERIC =
 export const expressionSide = (
   description: ExpressionDescription,
 ): ArithmeticSide => {
-  const sqlType = expressionSqlType(description);
+  const sqlType = valueSqlType(description);
 
   if (NOT_NUMERIC.test(sqlType)) {
     throw new Error(

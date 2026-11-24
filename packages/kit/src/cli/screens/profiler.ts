@@ -3,19 +3,48 @@
  */
 import { emitKeypressEvents } from "node:readline";
 import type { ProfiledRequest, ProfiledQuery } from "symmetria";
-import { fitLine, terminalWidth, theme, wrapLines } from "../ui/style";
-import { withScreen } from "../ui/terminal";
 import {
-  explainLines,
+  fitLine,
   terminalText,
-  wrapExplainLines,
-} from "./query-inspector";
+  terminalWidth,
+  theme,
+  wrapLines,
+} from "../ui/style";
+import { withScreen } from "../ui/terminal";
+import { explainLines, wrapExplainLines } from "./query-inspector";
 
 /** Why the profiler endpoint refused a request, with the fix for a wrong token. */
 export const profilerHttpError = (status: number): string =>
   status === 403
     ? "symmetria: the profiler rejected the token; pass --profile-token or set SYMMETRIA_PROFILE_TOKEN to the value used by profiler.serve()"
     : `symmetria: profiler returned HTTP ${status}`;
+
+/**
+ * An endpoint of the profiler at `address`, below its path: a profiler behind
+ * a reverse proxy at `http://host/prefix/` serves `http://host/prefix/requests`.
+ * An address that names the endpoint (`…/requests`) means its server.
+ */
+export const profilerEndpoint = (address: string, path: string): URL => {
+  let base: URL;
+
+  try {
+    base = new URL(address);
+  } catch {
+    throw new Error(
+      `symmetria: invalid --profile-url ${JSON.stringify(address)}`,
+    );
+  }
+
+  // The endpoint itself (http://127.0.0.1:7331/requests) is the form earlier
+  // versions took, so such addresses keep working.
+  base.pathname = base.pathname.replace(/\/requests\/?$/, "/");
+
+  if (!base.pathname.endsWith("/")) {
+    base.pathname += "/";
+  }
+
+  return new URL(path, base);
+};
 
 const milliseconds = (value: number) => `${value.toFixed(3)} ms`;
 
@@ -38,7 +67,7 @@ export const requestLines = (
   const compact = width < 72;
   const lines = [
     style(
-      `${request.label} · build ${milliseconds(request.buildMs)} · total ${milliseconds(request.durationMs)}`,
+      `${terminalText(request.label)} · build ${milliseconds(request.buildMs)} · total ${milliseconds(request.durationMs)}`,
       "pink",
     ),
   ];
@@ -152,7 +181,7 @@ export const profileScreen = async (
                 new Set(request.queries.map((entry) => entry.sql)).size;
               lines.push(
                 style(
-                  `${start + position === selectedRequest ? "›" : " "} ${fitLine(request.label, labelWidth).padEnd(labelWidth)} ${String(request.queries.length).padStart(3)}  ${request.buildMs.toFixed(2).padStart(7)}  ${request.durationMs.toFixed(2).padStart(7)}${duplicates ? `  ↻ ${duplicates}` : ""}${request.error ? "  ERROR" : ""}`,
+                  `${start + position === selectedRequest ? "›" : " "} ${fitLine(terminalText(request.label), labelWidth).padEnd(labelWidth)} ${String(request.queries.length).padStart(3)}  ${request.buildMs.toFixed(2).padStart(7)}  ${request.durationMs.toFixed(2).padStart(7)}${duplicates ? `  ↻ ${duplicates}` : ""}${request.error ? "  ERROR" : ""}`,
                   start + position === selectedRequest ? "selected" : "text",
                 ),
               );
@@ -176,14 +205,18 @@ export const profileScreen = async (
               mode === "plan"
                 ? wrapExplainLines(plan, terminalWidth())
                 : wrapLines(
-                    `${selected!.sql}\n\nParameters\n${JSON.stringify(selected!.parameters, null, 2)}${selected!.error ? `\n\n${selected!.error}` : ""}`,
+                    // SQL, parameters and errors quote what applications
+                    // stored: no escape sequence reaches the terminal.
+                    terminalText(
+                      `${selected!.sql}\n\nParameters\n${JSON.stringify(selected!.parameters, null, 2)}${selected!.error ? `\n\n${selected!.error}` : ""}`,
+                    ),
                   );
             offset = Math.min(offset, Math.max(0, wrapped.length - height));
             lines.push(...wrapped.slice(offset, offset + height));
           }
 
           process.stdout.write(
-            `\u001b[H\u001b[2J  ${fitLine(`${brand()} ${style("/ live profiler", "muted")}`)}\n  ${style(fitLine(error || address), error ? "danger" : "muted")}\n\n${lines.map((line) => `  ${fitLine(line)}`).join("\n")}\u001b[${Math.max(1, (process.stdout.rows || 24) - 1)};1H  ${style(fitLine("↑ ↓ navigate · enter open · esc back · e explain · a analyze · q quit"), "muted")}`,
+            `\u001b[H\u001b[2J  ${fitLine(`${brand()} ${style("/ live profiler", "muted")}`)}\n  ${style(fitLine(terminalText(error || address)), error ? "danger" : "muted")}\n\n${lines.map((line) => `  ${fitLine(line)}`).join("\n")}\u001b[${Math.max(1, (process.stdout.rows || 24) - 1)};1H  ${style(fitLine("↑ ↓ navigate · enter open · esc back · e explain · a analyze · q quit"), "muted")}`,
           );
         };
 
@@ -195,10 +228,13 @@ export const profileScreen = async (
           pending = true;
 
           try {
-            const response = await fetch(new URL("/requests", address), {
-              headers: { "x-symmetria-token": token },
-              signal: AbortSignal.timeout(3000),
-            });
+            const response = await fetch(
+              profilerEndpoint(address, "requests"),
+              {
+                headers: { "x-symmetria-token": token },
+                signal: AbortSignal.timeout(3000),
+              },
+            );
 
             if (!response.ok) {
               throw new Error(profilerHttpError(response.status));
@@ -245,7 +281,10 @@ export const profileScreen = async (
 
           try {
             const response = await fetch(
-              new URL(`/explain?id=${selected.id}&analyze=${analyze}`, address),
+              profilerEndpoint(
+                address,
+                `explain?id=${selected.id}&analyze=${analyze}`,
+              ),
               {
                 method: "POST",
                 headers: { "x-symmetria-token": token },
@@ -265,7 +304,9 @@ export const profileScreen = async (
             plan = Array.isArray(result) ? explainLines(result) : [];
 
             if (!plan.length) {
-              plan = JSON.stringify(result, null, 2).split("\n");
+              plan = JSON.stringify(result, null, 2)
+                .split("\n")
+                .map(terminalText);
             }
 
             mode = "plan";

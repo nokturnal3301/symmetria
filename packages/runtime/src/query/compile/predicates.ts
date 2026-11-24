@@ -4,7 +4,13 @@
 import { expressionSqlType } from "../plan/metadata";
 import { tsquerySql } from "./postgres/search";
 import { unconstrained } from "./postgres/render";
-import { negatable } from "../expressions/core";
+import { canonicalType, isBuiltInType } from "../codecs/type-names";
+import {
+  bareJsonOperand,
+  jsonNullAnswer,
+  negatable,
+  negatedJsonOperand,
+} from "../expressions/core";
 import type {
   PredicateDescription,
   ScopePredicate,
@@ -114,6 +120,32 @@ const scopeSql = (
   }
 };
 
+/**
+ * A comparison of a jsonb column read bare, which its btree index and a
+ * partial index declared with the same condition serve, written so that JSON
+ * null answers NULL, as `NULLIF(column, 'null'::jsonb)` would, in every
+ * context (below a raw NOT, in a selected boolean). `answer` is what the bare
+ * comparison answers for JSON null, when that is known. In a filter,
+ * PostgreSQL drops the constant NULL parts, and the comparison stays one
+ * condition of the filter (`"meta" > $1 AND "meta" <> 'null'::jsonb`).
+ */
+const bareJsonSql = (
+  comparison: string,
+  operand: string,
+  answer: boolean | undefined,
+): string => {
+  // NULL for JSON null, else TRUE: ANDed, it turns a TRUE for JSON null into NULL.
+  const present = `(${operand} <> 'null'::jsonb OR NULL)`;
+  // NULL for JSON null, else FALSE: ORed, it turns a FALSE for JSON null into NULL.
+  const nulled = `(${operand} = 'null'::jsonb AND NULL)`;
+
+  return answer === true
+    ? `(${comparison} AND ${present})`
+    : answer === false
+      ? `(${comparison} OR ${nulled})`
+      : `((${comparison} OR ${nulled}) AND ${present})`;
+};
+
 export const predicateSql = (
   compilation: Compilation,
   description: PredicateDescription,
@@ -138,10 +170,19 @@ export const predicateSql = (
       // narrows the plain one, so both together are exactly that negation,
       // and the plain one stays as written, as a CHECK or a partial index
       // declares it, for the planner to match. A cursor's shape keeps the
-      // plain form alone.
-      const strict = compilation.shapeOnly
-        ? description.predicate
-        : negatable(description.predicate);
+      // plain form alone. Where the strict form differs in one jsonb operand
+      // only, a type check of that operand stands for it.
+      if (compilation.shapeOnly) {
+        return negated;
+      }
+
+      const operand = negatedJsonOperand(description.predicate);
+
+      if (operand) {
+        return `(${negated} AND (jsonb_typeof(${operandSql(compilation, operand, bindings)}) <> 'null' OR NULL))`;
+      }
+
+      const strict = negatable(description.predicate);
 
       return strict === description.predicate
         ? negated
@@ -156,9 +197,28 @@ export const predicateSql = (
       const nullable =
         description.nullableParameter &&
         description.right.kind === "placeholder";
-      const left = operandSql(compilation, description.left, bindings);
+      // A jsonb column or path compared bare, which its indexes serve,
+      // reads JSON null as NULL as its NULLIF() would; a cursor's shape
+      // keeps the comparison alone, the form earlier versions sent.
+      const left = operandSql(
+        compilation,
+        description.bareJson
+          ? bareJsonOperand(description.left)
+          : description.left,
+        bindings,
+      );
       const right = operandSql(compilation, description.right, bindings);
-      const comparison = `${left} ${operator} ${right}`;
+      // `=` and `@>` are TRUE for JSON null only against JSON null, and stay so.
+      const comparison =
+        description.bareJson && !compilation.shapeOnly
+          ? bareJsonSql(
+              `${left} ${operator} ${right}`,
+              left,
+              operator === "=" || operator === "@>"
+                ? false
+                : jsonNullAnswer(operator, description.right),
+            )
+          : `${left} ${operator} ${right}`;
 
       if (!nullable || description.right.kind !== "placeholder") {
         return comparison;
@@ -170,19 +230,25 @@ export const predicateSql = (
         : `${left} IS NULL`;
       const whenNull = operator === "<>" ? `NOT (${isNull})` : isNull;
 
-      // An enum type's name is not known here to cast the parameter; the
-      // comparison comes first, so PostgreSQL takes the type from it. As in
-      // the CASE form, each branch is TRUE or FALSE when the other one holds,
-      // so not() of it stays exact: bound to null it is the null check alone,
-      // and a NULL row never matches a value under = or <>.
-      if (type === "enum") {
+      const declared = type === "derived" ? description.right.sqlType : type;
+
+      // The parameter takes the type of its first use. PostgreSQL's own
+      // types are named, without a modifier (casts drop it). Any other type
+      // (an enum, a domain, an extension's citext) is not named, not even by
+      // a customType()'s `base`: a domain's own type would round or check the
+      // value before it is compared (an `amount` over numeric(30,10)), and
+      // text for citext compares case-sensitively. The comparison comes
+      // first, so PostgreSQL takes the parameter's type from the operator,
+      // as for a literal: a domain's base type without its modifier, citext
+      // itself. As in the CASE form, each branch is FALSE, never NULL, where
+      // the other one applies, so not() of it stays exact: bound to null it is
+      // the null check alone, and a NULL row never matches a value under = or
+      // <>.
+      if (!isBuiltInType(canonicalType(declared))) {
         return `((${comparison} AND ${right} IS NOT NULL) OR (${right} IS NULL AND ${whenNull}))`;
       }
 
-      const checked = renderer.cast(right, {
-        kind: "typed",
-        type: type === "derived" ? description.right.sqlType : type,
-      });
+      const checked = renderer.cast(right, { kind: "typed", type: declared });
 
       return `(CASE WHEN ${checked} IS NULL THEN ${whenNull} ELSE ${comparison} END)`;
     }
@@ -190,7 +256,25 @@ export const predicateSql = (
       const operand = (node: ValueNode) =>
         operandSql(compilation, node, bindings);
 
-      return `${operand(description.value)} BETWEEN ${operand(description.lower)} AND ${operand(description.upper)}`;
+      const value = operand(
+        description.bareJson
+          ? bareJsonOperand(description.value)
+          : description.value,
+      );
+      const between = `${value} BETWEEN ${operand(description.lower)} AND ${operand(description.upper)}`;
+
+      if (!description.bareJson || compilation.shapeOnly) {
+        return between;
+      }
+
+      const from = jsonNullAnswer(">=", description.lower);
+      const to = jsonNullAnswer("<=", description.upper);
+
+      return bareJsonSql(
+        between,
+        value,
+        from === false || to === false ? false : from && to ? true : undefined,
+      );
     }
     case "has": {
       if (description.json) {
@@ -240,9 +324,15 @@ export const predicateSql = (
       }
 
       const left = operandSql(compilation, description.value, bindings);
+      // An IN list of a jsonb column or path is FALSE for JSON null, as `=`.
+      const bareMembership = (membership: string) =>
+        description.bareJson && !compilation.shapeOnly
+          ? bareJsonSql(membership, left, false)
+          : membership;
       const listType = largeListType(description);
-      // A page cursor's fingerprint keeps the list as 3.4.1 and earlier
-      // bound it: one parameter per value unless the type is a plain one.
+      // A page cursor's fingerprint keeps the list as earlier versions bound
+      // it, one parameter per value unless the type is a plain one, so their
+      // cursors stay valid.
       const arrayType =
         listType && (listType.type || !compilation.shapeOnly)
           ? listType
@@ -262,7 +352,9 @@ export const predicateSql = (
               })
             : bound;
 
-        return `${left} ${description.negated ? "<> ALL" : "= ANY"}(${array})`;
+        return bareMembership(
+          `${left} ${description.negated ? "<> ALL" : "= ANY"}(${array})`,
+        );
       }
 
       const operand = Array.isArray(description.values)
@@ -271,7 +363,9 @@ export const predicateSql = (
             .join(", ")
         : compilation.selectSql(description.values as SelectPlan, bindings);
 
-      return `${left} ${description.negated ? "NOT " : ""}IN (${operand})`;
+      return bareMembership(
+        `${left} ${description.negated ? "NOT " : ""}IN (${operand})`,
+      );
     }
   }
 };

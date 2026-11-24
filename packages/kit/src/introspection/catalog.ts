@@ -1,8 +1,9 @@
 /**
  * Catalog queries that only introspection needs on top of readCatalog: column
- * declaration order, generated columns, partitioning, structured index details
- * and what the schema cannot declare (views, triggers, inheritance, row-level
- * security, routines, sequences, tables of other schemas).
+ * declaration order, generated columns, partitioning, structured index details,
+ * the domains columns use, and what the schema cannot declare (views,
+ * triggers, inheritance, row-level security, routines, sequences, tables of
+ * other schemas).
  */
 import { normalizeResult } from "symmetria/internal";
 import {
@@ -259,6 +260,25 @@ export const readOtherSchemas = (options: CatalogOptions) =>
     ORDER BY namespace.nspname COLLATE "C"`,
   );
 
+/** A domain type: its name as columns spell it and the type it is based on (a domain too, sometimes). */
+export type DomainRow = { name: string; base: string };
+
+/**
+ * Every domain, named as format_type() names it in a column's type, with its
+ * base type and modifiers (`numeric(30,10)`). Domains of every schema: a
+ * table may use one from another schema.
+ */
+export const readDomains = (options: CatalogOptions) =>
+  query<DomainRow>(
+    options,
+    `SELECT format_type(type.oid, NULL) AS name, format_type(type.typbasetype, type.typtypmod) AS base
+    FROM pg_type type
+    WHERE type.typtype = 'd'
+      -- The shared parameters are not needed here, but must be referenced.
+      AND num_nulls($1::text, $2::text, $3::text) >= 0
+    ORDER BY format_type(type.oid, NULL) COLLATE "C"`,
+  );
+
 export type PullCatalog = Awaited<ReturnType<typeof readCatalog>> & {
   schemaName: string;
   /** Tables of the schema left out through `ignoreTables`. */
@@ -270,6 +290,8 @@ export type PullCatalog = Awaited<ReturnType<typeof readCatalog>> & {
   undeclared: UndeclaredObjectRow[];
   sequences: SequenceRow[];
   otherSchemas: OtherSchemaRow[];
+  /** Domain types and their base types; absent in catalogs built by hand. */
+  domains?: DomainRow[];
 };
 
 /**
@@ -293,6 +315,7 @@ export const readPullCatalog = async (
   const undeclared = await readUndeclaredObjects(options);
   const sequences = await readSequences(options);
   const otherSchemas = await readOtherSchemas(options);
+  const domains = await readDomains(options);
   const ignoreTables = new Set(options.ignoreTables ?? []);
 
   const kept = <Row extends { table_name?: string | null; name?: string }>(
@@ -336,5 +359,6 @@ export const readPullCatalog = async (
     ),
     sequences,
     otherSchemas,
+    domains,
   };
 };

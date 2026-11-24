@@ -219,6 +219,56 @@ test("decoding preserves special projection keys without mutating driver rows", 
   expect(stored.children[0].__proto__).toBe("9007199254740995");
 });
 
+test("a result key named like an internal alias or longer than 63 bytes keeps its own field", async () => {
+  const long = "利用者の表示名と最初の投稿のタイトルの一覧表"; // 66 bytes
+  const rows: Record<string, unknown>[] = [];
+  const model = schema(
+    {
+      users: { id: int.auto, name: text, deletedAt: timestamptz.nullable },
+      posts: ({ users }) => ({ id: int.auto, title: text, author: users }),
+    },
+    { executor: async () => rows },
+  );
+
+  // Nested rows are read through an alias named like none of their fields.
+  expect(
+    model
+      .users((user) => ({
+        posts: user.posts((post) => ({ __symmetria_row: post.title })),
+      }))
+      .toSQL().sql,
+  ).toContain(
+    `(SELECT COALESCE(json_agg("__symmetria_row_"), '[]'::json) FROM (SELECT "__symmetria_aggregate_0"."title" AS "__symmetria_row"`,
+  );
+
+  // A long key is selected under its first bytes and a hash, and read back
+  // under the key; nested rows are built with the key itself.
+  const query = model.users((user) => ({
+    [long]: user.name,
+    posts: user.posts((post) => ({ [long]: post.title })),
+  }));
+  const { sql: text_ } = query.toSQL();
+  const alias = /"users"\."name" AS "([^"]+)"/.exec(text_)![1]!;
+
+  expect(Buffer.byteLength(alias)).toBeLessThanOrEqual(63);
+  expect(alias).toStartWith("利用者の表示名と最初の投稿の");
+  expect(text_).toContain(
+    `json_agg(json_build_object('${long}', "__symmetria_row"."${alias}"))`,
+  );
+  rows.push({ [alias]: "Ada", posts: [{ [long]: "p1" }] });
+  expect(await query).toEqual([{ [long]: "Ada", posts: [{ [long]: "p1" }] }]);
+
+  // The $scope() check of RETURNING is named like no returned field.
+  const scoped = model
+    .$scope({ users: (user) => user.deletedAt.is(null) })
+    .users.insert({ name: "Ada" })
+    .returning((user) => ({ __symmetria_scope: user.name }))
+    .toSQL().sql;
+
+  expect(scoped).toContain('AS "__symmetria_scope", CASE WHEN');
+  expect(scoped).toEndWith('END AS "__symmetria_scope_"');
+});
+
 test("conditional predicates preserve false and zero and enum properties are typed", () => {
   const model = schema({
     records: { id: int, state: oneOf("draft", "published") },

@@ -8,6 +8,7 @@ import {
   bigint,
   bool,
   createDatabase,
+  customType,
   date,
   doublePrecision,
   not,
@@ -20,7 +21,9 @@ import {
   index,
   int,
   interval,
+  many,
   numeric,
+  one,
   sql,
   text,
   timestamp,
@@ -29,6 +32,7 @@ import {
   varchar,
   time,
   inet,
+  type Decimal,
 } from "../../../packages/runtime/src";
 import { fullText } from "../../../packages/runtime/src/entries/search";
 import {
@@ -1149,7 +1153,7 @@ describe.skipIf(!url)("pull round trip", () => {
         const { appSchema: edited } = await import(pathToFileURL(changed).href);
         expect(diffSchemas(snapshot, edited.$snapshot()).up).toEqual([
           'ALTER TABLE "accounts" DROP CONSTRAINT "accounts_small_check"',
-          'ALTER TABLE "accounts" ADD CONSTRAINT "accounts_small_check" CHECK ("small" > -99)',
+          'ALTER TABLE "accounts" ADD CONSTRAINT "accounts_small_check" CHECK ("small" > (-99))',
         ]);
       }),
     30000,
@@ -1424,6 +1428,133 @@ describe.skipIf(!url)("pull round trip", () => {
       expect(
         await detectDrift({ execute: context.driver.execute, snapshot }),
       ).toEqual([]);
+    }));
+
+  test("names and texts with line breaks, and negative numbers in expressions, pull back to no migration", () =>
+    sandbox(async (context) => {
+      const offset = -5;
+      const declared = schema({
+        odd: table({
+          id: int.auto,
+          n: int.named("n\rx"),
+          note: text.default("a\rb\u2028c\nd").named("note\u2028x"),
+          mood: oneOf("kept", "two\nlines").nullable,
+        })
+          .named("odd\ntable\u2029")
+          .checks((t) => ({
+            label: t.note.isNot("x\ry\u2028"),
+            shifted: sql<boolean>`${t.n}-${offset} > 0`,
+            negative: t.n.between(-100, -1),
+          }))
+          .indexes((t) => ({ low: index(t.n).where(t.n.below(-1)) })),
+      });
+      const { pulled, tables, snapshot } = await roundTrip(
+        context,
+        declared,
+        "lines",
+      );
+
+      // Line breaks reach the module only as escapes.
+      expect(pulled.source).not.toMatch(/[\r\u2028\u2029]/);
+      expect(pulled.source).toContain('.named("odd\\ntable\\u2029")');
+      expect(diffSchemas(declared.$snapshot(), tables).up).toEqual([]);
+      expect(
+        await detectDrift({ execute: context.driver.execute, snapshot }),
+      ).toEqual([]);
+    }));
+
+  test("domain columns pull back over their base type: no migration, values of the declared type at every depth", () =>
+    sandbox(async (context) => {
+      for (const statement of [
+        "CREATE DOMAIN amount AS numeric(30,10)",
+        "CREATE DOMAIN big_id AS bigint",
+        "CREATE DOMAIN moment AS timestamptz",
+        "CREATE DOMAIN flag AS boolean",
+        "CREATE DOMAIN positive AS amount CHECK (VALUE > 0)",
+      ]) {
+        await context.run(statement);
+      }
+
+      const owners = table({ id: int.auto, ledger: many });
+      const ledger = table({
+        id: int.auto,
+        owner: one(owners.ledger),
+        amount: customType<Decimal>("amount", { base: "numeric(30,10)" }),
+        big: customType<bigint>("big_id", { base: "bigint" }),
+        at: customType<Date>("moment", { base: "timestamp with time zone" }),
+        flag: customType<boolean>("flag", { base: "boolean" }),
+        positive: customType<Decimal>("positive", { base: "numeric(30,10)" }),
+      });
+      const declared = schema({ owners, ledger });
+      const { pulled, tables, snapshot } = await roundTrip(
+        context,
+        declared,
+        "domains",
+      );
+
+      expect(pulled.source).toContain(
+        'big: customType<bigint>("big_id", { base: "bigint" }), // pull: domain over bigint',
+      );
+      expect(pulled.source).toContain(
+        'positive: customType<Decimal>("positive", { base: "numeric(30,10)" }), // pull: domain over numeric(30,10)',
+      );
+      expect(diffSchemas(declared.$snapshot(), tables).up).toEqual([]);
+      expect(
+        await detectDrift({ execute: context.driver.execute, snapshot }),
+      ).toEqual([]);
+
+      await context.run(
+        "INSERT INTO owners DEFAULT VALUES; INSERT INTO ledger (owner_id, amount, big, at, flag, positive) VALUES (1, 1234567890.0123456789, 9007199254740993, '2026-01-02T03:04:05Z', true, 5.5)",
+      );
+      const { appSchema } = await import(
+        pathToFileURL(join(context.directory, "domains.ts")).href
+      );
+      const database = createDatabase({
+        schema: appSchema,
+        driver: context.driver,
+      }) as unknown as ReturnType<typeof createDatabase<typeof declared>>;
+      const expected = {
+        amount: "1234567890.0123456789",
+        big: 9007199254740993n,
+        at: new Date("2026-01-02T03:04:05Z"),
+        flag: true,
+        positive: "5.5000000000",
+      } as const;
+
+      // Top level, nested (read from JSON) and in $batch.
+      expect(
+        await database.ledger((entry) => ({
+          amount: entry.amount,
+          big: entry.big,
+          at: entry.at,
+          flag: entry.flag,
+          positive: entry.positive,
+        })),
+      ).toEqual([expected]);
+      expect(
+        await database.owners((owner) => ({
+          ledger: owner.ledger((entry) => ({
+            amount: entry.amount,
+            big: entry.big,
+            at: entry.at,
+            flag: entry.flag,
+            positive: entry.positive,
+          })),
+        })),
+      ).toEqual([{ ledger: [expected] }]);
+      expect(
+        await database.$batch((batch) => [
+          batch
+            .ledger((entry) => ({
+              amount: entry.amount,
+              big: entry.big,
+              at: entry.at,
+              flag: entry.flag,
+              positive: entry.positive,
+            }))
+            .first(),
+        ]),
+      ).toEqual([expected]);
     }));
 
   test("a search-shaped tsvector that is NOT NULL or used by another index stays a column with its warning", () =>

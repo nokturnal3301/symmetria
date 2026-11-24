@@ -9,10 +9,26 @@ import {
   indexClausesSQL,
   isIdentityDefault,
 } from "symmetria/internal";
-import type { MigrationPlan, MigrationStatus, RenameHints } from "../../index";
-import { canonicalJSON, type MigrationColumn } from "../../migrations/snapshot";
-import { renameMaps } from "../../migrations/diff";
-import { heading, panel, theme, fitLine, terminalWidth } from "./style";
+import type {
+  ExecutionStep,
+  MigrationPlan,
+  MigrationStatus,
+  RenameHints,
+} from "../../index";
+import {
+  canonicalJSON,
+  commentText,
+  type MigrationColumn,
+} from "../../migrations/snapshot";
+import { normalizedDefinition, renameMaps } from "../../migrations/diff";
+import {
+  heading,
+  panel,
+  theme,
+  fitLine,
+  terminalText,
+  terminalWidth,
+} from "./style";
 import stringWidth from "string-width";
 
 const equal = (left: unknown, right: unknown): boolean =>
@@ -60,9 +76,13 @@ export const formatDiff = (
   );
   const next = new Map(plan.after.tables.map((table) => [table.name, table]));
 
+  // Names and SQL are filtered before they are coloured: only the CLI's
+  // colours reach the terminal. A line break in a name is written as `\n`,
+  // so every change stays on its own line.
+  const line = (text: string) => terminalText(commentText(text));
   const marker = (sign: string, text: string) =>
     style(
-      `    ${sign} ${text}`,
+      `    ${sign} ${line(text)}`,
       sign === "+" ? "success" : sign === "-" ? "danger" : "warning",
     );
 
@@ -79,15 +99,29 @@ export const formatDiff = (
       [...renamedTables].find(([, target]) => target === name)?.[0] ?? name;
     const before = previous.get(originalName);
     const after = next.get(name);
+    // Checks and indexes compare as the SQL diff compares them: an
+    // expression spelled differently by another release is no change.
+    const types = new Map(
+      (after ?? before)!.columns.map((column) => [column.name, column.sqlType]),
+    );
+    const normalized = <Definition extends object>(
+      definition: Definition | undefined,
+    ) => definition && normalizedDefinition(definition, types);
+    const comparable = (table: typeof before) =>
+      table && {
+        ...table,
+        indexes: table.indexes.map(normalized),
+        ...(table.checks ? { checks: table.checks.map(normalized) } : {}),
+      };
 
-    if (equal(before, after)) {
+    if (equal(comparable(before), comparable(after))) {
       continue;
     }
 
     changed++;
     output.push(
       style(
-        `  ${before ? (after ? "~" : "-") : "+"} ${originalName === name ? name : `${originalName} → ${name}`}`,
+        `  ${before ? (after ? "~" : "-") : "+"} ${line(originalName === name ? name : `${originalName} → ${name}`)}`,
         "accent",
       ),
     );
@@ -146,7 +180,7 @@ export const formatDiff = (
         const old = before?.[kind]?.find((entry) => entry.sqlName === name);
         const current = after?.[kind]?.find((entry) => entry.sqlName === name);
 
-        if (equal(old, current)) {
+        if (equal(normalized(old), normalized(current))) {
           continue;
         }
 
@@ -251,6 +285,16 @@ export const columnTypeLabel = (column: ColumnSnapshot): string =>
     .filter(Boolean)
     .join(" ");
 
+/** A declared default as a literal: bigints as digits at any depth, not as quoted text. */
+export const defaultValueLabel = (value: unknown): string =>
+  typeof value === "bigint"
+    ? String(value)
+    : Array.isArray(value)
+      ? `[${value.map(defaultValueLabel).join(",")}]`
+      : JSON.stringify(value, (_name, entry) =>
+          typeof entry === "bigint" ? String(entry) : entry,
+        );
+
 /** `default …`, or the identity generation instead of the marker it is stored as. */
 const columnDefaultLabel = (column: ColumnSnapshot): string => {
   if (!column.default) {
@@ -264,7 +308,7 @@ const columnDefaultLabel = (column: ColumnSnapshot): string => {
       : "identity";
   }
 
-  return `default ${column.default.kind === "sql" ? column.default.sql : JSON.stringify(column.default.value, (_name, value) => (typeof value === "bigint" ? String(value) : value))}`;
+  return `default ${column.default.kind === "sql" ? column.default.sql : defaultValueLabel(column.default.value)}`;
 };
 
 export const formatSchema = (
@@ -377,7 +421,7 @@ export const formatStatus = (
     heading("Migration history", `${statuses.length} total`, color),
     ...statuses.map(
       (entry) =>
-        `  ${style(entry.status === "applied" ? "✓" : "○", entry.status === "applied" ? "success" : "warning")} ${style(entry.id.padEnd(36), "strong")} ${style(entry.status, entry.status === "applied" ? "success" : "warning")}${entry.status === "incomplete" ? ` · ${entry.direction} · ${entry.statement} confirmed statements · repair required` : entry.appliedAt ? style(` · ${entry.appliedAt.toISOString()}`, "muted") : ""}`,
+        `  ${style(entry.status === "applied" ? "✓" : "○", entry.status === "applied" ? "success" : "warning")} ${style(terminalText(entry.id).padEnd(36), "strong")} ${style(entry.status, entry.status === "applied" ? "success" : "warning")}${entry.status === "incomplete" ? ` · ${entry.direction} · ${entry.statement} confirmed statements · ${entry.running ? "running in another process" : "repair required"}` : entry.appliedAt ? style(` · ${entry.appliedAt.toISOString()}`, "muted") : ""}`,
     ),
     "",
     `  ${style(`${applied} applied`, "success")} ${style("·", "muted")} ${style(`${pending} pending`, pending ? "warning" : "muted")}${incomplete ? ` · ${style(`${incomplete} incomplete`, "warning")}` : ""}\n`,
@@ -409,7 +453,7 @@ export const formatDashboard = (
   ) => `${style(String(value), tone)} ${style(label, "muted")}`;
 
   const separator = style("  ·  ", "border");
-  const address = `${style("●", details.connection === "connected" ? "connected" : details.connection === "unavailable" ? "danger" : "muted")} ${details.address}`;
+  const address = `${style("●", details.connection === "connected" ? "connected" : details.connection === "unavailable" ? "danger" : "muted")} ${terminalText(details.address)}`;
 
   const width = terminalWidth();
 
@@ -484,9 +528,11 @@ export const formatDashboard = (
         (_line, index) => `  ${cards.map((card) => card[index]).join("  ")}`,
       ),
       ...(details.connection === "unavailable"
-        ? [`  ${style(fitLine(details.migrations, width), "danger")}`]
+        ? [
+            `  ${style(fitLine(terminalText(details.migrations), width), "danger")}`,
+          ]
         : []),
-      `  ${style(fitLine(details.config, width), "muted")}`,
+      `  ${style(fitLine(terminalText(details.config), width), "muted")}`,
     ].join("\n");
   }
 
@@ -518,9 +564,9 @@ export const formatDashboard = (
             ].join(separator)
           : "not configured"
       }`,
-      `${style("Migrations  ", "muted")}${style(details.migrations, details.connection === "unavailable" ? "danger" : details.pending ? "warning" : details.connection === "connected" ? "success" : "muted")}`,
+      `${style("Migrations  ", "muted")}${style(terminalText(details.migrations), details.connection === "unavailable" ? "danger" : details.pending ? "warning" : details.connection === "connected" ? "success" : "muted")}`,
       `${style("Changes     ", "muted")}${style(details.changes === undefined ? "schema not configured" : details.changes ? `${details.changes} SQL statements since last snapshot` : "✓ In sync with the latest snapshot", details.changes ? "warning" : details.changes === 0 ? "success" : "muted")}`,
-      style(details.config, "muted"),
+      style(terminalText(details.config), "muted"),
     ],
     color,
   );
@@ -565,14 +611,27 @@ export const formatPullWarnings = (
     `  ${style("!", "warning")} ${style(`${warnings.length} ${warnings.length === 1 ? "item needs" : "items need"} review`, "strong")}`,
     "",
     ...warnings.flatMap((warning) => [
-      `    ${style("•", "border")} ${style(`[${warning.code}]`, "muted")} ${warning.message}`,
+      `    ${style("•", "border")} ${style(`[${warning.code}]`, "muted")} ${terminalText(commentText(warning.message))}`,
       ...(warning.fix
-        ? [`      ${style("fix:", "accent")} ${warning.fix}`]
+        ? [`      ${style("fix:", "accent")} ${terminalText(warning.fix)}`]
         : []),
     ]),
     "",
   ].join("\n");
 };
+
+/**
+ * `migrate --plan` and `rollback --plan`: each step's SQL under a comment
+ * line. A migration's id is its directory's name, which may hold a line
+ * break: escaped, the rest of it cannot turn into SQL.
+ */
+export const formatPlan = (steps: readonly ExecutionStep[]): string =>
+  steps
+    .map(
+      (step) =>
+        `-- group ${step.group}: ${step.transaction} · ${commentText(step.id)}\n${step.statements.map((sql) => `${sql};`).join("\n\n")}`,
+    )
+    .join("\n\n");
 
 export const formatExecution = (
   migrationIdentifiers: readonly string[],
@@ -594,7 +653,7 @@ export const formatExecution = (
     ),
     ...migrationIdentifiers.map(
       (identifier) =>
-        `  ${style("✓", "success")} ${style(identifier, "strong")}`,
+        `  ${style("✓", "success")} ${style(terminalText(identifier), "strong")}`,
     ),
     "",
     `  ${style(`${action} ${migrationIdentifiers.length} migrations`, "success")} ${style(`in ${durationMs} ms`, "muted")}${action === "Applied" ? " · Database is up to date." : ""}\n`,

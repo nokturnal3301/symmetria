@@ -37,12 +37,35 @@ export const WRITE_TAG = "SymmetriaWrite";
 
 /**
  * A driver's way to count a connection a `stream()` reserves as held by the
- * code that iterates it: called where the loop starts, it returns a holder
- * the stream marks open while it holds the connection. A query in the loop
- * then fails at once where it would wait forever for that connection.
+ * code that iterates it. Called where the iterator is made, it marks that
+ * code as having started the stream; the claim then enters the async context
+ * of the code that reads the rows, so a query in the loop fails at once where
+ * it would wait forever for that connection. `close()` ends the streams that
+ * hold a connection.
  */
 export const CONNECTION_CLAIM = Symbol("symmetria.driver.claim");
-export type ConnectionClaim = () => { open: boolean };
+export type StreamClaim = {
+  /** Counts the connection as held by the code running now; once per context. */
+  readonly enter: () => void;
+  /** Whether the code running now counts the connection as held. */
+  readonly entered: () => boolean;
+  /** Whether other work waits for one of the pool's connections. */
+  readonly contended: () => boolean;
+  /**
+   * The stream holds its connection; `end` ends it, as `close()` does,
+   * `progress` counts the rows its reader has asked for, and `busy` tells
+   * whether it works on one now (a FETCH in flight, a row on its way) rather
+   * than waiting for its reader to ask.
+   */
+  readonly hold: (
+    end: () => Promise<void>,
+    progress: () => number,
+    busy: () => boolean,
+  ) => void;
+  /** The stream gave its connection back. */
+  readonly release: () => void;
+};
+export type ConnectionClaim = () => StreamClaim;
 export type ExecutionResult = {
   rows: Record<string, unknown>[];
   affectedRows: number;
@@ -260,12 +283,46 @@ export const numberedAlias = (preferred: string, ordinal: number): string => {
   return characters.join("") + suffix;
 };
 
+/** The number of rows a result says its statement wrote or read, when it says one. */
+const statedCount = (result: object): number | undefined => {
+  const { affectedRows, count, rowCount } = result as {
+    affectedRows?: unknown;
+    count?: unknown;
+    rowCount?: unknown;
+  };
+
+  return typeof affectedRows === "number"
+    ? affectedRows
+    : typeof count === "number"
+      ? count
+      : typeof rowCount === "number"
+        ? rowCount
+        : undefined;
+};
+
+/**
+ * An executor's result as `{ rows, affectedRows }`. An array of rows says its
+ * count with `count` (Bun.SQL, postgres.js), an object with `affectedRows` or
+ * `rowCount` (a node-postgres result); otherwise the rows are counted. A write
+ * without RETURNING returns no rows, so its count cannot be counted: with
+ * `write`, a result that does not state one is refused.
+ */
 export const normalizeResult = (
   result: ExecutionResult | Record<string, unknown>[],
-): ExecutionResult =>
-  Array.isArray(result)
-    ? {
-        rows: result,
-        affectedRows: (result as { count?: number }).count ?? result.length,
-      }
-    : result;
+  write = false,
+): ExecutionResult => {
+  if (!Array.isArray(result) && typeof result.affectedRows === "number") {
+    return result;
+  }
+
+  const rows = Array.isArray(result) ? result : result.rows;
+  const affectedRows = statedCount(result);
+
+  if (affectedRows === undefined && write) {
+    throw new Error(
+      "symmetria: the executor's result does not say how many rows the write changed (the statement ran); return { rows, affectedRows } from the executor, or a node-postgres result or Bun.SQL array as they are, instead of the array of rows alone",
+    );
+  }
+
+  return { rows, affectedRows: affectedRows ?? rows.length };
+};

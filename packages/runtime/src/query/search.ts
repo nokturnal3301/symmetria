@@ -7,17 +7,27 @@
 import { primaryKeyColumns, type TableSnapshot } from "../schema/assembly";
 import {
   declaredSearches,
+  meaningSource,
   wordsColumn,
   type wordsDocument,
   type EmbeddingModel,
+  type MeaningSource,
   type Search,
   type SearchCallback,
 } from "../schema/search";
-import { rowNumber, sql } from "./expressions";
-import { QUERY_TAG, WRITE_TAG, type Awaitable } from "./plan/types";
+import { shortestReal, type RuntimeCodec } from "./codecs";
+import { canonicalType } from "./codecs/type-names";
+import { COLUMN_EXPRESSION, rowNumber, sql } from "./expressions";
+import {
+  DEFAULT_VALUE,
+  QUERY_TAG,
+  WRITE_TAG,
+  type Awaitable,
+} from "./plan/types";
 import { FULL_JOIN } from "./select/joins";
 import { equalityPredicates, plainRecord } from "./select/shape";
 import type { RuntimeScope } from "./select/types";
+import { exactTextParts } from "./write/nested-input";
 
 /** Reciprocal rank fusion's damping constant; 60 is the value from the original paper. */
 const RRF_K = 60;
@@ -41,23 +51,209 @@ const template = (strings: string[], ...values: unknown[]) =>
   sql(Object.assign([...strings], { raw: [...strings] }), ...values);
 
 /**
+ * What counts as a space, the same in JavaScript and in PostgreSQL's regular
+ * expressions (JavaScript's `\s`, as `trim()` removes it): a text made only of
+ * these, no-break spaces and byte order marks included, has nothing to search
+ * for or to embed.
+ */
+const SPACES =
+  "\\t\\n\\v\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff";
+const NOT_SPACE = new RegExp(`[^${SPACES}]`, "u");
+
+/** Whether a text holds anything but spaces. */
+const hasText = (value: string | undefined): value is string =>
+  value !== undefined && NOT_SPACE.test(value);
+
+/**
+ * A word of a question: letters, digits and combining marks (Hindi, Thai,
+ * Arabic vowels, decomposed accents), with the `@ . - _ /` inside it, so an
+ * address or a host name stays the one word PostgreSQL's parser makes of it.
+ */
+const WORD = /[\p{L}\p{N}\p{M}]+(?:[@._\-/][\p{L}\p{N}\p{M}]+)*/gu;
+/** A run of letters, digits and marks: PostgreSQL's parser makes at most one word of it. */
+const PART = /[\p{L}\p{N}\p{M}]+/gu;
+/** A question is searched by its first this many distinct words. */
+const QUESTION_WORDS = 64;
+/**
+ * How much more than its words a question may send, so that none makes
+ * PostgreSQL build more than about two thousand query nodes: each word at
+ * most 16 runs of letters and digits; other spellings and pieces within 128
+ * operands and 256 runs in all, 16 runs and 200 characters each; a piece
+ * between spaces is sent whole only with at most 8 words.
+ */
+const QUESTION_OPERANDS = 128;
+const QUESTION_PARTS = 256;
+const OPERAND_PARTS = 16;
+const OPERAND_LENGTH = 200;
+const PIECE_WORDS = 8;
+/** PostgreSQL keeps no longer word in a document, so a question needs none. */
+const LONGEST_WORD = 2047;
+
+/** Text as a quoted operand of the raw query syntax, where it is only ever words. */
+const quotedOperand = (text: string): string =>
+  `' ${text.replaceAll("\\", "\\\\").replaceAll("'", "''")}'`;
+
+const partsOf = (text: string): number => text.match(PART)?.length ?? 0;
+
+/** ASCII characters PostgreSQL's parser drops next to a word and between words, outside a URL. */
+const DROPPED = "!\"#$%&'()*,;<=>?@[\\\\\\]^`{|}";
+const ONLY_DROPPED = new RegExp(`^[${DROPPED}]*$`);
+/** Before the first word, also `. : _` and a sign that no digit follows. */
+const DROPPED_BEFORE = new RegExp(`^[${DROPPED}.:_+-]*$`);
+/**
+ * After the last word, also `. : _ + - ~`, but no two of `. _ ~` together,
+ * which make a file name (`..`), except an ellipsis (`...`).
+ */
+const DROPPED_AFTER = new RegExp(`^[${DROPPED}.:_+~-]*$`);
+const FILE_NAME = /[._~]{2}/;
+
+/**
+ * Whether a spelling makes no lexeme that its words alone do not, which are
+ * sent already: PostgreSQL's parser drops what it adds to them (`keys?`,
+ * `(account,`, `What's`, `memory:`, `e-mail--`, `...end`). Otherwise it may
+ * join a word into another lexeme: a sign before a number (`-5`, `+5`), a
+ * path (`/etc/hosts`, `~/x`, `..`, `v1.2-`, `U.S_`), a port, nearly any
+ * character in a URL's path or query (after `x.org/`), and a character
+ * beyond ASCII, which a database in the C locale reads as a letter. Checked
+ * against PostgreSQL 16 and 18 for every run of up to four such characters
+ * before and after each kind of word.
+ */
+const addsNothing = (written: string): boolean => {
+  const found = [...written.matchAll(WORD)];
+  const first = found[0];
+  const last = found.at(-1);
+
+  if (!first || !last || found.some((match) => match[0].includes("/"))) {
+    return false;
+  }
+
+  const before = written.slice(0, first.index);
+  const after = written.slice(last.index + last[0].length);
+
+  return (
+    found.every(
+      (match, position) =>
+        position === 0 ||
+        ONLY_DROPPED.test(
+          written.slice(
+            found[position - 1]!.index + found[position - 1]![0].length,
+            match.index,
+          ),
+        ),
+    ) &&
+    DROPPED_BEFORE.test(before) &&
+    !(/^\p{N}/u.test(first[0]) && /[+-]$/.test(before)) &&
+    DROPPED_AFTER.test(after) &&
+    !FILE_NAME.test(after.replace(/\.{3,}/g, "!")) &&
+    !(last[0].includes(".") && /^[-_]/.test(after))
+  );
+};
+
+/**
+ * A word as sent alone: as written, or its first run of letters and digits
+ * when it has more than 16, which every document holding the word also
+ * holds; nothing for a word longer than PostgreSQL keeps.
+ */
+const bareWord = (word: string): string | undefined => {
+  const sent = partsOf(word) > OPERAND_PARTS ? word.match(PART)![0] : word;
+
+  return sent.length > LONGEST_WORD ? undefined : sent;
+};
+
+/**
  * A question as a full-text query that matches any of its words: `websearch`
  * would demand all of them, and a question shares few words with its answer.
- * A word keeps its combining marks (Hindi, Thai, Arabic vowels, decomposed
- * accents) and the `@ . - _ /` inside it, so an address or a host name stays
- * the one word PostgreSQL's parser makes of it. Nothing else survives, so the
- * raw query syntax cannot break.
+ * Each operand is quoted, and PostgreSQL turns it into lexemes with the
+ * document's own parser and dictionaries, lowercasing it as it lowercased the
+ * document (`İstanbul`, `ΟΔΟΣ`). Every word is sent bare, so a question finds
+ * every row that one of its words finds by itself. The first and last word of a
+ * piece between spaces are also sent with what surrounds them, read after a
+ * space as in the middle of a document (`/etc/hosts`, `-5`, `./run.sh`), and a
+ * short piece of several words whole (the address and query of a URL), within
+ * the bounds above. A word made of several lexemes (`e-mail`) matches them as
+ * a phrase. The first 64 distinct words count.
  */
-const anyWord = (text: string): string =>
-  [
-    ...new Set(
-      text
-        .toLowerCase()
-        .match(/[\p{L}\p{N}\p{M}]+(?:[@._\-/][\p{L}\p{N}\p{M}]+)*/gu) ?? [],
-    ),
-  ]
-    .slice(0, 64)
-    .join(" | ");
+const anyWord = (text: string): string => {
+  const words = new Map<string, string>();
+  const spellings: string[] = [];
+  const spell = (written: string): void => {
+    if (
+      written.length <= OPERAND_LENGTH &&
+      partsOf(written) <= OPERAND_PARTS &&
+      !addsNothing(written)
+    ) {
+      spellings.push(written);
+    }
+  };
+
+  pieces: for (const piece of text.split(/\s+/u)) {
+    const found = [...piece.matchAll(WORD)];
+
+    for (const [position, match] of found.entries()) {
+      const word = match[0].toLowerCase();
+
+      if (!words.has(word)) {
+        if (words.size === QUESTION_WORDS) {
+          break pieces;
+        }
+
+        words.set(word, match[0]);
+      }
+
+      const written = piece.slice(
+        position === 0 ? 0 : match.index,
+        position === found.length - 1
+          ? piece.length
+          : match.index + match[0].length,
+      );
+
+      if (written !== match[0]) {
+        spell(written);
+      }
+    }
+
+    if (
+      found.length > 1 &&
+      found.length <= PIECE_WORDS &&
+      piece.length <= OPERAND_LENGTH
+    ) {
+      spell(piece);
+    }
+  }
+
+  const sent = new Set<string>();
+  const operands: string[] = [];
+  let parts = 0;
+  const send = (written: string): void => {
+    const key = written.toLowerCase();
+
+    if (!sent.has(key)) {
+      sent.add(key);
+      parts += partsOf(written);
+      operands.push(quotedOperand(written));
+    }
+  };
+
+  for (const word of words.values()) {
+    const bare = bareWord(word);
+
+    if (bare !== undefined) {
+      send(bare);
+    }
+  }
+
+  for (const written of spellings) {
+    if (operands.length >= QUESTION_OPERANDS) {
+      break;
+    }
+
+    if (parts + partsOf(written) <= QUESTION_PARTS) {
+      send(written);
+    }
+  }
+
+  return operands.join(" | ");
+};
 
 /** What was asked of one declared search: words, an embedding, or both. */
 type Input = { text?: string; vector?: readonly number[] };
@@ -146,6 +342,12 @@ export const createSearch = (
   declared: readonly Search[],
   /** Whether a $scope() filter narrows every read of the table. */
   scoped: boolean,
+  /**
+   * In a transaction: runs a search that waits for a model in the place it
+   * took in the transaction's order when it started, against the table as
+   * that place sees it.
+   */
+  ordered?: InOrder,
 ) => {
   const source = queryTable as Source;
   const keys = primaryKeyColumns(table);
@@ -224,38 +426,27 @@ export const createSearch = (
           : [resolved];
     };
 
-    /** The lists of this search; embeddings a model must compute come first. */
-    type Ranked = { lists: List[]; partial?: PartialSearch };
-    let ranking: Promise<Ranked> | undefined;
-    // An embedding is asked for once, whether the search runs or only prints its SQL.
-    const lists = (): Promise<Ranked> => (ranking ??= rank());
-    const rank = async (): Promise<Ranked> => {
-      const result: List[] = [];
-      let partial: PartialSearch | undefined;
+    /** What one input asks for: words, a vector given, or a text a model embeds. */
+    type Step = {
+      readonly search: Search;
+      readonly words?: string;
+      readonly vector?: readonly number[];
+      readonly embed?: string;
+    };
 
-      for (const { search, input } of inputs) {
+    /** The steps of this search, checked before any model is asked. */
+    const plan = (): Step[] =>
+      inputs.flatMap(({ search, input }): Step[] => {
         const { name } = search;
 
         // An empty question finds nothing, whichever way it is searched.
-        if (!input.vector && !input.text?.trim()) {
-          continue;
+        if (!input.vector && !hasText(input.text)) {
+          return [];
         }
+
         const words =
           search.words && input.text !== undefined ? input.text : undefined;
-        let vector = search.meaning ? input.vector : undefined;
-
-        if (search.meaning && !vector && input.text !== undefined) {
-          try {
-            vector = await embedQuery(search.meaning.model, input.text);
-          } catch (error) {
-            // Words still answer; without them there is nothing to fall back on.
-            if (words === undefined) {
-              throw error;
-            }
-
-            partial ??= { search: name, error };
-          }
-        }
+        const vector = search.meaning ? input.vector : undefined;
 
         if (input.vector && !search.meaning) {
           throw new Error(
@@ -269,10 +460,95 @@ export const createSearch = (
           );
         }
 
-        if (words === undefined && !vector) {
+        const embed =
+          search.meaning && !vector && input.text !== undefined
+            ? input.text
+            : undefined;
+
+        if (words === undefined && !vector && embed === undefined) {
           throw new Error(
             `symmetria: search "${name}" matches ${search.words ? "words" : "meaning"}; give it ${search.words ? "text" : "text or a vector"}`,
           );
+        }
+
+        return [
+          {
+            search,
+            ...(words !== undefined ? { words } : {}),
+            ...(vector ? { vector } : {}),
+            ...(embed !== undefined ? { embed } : {}),
+          },
+        ];
+      });
+
+    // The question's embeddings a model answered. The search runs again on
+    // every await, and asks a model again only where it failed.
+    const embedded = new Map<string, readonly number[]>();
+    const asking = new Map<string, Promise<readonly number[]>>();
+    const ask = ({ search, embed }: Step): Promise<readonly number[]> => {
+      const { name } = search;
+      let answer = asking.get(name);
+
+      if (!answer) {
+        answer = embedQuery(search.meaning!.model, embed!).then(
+          (vector) => {
+            embedded.set(name, vector);
+
+            return vector;
+          },
+          (error: unknown) => {
+            asking.delete(name);
+
+            throw error;
+          },
+        );
+        asking.set(name, answer);
+      }
+
+      return answer;
+    };
+    /** Asks the models the steps still need, all at once; the failures, by search. */
+    const embedAll = async (
+      steps: readonly Step[],
+    ): Promise<ReadonlyMap<string, unknown>> => {
+      const waiting = steps.filter(
+        (step) => step.embed !== undefined && !embedded.has(step.search.name),
+      );
+      const settled = await Promise.allSettled(waiting.map(ask));
+
+      return new Map(
+        settled.flatMap((result, position) =>
+          result.status === "rejected"
+            ? [[waiting[position]!.search.name, result.reason] as const]
+            : [],
+        ),
+      );
+    };
+
+    /** The lists of this search once its embeddings are known. */
+    type Ranked = { lists: List[]; partial?: PartialSearch };
+    const ranked = (
+      steps: readonly Step[],
+      failures: ReadonlyMap<string, unknown> = new Map(),
+    ): Ranked => {
+      const result: List[] = [];
+      let partial: PartialSearch | undefined;
+
+      for (const step of steps) {
+        const { search } = step;
+        const { name } = search;
+        const { words } = step;
+        const vector = step.vector ?? embedded.get(name);
+
+        if (step.embed !== undefined && !vector) {
+          const error = failures.get(name);
+
+          // Words still answer; without them there is nothing to fall back on.
+          if (words === undefined) {
+            throw error;
+          }
+
+          partial ??= { search: name, error };
         }
 
         if (vector) {
@@ -326,7 +602,7 @@ export const createSearch = (
                 ties: true,
               });
             }
-          } else if (words.trim()) {
+          } else if (hasText(words)) {
             result.push({
               label: `${name}_words`,
               filter: (row) => {
@@ -364,7 +640,7 @@ export const createSearch = (
       return { lists: result, ...(partial ? { partial } : {}) };
     };
 
-    const build = (ranked: List[]): Source | undefined => {
+    const build = (ranked: List[], from: Source): Source | undefined => {
       if (!ranked.length) {
         return undefined;
       }
@@ -391,7 +667,7 @@ export const createSearch = (
         // filters, so the fewer rows they keep, the further it has to look.
         // Few enough rows are faster, and exactly, ranked one by one; the
         // list that does not apply is skipped without reading the table.
-        const probe = source((row: Row) => ({ id: row[key] }), {
+        const probe = from((row: Row) => ({ id: row[key] }), {
           where: (row: Row, tools: unknown) => [
             ...filtered(row, tools),
             list.filter(row),
@@ -431,7 +707,7 @@ export const createSearch = (
         ];
       });
       const tables = gated.map((list) =>
-        source(
+        from(
           (row: Row) => ({
             id: row[key],
             position: rowNumber().over({ orderBy: order(list, row) as never }),
@@ -474,7 +750,7 @@ export const createSearch = (
 
       return fused(
         (found: Row, tools: Tools) => {
-          const row = (tools.innerJoin as Callable)(source, (joined: Row) =>
+          const row = (tools.innerJoin as Callable)(from, (joined: Row) =>
             (joined[key] as unknown as { is: (value: unknown) => unknown }).is(
               found.id,
             ),
@@ -499,22 +775,54 @@ export const createSearch = (
       );
     };
 
-    const execute = async () => {
-      const { lists: ranked, partial } = await lists();
-      const rows = (await build(ranked)?.execute()) ?? [];
+    const rows = async (
+      { lists, partial }: Ranked,
+      from: Source,
+    ): Promise<Record<string, unknown>[]> => {
+      const found = (await build(lists, from)?.execute()) ?? [];
 
       // Said on the result rather than thrown: the rows are still an answer.
       return partial
-        ? Object.defineProperty(rows, "partial", { value: partial })
-        : rows;
+        ? Object.defineProperty(found, "partial", { value: partial })
+        : found;
     };
-    let running: Promise<Record<string, unknown>[]> | undefined;
-    const run = () => (running ??= execute());
+    /**
+     * Runs the search, every time it is awaited, as a query does. A question
+     * whose embedding is known is sent at once. One a model must embed first
+     * keeps the place it took when it started in a transaction's order: the
+     * model is asked now, and the statement goes out once it answers, before
+     * anything started after it.
+     */
+    const run = (): Promise<Record<string, unknown>[]> => {
+      try {
+        const steps = plan();
+
+        if (
+          steps.every(
+            (step) =>
+              step.embed === undefined || embedded.has(step.search.name),
+          )
+        ) {
+          return rows(ranked(steps), source);
+        }
+
+        const failures = embedAll(steps);
+        const answer = async (from: Source) =>
+          rows(ranked(steps, await failures), from);
+
+        return ordered
+          ? ordered((from) => answer(from as Source))
+          : answer(source);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    };
 
     return {
       execute: run,
       toSQL: async () => {
-        const query = build((await lists()).lists);
+        const steps = plan();
+        const query = build(ranked(steps, await embedAll(steps)).lists, source);
 
         if (!query) {
           throw new Error("symmetria: this search has no words to look for");
@@ -529,6 +837,14 @@ export const createSearch = (
     };
   };
 };
+
+/**
+ * Runs `run` in the place an operation takes in a transaction's order when
+ * it starts, with the table as that place sees it (`from`).
+ */
+export type InOrder = <Value>(
+  run: (from: object) => Promise<Value>,
+) => Promise<Value>;
 
 /** A model's answer as a vector it can store: its length, finite numbers only. */
 const modelVector = (
@@ -561,16 +877,146 @@ const embedQuery = async (
   return modelVector(model, vector, "a question");
 };
 
-/** The text a model embeds for a row: its source columns, one per paragraph. */
+/** A JSON value's keys in one order, as the value is written and as it is read back. */
+const sortedKeys = (_key: string, value: unknown): unknown => {
+  if (typeof value === "bigint") {
+    return String(value);
+  }
+
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    (Object.getPrototypeOf(value) !== Object.prototype &&
+      Object.getPrototypeOf(value) !== null)
+  ) {
+    return value;
+  }
+
+  const record = value as Record<string, unknown>;
+
+  return Object.fromEntries(
+    Object.keys(record)
+      .sort()
+      .map((name) => [name, record[name]]),
+  );
+};
+
+/** Bytes as PostgreSQL writes them: `\x0102`. */
+const bytesText = (value: Uint8Array): string =>
+  `\\x${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("hex")}`;
+
+/** A number as a `real` column stores and reads it: 1/3 is 0.33333334. */
+const realNumber = (value: number): number => shortestReal(Math.fround(value));
+
+/**
+ * A value as JSON text, its object keys sorted: jsonb stores keys in an
+ * order of its own. The elements of an array that is not JSON (`bytea[]`,
+ * `real[]`) are written as a lone value of their type is: bytes as
+ * `\x0102`, a real as stored.
+ */
+const jsonDocument = (
+  value: unknown,
+  elements?: { readonly real: boolean },
+): string | undefined => {
+  try {
+    return JSON.stringify(
+      value,
+      elements
+        ? function (this: Record<string, unknown>, key, item) {
+            // A Buffer's toJSON() ran first: its bytes are the original.
+            const original = this[key];
+
+            return original instanceof Uint8Array
+              ? bytesText(original)
+              : elements.real && typeof item === "number"
+                ? realNumber(item)
+                : sortedKeys(key, item);
+          }
+        : sortedKeys,
+    );
+  } catch {
+    // A value no JSON column holds, which its write refuses.
+    return undefined;
+  }
+};
+
+/**
+ * The text a model reads for a source value, as the application writes it
+ * and as a read returns it: a string as it is (uuid, numeric, a date, an
+ * enum's label…), a number, a bigint or a boolean as JavaScript writes it,
+ * a Date as its ISO 8601 text, bytes as PostgreSQL writes them (`\x0102`),
+ * and an array or an object as JSON. A JSON column's value is read as it is
+ * stored, as JSON: a JSON string is the string itself, anything else its
+ * JSON text with object keys sorted, and JSON null no text.
+ */
+const valueText = (
+  value: unknown,
+  { json, real }: { readonly json: boolean; readonly real: boolean },
+): string | undefined => {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  if (json) {
+    // A Date, or another value whose JSON is a string, is stored as that string.
+    const text = jsonDocument(value);
+
+    return text === undefined || text === "null"
+      ? undefined
+      : text.startsWith('"')
+        ? (JSON.parse(text) as string)
+        : text;
+  }
+
+  switch (typeof value) {
+    case "string":
+      return value;
+    case "number":
+      return String(real ? realNumber(value) : value);
+    case "bigint":
+    case "boolean":
+      return String(value);
+    case "object":
+      break;
+    default:
+      return undefined;
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? undefined : value.toISOString();
+  }
+
+  if (value instanceof Uint8Array) {
+    return bytesText(value);
+  }
+
+  // An object of the application's own (a Decimal) as its text, when it has one.
+  return !Array.isArray(value) &&
+    Object.getPrototypeOf(value) !== Object.prototype &&
+    Object.getPrototypeOf(value) !== null &&
+    (value as object).toString !== Object.prototype.toString
+    ? String(value)
+    : jsonDocument(value, { real });
+};
+
+/**
+ * The text a model embeds for a row: its source columns, one per paragraph,
+ * each as `valueText` writes it. An insert computes it from the values as
+ * written, `reindex()` from the values as read.
+ */
 export const documentText = (
-  sources: readonly string[],
+  search: Pick<Embedded, "sources" | "reads">,
   row: Record<string, unknown>,
 ): string =>
-  sources
-    .map((name) => row[name])
-    .filter(
-      (value): value is string => typeof value === "string" && value !== "",
+  search.sources
+    .map((name) =>
+      valueText(row[name], {
+        json: !!search.reads?.get(name)?.json,
+        real: !!search.reads?.get(name)?.real,
+      }),
     )
+    .filter((text): text is string => text !== undefined && text !== "")
     .join("\n\n");
 
 /** The searches of a table that keep an embedding, with the columns it is made from. */
@@ -583,12 +1029,93 @@ type Embedded = {
    * PostgreSQL fills in their default.
    */
   readonly defaults?: ReadonlySet<string>;
+  /** How each source column is read, by its type: see `MeaningSource`. */
+  readonly reads?: ReadonlyMap<string, MeaningSource>;
+  /** How `reindex()` reads the table's primary key: see `KeyRead`. */
+  readonly key?: KeyRead;
+};
+
+/**
+ * A single-column primary key as `reindex()` addresses rows by it. `exact`:
+ * a read returns it as stored (an integer, text, uuid without a codec), so
+ * the value read finds the row. Any other key (a timestamptz with
+ * microseconds a Date has not, numeric or an interval read in another form,
+ * a customType that decodes) is found by its stored value, read as text
+ * that casts back to it (`exactTextParts()` of `type`) as `sqlType`.
+ */
+type KeyRead = {
+  readonly exact: boolean;
+  readonly type: string;
+  readonly sqlType: string;
+};
+
+/** Key types a read returns exactly as stored, without a codec. */
+const EXACT_KEY =
+  /^(?:integer|smallint|bigint|text|uuid|boolean|varchar(?:\(\d+\))?)$/;
+
+const keyRead = (
+  table: TableSnapshot | undefined,
+  codecs: Readonly<Record<string, RuntimeCodec>> | undefined,
+): KeyRead | undefined => {
+  const keys = table ? primaryKeyColumns(table) : [];
+
+  if (keys.length !== 1) {
+    return undefined;
+  }
+
+  const column = keys[0]!;
+  const codec = codecs?.[column.name];
+  const type = canonicalType(column.sqlType);
+
+  return {
+    exact:
+      codec === undefined &&
+      (!!column.enumerationValues || EXACT_KEY.test(type)),
+    type:
+      codec?.base ??
+      (codec?.element?.base === undefined ? type : `${codec.element.base}[]`),
+    sqlType: column.sqlType,
+  };
+};
+
+/**
+ * A row's primary key as text that casts back to its stored value, as
+ * template strings around copies of the key: `(key)::text` for a key read
+ * exactly, as PostgreSQL prints it.
+ */
+const keyTextStrings = (key: KeyRead | undefined): string[] =>
+  key && !key.exact
+    ? exactTextParts(key.type, "\u0000").join("").split("\u0000")
+    : ["(", ")::text"];
+
+/** `keyTextStrings()` between two pieces of SQL, after `values`, as a template. */
+const withKeyText = (
+  key: KeyRead | undefined,
+  value: unknown,
+  strings: readonly string[],
+  values: readonly unknown[],
+  after: string,
+) => {
+  const text = keyTextStrings(key);
+
+  return template(
+    [
+      ...strings.slice(0, -1),
+      `${strings.at(-1)}${text[0]}`,
+      ...text.slice(1, -1),
+      `${text.at(-1)}${after}`,
+    ],
+    ...values,
+    ...text.slice(1).map(() => value),
+  );
 };
 
 export const embeddedSearches = (
   declared: readonly Search[],
   sourceNames: (search: NonNullable<Search["meaning"]>) => readonly string[],
   table?: TableSnapshot,
+  /** The table's column codecs: a customType's `base` tells its type. */
+  codecs?: Readonly<Record<string, RuntimeCodec>>,
 ): readonly Embedded[] =>
   declared.flatMap((search) => {
     if (!search.meaning) {
@@ -596,18 +1123,31 @@ export const embeddedSearches = (
     }
 
     const sources = sourceNames(search.meaning);
+    const key = keyRead(table, codecs);
 
     return [
       {
         column: search.name,
         model: search.meaning.model,
         sources,
+        ...(key ? { key } : {}),
         defaults: new Set(
           sources.filter(
             (name) =>
               table?.columns.find((column) => column.name === name)?.default !==
               undefined,
           ),
+        ),
+        reads: new Map(
+          sources.flatMap((name) => {
+            const column = table?.columns.find(
+              (candidate) => candidate.name === name,
+            );
+
+            return column
+              ? [[name, meaningSource(column, codecs?.[name])] as const]
+              : [];
+          }),
         ),
       },
     ];
@@ -620,6 +1160,13 @@ const writtenRow = (value: unknown): value is Record<string, unknown> =>
   !Array.isArray(value) &&
   (Object.getPrototypeOf(value) === Object.prototype ||
     Object.getPrototypeOf(value) === null);
+
+/** A value PostgreSQL computes when it writes the row: an SQL expression, or DEFAULT. */
+const computedValue = (value: unknown): boolean =>
+  value === DEFAULT_VALUE ||
+  (!!value &&
+    (typeof value === "object" || typeof value === "function") &&
+    COLUMN_EXPRESSION in value);
 
 /**
  * The text a row's embedding is made of, or undefined when the row does not
@@ -638,12 +1185,12 @@ const knownText = (
       if (conflict || search.defaults?.has(name)) {
         return undefined;
       }
-    } else if (value !== null && typeof value !== "string") {
+    } else if (computedValue(value)) {
       return undefined;
     }
   }
 
-  return documentText(search.sources, row);
+  return documentText(search, row);
 };
 
 /**
@@ -671,7 +1218,8 @@ export const embedRows = async (
 
       const text = knownText(search, row, conflict);
 
-      if (!text) {
+      // Only spaces mean nothing, as in a question.
+      if (!hasText(text)) {
         row[column] = null;
 
         return [];
@@ -713,7 +1261,8 @@ export const needsEmbedding = (
       writtenRow(row) &&
       embedded.some(
         (search) =>
-          row[search.column] === undefined && !!knownText(search, row, false),
+          row[search.column] === undefined &&
+          hasText(knownText(search, row, false)),
       ),
   );
 
@@ -722,38 +1271,24 @@ const TERMINALS = new Set(["then", "catch", "finally", "execute"]);
 /**
  * A write that has to wait for its embeddings: the calls chained onto it
  * (`returning()`, `onConflict()`…) are remembered and made on the real
- * builder once it exists. `start` receives them as a function, so it can
- * try the whole write on the rows as given before it asks a model.
+ * builder once it exists. Like any write it runs each time it is awaited
+ * (or `execute()` is called): `start` receives the chained calls, writes,
+ * and resolves with what the write returns.
  */
 export const deferredWrite = (
   start: (
-    chained: (builder: object) => object,
     /** The chained calls, such as `onConflict("slug")`, with their arguments. */
     calls: readonly (readonly [string, readonly unknown[]])[],
-  ) => Promise<{
-    readonly builder: object;
-    /** The chained calls were already made on `builder`. */
-    readonly chained?: true;
-  }>,
+  ) => Promise<unknown>,
   chain: readonly (readonly [string, readonly unknown[]])[] = [],
 ): object => {
-  let running: Promise<unknown> | undefined;
-  const chained = (builder: object) =>
-    chain.reduce(
-      (current, [method, argumentsList]) =>
-        (current as Record<string, (...values: readonly unknown[]) => object>)[
-          method
-        ]!(...argumentsList),
-      builder,
-    );
-  const run = () =>
-    (running ??= start(chained, chain).then((started) =>
-      (
-        (started.chained ? started.builder : chained(started.builder)) as {
-          execute: () => Promise<unknown>;
-        }
-      ).execute(),
-    ));
+  const run = (): Promise<unknown> => {
+    try {
+      return start(chain);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
 
   return new Proxy(Object.create(null) as object, {
     get: (_target, key) => {
@@ -807,9 +1342,6 @@ type ReindexOptions = {
   readonly order?: "asc" | "desc";
 };
 
-/** Separates the source columns of a document, as `documentText` joins them. */
-const PARAGRAPH = "\n\n";
-
 /** The filter of `reindex()` and `missing()`: rows of a search that still need an embedding. */
 const unembedded = (
   search: Embedded,
@@ -828,29 +1360,73 @@ const unembedded = (
     (row[search.column] as unknown as { is: (value: null) => unknown }).is(
       null,
     ),
-    // A row with no text has nothing to embed; it is left out in SQL, so it
-    // is not read again on every call.
-    template(["", " <> ''"], documentSQL(search.sources, row)),
+    // A row with no text (or only spaces) has nothing to embed; it is left
+    // out in SQL, so it is not read again on every call.
+    hasTextSQL(search, row),
   ];
 };
 
 /**
- * The text a row's embedding is made from, computed by PostgreSQL the way
- * `documentText` computes it: the non-empty source columns, one per
- * paragraph (`concat_ws(sep, NULLIF(a, ''), NULLIF(b, ''))`).
+ * Whether a row has text to embed, in SQL, as `documentText` finds it in
+ * JavaScript: a source column whose value has text (see `MeaningSource`).
+ *
+ * A text column (and the text PostgreSQL writes out for a value whose text
+ * may be empty: an enum's label, a tsvector, a type not known) holds a
+ * character that is not a space. A text that starts with another character
+ * is known by it without reading the rest of the text or the next columns:
+ * a printable ASCII character by comparing bytes, any other by the regular
+ * expression on that one character; only one that starts with a space is
+ * matched as a whole, which converts the whole text first. Every comparison
+ * and match is under the "C" collation: a regular expression refuses a
+ * nondeterministic collation, and an ignorable character is no empty text.
+ * No `ascii()`, which raises for a character beyond ASCII in a multibyte
+ * encoding other than UTF8 (EUC_JP).
+ *
+ * A JSON value has text unless it is JSON null or a JSON string without
+ * text, which is checked as a text column is; that reads each document for
+ * its type. Any other value has text unless it is NULL.
  */
-const documentSQL = (sources: readonly string[], row: Row) =>
-  template(
-    [
-      "concat_ws(",
-      ...sources.map((_name, position) =>
-        position === 0 ? ", NULLIF(" : ", ''), NULLIF(",
-      ),
-      ", ''))",
-    ],
-    PARAGRAPH,
-    ...sources.map((name) => row[name]),
-  );
+const hasTextSQL = ({ sources, reads }: Embedded, row: Row) => {
+  const pattern = `E'[^${SPACES.replaceAll("\\", "\\\\")}]'`;
+  const strings = ["("];
+  const values: unknown[] = [];
+
+  sources.forEach((name, position) => {
+    const check = reads?.get(name)?.check ?? "text";
+    const [open, close] =
+      check === "output"
+        ? ["concat(", ') COLLATE "C"']
+        : check === "text" || check === "value"
+          ? ["", ' COLLATE "C"']
+          : ["(", ` #>> '{}') COLLATE "C"`];
+    const spaces = [
+      `${close} <> '' AND (left(${open}`,
+      `${close}, 1) BETWEEN '!' AND '~' OR left(${open}`,
+      `${close}, 1) ~ ${pattern} OR ${open}`,
+      `${close} ~ ${pattern})`,
+    ];
+    // The SQL around each place the column goes.
+    const [first, ...rest] =
+      check === "value"
+        ? ["", " IS NOT NULL"]
+        : check === "json" || check === "jsonb"
+          ? [
+              "",
+              ` IS NOT NULL AND CASE ${check}_typeof(`,
+              `) WHEN 'string' THEN ${open}`,
+              ...spaces.slice(0, -1),
+              `${spaces.at(-1)} WHEN 'null' THEN FALSE ELSE TRUE END`,
+            ]
+          : [open, ...spaces];
+
+    strings[strings.length - 1] += `${position ? " OR " : ""}(${first}`;
+    strings.push(...rest.slice(0, -1), `${rest.at(-1)})`);
+    rest.forEach(() => values.push(row[name]));
+  });
+  strings[strings.length - 1] += ")";
+
+  return template(strings, ...values);
+};
 
 const readOptions = (table: TableSnapshot, options: ReindexOptions) => {
   const keys = primaryKeyColumns(table);
@@ -894,17 +1470,43 @@ export const createReindex =
         (column) => column.name === search.column,
       )!.sqlType;
       let last: unknown;
+      // A source whose value as read is not its stored text (a type that is
+      // not text, a codec that decrypts) is also read as stored.
+      const stored = search.sources.map(
+        (name) => !search.reads?.get(name)?.plain,
+      );
+      // A key read in another form than stored is addressed by its stored
+      // value, from the text read: a Date without the key's microseconds
+      // would find no row to write and page back to the same row for ever.
+      const exact = !search.key || search.key.exact;
+      const storedKey = (text: unknown) =>
+        template(["(", `)::${search.key!.sqlType}`], text);
 
       // By key, so a row that was not written (its text changed meanwhile)
       // is passed once, not met forever.
       for (;;) {
         const rows = await source(
           (row: Row) => ({
+            // Read through their codecs, as a query reads them: the model
+            // gets the text an insert of these values gets.
             ...Object.fromEntries(
               [key, ...search.sources].map((name) => [name, row[name]]),
             ),
-            // The key as PostgreSQL prints it, to address the row in JSON.
-            [KEY_TEXT]: template(["(", ")::text"], row[key]),
+            // The key as text that casts back to it, to address the row in
+            // JSON and to page on.
+            [KEY_TEXT]: withKeyText(search.key, row[key], [""], [], ""),
+            ...Object.fromEntries(
+              search.sources.flatMap((name, position) =>
+                stored[position]
+                  ? [
+                      [
+                        `${STORED_TEXT}${position}`,
+                        template(["concat(", ")"], row[name]),
+                      ],
+                    ]
+                  : [],
+              ),
+            ),
           }),
           {
             where: (row: Row, tools: unknown) => [
@@ -912,12 +1514,18 @@ export const createReindex =
               ...(last === undefined
                 ? []
                 : [
-                    (
-                      row[key] as unknown as Record<
-                        "above" | "below",
-                        (value: unknown) => unknown
-                      >
-                    )[order === "asc" ? "above" : "below"](last),
+                    exact
+                      ? (
+                          row[key] as unknown as Record<
+                            "above" | "below",
+                            (value: unknown) => unknown
+                          >
+                        )[order === "asc" ? "above" : "below"](last)
+                      : template(
+                          ["(", `) ${order === "asc" ? ">" : "<"} `, ""],
+                          row[key],
+                          storedKey(last),
+                        ),
                   ]),
             ],
             orderBy: (row: Row) =>
@@ -935,7 +1543,7 @@ export const createReindex =
           break;
         }
 
-        last = rows.at(-1)![key];
+        last = rows.at(-1)![exact ? key : KEY_TEXT];
 
         const filled = await embedRows([search], rows);
         const written = filled.filter((row) =>
@@ -947,8 +1555,10 @@ export const createReindex =
         }
 
         // One statement for the batch. A row keeps what it has when its
-        // embedding was written meanwhile, or its text changed while the
-        // model was asked: that text is embedded on a later call.
+        // embedding was written meanwhile, or a source changed while the
+        // model was asked: what it says now is embedded on a later call.
+        // The sources are compared as stored, as PostgreSQL writes them out
+        // (`concat()`, '' for NULL): the text the model got may differ.
         const vectors = JSON.stringify(
           Object.fromEntries(
             written.map((row) => [
@@ -957,38 +1567,62 @@ export const createReindex =
             ]),
           ),
         );
-        const texts = JSON.stringify(
+        const unchanged = JSON.stringify(
           Object.fromEntries(
             written.map((row) => [
               row[KEY_TEXT],
-              documentText(search.sources, row),
+              search.sources.map((name, position) =>
+                stored[position]
+                  ? row[`${STORED_TEXT}${position}`]
+                  : (row[name] ?? ""),
+              ),
             ]),
           ),
         );
-        const ids = written.map((row) => row[key]);
+        const ids = written.map((row) => row[exact ? key : KEY_TEXT]);
         const { affectedRows } = await source.update(
           (row) => ({
-            [search.column]: template(
-              ["((", "::text::jsonb) ->> (", `)::text)::${columnType}`],
-              vectors,
+            [search.column]: withKeyText(
+              search.key,
               row[key],
+              ["((", "::text::jsonb) ->> "],
+              [vectors],
+              `)::${columnType}`,
             ),
           }),
           {
             where: (row) => [
-              (
-                row[key] as unknown as { in: (values: unknown[]) => unknown }
-              ).in(ids),
+              exact
+                ? (
+                    row[key] as unknown as {
+                      in: (values: unknown[]) => unknown;
+                    }
+                  ).in(ids)
+                : template(
+                    [
+                      "(",
+                      ") IN (SELECT (jsonb_array_elements_text(",
+                      `::text::jsonb))::${search.key!.sqlType})`,
+                    ],
+                    row[key],
+                    JSON.stringify(ids),
+                  ),
               (
                 row[search.column] as unknown as {
                   is: (value: null) => unknown;
                 }
               ).is(null),
-              template(
-                ["", " = ((", "::text::jsonb) ->> (", ")::text)"],
-                documentSQL(search.sources, row),
-                texts,
+              withKeyText(
+                search.key,
                 row[key],
+                [
+                  "jsonb_build_array(concat(",
+                  ...search.sources.slice(1).map(() => "), concat("),
+                  ")) = ((",
+                  "::text::jsonb) -> ",
+                ],
+                [...search.sources.map((name) => row[name]), unchanged],
+                ")",
               ),
             ],
           },
@@ -1025,3 +1659,5 @@ export const createMissing =
 
 /** The field that carries a row's key as text through `reindex()`. */
 const KEY_TEXT = "__symmetria_key";
+/** The fields that carry a source's stored text through `reindex()`, by its place. */
+const STORED_TEXT = "__symmetria_stored_";

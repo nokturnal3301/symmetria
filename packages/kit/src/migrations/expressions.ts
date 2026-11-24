@@ -1,6 +1,11 @@
 import { type SqlExpression, UnsupportedExpression } from "./expression-tree";
 import { parseExpression } from "./expression-parser";
-import { canonicalLiteral, simplifyExpression } from "./expression-simplify";
+import { normalizeSqlType } from "./drift";
+import {
+  canonicalLiteral,
+  minusCommutes,
+  simplifyExpression,
+} from "./expression-simplify";
 
 export type { SqlExpression } from "./expression-tree";
 
@@ -73,10 +78,256 @@ const printKey = (node: SqlExpression): string => {
   }
 };
 
+/** A piece of SQL text: comments and quoted text stay whole, so nothing inside them is rewritten. */
+type Piece = {
+  readonly kind:
+    | "space"
+    | "comment"
+    | "escaped"
+    | "string"
+    | "quoted"
+    | "number"
+    | "word"
+    | "symbol"
+    | "operator"
+    /** A negative number whose parentheses were taken off. */
+    | "negative";
+  readonly text: string;
+};
+
+const PIECE =
+  /(\s+)|(--[^\n\r]*|\/\*[\s\S]*?(?:\*\/|$))|([eE]'(?:[^'\\]|\\[\s\S]|'')*(?:'|$))|('(?:[^']|'')*(?:'|$)|\$(?:[A-Za-z_\u0080-\uFFFF][\w\u0080-\uFFFF]*)?\$)|("(?:[^"]|"")*(?:"|$))|((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)|([A-Za-z_\u0080-\uFFFF][\w$\u0080-\uFFFF]*)|(::|[()[\],.;:])|((?:(?!--|\/\*)[-+*/<>=~!@#%^&|`?])+)|([\s\S])/gy;
+const KINDS = [
+  "space",
+  "comment",
+  "escaped",
+  "string",
+  "quoted",
+  "number",
+  "word",
+  "symbol",
+  "operator",
+  "symbol",
+] as const;
+
+const pieces = (sql: string): Piece[] => {
+  const result: Piece[] = [];
+  PIECE.lastIndex = 0;
+
+  for (let found = PIECE.exec(sql); found; found = PIECE.exec(sql)) {
+    const group = found.findIndex((text, index) => index > 0 && text);
+    const text = found[0];
+
+    // A dollar quote runs to the same tag (its body is not SQL).
+    if (group === 4 && text.startsWith("$")) {
+      const end = sql.indexOf(text, PIECE.lastIndex);
+      const close = end < 0 ? sql.length : end + text.length;
+      result.push({
+        kind: "string",
+        text: sql.slice(found.index, close),
+      });
+      PIECE.lastIndex = close;
+      continue;
+    }
+
+    result.push({ kind: KINDS[group - 1]!, text });
+  }
+
+  return result;
+};
+
+/**
+ * SQL with a line break after the `--` comment it ends in, as a sql``
+ * template's text is saved now. Snapshots saved by earlier versions hold
+ * `1 -- one`, and SQL written after it (`SET DEFAULT 1 -- one;`) would be
+ * part of the comment.
+ */
+export const commentEnded = (sql: string): string => {
+  const last = pieces(sql).at(-1);
+
+  return last?.kind === "comment" && last.text.startsWith("--")
+    ? `${sql}\n`
+    : sql;
+};
+
+/**
+ * Words after which `(` groups an operand, as it does after an operator,
+ * rather than opening an argument list (`f(-5)`, `IN (-5)`).
+ */
+const OPERAND_WORDS = new Set([
+  "and",
+  "or",
+  "not",
+  "is",
+  "between",
+  "symmetric",
+  "like",
+  "ilike",
+  "similar",
+  "to",
+  "escape",
+  "case",
+  "when",
+  "then",
+  "else",
+  "at",
+  "zone",
+  "from",
+  "select",
+  "where",
+]);
+
+/**
+ * Writes in one spelling the literals that versions spell differently: a
+ * negative number in parentheses as the bare number where the parentheses
+ * change nothing (`"n" > (-5)` is `"n" > -5`; `f((-5))` is `f(-5)`;
+ * `(-5)::text::real` is `-5::text::real`; not before `::text`, a subscript
+ * or a field: see minusCommutes), and a bytea escape string as the
+ * plain string it reads as (`E'\\x0102'::bytea` is `'\x0102'::bytea`). Schema
+ * expressions write `(-5)` and `E'\\x…'::bytea`, while snapshots saved by
+ * earlier versions hold `-5` and `'\x…'::bytea`; both compare the same.
+ */
+const literalSpellings = (sql: string): string => {
+  const list = pieces(sql);
+  const significant = (from: number, step: 1 | -1): number => {
+    let index = from;
+
+    while (list[index]?.kind === "space" || list[index]?.kind === "comment") {
+      index += step;
+    }
+
+    return index;
+  };
+  /**
+   * The types of the casts starting at `from`, normalized (`::text::float8`
+   * is text, then double precision), or undefined where one is not a plain
+   * type name: a quoted or qualified name, or an array type.
+   */
+  const castsFrom = (from: number) => {
+    const casts: string[] = [];
+    let index = from;
+
+    while (list[index]?.text === "::") {
+      let end = significant(index + 1, 1);
+      const word = list[end];
+
+      if (word?.kind !== "word") {
+        return undefined;
+      }
+
+      let type = word.text;
+      const second = significant(end + 1, 1);
+
+      if (
+        type.toLowerCase() === "double" &&
+        list[second]?.text.toLowerCase() === "precision"
+      ) {
+        type = "double precision";
+        end = second;
+      }
+
+      index = significant(end + 1, 1);
+      const modifier = list[index]?.text === "(";
+
+      for (let depth = 0; modifier && index < list.length; index++) {
+        type += list[index]!.kind === "space" ? "" : list[index]!.text;
+        depth +=
+          list[index]!.text === "(" ? 1 : list[index]!.text === ")" ? -1 : 0;
+
+        if (depth === 0) {
+          index = significant(index + 1, 1);
+          break;
+        }
+      }
+
+      if (list[index]?.text === "[" || list[index]?.text === ".") {
+        return undefined;
+      }
+
+      casts.push(normalizeSqlType(type));
+    }
+
+    return casts;
+  };
+
+  for (let index = 0; index < list.length; index++) {
+    const piece = list[index]!;
+    const next = significant(index + 1, 1);
+
+    if (
+      piece.kind === "escaped" &&
+      /^[eE]'\\\\x[0-9A-Fa-f]*'$/.test(piece.text) &&
+      list[next]?.text === "::" &&
+      list[significant(next + 1, 1)]?.text.toLowerCase() === "bytea"
+    ) {
+      list[index] = { kind: "string", text: `'${piece.text.slice(3)}` };
+    }
+  }
+
+  // Inside out, so `((-5))` loses both pairs where neither is a call's.
+  for (let changed = true; changed; ) {
+    changed = false;
+
+    for (let index = 0; index < list.length; index++) {
+      if (list[index]!.text !== "(") {
+        continue;
+      }
+
+      const negative =
+        list[index + 1]?.kind === "negative"
+          ? { text: list[index + 1]!.text, length: 3 }
+          : list[index + 1]?.text === "-" && list[index + 2]?.kind === "number"
+            ? { text: `-${list[index + 2]!.text}`, length: 4 }
+            : undefined;
+
+      if (!negative || list[index + negative.length - 1]?.text !== ")") {
+        continue;
+      }
+
+      const before = list[significant(index - 1, -1)];
+      const afterIndex = significant(index + negative.length, 1);
+      const after = list[afterIndex];
+      const opensOperand =
+        !before ||
+        before.kind === "operator" ||
+        ["(", "[", ","].includes(before.text) ||
+        (before.kind === "word" &&
+          OPERAND_WORDS.has(before.text.toLowerCase()));
+      const casts = after?.text === "::" ? castsFrom(afterIndex) : [];
+      const bindsTighter =
+        after?.text === "[" ||
+        after?.text === "." ||
+        casts === undefined ||
+        (casts.length > 0 &&
+          !minusCommutes(negative.text.replace(/^\s*-/, ""), casts));
+
+      if (!opensOperand || bindsTighter) {
+        continue;
+      }
+
+      // Written right after an operator ending in `-` (a comment) or holding
+      // one of ~ ! @ # % ^ & | ` ?, the minus sign would join it.
+      const adjacent = list[index - 1];
+      const glue =
+        adjacent?.kind === "operator" && /-$|[~!@#%^&|`?]/.test(adjacent.text)
+          ? " "
+          : "";
+      list.splice(index, negative.length, {
+        kind: "negative",
+        text: `${glue}${negative.text}`,
+      });
+      changed = true;
+    }
+  }
+
+  return list.map((piece) => piece.text).join("");
+};
+
 /**
  * The comparison key of a CHECK expression, index predicate or key expression:
  * two expressions with equal keys are the same expression. SQL the parser does
- * not model is compared by its text, with whitespace collapsed.
+ * not model is compared by its text, with whitespace collapsed and literals in
+ * one spelling.
  */
 export const expressionKey = (
   sql: string,
@@ -86,7 +337,7 @@ export const expressionKey = (
     return printKey(simplifyExpression(parseExpression(sql), columns));
   } catch (error) {
     if (error instanceof UnsupportedExpression) {
-      return sql.replace(/\s+/g, " ").trim();
+      return literalSpellings(sql).replace(/\s+/g, " ").trim();
     }
 
     throw error;

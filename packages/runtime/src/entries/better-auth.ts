@@ -11,7 +11,7 @@ import {
   type CleanedWhere,
   type DBAdapterDebugLogOption,
 } from "better-auth/adapters";
-import { and, not, or } from "../query/expressions";
+import { and, coalesce, not, or } from "../query/expressions";
 
 export type SymmetriaAdapterOptions = {
   /** Tables are keyed in the plural (`users`, `sessions`). */
@@ -59,65 +59,126 @@ const member = (target: Loose, key: string): Loose => {
   return value === (Object.prototype as Loose)[key] ? undefined : value;
 };
 
-const predicate = (row: Loose, clause: KeyedWhere) => {
-  const column = member(row, clause.key);
+/** The column `key` of a row, for better-auth's field `field`. */
+const columnOf = (row: Loose, key: string, field: string): Loose => {
+  const column = member(row, key);
 
   if (!column) {
     throw new Error(
-      `symmetria: better-auth asked for field "${clause.field}", which the table does not have`,
+      `symmetria: better-auth asked for field "${field}", which the table does not have`,
     );
   }
 
+  return column;
+};
+
+/**
+ * A where value in the form its field's column compares. better-auth passes
+ * request values on as they come (the admin plugin's `filterValue: 1984` for
+ * a text field): node-postgres sends a number untyped, which PostgreSQL reads
+ * as text, while Bun.SQL binds it as an integer and the comparison fails, so a
+ * string field gets a string on every driver. A list for a boolean field
+ * reads "true" and "false" as better-auth reads a single value.
+ */
+const comparable = (
+  type: Field["type"] | undefined,
+  value: unknown,
+): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((item) => comparable(type, item));
+  }
+
+  if (
+    (type === "string" || Array.isArray(type)) &&
+    (typeof value === "number" ||
+      typeof value === "bigint" ||
+      typeof value === "boolean")
+  ) {
+    return String(value);
+  }
+
+  return type === "boolean" && (value === "true" || value === "false")
+    ? value === "true"
+    : value;
+};
+
+// A comparison without a value matches no row, as `= NULL` does in
+// better-auth's SQL adapters: a request that names a filter field and no
+// value (`listMembers?filterField=role`) passes `undefined`.
+const none = (column: Loose) => column.in([]);
+
+const predicate = (row: Loose, clause: KeyedWhere) => {
+  const column = columnOf(row, clause.key, clause.field);
+  const { value } = clause;
+  const missing = value === undefined || value === null;
   const insensitive =
-    clause.mode === "insensitive" && typeof clause.value === "string";
-  // A list compared without case: one ILIKE per value, as a single value is.
-  const insensitiveList =
-    clause.mode === "insensitive" &&
-    Array.isArray(clause.value) &&
-    clause.value.length > 0 &&
-    clause.value.every((value) => typeof value === "string");
+    clause.mode === "insensitive" && typeof value === "string";
   const pattern = (text: string) =>
     insensitive ? column.ilike(text) : column.like(text);
 
   switch (clause.operator) {
     case "ne":
-      return insensitive
-        ? not(column.ilike(escapeLike(clause.value)))
-        : column.isNot(clause.value);
+      if (value === null) {
+        return column.isNot(null);
+      }
+
+      return value === undefined
+        ? none(column)
+        : insensitive
+          ? not(column.ilike(escapeLike(value)))
+          : column.isNot(value);
     case "in":
+    case "not_in": {
+      const list: unknown[] = Array.isArray(value) ? value : [value];
+      const present = list.filter(
+        (item) => item !== undefined && item !== null,
+      );
+      // A list compared without case: one ILIKE per value, as a single value is.
+      const insensitiveList =
+        clause.mode === "insensitive" &&
+        present.length > 0 &&
+        present.every((item) => typeof item === "string");
+
+      if (clause.operator === "in") {
+        // NULL is in no list, as in SQL.
+        return insensitiveList
+          ? or(...present.map((item) => column.ilike(escapeLike(item))))
+          : column.in(present);
+      }
+
+      // `NOT IN (…, NULL)` holds for no row, as in SQL.
+      if (present.length < list.length) {
+        return none(column);
+      }
+
       return insensitiveList
-        ? or(
-            ...(clause.value as string[]).map((value) =>
-              column.ilike(escapeLike(value)),
-            ),
-          )
-        : column.in(clause.value);
-    case "not_in":
-      return insensitiveList
-        ? and(
-            ...(clause.value as string[]).map((value) =>
-              not(column.ilike(escapeLike(value))),
-            ),
-          )
-        : column.notIn(clause.value);
+        ? and(...present.map((item) => not(column.ilike(escapeLike(item)))))
+        : column.notIn(present);
+    }
     case "gt":
-      return column.above(clause.value);
+      return missing ? none(column) : column.above(value);
     case "gte":
-      return column.atLeast(clause.value);
+      return missing ? none(column) : column.atLeast(value);
     case "lt":
-      return column.below(clause.value);
+      return missing ? none(column) : column.below(value);
     case "lte":
-      return column.atMost(clause.value);
+      return missing ? none(column) : column.atMost(value);
     case "contains":
-      return pattern(`%${escapeLike(clause.value)}%`);
+      return missing ? none(column) : pattern(`%${escapeLike(value)}%`);
     case "starts_with":
-      return pattern(`${escapeLike(clause.value)}%`);
+      return missing ? none(column) : pattern(`${escapeLike(value)}%`);
     case "ends_with":
-      return pattern(`%${escapeLike(clause.value)}`);
+      return missing ? none(column) : pattern(`%${escapeLike(value)}`);
     default:
-      return insensitive
-        ? column.ilike(escapeLike(clause.value))
-        : column.is(clause.value);
+      if (value === null) {
+        return column.is(null);
+      }
+
+      return value === undefined
+        ? none(column)
+        : insensitive
+          ? column.ilike(escapeLike(value))
+          : column.is(value);
   }
 };
 
@@ -143,19 +204,110 @@ const COLUMN_TYPES: Readonly<Record<string, string>> = {
   "number[]": "int.array",
 };
 
+/** A key's SQL name under schema()'s default casing (`requestedBy` → `requested_by`). */
 const snakeCase = (name: string): string =>
-  name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+  name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+
+/** Names a module cannot declare: JavaScript's reserved words and what it imports. */
+const TAKEN: ReadonlySet<string> = new Set([
+  "arguments",
+  "await",
+  "break",
+  "case",
+  "catch",
+  "class",
+  "const",
+  "continue",
+  "debugger",
+  "default",
+  "delete",
+  "do",
+  "else",
+  "enum",
+  "eval",
+  "export",
+  "extends",
+  "false",
+  "finally",
+  "for",
+  "function",
+  "if",
+  "implements",
+  "import",
+  "in",
+  "instanceof",
+  "interface",
+  "let",
+  "new",
+  "null",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "return",
+  "static",
+  "super",
+  "switch",
+  "this",
+  "throw",
+  "true",
+  "try",
+  "typeof",
+  "undefined",
+  "var",
+  "void",
+  "while",
+  "with",
+  "yield",
+  "Infinity",
+  "NaN",
+  "authTables",
+  "bigint",
+  "bool",
+  "index",
+  "int",
+  "jsonb",
+  "maybe",
+  "one",
+  "oneOf",
+  "self",
+  "table",
+  "text",
+  "timestamptz",
+]);
+
+/** A JavaScript name for a model: `auth-user` → `authUser`, `default` → `defaultTable`. */
+const identifierOf = (name: string): string => {
+  const joined = name
+    .split(/[^\p{ID_Continue}$]+/u)
+    .filter(Boolean)
+    .map((word, position) =>
+      position ? `${word[0]!.toUpperCase()}${word.slice(1)}` : word,
+    )
+    .join("");
+  const named = /^[\p{ID_Start}$_]/u.test(joined) ? joined : `_${joined}`;
+
+  return TAKEN.has(named) ? `${named}Table` : named;
+};
+
+/** The relation a reference field becomes: `userId` → `user`, `requestedBy` stays. */
+const relationOf = (key: string): string =>
+  key.length > 2 && key.endsWith("Id") ? key.slice(0, -2) : key;
 
 /**
  * The auth tables as a Symmetria schema module, for `npx auth generate`.
  * Tables come out in an order where each one follows the tables it
  * references; spread `authTables` into `schema({ ... })`. With `usePlural`
  * the tables are keyed in the plural (`users`), as the adapter then asks for
- * them.
+ * them; `casing` is the schema's (`"preserve"` keeps a reference key such as
+ * `requestedBy` as its SQL name).
  */
 export const authSchemaSource = (
   input: Tables,
-  options: { readonly usePlural?: boolean } = {},
+  options: {
+    readonly usePlural?: boolean;
+    readonly casing?: "snake_case" | "preserve";
+  } = {},
 ): string => {
   const tables: Tables = options.usePlural
     ? Object.fromEntries(
@@ -171,6 +323,32 @@ export const authSchemaSource = (
     tables[model]?.modelName ??
     models.find((entry) => entry.modelName === model)?.modelName ??
     model;
+  // Each table's export name: its model name where that is a free JavaScript
+  // name, otherwise one made from it (`"auth-user": authUser`).
+  const identifiers = new Map<string, string>();
+  const used = new Set<string>();
+
+  for (const plain of [true, false]) {
+    for (const { modelName } of models) {
+      const base = identifierOf(modelName);
+
+      if ((base === modelName) !== plain || identifiers.has(modelName)) {
+        continue;
+      }
+
+      let name = base;
+
+      for (let count = 2; used.has(name); count++) {
+        name = `${base}${count}`;
+      }
+
+      used.add(name);
+      identifiers.set(modelName, name);
+    }
+  }
+
+  const identifier = (modelName: string): string =>
+    identifiers.get(modelName) ?? modelName;
   const ordered: typeof models = [];
   const pending = [...models];
 
@@ -193,49 +371,121 @@ export const authSchemaSource = (
   }
 
   const declarations = ordered.map((entry) => {
-    const targets = Object.values(entry.fields).flatMap((field) =>
+    const name = identifier(entry.modelName);
+    const fields = entry.fields;
+    // A reference is a relation, whose key column is `<relation>Id`.
+    const columnKey = (key: string): string =>
+      fields[key]?.references ? `${relationOf(key)}Id` : key;
+    // A single-field index the table declares (device-authorization's
+    // unique `userCode`) is the column's own `.unique` or `.index`.
+    const single = new Map<string, boolean>();
+    const composite: NonNullable<Tables[string]["indexes"]>[number][] = [];
+
+    for (const definition of entry.indexes ?? []) {
+      const [only, ...others] = definition.fields;
+
+      if (only !== undefined && !others.length && Object.hasOwn(fields, only)) {
+        single.set(
+          only,
+          single.get(only) === true || definition.unique === true,
+        );
+      } else {
+        composite.push(definition);
+      }
+    }
+
+    const targets = Object.values(fields).flatMap((field) =>
       field.references ? [nameOf(field.references.model)] : [],
     );
-    const lines = Object.entries(entry.fields).map(([key, field]) => {
-      const named =
-        field.fieldName &&
-        field.fieldName !== key &&
-        field.fieldName !== snakeCase(key)
-          ? `.named(${JSON.stringify(field.fieldName)})`
-          : "";
+    const lines = Object.entries(fields).map(([key, field]) => {
+      // The SQL name better-auth was given, whenever it is not the key: it
+      // is the column's name under either casing.
+      const sqlName =
+        field.fieldName && field.fieldName !== key
+          ? field.fieldName
+          : undefined;
+      const unique = field.unique === true || single.get(key) === true;
       const reference = field.references;
 
-      if (reference && reference.field === "id" && key.endsWith("Id")) {
+      if (reference) {
         const target = nameOf(reference.model);
-        // A key column better-auth names its own way keeps that SQL name.
-        const keyColumn = named
-          ? `.column(${JSON.stringify(field.fieldName)})`
-          : "";
-        // better-auth's own migrations cascade when a reference names no action.
+        const relation = relationOf(key);
+
+        const clash = [relation, `${relation}Id`].find(
+          (other) => other !== key && Object.hasOwn(fields, other),
+        );
+
+        if (clash) {
+          throw new Error(
+            `symmetria: ${entry.modelName}.${key} references ${target} and becomes the relation "${relation}" with the key "${relation}Id", but ${entry.modelName} has another field "${clash}"; rename one of the two`,
+          );
+        }
+
+        // A key that does not end in `Id` keeps its own SQL name; the
+        // relation would otherwise call it `<relation>_id`.
+        const column =
+          sqlName ??
+          (relation === key
+            ? options.casing === "preserve"
+              ? key
+              : snakeCase(key)
+            : undefined);
+        const keyColumn =
+          column === undefined ? "" : `.column(${JSON.stringify(column)})`;
+        // A reference to a field other than the id names it.
+        const targetFields = models.find(
+          (model) => model.modelName === target,
+        )?.fields;
+        const targetKey =
+          reference.field === "id" ||
+          !targetFields ||
+          Object.hasOwn(targetFields, reference.field)
+            ? reference.field
+            : (Object.entries(targetFields).find(
+                ([, candidate]) => candidate.fieldName === reference.field,
+              )?.[0] ?? reference.field);
+        const by =
+          targetKey === "id"
+            ? ""
+            : `.by(${JSON.stringify(targetFields?.[targetKey]?.references ? `${relationOf(targetKey)}Id` : targetKey)})`;
+        // better-auth's own migrations cascade when a reference names no
+        // action. They give a key no default, so its SET DEFAULT sets NULL:
+        // SET NULL for an optional key, a refused delete for a required one.
         const action =
           reference.onDelete === undefined || reference.onDelete === "cascade"
             ? "cascade"
-            : reference.onDelete === "set null"
+            : reference.onDelete === "set null" ||
+                (reference.onDelete === "set default" &&
+                  field.required === false)
               ? "setNull"
-              : undefined;
-        const relation = key.slice(0, -2);
+              : reference.onDelete === "no action" ||
+                  reference.onDelete === "set default"
+                ? "noAction"
+                : undefined;
+        const nullable = field.required === false || action === "setNull";
         const self = target === entry.modelName;
+        const shared = targets.filter((other) => other === target).length > 1;
 
-        // Two keys to one table need names for their reverse sides.
-        if (targets.filter((name) => name === target).length > 1 || self) {
+        // Two keys to one table need names for their reverse sides; NO
+        // ACTION is spelled on the reference itself.
+        if (shared || self || action === "noAction") {
           if (self) {
             builders.add("self");
           }
 
-          return `  ${relation}: ${self ? "self" : target}${keyColumn}${field.required === false || action === "setNull" ? ".nullable" : ""}${field.unique ? ".unique" : ".index"}${action ? `.onDelete.${action}` : ""}.inverse(${JSON.stringify(`${entry.modelName}By${relation[0]!.toUpperCase()}${relation.slice(1)}`)}),`;
+          const inverse =
+            shared || self
+              ? `.inverse(${JSON.stringify(`${name}By${relation[0]!.toUpperCase()}${relation.slice(1)}`)})`
+              : "";
+
+          return `  ${relation}: ${self ? "self" : identifier(target)}${by}${keyColumn}${nullable ? ".nullable" : ""}${unique ? ".unique" : ".index"}${action ? `.onDelete.${action}` : ""}${inverse},`;
         }
 
-        const claim =
-          field.required === false || action === "setNull" ? "maybe" : "one";
+        const claim = nullable ? "maybe" : "one";
 
         builders.add(claim);
 
-        return `  ${relation}: ${claim}(${target})${action ? `.${action}` : ""}${field.unique ? ".unique" : ""}${keyColumn},`;
+        return `  ${relation}: ${claim}(${identifier(target)})${action ? `.${action}` : ""}${unique ? ".unique" : ""}${by}${keyColumn},`;
       }
 
       let type: string;
@@ -258,26 +508,24 @@ export const authSchemaSource = (
         typeof fallback === "boolean"
           ? `.default(${field.bigint ? `${fallback}n` : JSON.stringify(fallback)})`
           : "";
+      const indexed = (field.index === true || single.has(key)) && !unique;
 
-      return `  ${key}: ${type}${named}${field.required === false ? ".nullable" : ""}${field.unique ? ".unique" : ""}${field.index && !field.unique ? ".index" : ""}${literal},`;
+      return `  ${key}: ${type}${sqlName ? `.named(${JSON.stringify(sqlName)})` : ""}${field.required === false ? ".nullable" : ""}${unique ? ".unique" : ""}${indexed ? ".index" : ""}${literal},`;
     });
-    const indexes = (entry.indexes ?? []).filter(
-      (definition) => definition.fields.length > 1,
-    );
 
-    if (indexes.length) {
+    if (composite.length) {
       builders.add("index");
     }
 
     return [
-      `export const ${entry.modelName} = table({`,
+      `export const ${name} = table({`,
       "  id: text,",
       ...lines,
-      indexes.length
-        ? `}).indexes((${entry.modelName}) => ({\n${indexes
+      composite.length
+        ? `}).indexes((${name}) => ({\n${composite
             .map(
               (definition) =>
-                `  ${definition.fields.join("_").replace(/_(\w)/g, (_match, letter: string) => letter.toUpperCase())}: index(${definition.fields.map((name) => `${entry.modelName}.${name}`).join(", ")})${definition.unique ? ".unique" : ""},`,
+                `  ${definition.fields.join("_").replace(/_(\w)/g, (_match, letter: string) => letter.toUpperCase())}: index(${definition.fields.map((field) => `${name}.${columnKey(field)}`).join(", ")})${definition.unique ? ".unique" : ""},`,
             )
             .join("\n")}\n}));`
         : "});",
@@ -291,10 +539,21 @@ export const authSchemaSource = (
     "",
     declarations.join("\n\n"),
     "",
-    `export const authTables = { ${ordered.map((entry) => entry.modelName).join(", ")} };`,
+    `export const authTables = { ${ordered
+      .map((entry) => {
+        const name = identifier(entry.modelName);
+
+        return name === entry.modelName
+          ? name
+          : `${JSON.stringify(entry.modelName)}: ${name}`;
+      })
+      .join(", ")} };`,
     "",
   ].join("\n");
 };
+
+const SAFE_MIN = BigInt(Number.MIN_SAFE_INTEGER);
+const SAFE_MAX = BigInt(Number.MAX_SAFE_INTEGER);
 
 /**
  * `betterAuth({ database: symmetriaAdapter(db) })`. `db` is the database (or a
@@ -307,6 +566,21 @@ export const symmetriaAdapter = (
 ) => {
   // What better-auth hands the adapter, kept for the adapters built around a transaction.
   let authOptions: BetterAuthOptions | undefined;
+  // Each table's column keys, read once: they tell a reference written as a
+  // relation (`requestedById`) from one written as a plain column
+  // (`requestedBy`), as modules that earlier versions of `auth generate`
+  // wrote declare it, so those modules keep working.
+  let columns: ReadonlyMap<string, ReadonlySet<string>> | undefined;
+  const columnsOf = (model: string): ReadonlySet<string> | undefined => {
+    columns ??= new Map(
+      ((db as Loose).$snapshot?.()?.tables ?? []).map((table: Loose) => [
+        table.name,
+        new Set(table.columns.map((column: Loose) => column.name)),
+      ]),
+    );
+
+    return columns.get(model);
+  };
 
   const build = (connection: Loose): ReturnType<typeof createAdapterFactory> =>
     createAdapterFactory({
@@ -330,6 +604,7 @@ export const symmetriaAdapter = (
       adapter: ({
         getDefaultFieldName,
         getDefaultModelName,
+        getFieldAttributes,
         getFieldName,
         schema,
       }) => {
@@ -344,14 +619,61 @@ export const symmetriaAdapter = (
 
           return handle;
         };
+        // A reference field the table holds as a relation's key column
+        // `<field>Id`: `requestedBy` is the relation `requestedBy` and the
+        // column `requestedById`. (`userId` is the relation `user` and keeps
+        // its key.)
+        const relationKeys = new Map<string, ReadonlyMap<string, string>>();
+        const relationKeysOf = (model: string): ReadonlyMap<string, string> => {
+          let keys = relationKeys.get(model);
+
+          if (!keys) {
+            const present = columnsOf(model);
+            let fields: Record<string, Loose> = {};
+
+            try {
+              fields = schema[getDefaultModelName(model)]?.fields ?? {};
+            } catch {
+              // Not one of better-auth's models.
+            }
+
+            keys = new Map(
+              Object.entries(fields).flatMap(([key, field]) =>
+                field.references &&
+                present &&
+                !present.has(key) &&
+                present.has(`${key}Id`)
+                  ? [[key, `${key}Id`] as const]
+                  : [],
+              ),
+            );
+            relationKeys.set(model, keys);
+          }
+
+          return keys;
+        };
         // better-auth hands over rows and clauses by each field's database
         // name (`fields: { emailVerified: "email_verified" }`); the tables are
         // keyed by its field names (`emailVerified`) with that SQL name.
         const keyOf = (model: string, field: string): string => {
+          let key: string;
+
           try {
-            return getDefaultFieldName({ model, field });
+            key = getDefaultFieldName({ model, field });
           } catch {
             return field;
+          }
+
+          return relationKeysOf(model).get(key) ?? key;
+        };
+        const typeOf = (
+          model: string,
+          field: string,
+        ): Field["type"] | undefined => {
+          try {
+            return getFieldAttributes({ model, field }).type;
+          } catch {
+            return undefined;
           }
         };
         const keyed = (model: string, data: Record<string, unknown>) =>
@@ -375,6 +697,28 @@ export const symmetriaAdapter = (
             return false;
           }
         };
+        // The better-auth field a key of the table holds, if any.
+        const fieldOf = (model: string, key: string): string | undefined => {
+          if (isField(model, key)) {
+            return key;
+          }
+
+          const field = key.slice(0, -2);
+
+          return key.endsWith("Id") && relationKeysOf(model).get(field) === key
+            ? field
+            : undefined;
+        };
+        // A `bigint` column (`rateLimit.lastRequest`) reads as a bigint;
+        // better-auth types its number fields as numbers, so a safe integer
+        // goes back as one.
+        const output = (model: string, field: string, value: unknown) =>
+          typeof value === "bigint" &&
+          value >= SAFE_MIN &&
+          value <= SAFE_MAX &&
+          typeOf(model, field) === "number"
+            ? Number(value)
+            : value;
         // Rows go back under better-auth's database names. A column of the
         // application's own (`plan`) is not a better-auth field: it keeps its
         // key, and a field's value wins over it when the two names meet
@@ -387,14 +731,21 @@ export const symmetriaAdapter = (
             return null;
           }
 
-          const entries = Object.entries(row);
-          const own = entries.filter(([key]) => !isField(model, key));
-          const fields = entries
-            .filter(([key]) => isField(model, key))
-            .map(([key, value]) => [
-              getFieldName({ model, field: key }),
-              value,
-            ]);
+          const own: [string, unknown][] = [];
+          const fields: [string, unknown][] = [];
+
+          for (const [key, value] of Object.entries(row)) {
+            const field = fieldOf(model, key);
+
+            if (field === undefined) {
+              own.push([key, value]);
+            } else {
+              fields.push([
+                getFieldName({ model, field }),
+                output(model, field, value),
+              ]);
+            }
+          }
 
           return Object.fromEntries([...own, ...fields]);
         };
@@ -405,7 +756,30 @@ export const symmetriaAdapter = (
           (clauses ?? []).map((clause) => ({
             ...clause,
             key: keyOf(model, clause.field),
+            value: comparable(
+              typeOf(model, clause.field),
+              clause.value,
+            ) as CleanedWhere["value"],
           }));
+        // A read of the whole row, or of the fields better-auth selects.
+        const read = (
+          model: string,
+          select: readonly string[] | undefined,
+          query: object,
+        ) =>
+          select?.length
+            ? table(model)(
+                (row: Loose) =>
+                  Object.fromEntries(
+                    select.map((field) => {
+                      const key = keyOf(model, field);
+
+                      return [key, columnOf(row, key, field)];
+                    }),
+                  ),
+                query,
+              )
+            : table(model)(query);
         // An UPDATE or DELETE without a filter is refused unless spelled
         // out; better-auth means every row when it sends none.
         const filtered = (
@@ -416,6 +790,29 @@ export const symmetriaAdapter = (
           clauses?.length
             ? mutation.where(filter(where(model, clauses)))
             : mutation.all();
+        // A filter that holds for every row (`not_in` an empty list, `ne`
+        // null on a required field) is refused like a missing where().
+        const refusing = async (
+          method: string,
+          model: string,
+          run: () => Loose,
+        ): Promise<Loose> => {
+          try {
+            return await run();
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              error.message.includes("leaves no condition")
+            ) {
+              throw new Error(
+                `symmetria: better-auth's ${method}() on "${model}" has a where that holds for every row (such as not_in an empty list, or ne null on a required field), so the adapter refuses it rather than write every row; call ${method}() without a where to write every row`,
+                { cause: error },
+              );
+            }
+
+            throw error;
+          }
+        };
 
         return {
           create: async ({ model, data }) =>
@@ -424,18 +821,25 @@ export const symmetriaAdapter = (
               await table(model).insert(keyed(model, data)).returning(),
             ) as never,
 
-          findOne: async ({ model, where: clauses }) =>
+          findOne: async ({ model, where: clauses, select }) =>
             fielded(
               model,
-              await table(model)({
+              await read(model, select, {
                 where: filter(where(model, clauses)),
                 limit: 1,
               }).first(),
             ) as never,
 
-          findMany: async ({ model, where: clauses, limit, offset, sortBy }) =>
+          findMany: async ({
+            model,
+            where: clauses,
+            limit,
+            offset,
+            sortBy,
+            select,
+          }) =>
             (
-              await table(model)({
+              await read(model, select, {
                 where: filter(where(model, clauses)),
                 limit,
                 offset,
@@ -449,33 +853,42 @@ export const symmetriaAdapter = (
             table(model)({ where: filter(where(model, clauses)) }).count(),
 
           update: async ({ model, where: clauses, update }) => {
-            const [row] = await filtered(
-              model,
-              table(model).update(
-                keyed(model, update as Record<string, unknown>),
-              ),
-              clauses,
-            ).returning();
+            const [row] = await refusing("update", model, () =>
+              filtered(
+                model,
+                table(model).update(
+                  keyed(model, update as Record<string, unknown>),
+                ),
+                clauses,
+              ).returning(),
+            );
 
             return fielded(model, row ?? null) as never;
           },
 
           updateMany: async ({ model, where: clauses, update }) =>
             (
-              await filtered(
-                model,
-                table(model).update(keyed(model, update)),
-                clauses,
+              await refusing("updateMany", model, () =>
+                filtered(
+                  model,
+                  table(model).update(keyed(model, update)),
+                  clauses,
+                ),
               )
             ).affectedRows,
 
           delete: async ({ model, where: clauses }) => {
-            await filtered(model, table(model).delete(), clauses);
+            await refusing("delete", model, () =>
+              filtered(model, table(model).delete(), clauses),
+            );
           },
 
           deleteMany: async ({ model, where: clauses }) =>
-            (await filtered(model, table(model).delete(), clauses))
-              .affectedRows,
+            (
+              await refusing("deleteMany", model, () =>
+                filtered(model, table(model).delete(), clauses),
+              )
+            ).affectedRows,
 
           // One row at most: the DELETE by key decides which of two
           // concurrent callers gets it.
@@ -497,21 +910,43 @@ export const symmetriaAdapter = (
             return fielded(model, row ?? null) as never;
           },
 
+          // One row, as better-auth's SQL adapters change it: the first the
+          // filter finds, written only while the filter still holds for it,
+          // so a concurrent change that breaks the filter leaves it alone. A
+          // NULL counter counts from 0, as better-auth's own fallback does.
           incrementOne: async ({ model, where: clauses, increment, set }) => {
-            const [row] = await filtered(
-              model,
-              table(model).update((current: Loose) => ({
+            const handle = table(model);
+            const keyedWhere = where(model, clauses);
+            const condition = keyedWhere.length
+              ? filter(keyedWhere)
+              : undefined;
+            const [row] = await handle
+              .update((current: Loose) => ({
                 ...keyed(model, set ?? {}),
                 ...Object.fromEntries(
                   Object.entries(increment).map(([field, delta]) => {
                     const key = keyOf(model, field);
 
-                    return [key, current[key].plus(delta)];
+                    return [
+                      key,
+                      (coalesce as Loose)(
+                        columnOf(current, key, field),
+                        0,
+                      ).plus(delta),
+                    ];
                   }),
                 ),
-              })),
-              clauses,
-            ).returning();
+              }))
+              .where((target: Loose) => [
+                ...(condition ? [condition(target)] : []),
+                columnOf(target, "id", "id").in(
+                  handle((first: Loose) => ({ id: first.id }), {
+                    where: condition,
+                    limit: 1,
+                  }),
+                ),
+              ])
+              .returning();
 
             return fielded(model, row ?? null) as never;
           },
@@ -519,6 +954,7 @@ export const symmetriaAdapter = (
           createSchema: async ({ tables, file }) => ({
             code: authSchemaSource(tables as Tables, {
               usePlural: options.usePlural ?? false,
+              casing: (db as Loose).$snapshot?.()?.casing,
             }),
             path: file ?? "./auth-schema.ts",
             overwrite: true,

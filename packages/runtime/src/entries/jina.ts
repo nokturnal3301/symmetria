@@ -3,20 +3,29 @@
  * `meaning: jinaV3(chunk.title, chunk.content)`. The key is read from
  * `JINA_API_KEY` unless given.
  */
-import { apiKey, byIndex, inBatches, postJson } from "../embedders/http";
+import {
+  apiKey,
+  byIndex,
+  inBatches,
+  postJson,
+  requestOptions,
+  type RequestOptions,
+} from "../embedders/http";
 import { embedder } from "../schema/search";
 
 const BATCH = 128;
 
-export type JinaOptions = {
+export type JinaOptions = RequestOptions & {
   readonly apiKey?: string;
   /** Embedding length; sent as `dimensions` when given. */
   readonly size?: number;
   readonly baseUrl?: string;
 };
 
-export const jina = (model: string, options: JinaOptions = {}) =>
-  embedder(
+export const jina = (model: string, options: JinaOptions = {}) => {
+  const request = requestOptions(model, options);
+
+  return embedder(
     options.size ?? 1024,
     (texts, kind) =>
       inBatches(texts, BATCH, async (input) =>
@@ -38,11 +47,13 @@ export const jina = (model: string, options: JinaOptions = {}) =>
                   ? { dimensions: options.size }
                   : {}),
               },
+              request,
             )
           ).data,
         ),
       ),
     { name: model },
   );
+};
 
 export const jinaV3 = jina("jina-embeddings-v3");

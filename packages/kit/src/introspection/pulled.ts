@@ -5,7 +5,10 @@
 import type { Casing } from "symmetria";
 
 export type PullWarningCode =
-  /** No longer reported: BY DEFAULT identities are declared with `.auto.byDefault`. */
+  /**
+   * Never reported: BY DEFAULT identities are declared with `.auto.byDefault`.
+   * The code stays so that programs that match on it still compile.
+   */
   | "identity-by-default"
   | "serial"
   | "identity-type"
@@ -76,7 +79,11 @@ export type ColumnType =
   | { kind: "enum"; values: string[]; name?: string }
   /** `vector(n)`, or `halfvec(n)` when `half`. */
   | { kind: "vector"; dimensions?: number; half?: true }
-  | { kind: "custom"; sqlType: string; valueType: string };
+  /**
+   * `customType()`. `base` is a domain's base type (`numeric(30,10)`), whose
+   * builder the values read and write like; without it, driver-native values.
+   */
+  | { kind: "custom"; sqlType: string; valueType: string; base?: string };
 
 export type ColumnDefault =
   | { kind: "auto"; byDefault?: true }

@@ -1,4 +1,6 @@
 import { dataError } from "./deferred";
+import { keyAlias } from "../compile/state";
+import { canonicalType } from "./type-names";
 
 export type Codec<Value, Input = Value> = {
   readonly encode: (value: Input) => unknown;
@@ -10,8 +12,14 @@ export type RuntimeCodec = {
   readonly decode: (value: unknown) => unknown;
   /** SQL type for `$n::text::<cast>` parameters, such as jsonb or text[]. */
   readonly parameterCast?: string;
-  /** Declared SQL type the codec decodes, when parameters need no cast: `numeric(12,2)`. */
+  /** Declared SQL type the codec decodes, such as `numeric(12,2)`; typed expressions follow it. */
   readonly sqlType?: string;
+  /**
+   * The type the values have when the declared one is another name for it,
+   * such as a domain's base type, in the runtime's spelling (`canonicalType`):
+   * JSON precision, aggregates and arithmetic follow it. Never rendered.
+   */
+  readonly base?: string;
   /** Element codec of an array column. */
   readonly element?: RuntimeCodec;
   /** Decoding returns the value as it came; row decoders skip the call. */
@@ -256,7 +264,7 @@ const integerCodec = (
   const limit = 2 ** (bits - 1);
 
   return {
-    // `integer` keeps no declared type, so parameters stay as untyped as before.
+    // `integer` declares no type, so its parameters stay untyped in the SQL.
     ...(sqlType === "smallint" ? { sqlType } : {}),
     encode: (value: unknown) => {
       if (
@@ -369,7 +377,13 @@ export const bytesCodec: RuntimeCodec = {
   },
   decode: (value) => {
     if (value instanceof Uint8Array) {
-      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      // A driver's Buffer can be a view into memory other values share:
+      // Node's 8 KB pool holds other queries' SQL, parameters and rows behind
+      // `value.buffer`. Such a value gets bytes of its own.
+      return value.byteOffset === 0 &&
+        value.byteLength === value.buffer.byteLength
+        ? new Uint8Array(value.buffer)
+        : new Uint8Array(value);
     }
 
     if (value instanceof ArrayBuffer) {
@@ -421,10 +435,24 @@ export const arrayCodec = (
   elementType: string,
   element?: RuntimeCodec,
 ): RuntimeCodec => {
-  const nullable = elementType === "jsonb" || elementType === "json";
+  const type = element?.base ?? canonicalType(elementType);
+  const nullable = type === "jsonb" || type === "json";
   // PostgreSQL separates the elements of a box array with ";": its own
   // elements hold commas.
-  const delimiter = /^box$/i.test(elementType) ? ";" : ",";
+  const delimiter = type === "box" ? ";" : ",";
+  // An array arriving as text has PostgreSQL's text form of each element,
+  // which the codecs read like a driver's value, except booleans and JSON.
+  const fromText =
+    type === "boolean"
+      ? (text: string): unknown =>
+          text === "t" || text === "true"
+            ? true
+            : text === "f" || text === "false"
+              ? false
+              : text
+      : nullable
+        ? (text: string): unknown => JSON.parse(text)
+        : undefined;
 
   const nullElement = (direction: "store" | "read"): Error =>
     new Error(
@@ -462,9 +490,14 @@ export const arrayCodec = (
         typeof value === "string" && value.startsWith("[")
           ? (JSON.parse(value) as unknown[])
           : // A type the driver has no parser for (an enum, tsvector or range
-            // array on node-postgres, an enum array on Bun) arrives as text.
+            // array on node-postgres, an enum array on Bun, an array of a
+            // domain on both) arrives as text.
             typeof value === "string" && value.startsWith("{")
-            ? arrayLiteral(value, delimiter)
+            ? fromText
+              ? arrayLiteral(value, delimiter).map((text) =>
+                  text === null ? text : fromText(text),
+                )
+              : arrayLiteral(value, delimiter)
             : // Bun reads integer[] and real[] parameters and RETURNING values as typed arrays.
               ArrayBuffer.isView(value) && !(value instanceof DataView)
               ? Array.from(value as unknown as ArrayLike<unknown>)
@@ -656,7 +689,10 @@ const timestampParameter =
     return timestampText(value);
   };
 
-export const codecFor = (sqlType: string): RuntimeCodec | undefined => {
+/** The codec of a built-in type, by any of its names (`int8`, `DECIMAL(12,2)`). */
+export const codecFor = (declared: string): RuntimeCodec | undefined => {
+  const sqlType = canonicalType(declared);
+
   if (sqlType.endsWith("[]")) {
     const elementType = sqlType.slice(0, -2);
 
@@ -702,7 +738,7 @@ export const codecFor = (sqlType: string): RuntimeCodec | undefined => {
 
   if (sqlType === "jsonb" || sqlType === "json") {
     return {
-      encode: (value) => JSON.stringify(value),
+      encode: jsonText,
       decode: (value) => value,
       parameterCast: sqlType,
     };
@@ -744,6 +780,119 @@ export const codecFor = (sqlType: string): RuntimeCodec | undefined => {
 };
 
 /**
+ * JSON.stringify's replacer that refuses NaN and ±Infinity where it writes
+ * them: it sees each value as written, after its `toJSON(key)`, under its key.
+ */
+const refuseNonFinite = (key: string, value: unknown): unknown => {
+  if (
+    (typeof value === "number" || value instanceof Number) &&
+    !Number.isFinite(Number(value))
+  ) {
+    throw new Error(
+      `symmetria: a json or jsonb value cannot hold NaN or Infinity${key === "" ? "" : ` (at ${JSON.stringify(key)})`}: JSON has neither, and JSON.stringify would write null`,
+    );
+  }
+
+  return value;
+};
+
+const dateToJSON = Date.prototype.toJSON;
+
+/**
+ * Whether a value may hold NaN or ±Infinity where JSON.stringify writes it:
+ * a quick walk of what JSON.stringify writes, calling each `toJSON(key)` as
+ * it does, that may answer yes for a value that does not (a key from the
+ * prototype, a getter that answers differently the second time), never no
+ * for one that does. A Date's own `toJSON()` writes its text or null, never a
+ * number.
+ */
+const mayHoldNonFinite = (
+  value: unknown,
+  key: string | number,
+  written = false,
+): boolean => {
+  if (typeof value === "number") {
+    return !Number.isFinite(value);
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  if (!written) {
+    const toJSON = (value as { toJSON?: unknown }).toJSON;
+
+    if (typeof toJSON === "function") {
+      return toJSON === dateToJSON
+        ? false
+        : mayHoldNonFinite(toJSON.call(value, String(key)), key, true);
+    }
+  }
+
+  if (value instanceof Number) {
+    return !Number.isFinite(Number(value));
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const item: unknown = value[index];
+
+      if (
+        typeof item === "number"
+          ? !Number.isFinite(item)
+          : typeof item === "object" &&
+            item !== null &&
+            mayHoldNonFinite(item, index)
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  for (const name in value) {
+    const item: unknown = (value as Record<string, unknown>)[name];
+
+    if (
+      typeof item === "number"
+        ? !Number.isFinite(item)
+        : typeof item === "object" &&
+          item !== null &&
+          mayHoldNonFinite(item, name)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
+/**
+ * Matches every `null` JSON.stringify writes as a value, and a few inside
+ * strings (`"a,null]"` does, `"nullable"` does not): a match is only a reason
+ * to look closer.
+ */
+const NULL_TOKEN = /(?:^|[[,:])null(?=[,\]}]|$)/;
+
+/**
+ * A value as JSON text, refusing NaN and ±Infinity at any depth:
+ * JSON.stringify writes them as null, which would store or compare JSON null.
+ * Only a text that holds a `null` value can hide one, so others need no
+ * second look; one that may is written again, checking each value as it is
+ * written, and that text is the one returned.
+ */
+export const jsonText = (value: unknown): string => {
+  const text = JSON.stringify(value);
+
+  return text?.includes("null") &&
+    NULL_TOKEN.test(text) &&
+    mayHoldNonFinite(value, "")
+    ? JSON.stringify(value, refuseNonFinite)
+    : text;
+};
+
+/**
  * A value the codec rejects is a data error: while a query is built it is
  * recorded for execution and stands in as NULL (see `./deferred`).
  */
@@ -769,15 +918,31 @@ export const createRowDecoder = (
     readonly outputName: string;
     readonly codec?: RuntimeCodec;
   }[],
+  /** Rows of a statement, whose columns are the keys' SQL aliases (`keyAlias`); JSON rows carry the keys. */
+  columns = false,
 ): ((row: Record<string, unknown>) => Record<string, unknown>) => {
+  const sources = columns
+    ? selection.map((expression) => keyAlias(expression.outputName))
+    : undefined;
+
   // Assignment to __proto__ would invoke Object.prototype's setter instead of
   // defining a selected field. Keep data-property semantics for that projection.
-  if (selection.some((expression) => expression.outputName === "__proto__")) {
+  // A key too long for an SQL alias comes back under its shorter `keyAlias`.
+  if (
+    selection.some(
+      (expression, position) =>
+        expression.outputName === "__proto__" ||
+        (sources && sources[position] !== expression.outputName),
+    )
+  ) {
     return (row) =>
       Object.fromEntries(
-        selection.map((expression) => [
+        selection.map((expression, position) => [
           expression.outputName,
-          decodeValue(row[expression.outputName], expression.codec),
+          decodeValue(
+            row[sources?.[position] ?? expression.outputName],
+            expression.codec,
+          ),
         ]),
       );
   }
@@ -892,9 +1057,9 @@ const knownFirstNames = new Map<DecoderFactory, string>();
 /** Primitive parameter values can be reused; object-backed values are cloned defensively. */
 export const cloneParameter = (value: unknown): unknown => {
   if (value === null || typeof value !== "object") {
-    // Functions and symbols are rejected by structuredClone, as before.
+    // Functions and symbols cannot be copied: `cloned` refuses them by name.
     return typeof value === "function" || typeof value === "symbol"
-      ? structuredClone(value)
+      ? cloned(value)
       : value;
   }
 
@@ -905,12 +1070,37 @@ export const cloneParameter = (value: unknown): unknown => {
   if (Array.isArray(value)) {
     for (const entry of value) {
       if (entry !== null && typeof entry === "object") {
-        return structuredClone(value);
+        return cloned(value);
       }
     }
 
     return value.slice();
   }
 
-  return structuredClone(value);
+  return cloned(value);
+};
+
+/** structuredClone, failing with what cannot be bound instead of a DataCloneError. */
+const cloned = (value: unknown): unknown => {
+  try {
+    return structuredClone(value);
+  } catch (error) {
+    const name = (value as { constructor?: { name?: unknown } }).constructor
+      ?.name;
+    const what =
+      typeof value === "function"
+        ? "a function"
+        : typeof value === "symbol"
+          ? "a symbol"
+          : Array.isArray(value)
+            ? "an array with a part that cannot be copied"
+            : typeof name === "string" && name !== "Object"
+              ? `a ${name}`
+              : "an object with a part that cannot be copied";
+
+    throw new Error(
+      `symmetria: ${what} cannot be bound as a SQL value; pass a string, number, bigint, boolean, Date, Buffer, plain JSON object or an array of these`,
+      { cause: error },
+    );
+  }
 };

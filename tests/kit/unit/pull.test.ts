@@ -13,11 +13,16 @@ import {
   type PulledColumn,
   type PulledReference,
 } from "../../../packages/kit/src/introspection/model";
-import { objectName } from "../../../packages/kit/src/migrations/snapshot";
+import {
+  commentText,
+  objectName,
+} from "../../../packages/kit/src/migrations/snapshot";
 import { renderSchema } from "../../../packages/kit/src/introspection/render";
+import { interpolate } from "../../../packages/kit/src/introspection/constraints";
 import {
   camelKey,
   escapeTemplate,
+  quoteString,
 } from "../../../packages/kit/src/introspection/names";
 import { migrationSnapshot } from "../../../packages/kit/src";
 import { withMigrationDirectory } from "../../support/directories";
@@ -298,7 +303,124 @@ describe("pull: names", () => {
 
   test("template escaping keeps backticks, interpolations and backslashes literal", () => {
     expect(escapeTemplate("a`b${c}\\d")).toBe("a\\`b\\${c}\\\\d");
+    // Written a character at a time outside literals, `$` and `{` still
+    // cannot meet as an interpolation.
+    expect(interpolate("a ${b} 'c${d}'", new Map(), "t").template).toBe(
+      "a \\${b} 'c\\${d}'",
+    );
   });
+
+  test("line breaks, control characters and direction marks are escaped in templates, strings and comments", () => {
+    expect(escapeTemplate("a\rb\u2028c\u202ed\u0007e\nf\tg")).toBe(
+      "a\\rb\\u2028c\\u202ed\\u0007e\nf\tg",
+    );
+    expect(quoteString("a\u2028b\u2029c\u202ed\ne")).toBe(
+      '"a\\u2028b\\u2029c\\u202ed\\ne"',
+    );
+    expect(commentText("a\nb\rc\u2028d\u2029e\u001bf\u202eg\th")).toBe(
+      "a\\nb\\rc\\u2028d\\u2029e\\u001bf\\u202eg\th",
+    );
+    // Ordinary text is written as it was.
+    for (const text of ["users_email_key", 'a "quoted" name', "café"]) {
+      expect(commentText(text)).toBe(text);
+      expect(quoteString(text)).toBe(JSON.stringify(text));
+      expect(escapeTemplate(text)).toBe(text);
+    }
+  });
+
+  test("database names with line breaks stay inside the comments and strings of the module", () =>
+    withMigrationDirectory(async (directory) => {
+      // Each payload would run as code if it reached a line of its own.
+      const payload = (n: number) => `x${n}:(globalThis.pulled${n}=1)&&text,//`;
+      const model = buildPulledSchema(
+        catalog([
+          {
+            name: "t1",
+            primaryKey: ["id"],
+            unique: [{ name: `odd\n${payload(1)}`, columns: ["code"] }],
+            columns: [
+              { name: "id", type: "integer", identity: "a" },
+              { name: "code", type: "text" },
+            ],
+          },
+          {
+            name: "t2",
+            primaryKey: ["id"],
+            checks: [{ name: `chk\r${payload(2)}`, expression: "(n > 0)" }],
+            columns: [
+              { name: "id", type: "integer", identity: "a" },
+              { name: "n", type: "integer" },
+            ],
+          },
+          {
+            name: "t3",
+            primaryKey: ["id"],
+            partitioned: true,
+            columns: [{ name: "id", type: "integer", identity: "a" }],
+          },
+          {
+            name: `p\u2028globalThis.pulled3=1;//`,
+            partition: true,
+            columns: [{ name: "id", type: "integer" }],
+          },
+          {
+            name: `odd\u2029${payload(4)}`,
+            primaryKey: ["id"],
+            columns: [
+              { name: "id", type: "integer", identity: "a" },
+              { name: "note", type: "text", default: "'a\rb\u2028c'::text" },
+              {
+                name: "label",
+                type: "text",
+                default: "('x\r'::text || 'y\u2029'::text)",
+              },
+            ],
+          },
+          {
+            name: "loose",
+            columns: [
+              { name: "id", type: "integer", nullable: true },
+              { name: "label", type: "text", nullable: true },
+            ],
+          },
+        ]),
+      );
+      const source = renderSchema(model, {
+        module: runtime,
+        header: [`from\n${payload(5)}`],
+      });
+
+      // Only the module's own line feeds break lines.
+      expect(source).not.toMatch(/[\r\u2028\u2029]/);
+      expect(source).toContain(
+        `// pull: constraint "odd\\n${payload(1)}" is named "t1_code_key"`,
+      );
+      expect(source).toContain(
+        '// pull: table "p\\u2028globalThis.pulled3=1;//" skipped',
+      );
+
+      const path = join(directory, "schema.ts");
+      await writeFile(path, source);
+      const loaded = await import(pathToFileURL(path).href);
+      const ran = [1, 2, 3, 4, 5].filter(
+        (n) => (globalThis as Record<string, unknown>)[`pulled${n}`],
+      );
+
+      expect(ran).toEqual([]);
+
+      // The names and the texts of defaults are the database's, unchanged.
+      const odd = migrationSnapshot(loaded.appSchema.$snapshot()).tables.find(
+        (table) => table.name === `odd\u2029${payload(4)}`,
+      )!;
+
+      expect(
+        odd.columns.map((column) => [column.name, column.default]),
+      ).toEqual([
+        ["id", undefined],
+        ["note", "E'a\rb\u2028c'"],
+        ["label", "('x\r'::text || 'y\u2029'::text)"],
+      ]);
+    }));
 });
 
 describe("pull: columns", () => {
@@ -561,6 +683,93 @@ describe("pull: columns", () => {
       'other: oneOf("happy", "sad").typeName("mood").nullable,',
     );
   });
+
+  test("domain columns are declared over their base type; a domain without a builder stays driver-native", () =>
+    withMigrationDirectory(async (directory) => {
+      const model = buildPulledSchema({
+        ...catalog([
+          {
+            name: "ledger",
+            primaryKey: ["id"],
+            columns: [
+              { name: "id", type: "integer", identity: "a" },
+              { name: "amount", type: "amount" },
+              { name: "big", type: "big_id" },
+              { name: "rate", type: "rate", default: "5" },
+              { name: "at", type: "moment", nullable: true },
+              { name: "amounts", type: "amount[]" },
+              { name: "nested", type: "positive_amount" },
+              { name: "label", type: "label", collation: "C" },
+              { name: "price", type: "price" },
+              { name: "payload", type: "payload" },
+              { name: "ref", type: "ref" },
+            ],
+          },
+        ]),
+        domains: [
+          { name: "amount", base: "numeric(30,10)" },
+          { name: "big_id", base: "bigint" },
+          { name: "rate", base: "integer" },
+          { name: "moment", base: "timestamp with time zone" },
+          { name: "positive_amount", base: "amount" },
+          { name: "label", base: "text" },
+          { name: "price", base: "money" },
+          { name: "payload", base: "json" },
+          { name: "ref", base: "oid" },
+        ],
+      });
+
+      expect(column(model, "ledger", "nested").type).toEqual({
+        kind: "custom",
+        sqlType: "positive_amount",
+        valueType: "Decimal",
+        base: "numeric(30,10)",
+      });
+      expect(column(model, "ledger", "label").collation).toBe("C");
+
+      const source = renderSchema(model, { module: runtime });
+      for (const line of [
+        'amount: customType<Decimal>("amount", { base: "numeric(30,10)" }), // pull: domain over numeric(30,10)',
+        'big: customType<bigint>("big_id", { base: "bigint" }), // pull: domain over bigint',
+        'rate: customType<number>("rate", { base: "integer" }).default(5), // pull: domain over integer',
+        'at: customType<Date>("moment", { base: "timestamp with time zone" }).nullable, // pull: domain over timestamp with time zone',
+        'amounts: customType<Decimal>("amount", { base: "numeric(30,10)" }).array, // pull: domain over numeric(30,10)',
+        'label: customType<string>("label", { base: "text" }).collate("C"), // pull: domain over text',
+        // No builder for the base: values stay as the driver delivers them.
+        'price: customType<string>("price", passthrough<string>()), // pull: domain over money, no builder for it',
+        // ... and like a plain column of the base type: json and oid.
+        'payload: customType<unknown>("payload", passthrough<unknown>()), // pull: domain over json, no builder for it',
+        'ref: customType<number>("ref", asNumber()), // pull: domain over oid, no builder for it',
+      ]) {
+        expect(source).toContain(line);
+      }
+      // Decimal, the numeric builder's value type, is imported as a type.
+      expect(source).toMatch(
+        /^import \{[^}]*customType,[^}]*type Decimal,?\s*\} from /m,
+      );
+      expect(model.warnings.map((warning) => warning.code)).toEqual(
+        Array(10).fill("custom-type"),
+      );
+
+      const path = join(directory, "domains.ts");
+      await writeFile(path, source);
+      const loaded = await import(pathToFileURL(path).href);
+      const ledger = migrationSnapshot(
+        loaded.appSchema.$snapshot(),
+      ).tables.find((table) => table.name === "ledger")!;
+
+      // The declared SQL type is the domain: no DDL change.
+      expect(
+        Object.fromEntries(
+          ledger.columns.map((entry) => [entry.name, entry.sqlType]),
+        ),
+      ).toMatchObject({
+        amount: "amount",
+        big: "big_id",
+        amounts: "amount[]",
+        nested: "positive_amount",
+      });
+    }));
 });
 
 describe("pull: what the schema cannot declare", () => {
