@@ -214,13 +214,43 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
     column.enum_name ===
       conventionalNames.enumeration(column.table_name, column.column_name);
 
-  // Views, materialized views and triggers have no declaration; list each one.
+  // Views, materialized views, triggers, rules and foreign tables have no
+  // declaration; list each one.
   const quotedList = (names: readonly string[]): string =>
     names.map((name) => `"${name}"`).join(", ");
   const routines: string[] = [];
+  // What a declared table carries in the database only, for the `// pull:`
+  // lines at the top of its declaration.
+  const tableNotes = new Map<string, string[]>();
+  const note = (table: string, text: string) =>
+    tableNotes.set(table, [...(tableNotes.get(table) ?? []), text]);
 
   for (const object of catalog.undeclared ?? []) {
     switch (object.kind) {
+      case "rule":
+        if (object.table_name !== null) {
+          note(object.table_name, `rule "${object.name}" is not declared`);
+        }
+
+        warn({
+          code: "rule",
+          table: object.table_name ?? object.name,
+          object: object.name,
+          message: `rule "${object.name}" on "${object.table_name}" is not declared; the schema does not manage rules, so migrations neither create nor drop it and a database built from this schema lacks it (${object.definition.replace(/\s+/g, " ").trim()})`,
+        });
+        break;
+      case "foreign table":
+        skippedTables.push({
+          sqlName: object.name,
+          reason: `a foreign table of server "${object.definition}"; the schema declares ordinary tables`,
+        });
+        warn({
+          code: "foreign-table",
+          table: object.name,
+          object: object.name,
+          message: `foreign table "${object.name}" of server "${object.definition}" is not declared; queries cannot reach it through the schema and migrations neither create nor drop it`,
+        });
+        break;
       case "inheritance":
         warn({
           code: "inheritance",
@@ -424,6 +454,17 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       });
     }
 
+    if (details?.reloptions?.length) {
+      const parameters = details.reloptions.join(", ");
+
+      note(table.name, `storage parameters are not declared: ${parameters}`);
+      warn({
+        code: "storage-parameters",
+        table: table.name,
+        message: `"${table.name}" has storage parameters the schema cannot declare (${parameters}); a database built from this schema creates the table with the defaults`,
+      });
+    }
+
     // An identity's sequence options are not declared: `.auto` numbers from 1 by 1.
     for (const sequence of catalog.sequences ?? []) {
       if (
@@ -480,8 +521,13 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
   }
 
   // -- pass 2: foreign keys that can become relations -------------------------
+  // The foreign keys of a column that the schema leaves out, by the one it declares.
+  const undeclaredKeys = new Map<PendingReference, CatalogConstraint[]>();
+
   for (const table of facts.values()) {
     const columnKeys = new Set(table.columnKeys.values());
+    // A column can carry several foreign keys; the schema declares one.
+    const candidates = new Map<string, PendingReference[]>();
 
     for (const constraint of table.constraints.filter(
       (entry) => entry.kind === "f",
@@ -586,13 +632,18 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
           return "generated columns cannot be relations";
         }
 
-        table.references.set(columnName!, {
-          constraint,
-          key,
-          targetSql: target.sqlName,
-          ...(isPrimary ? {} : { by: target.columnKeys.get(referencedName!)! }),
-          ...(conventional ? {} : { column: columnName! }),
-        });
+        candidates.set(columnName!, [
+          ...(candidates.get(columnName!) ?? []),
+          {
+            constraint,
+            key,
+            targetSql: target.sqlName,
+            ...(isPrimary
+              ? {}
+              : { by: target.columnKeys.get(referencedName!)! }),
+            ...(conventional ? {} : { column: columnName! }),
+          },
+        ]);
 
         return undefined;
       })();
@@ -604,6 +655,33 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
           column: constraint.columns.join(", "),
           object: constraint.name,
           message: `foreign key "${constraint.name}" is kept as a plain column: ${reason}`,
+        });
+      }
+    }
+
+    for (const [columnName, keys] of candidates) {
+      // The key under the name the schema gives it, so that nothing needs a
+      // rename; else the first by name, the order the catalog lists them in.
+      const expected = conventionalNames.foreignKey(table.sqlName, columnName);
+      const declared =
+        keys.find((entry) => entry.constraint.name === expected) ?? keys[0]!;
+      const others = keys
+        .filter((entry) => entry !== declared)
+        .map((entry) => entry.constraint);
+
+      table.references.set(columnName, declared);
+
+      if (others.length) {
+        undeclaredKeys.set(declared, others);
+      }
+
+      for (const other of others) {
+        warn({
+          code: "foreign-key",
+          table: table.sqlName,
+          column: columnName,
+          object: other.name,
+          message: `foreign key "${other.name}" is not declared: "${table.sqlName}.${columnName}" has more than one foreign key and the schema declares one per column, here "${declared.constraint.name}" (${declared.constraint.name === expected ? "the one with the name the schema gives the key" : "the first by name"}); migrations neither create nor drop "${other.name}", and a database built from this schema lacks it (${other.definition})`,
         });
       }
     }
@@ -707,7 +785,7 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
       members: [],
       indexes: [],
       checks: [],
-      comments: [],
+      comments: [...(tableNotes.get(table.sqlName) ?? [])],
       skipped: [],
     };
     const uniqueConstraints = table.constraints.filter(
@@ -924,6 +1002,12 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
           });
         }
 
+        for (const other of undeclaredKeys.get(reference) ?? []) {
+          member.comments.push(
+            `foreign key "${other.name}" is not declared: ${other.definition}`,
+          );
+        }
+
         const expected = conventionalNames.foreignKey(
           table.sqlName,
           column.column_name,
@@ -1032,16 +1116,51 @@ export const buildPulledSchema = (catalog: PullCatalog): PulledSchema => {
         (entry) => entry.index_name === constraint.name,
       );
       const columns = constraint.columns.map(quoteSql).join(", ");
-      warn({
-        code: "unique-constraint",
-        table: table.sqlName,
-        object: constraint.name,
-        message: `multi-column unique constraint "${constraint.name}" (${constraint.columns.join(", ")}) is declared as a unique index of the same name; the constraint itself stays undeclared`,
-        fix: `ALTER TABLE ${quoteSql(table.sqlName)} DROP CONSTRAINT ${quoteSql(constraint.name)}; CREATE UNIQUE INDEX ${quoteSql(constraint.name)} ON ${quoteSql(table.sqlName)} (${columns});`,
-      });
+      const described = `multi-column unique constraint "${constraint.name}" (${constraint.columns.join(", ")})`;
+      const deferred = constraint.deferrable
+        ? `DEFERRABLE${constraint.initially_deferred ? " INITIALLY DEFERRED" : ""}`
+        : undefined;
+
+      if (constraint.nulls_not_distinct) {
+        // The unique index that would stand for it treats NULLs as distinct,
+        // so nothing is declared (declareIndex reports the index) and no fix
+        // is offered: it would let in the rows the constraint refuses.
+        warn({
+          code: "unique-constraint",
+          table: table.sqlName,
+          object: constraint.name,
+          message: `${described} is NULLS NOT DISTINCT${deferred ? ` and ${deferred}` : ""}, which the schema cannot declare; the constraint stays undeclared, and a database built from this schema lacks it`,
+        });
+      } else if (deferred) {
+        // No fix either: replacing the constraint by the index would make
+        // the check immediate in the database as well.
+        warn({
+          code: "unique-constraint",
+          table: table.sqlName,
+          object: constraint.name,
+          message: `${described} is ${deferred}, which the schema cannot declare. It is declared as a unique index of the same name, and an index refuses a duplicate at once, where this constraint waits for the end of the ${constraint.initially_deferred ? "transaction" : "statement (or of the transaction, after SET CONSTRAINTS)"}: a database built from this schema fails writes that hold a duplicate only for a moment, such as two rows swapping their values. The constraint itself stays undeclared`,
+        });
+      } else {
+        warn({
+          code: "unique-constraint",
+          table: table.sqlName,
+          object: constraint.name,
+          message: `${described} is declared as a unique index of the same name; the constraint itself stays undeclared`,
+          fix: `ALTER TABLE ${quoteSql(table.sqlName)} DROP CONSTRAINT ${quoteSql(constraint.name)}; CREATE UNIQUE INDEX ${quoteSql(constraint.name)} ON ${quoteSql(table.sqlName)} (${columns});`,
+        });
+      }
 
       if (row) {
-        declareIndex(row, indexTools, { exact: true });
+        declareIndex(row, indexTools, {
+          exact: true,
+          ...(deferred
+            ? {
+                comments: [
+                  `the constraint is ${deferred}; the index checks at once`,
+                ],
+              }
+            : {}),
+        });
       }
     }
 

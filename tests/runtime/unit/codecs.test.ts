@@ -306,6 +306,115 @@ test("an array that arrives as text reads each element from its text form", () =
   ).toEqual([9007199254740993n]);
 });
 
+test("an array of more than one dimension is refused however it arrives", () => {
+  const codecOf = (column: unknown) =>
+    (column as { [COLUMN_CODEC]: RuntimeCodec })[COLUMN_CODEC];
+  const refusal = "symmetria: multidimensional arrays are not supported";
+
+  // A driver and JSON hand over the second dimension as arrays, which the
+  // element codecs would read as values: Number([1, 2]) is NaN.
+  for (const type of [
+    "integer",
+    "bigint",
+    "numeric",
+    "real",
+    "double precision",
+    "text",
+    "boolean",
+    "date",
+    "timestamptz",
+    "uuid",
+    "bytea",
+    "int4range",
+  ]) {
+    const codec = codecFor(`${type}[]`)!;
+
+    expect(() =>
+      codec.decode([
+        ["1", "2"],
+        ["3", "4"],
+      ]),
+    ).toThrow(refusal);
+    expect(() => codec.decode('[["1","2"],["3","4"]]')).toThrow(refusal);
+    expect(() => codec.decode("{{1,2},{3,4}}")).toThrow(refusal);
+    expect(() => codec.decode("[1:2][1:2]={{1,2},{3,4}}")).toThrow(refusal);
+  }
+
+  // A domain is its base type, and a customType() over a built-in type
+  // receives that type's values, whatever it makes of them.
+  const amounts = codecOf(
+    customType<string>("amount", { base: "numeric(30,10)" }).array,
+  );
+  const spans = codecOf(
+    customType<[number, number]>("int4range", {
+      encode: ([from, to]) => `[${from},${to})`,
+      decode: (value) =>
+        String(value).slice(1, -1).split(",").map(Number) as [number, number],
+    }).array,
+  );
+
+  expect(() => amounts.decode([["1.5"], ["2.5"]])).toThrow(refusal);
+  expect(() => spans.decode([["[1,5)"], ["[2,3)"]])).toThrow(refusal);
+  expect(spans.decode(["[1,5)", "[2,3)"])).toEqual([
+    [1, 5],
+    [2, 3],
+  ]);
+  expect(spans.decode('{"[1,5)","[2,3)"}')).toEqual([
+    [1, 5],
+    [2, 3],
+  ]);
+
+  // Bun's typed arrays are one dimension of numbers; inside an array they
+  // would be a second one. A bytea element is its bytes.
+  expect(codecFor("integer[]")!.decode(new Int32Array([1, 2]))).toEqual([1, 2]);
+  expect(codecFor("real[]")!.decode(new Float32Array([1.5, 2.5]))).toEqual([
+    1.5, 2.5,
+  ]);
+  expect(() => codecFor("integer[]")!.decode([new Int32Array([1, 2])])).toThrow(
+    refusal,
+  );
+  expect(
+    codecFor("bytea[]")!.decode([new Uint8Array([1]), Buffer.from([2, 3])]),
+  ).toEqual([new Uint8Array([1]), new Uint8Array([2, 3])]);
+
+  // A JSON element may be an array, and so may the element of a type known
+  // by its name alone: a domain over jsonb or over an array, whose values a
+  // nested result holds as JSON.
+  expect(codecFor("jsonb[]")!.decode([[1, 2], [3]])).toEqual([[1, 2], [3]]);
+  expect(
+    codecOf(customType<unknown>("doc", { base: "jsonb" }).array).decode([
+      [1, 2],
+      { a: [3] },
+    ]),
+  ).toEqual([[1, 2], { a: [3] }]);
+  expect(
+    codecOf(
+      customType<number[]>("pair", {
+        encode: (value) => `{${value.join(",")}}`,
+        decode: (value) =>
+          Array.isArray(value)
+            ? value.map(Number)
+            : String(value).slice(1, -1).split(",").map(Number),
+      }).array,
+    ).decode([
+      [1, 2],
+      [3, 4],
+    ]),
+  ).toEqual([
+    [1, 2],
+    [3, 4],
+  ]);
+  expect(
+    codecOf(customType<number[]>("pair", { base: "integer[]" }).array).decode([
+      [1, 2],
+      [3, 4],
+    ]),
+  ).toEqual([
+    [1, 2],
+    [3, 4],
+  ]);
+});
+
 test("a json value refuses NaN and Infinity at any depth instead of writing null", () => {
   const json = codecFor("jsonb")!.encode as (value: unknown) => unknown;
   const list = codecFor("jsonb[]")!.encode as (value: unknown) => unknown;

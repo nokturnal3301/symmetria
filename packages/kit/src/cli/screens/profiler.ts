@@ -10,6 +10,7 @@ import {
   theme,
   wrapLines,
 } from "../ui/style";
+import { interrupt } from "../signals";
 import { withScreen } from "../ui/terminal";
 import { explainLines, wrapExplainLines } from "./query-inspector";
 
@@ -347,7 +348,15 @@ export const profileScreen = async (
           input: string,
           key: { name?: string; ctrl?: boolean },
         ) => {
-          if (input === "q" || (key.ctrl && key.name === "c")) {
+          // Ctrl-C in raw mode is a key, not a signal: it takes the
+          // signal's path, which restores the screen and exits with 130.
+          if (key.ctrl && key.name === "c") {
+            interrupt();
+
+            return;
+          }
+
+          if (input === "q") {
             finish();
 
             return;

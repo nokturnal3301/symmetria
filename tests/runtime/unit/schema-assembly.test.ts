@@ -348,7 +348,21 @@ describe("errors", () => {
         users: { id: uuid.v7 },
         posts: ({ users }) => ({ id: uuid.v7, author: users, editor: users }),
       }),
-    ).toThrow(/ambiguous/);
+    ).toThrow(
+      /relation name "posts" on "users" is ambiguous .*declare the relations as slots .* or name the reverse side on the reference with \.inverse\("<name>"\)/,
+    );
+  });
+
+  test("two collections of one name through a junction are told to use slots", () => {
+    const users = table({ id: int.auto });
+
+    // A junction's keys take no .inverse(), so the advice must not name it.
+    expect(() =>
+      // @ts-expect-error both keys give users a collection named "users"
+      schema({ users, follows: junction({ a: users, b: users }) }),
+    ).toThrow(
+      /relation name "users" on "users" is ambiguous \(M:N through follows vs M:N through follows\)\. Give each collection its own name: declare them as slots of their tables and join the slots, link\(/,
+    );
   });
 
   test("referencing a table outside the schema throws", () => {

@@ -42,6 +42,8 @@ export type MigratorOptions = ExecutionOptions & {
   verificationDatabaseUrl?: string;
   /** Undeclared tables that adoption and repair leave out of their schema comparison. */
   ignoreTables?: readonly string[];
+  /** Milliseconds the verification server may take to accept a connection. */
+  connectionTimeoutMs?: number;
 };
 export type MigrationStatus = {
   id: string;
@@ -94,11 +96,29 @@ const ambiguousBaseline = (migrations: readonly Migration[]): Error =>
     `symmetria: the database schema matches multiple local migrations (${migrations.map((migration) => migration.id).join(", ")}); migrations that change only data cannot be told apart by schema, so choose the baseline with --to <id> (adopt({ to }) in the API)`,
   );
 
-export const migrator = (options: MigratorOptions) => {
+/**
+ * Where a migrator keeps its journal, and the name of the advisory lock that
+ * guards it: the one definition for code that must agree with a migrator
+ * without loading a chain, as `discard` does.
+ */
+export const migrationJournal = (
+  options: Pick<MigratorOptions, "metadataSchema" | "metadataTable">,
+) => {
   const metadataSchema = options.metadataSchema ?? "public";
   const metadataTable = options.metadataTable ?? "_symmetria_migrations";
   const qualifiedName = `${quoteIdentifier(metadataSchema)}.${quoteIdentifier(metadataTable)}`;
-  const lockName = `symmetria:migrations:${qualifiedName}`;
+
+  return {
+    metadataSchema,
+    metadataTable,
+    qualifiedName,
+    lockName: `symmetria:migrations:${qualifiedName}`,
+  };
+};
+
+export const migrator = (options: MigratorOptions) => {
+  const { metadataSchema, metadataTable, qualifiedName, lockName } =
+    migrationJournal(options);
 
   const connection = <Result>(
     callback: (connection: MigrationConnection) => Promise<Result>,

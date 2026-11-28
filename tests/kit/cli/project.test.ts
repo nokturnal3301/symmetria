@@ -1,5 +1,13 @@
 import { expect, test } from "bun:test";
-import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import {
+  readFile,
+  writeFile,
+  mkdir,
+  readdir,
+  realpath,
+  rm,
+} from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { schema, table, int, text, index } from "../../../packages/runtime/src";
 import {
@@ -12,6 +20,7 @@ import {
   initializeProject,
 } from "../../../packages/kit/src/cli/scaffold";
 import {
+  formatDashboard,
   formatDiff,
   formatSchema,
 } from "../../../packages/kit/src/cli/ui/format";
@@ -23,6 +32,9 @@ import {
   rollbackSummary,
 } from "../../../packages/kit/src/cli/screens/rollback-prompt";
 import { withMigrationDirectory } from "../../support/directories";
+import { postgres } from "../../support/postgres";
+
+const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
 const run = async (directory: string, ...argumentsList: string[]) => {
   const child = Bun.spawn(
@@ -310,58 +322,728 @@ test("init reads an existing schema module as code: strings and comments do not 
   ).toBeUndefined();
 });
 
-test("a bad timeout or database URL names the config key or the flag it came from", () =>
+test(
+  "a bad timeout or database URL names the config key or the flag it came from",
+  () =>
+    withMigrationDirectory(async (directory) => {
+      await writeFile(
+        join(directory, "symmetria.config.ts"),
+        `export default { directory: "migrations", lockTimeoutMs: -5 };\n`,
+      );
+      const fromConfig = await run(directory, "status", "--json");
+      expect(fromConfig.exitCode).toBe(1);
+      expect(JSON.parse(fromConfig.stdout).error.message).toBe(
+        "symmetria: invalid lockTimeoutMs in the config: expected whole milliseconds from 0 to 2147483647",
+      );
+
+      await writeFile(
+        join(directory, "symmetria.config.ts"),
+        `export default { directory: "migrations" };\n`,
+      );
+      // An empty flag is not 0, which would disable the timeout.
+      const empty = await run(
+        directory,
+        "status",
+        "--lock-timeout=",
+        "--database-url",
+        "postgres://127.0.0.1:1/app",
+        "--json",
+      );
+      expect(JSON.parse(empty.stdout).error.message).toBe(
+        "symmetria: --lock-timeout needs a value",
+      );
+      // So does every flag that takes one: `--to ""` is not "no --to".
+      for (const flags of [
+        ["migrate", "--to", ""],
+        ["rollback", "--yes", "--steps", ""],
+        ["status", "--ignore-table", ""],
+      ]) {
+        const refused = await run(directory, ...flags, "--json");
+        expect(refused.exitCode).toBe(1);
+        expect(JSON.parse(refused.stdout).error.message).toBe(
+          `symmetria: ${flags.at(-2)} needs a value`,
+        );
+      }
+
+      const url = await run(
+        directory,
+        "status",
+        "--database-url",
+        "not a url",
+        "--json",
+      );
+      expect(JSON.parse(url.stdout).error.message).toBe(
+        "symmetria: invalid database URL in --database-url: expected postgres://user:password@host:5432/database",
+      );
+
+      // Text with the `postgres://` forgotten is a URL to a parser too, with
+      // `localhost:` or `app:` for a scheme; node-postgres would find no host
+      // in it and connect to localhost, the wrong server.
+      for (const text of [
+        "localhost:55451/postgres",
+        "db.example.invalid:6543/app",
+        "app:secretpw@192.0.2.1:6543/app",
+        "postgres:app",
+        "postgres:/app",
+        "mysql://app:secretpw@127.0.0.1:1/app",
+      ]) {
+        for (const [command, flag] of [
+          ["status", "--database-url"],
+          ["verify", "--verify-url"],
+          ["adopt", "--verify-url"],
+        ] as const) {
+          const refused = await run(
+            directory,
+            command,
+            flag,
+            text,
+            // For adopt, whose own database is not what is checked here.
+            ...(command === "adopt"
+              ? ["--database-url", "postgres://127.0.0.1:1/app"]
+              : []),
+            "--connect-timeout",
+            "2000",
+          );
+
+          // Where the value came from, and never the value: it holds a password.
+          expect(refused).toEqual({
+            exitCode: 1,
+            stdout: "",
+            stderr: `symmetria: invalid database URL in ${flag}: expected postgres://user:password@host:5432/database\n`,
+          });
+        }
+      }
+
+      // Every form that names its server is still read: these get as far as
+      // the connection, which nothing accepts.
+      for (const text of [
+        "postgres://app:p%40ss%2Fword@127.0.0.1:1/app",
+        "postgresql://127.0.0.1:1/app",
+        "POSTGRES://127.0.0.1:1/app",
+        "postgres://[::1]:1/app",
+        "postgres:///app?host=/nonexistent/socket/directory",
+        "postgres://app:secretpw@/app?host=/nonexistent/socket/directory",
+        "/nonexistent/socket/directory",
+        "socket:/nonexistent/socket/directory?db=app",
+      ]) {
+        const tried = await run(
+          directory,
+          "status",
+          "--database-url",
+          text,
+          "--connect-timeout",
+          "2000",
+        );
+
+        expect(tried.exitCode).toBe(1);
+        expect(tried.stderr).not.toContain("invalid database URL");
+        expect(tried.stderr).toMatch(
+          /ECONNREFUSED|ENOENT|EADDRNOTAVAIL|ENETUNREACH|EHOSTUNREACH/,
+        );
+        expect(tried.stderr).not.toContain("secretpw");
+      }
+
+      // Milliseconds are plain digits: 1e3 and 0x10 are not 1000 and 16.
+      for (const flag of [
+        "--lock-timeout",
+        "--statement-timeout",
+        "--advisory-lock-timeout",
+        "--connect-timeout",
+      ]) {
+        for (const value of ["1e3", "0x10", "1.5", "2147483648"]) {
+          const refused = await run(directory, "status", flag, value, "--json");
+          expect(refused.exitCode).toBe(1);
+          expect(JSON.parse(refused.stdout).error.message).toBe(
+            `symmetria: invalid ${flag} "${value}": expected whole milliseconds from 0 to 2147483647`,
+          );
+        }
+      }
+
+      // So is a number of migrations; "abc" used to reach the runner as NaN.
+      for (const value of ["abc", "1e1", "0", "1.0"]) {
+        const refused = await run(
+          directory,
+          "rollback",
+          "--plan",
+          "--steps",
+          value,
+          "--json",
+        );
+        expect(JSON.parse(refused.stdout).error.message).toBe(
+          `symmetria: invalid --steps "${value}": expected a whole number of migrations, 1 or more`,
+        );
+      }
+
+      // After "--" a word is an argument, not the flag: the error is not JSON.
+      const argument = await run(directory, "status", "--", "--json");
+      expect(argument).toEqual({
+        exitCode: 1,
+        stdout: "",
+        stderr: "symmetria: unexpected positional arguments\n",
+      });
+    }),
+  30_000,
+);
+
+test("wrong input in a config or a flag's file is refused with a message that names it", () =>
   withMigrationDirectory(async (directory) => {
-    await writeFile(
-      join(directory, "symmetria.config.ts"),
-      `export default { directory: "migrations", lockTimeoutMs: -5 };\n`,
-    );
-    const fromConfig = await run(directory, "status", "--json");
-    expect(fromConfig.exitCode).toBe(1);
-    expect(JSON.parse(fromConfig.stdout).error.message).toBe(
-      "symmetria: invalid lockTimeoutMs in the config: expected whole milliseconds from 0 to 2147483647",
+    const real = await realpath(directory);
+    const config = (body: string) =>
+      writeFile(join(directory, "symmetria.config.ts"), body);
+    const failure = async (...argumentsList: string[]) => {
+      const result = await run(directory, ...argumentsList, "--json");
+
+      expect(result.exitCode).toBe(1);
+
+      return JSON.parse(result.stdout).error.message as string;
+    };
+    const model = JSON.stringify(
+      schema({ records: { id: int, name: text } }).$snapshot(),
     );
 
-    await writeFile(
-      join(directory, "symmetria.config.ts"),
-      `export default { directory: "migrations" };\n`,
+    await config(
+      `export default { schema: ${model}, directory: "migrations" };`,
     );
-    // An empty flag is not 0, which would disable the timeout.
-    const empty = await run(
-      directory,
-      "status",
-      "--lock-timeout=",
+    await writeFile(join(directory, "null.json"), "null");
+    await writeFile(join(directory, "list.json"), "[]");
+    await writeFile(join(directory, "broken.json"), "{ nope");
+    expect(await failure("diff", "--diff", "null.json")).toBe(
+      `symmetria: the --diff file ${join(real, "null.json")} must hold a JSON object with rename hints and USING conversions, such as {"renames": {"columns": {"posts": {"title": "headline"}}}}; it holds null`,
+    );
+    expect(await failure("generate", "x", "--diff", "list.json")).toEndWith(
+      "; it holds an array",
+    );
+    expect(await failure("lint", "--diff", "broken.json")).toStartWith(
+      `symmetria: the --diff file ${join(real, "broken.json")} is not valid JSON (`,
+    );
+    expect(await failure("diff", "--diff", "absent.json")).toStartWith(
+      `symmetria: cannot read the --diff file ${join(real, "absent.json")} (`,
+    );
+    // Read before the first connection is opened.
+    const repair = [
+      "repair",
+      "000001_initial",
+      "--action",
+      "retry",
       "--database-url",
       "postgres://127.0.0.1:1/app",
-      "--json",
+      "--dir",
+      ".",
+      "--snapshot",
+    ];
+    expect(await failure(...repair, "broken.json")).toStartWith(
+      `symmetria: the --snapshot file ${join(real, "broken.json")} is not valid JSON (`,
     );
-    expect(JSON.parse(empty.stdout).error.message).toBe(
-      "symmetria: --lock-timeout needs a value",
+    expect(await failure(...repair, "null.json")).toStartWith(
+      `symmetria: the --snapshot file ${join(real, "null.json")} is not a migration snapshot such as meta/snapshot.json (`,
     );
-    // So does every flag that takes one: `--to ""` is not "no --to".
-    for (const flags of [
-      ["migrate", "--to", ""],
-      ["rollback", "--yes", "--steps", ""],
-      ["status", "--ignore-table", ""],
-    ]) {
-      const refused = await run(directory, ...flags, "--json");
-      expect(refused.exitCode).toBe(1);
-      expect(JSON.parse(refused.stdout).error.message).toBe(
-        `symmetria: ${flags.at(-2)} needs a value`,
+
+    await config("export default { directory: 5 };");
+    expect(await failure("diff")).toBe(
+      'symmetria: invalid directory in the config: expected a path such as "./migrations"',
+    );
+    // null is "not set", like undefined: the default directory.
+    await config(
+      `export default { schema: ${model}, directory: null, databaseUrl: null };`,
+    );
+    expect(await run(directory, "generate", "initial")).toMatchObject({
+      exitCode: 0,
+      stdout: "Generated 000001_initial\n",
+    });
+    expect(await readdir(join(directory, "migrations"))).toContain(
+      "000001_initial",
+    );
+    await rm(join(directory, "migrations"), { recursive: true });
+    await config('export default { databaseUrl: 5, directory: "migrations" };');
+    expect(await failure("status")).toBe(
+      "symmetria: invalid database URL in databaseUrl in the config: expected a string such as postgres://user:password@host:5432/database",
+    );
+    // A command that opens no connection does not read it.
+    expect((await run(directory, "lint")).exitCode).toBe(0);
+    await config('export default { schema: {}, directory: "migrations" };');
+
+    for (const command of [["diff"], ["inspect"], ["generate", "x"]]) {
+      expect(await failure(...command)).toBe(
+        "symmetria: invalid schema in the config: expected a schema() value, or the snapshot its $snapshot() returns",
       );
     }
 
-    const url = await run(
-      directory,
-      "status",
-      "--database-url",
-      "not a url",
-      "--json",
-    );
-    expect(JSON.parse(url.stdout).error.message).toBe(
-      "symmetria: invalid database URL in --database-url: expected postgres://user:password@host:5432/database",
-    );
+    // A Promise or an array is an object, and read as a config without a setting.
+    for (const [body, found] of [
+      [
+        "export default Promise.resolve({});",
+        "exports a Promise, which is not awaited",
+      ],
+      ["export default [];", "exports an array"],
+      ["export default () => ({});", "exports a function"],
+      ["export const config = {};", "has no default export"],
+    ] as const) {
+      await config(body);
+      expect(await failure("diff")).toBe(
+        `symmetria: ${join(real, "symmetria.config.ts")} must default-export a migration configuration object, as in "export default defineMigrationConfig({ schema, directory })"; it ${found}`,
+      );
+    }
   }));
+
+test("a migrations directory that does not exist is a wrong path, or a project before its first generate", () =>
+  withMigrationDirectory(async (directory) => {
+    const real = await realpath(directory);
+    const failure = async (...argumentsList: string[]) => {
+      const result = await run(directory, ...argumentsList, "--json");
+
+      expect(result.exitCode).toBe(1);
+
+      return JSON.parse(result.stdout).error.message as string;
+    };
+
+    // No config file and no ./migrations: the command runs in the wrong place.
+    for (const command of [
+      ["migrate"],
+      ["status"],
+      ["lint", "--strict"],
+      ["recover"],
+      ["squash", "base"],
+    ]) {
+      expect(await failure(...command)).toBe(
+        `symmetria: no config file was found in the current directory (looked for ${join(real, "symmetria.config.ts")}), and there is no migrations directory at ${join(real, "migrations")} either; run the command in the project's directory, or pass --config <file> or --dir <directory>`,
+      );
+    }
+
+    const config = join(directory, "symmetria.config.ts");
+    await writeFile(
+      config,
+      `export default { schema: ${JSON.stringify(schema({ records: { id: int } }).$snapshot())}, directory: "migrations" };`,
+    );
+
+    // A directory named with --dir must be there for whatever reads it.
+    for (const command of [
+      ["migrate"],
+      ["status"],
+      ["rollback", "--yes"],
+      ["verify"],
+      ["adopt"],
+      ["drift"],
+      ["lint"],
+      ["squash", "base"],
+      ["discard"],
+      ["recover"],
+    ]) {
+      expect(await failure(...command, "--dir", "migratoins")).toBe(
+        `symmetria: the migrations directory ${join(real, "migratoins")} (--dir) does not exist`,
+      );
+    }
+
+    // Under a config file the project is new: exit 0, and the reason is said.
+    const note = `No migrations yet: the migrations directory ${join(real, "migrations")} does not exist. "symmetria generate <name>" creates the first migration.\n`;
+
+    for (const command of [["recover"], ["squash", "base"]]) {
+      expect(await run(directory, ...command)).toEqual({
+        exitCode: 0,
+        stdout: note,
+        stderr: "",
+      });
+    }
+
+    expect(
+      JSON.parse((await run(directory, "squash", "base", "--json")).stdout),
+    ).toEqual({ id: null, missingDirectory: join(real, "migrations") });
+    expect(
+      JSON.parse((await run(directory, "recover", "--json")).stdout),
+    ).toEqual({ recovered: false, missingDirectory: join(real, "migrations") });
+    expect(await failure("discard", "--force")).toBe(
+      `symmetria: there is no migration to discard: the migrations directory ${join(real, "migrations")} does not exist`,
+    );
+    // Asking created nothing.
+    expect(await readdir(directory)).toEqual(["symmetria.config.ts"]);
+
+    // What needs no migrations works without the directory, also a named one.
+    expect((await run(directory, "lint", "--strict")).exitCode).toBe(0);
+
+    for (const command of [["diff"], ["inspect", "--json"], ["graph"]]) {
+      expect(
+        (await run(directory, ...command, "--dir", "migratoins")).exitCode,
+      ).toBe(0);
+    }
+
+    expect(
+      (await run(directory, "generate", "initial", "--dir", "made")).exitCode,
+    ).toBe(0);
+    expect(await readdir(join(directory, "made"))).toContain("000001_initial");
+
+    // Without a config file an existing ./migrations is the project, as before.
+    await rm(config);
+    await mkdir(join(directory, "migrations"));
+    expect(await run(directory, "recover")).toMatchObject({
+      exitCode: 0,
+      stdout: "Nothing to recover: no generation lock was left behind.\n",
+    });
+  }));
+
+test("a database that does not answer ends the command at the connection timeout, and Ctrl-C before any connection exits at once", async () => {
+  // Accepts connections and never answers, as a host behind a firewall that
+  // drops packets looks to the client.
+  const silent = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { data() {}, open() {} },
+  });
+  const url = `postgres://user:secret@127.0.0.1:${silent.port}/app`;
+
+  try {
+    await withMigrationDirectory(async (directory) => {
+      await mkdir(join(directory, "migrations"));
+
+      for (const command of [
+        ["status"],
+        ["migrate"],
+        ["lint", "--pending"],
+        ["pull", "pulled.ts"],
+      ]) {
+        const started = performance.now();
+        const result = await run(
+          directory,
+          ...command,
+          "--database-url",
+          url,
+          "--connect-timeout",
+          "300",
+          "--json",
+        );
+
+        expect(result.exitCode).toBe(1);
+        // The host and the port, never the password.
+        expect(JSON.parse(result.stdout).error.message).toBe(
+          `symmetria: no connection to the database: 127.0.0.1:${silent.port} did not answer within 300ms (--connect-timeout <ms> sets the limit; 0 waits as long as the operating system does)`,
+        );
+        expect(performance.now() - started).toBeLessThan(4000);
+      }
+
+      // The server of the disposable verification databases has the same limit.
+      const started = performance.now();
+      const verified = await run(
+        directory,
+        "verify",
+        "--verify-url",
+        url,
+        "--connect-timeout",
+        "300",
+        "--json",
+      );
+
+      expect(verified.exitCode).toBe(1);
+      expect(JSON.parse(verified.stdout).error.message).toBe(
+        `symmetria: no connection to the verification server: 127.0.0.1:${silent.port} did not answer within 300ms`,
+      );
+      expect(performance.now() - started).toBeLessThan(4000);
+
+      // No limit, and the first connection never opens: nothing has reached
+      // the server, so the interrupt has nothing to wait for (work under way
+      // gets five seconds to stop). The same for either server.
+      for (const [command, flag, server] of [
+        ["status", "--database-url", "database"],
+        ["verify", "--verify-url", "verification server"],
+      ] as const) {
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            resolve("packages/kit/src/cli/index.ts"),
+            command,
+            flag,
+            url,
+            "--connect-timeout",
+            "0",
+          ],
+          {
+            cwd: directory,
+            stdout: "pipe",
+            stderr: "pipe",
+            env: { ...process.env, DATABASE_URL: "", NO_COLOR: "1" },
+          },
+        );
+
+        await Bun.sleep(800);
+        const interrupted = performance.now();
+        child.kill("SIGINT");
+        const [stderr, exitCode] = await Promise.all([
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+
+        expect(exitCode).toBe(130);
+        expect(stderr).toBe(
+          `symmetria: interrupted: exited before a connection to the ${server} was made; nothing was sent\n`,
+        );
+        expect(performance.now() - interrupted).toBeLessThan(2500);
+      }
+    });
+  } finally {
+    silent.stop(true);
+  }
+}, 30000);
+
+test.skipIf(!databaseUrl)(
+  "with a database: a new project is not reported as up to date, rollback --plan with nothing applied succeeds, and discard repairs a deleted migration",
+  async () => {
+    const name = `cli_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+    const admin = postgres({ url: databaseUrl!, max: 1 });
+    const address = new URL(databaseUrl!);
+
+    address.pathname = `/${name}`;
+    await admin.execute({ sql: `CREATE DATABASE "${name}"`, parameters: [] });
+
+    try {
+      await withMigrationDirectory(async (directory) => {
+        const real = await realpath(directory);
+        const save = (model: { $snapshot: () => unknown }) =>
+          writeFile(
+            join(directory, "symmetria.config.ts"),
+            `export default ${JSON.stringify({ schema: model.$snapshot(), directory: "migrations", databaseUrl: address.toString() })};`,
+          );
+        const note = `No migrations yet: the migrations directory ${join(real, "migrations")} does not exist. "symmetria generate <name>" creates the first migration.\n`;
+
+        await save(schema({ records: { id: int } }));
+
+        // The commands run as before, so an applied chain of another project
+        // would still be reported; only "nothing to do" reads differently.
+        for (const command of [
+          ["migrate"],
+          ["migrate", "--plan"],
+          ["status"],
+          ["rollback", "--yes"],
+          ["rollback", "--plan"],
+        ]) {
+          expect(await run(directory, ...command)).toEqual({
+            exitCode: 0,
+            stdout: note,
+            stderr: "",
+          });
+        }
+
+        expect(
+          JSON.parse((await run(directory, "migrate", "--json")).stdout),
+        ).toEqual({
+          applied: [],
+          durationMs: expect.any(Number),
+          missingDirectory: join(real, "migrations"),
+        });
+        expect(
+          JSON.parse((await run(directory, "status", "--json")).stdout),
+        ).toEqual({
+          migrations: [],
+          missingDirectory: join(real, "migrations"),
+        });
+        expect(
+          (await run(directory, "migrate", "--dir", "migratoins")).stderr,
+        ).toBe(
+          `symmetria: the migrations directory ${join(real, "migratoins")} (--dir) does not exist\n`,
+        );
+
+        expect((await run(directory, "generate", "initial")).exitCode).toBe(0);
+        // With migrations and nothing applied the plan is empty, as the
+        // rollback itself is.
+        expect(await run(directory, "rollback", "--plan")).toMatchObject({
+          exitCode: 0,
+          stdout: "No applied migrations.\n",
+        });
+        expect(
+          JSON.parse(
+            (await run(directory, "rollback", "--plan", "--json")).stdout,
+          ),
+        ).toEqual({ steps: [] });
+        expect(await run(directory, "rollback", "--yes")).toMatchObject({
+          exitCode: 0,
+          stdout: "No applied migrations.\n",
+        });
+        expect(await run(directory, "migrate")).toMatchObject({
+          exitCode: 0,
+          stdout: "Applied 000001_initial\n",
+        });
+        expect((await run(directory, "rollback", "--plan")).stdout).toContain(
+          'DROP TABLE "records"',
+        );
+
+        // A second migration that no database has applied, deleted by hand.
+        await save(schema({ records: { id: int, note: text.nullable } }));
+        expect((await run(directory, "generate", "note")).exitCode).toBe(0);
+        await rm(join(directory, "migrations", "000002_note"), {
+          recursive: true,
+        });
+        expect((await run(directory, "status")).stderr).toContain(
+          '"symmetria discard" takes it out of the journal',
+        );
+        // The database is configured and has not applied it: discard repairs.
+        expect(await run(directory, "discard")).toEqual({
+          exitCode: 0,
+          stdout:
+            "Discarded 000002_note; the snapshot is the schema before it.\n",
+          stderr: "",
+        });
+        expect((await run(directory, "status")).stdout).toBe(
+          "applied 000001_initial\n",
+        );
+
+        // One the database has applied stays, with or without its directory.
+        expect((await run(directory, "discard", "--force")).stderr).toBe(
+          'symmetria: "000001_initial" is applied in the configured database; roll it back first (symmetria rollback), then discard it\n',
+        );
+        expect((await run(directory, "generate", "note")).exitCode).toBe(0);
+        expect((await run(directory, "migrate")).exitCode).toBe(0);
+        await rm(join(directory, "migrations", "000002_note"), {
+          recursive: true,
+        });
+        expect((await run(directory, "discard", "--force")).stderr).toBe(
+          'symmetria: "000002_note" is applied in the configured database, and its directory is gone: restore the directory (from version control), roll the migration back (symmetria rollback), then discard it\n',
+        );
+        expect(
+          JSON.parse(
+            await readFile(
+              join(directory, "migrations", "meta", "migration.json"),
+              "utf8",
+            ),
+          ).migrations,
+        ).toHaveLength(2);
+      });
+    } finally {
+      await admin.execute({
+        sql: `DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`,
+        parameters: [],
+      });
+      await admin.close();
+    }
+  },
+  60000,
+);
+
+test.skipIf(!databaseUrl)(
+  "with a database: discard refuses while another process is applying migrations, also with --force",
+  async () => {
+    const name = `cli_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+    const admin = postgres({ url: databaseUrl!, max: 1 });
+    const address = new URL(databaseUrl!);
+
+    address.pathname = `/${name}`;
+    await admin.execute({ sql: `CREATE DATABASE "${name}"`, parameters: [] });
+
+    const inside = postgres({ url: address.toString(), max: 1 });
+
+    try {
+      await withMigrationDirectory(async (directory) => {
+        const save = (model: { $snapshot: () => unknown }) =>
+          writeFile(
+            join(directory, "symmetria.config.ts"),
+            `export default ${JSON.stringify({ schema: model.$snapshot(), directory: "migrations", databaseUrl: address.toString() })};`,
+          );
+
+        await save(schema({ records: { id: int } }));
+        expect((await run(directory, "generate", "initial")).exitCode).toBe(0);
+        expect((await run(directory, "migrate")).exitCode).toBe(0);
+        await save(schema({ records: { id: int, note: text.nullable } }));
+        expect((await run(directory, "generate", "note")).exitCode).toBe(0);
+
+        // A slow step before the generated SQL: the migration's transaction
+        // stays open, and its journal row is in it, unseen by other sessions.
+        const up = join(directory, "migrations", "000002_note", "up.sql");
+        await writeFile(
+          up,
+          `SELECT pg_sleep(3);\n\n${await readFile(up, "utf8")}`,
+        );
+        const migrating = run(directory, "migrate");
+
+        // Until the run holds the migration lock.
+        for (let attempt = 0; ; attempt += 1) {
+          const result = await inside.execute({
+            sql: "SELECT count(*)::int AS held FROM pg_locks WHERE locktype = 'advisory' AND granted AND classid = 1937339476::oid",
+            parameters: [],
+          });
+          const [row] = (Array.isArray(result) ? result : result.rows) as {
+            held: number;
+          }[];
+
+          if (row!.held > 0) {
+            break;
+          }
+
+          expect(attempt).toBeLessThan(200);
+          await Bun.sleep(50);
+        }
+
+        // --force is needed for the edited up.sql, and overrides nothing else.
+        const refused = await run(directory, "discard", "--force");
+        expect(refused.exitCode).toBe(1);
+        expect(refused.stdout).toBe("");
+        expect(refused.stderr).toMatch(
+          /^symmetria: another process holds the migration lock of the configured database \(PostgreSQL process \d+\): a migrate, rollback, adopt or repair is running there and may be applying "000002_note" right now\. Run discard again when it has finished and status shows the migration as pending\n$/,
+        );
+
+        expect(await migrating).toMatchObject({
+          exitCode: 0,
+          stdout: "Applied 000002_note\n",
+        });
+        // What the database applied is still there.
+        expect(await readdir(join(directory, "migrations"))).toContain(
+          "000002_note",
+        );
+        expect((await run(directory, "status")).stdout).toBe(
+          "applied 000001_initial\napplied 000002_note\n",
+        );
+        expect((await run(directory, "discard", "--force")).stderr).toBe(
+          'symmetria: "000002_note" is applied in the configured database; roll it back first (symmetria rollback), then discard it\n',
+        );
+      });
+    } finally {
+      await inside.close();
+      await admin.execute({
+        sql: `DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`,
+        parameters: [],
+      });
+      await admin.close();
+    }
+  },
+  60000,
+);
+
+test("the dashboard header names a migrations directory that does not exist instead of counting it as up to date", () => {
+  const header = (missing?: string) =>
+    formatDashboard({
+      address: "PostgreSQL · 127.0.0.1:5432/app",
+      connection: "connected",
+      snapshot: undefined,
+      migrations: "0 applied · 0 pending",
+      applied: 0,
+      local: 0,
+      pending: 0,
+      changes: undefined,
+      config: "No config · symmetria init to get started",
+      ...(missing ? { missing } : {}),
+    });
+  const note =
+    "No config file was found in the current directory, and there is no migrations directory either";
+  const { columns } = process.stdout;
+
+  try {
+    // The three cards, and the framed list of a narrow terminal.
+    for (const width of [100, 60]) {
+      Object.assign(process.stdout, { columns: width });
+      expect(header()).toContain(
+        width === 100 ? "✓ Up to date" : "0 applied · 0 pending",
+      );
+
+      const shown = header(note);
+
+      expect(shown).not.toContain("Up to date");
+      expect(shown).not.toContain("0 applied");
+      // Wrapped or cut to the width; its start is always there.
+      expect(shown).toContain("No config file was found");
+
+      if (width === 100) {
+        expect(shown).toContain("No directory");
+        expect(shown.replace(/\s+/g, " ")).toContain(note);
+      }
+    }
+  } finally {
+    Object.assign(process.stdout, { columns });
+  }
+});
 
 test("init does not introduce a second schema into a configured project or migration history", () =>
   withMigrationDirectory(async (directory) => {

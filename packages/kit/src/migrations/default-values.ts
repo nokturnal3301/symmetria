@@ -5,6 +5,7 @@
  * form. Both are the same default, so changing one into the other is no
  * migration.
  */
+import { timestampKey } from "symmetria/internal";
 import { normalizeSqlType } from "./drift";
 import { expressionKey } from "./expressions";
 import { intervalKey } from "./expression-simplify";
@@ -39,32 +40,54 @@ const literalText = (escaped: boolean, body: string): string | undefined => {
   return text;
 };
 
-/** A one-dimensional array literal's elements, `NULL` as null. */
-const arrayElements = (text: string): (string | null)[] | undefined => {
-  if (!text.startsWith("{") || !text.endsWith("}")) {
+/** The white space PostgreSQL's array input skips: ASCII only, not NBSP. */
+const ARRAY_SPACE = /[ \t\n\r\f\v]/;
+
+/**
+ * A one-dimensional array literal's elements as PostgreSQL's array input
+ * reads them, `NULL` as null: white space around elements and delimiters is
+ * skipped, a quoted element keeps everything between its quotes (a backslash
+ * takes the next character as it is), and only an unquoted `NULL`, in any
+ * letter case, is null. Undefined for a literal PostgreSQL refuses (`{a,}`,
+ * `{"a"b}`) and for one this does not read: explicit bounds (`[0:1]={a,b}`
+ * is another value than `{a,b}`), nested arrays, and a backslash outside
+ * quotes. `delimiter` is the element type's.
+ */
+const arrayElements = (
+  text: string,
+  delimiter = ",",
+): (string | null)[] | undefined => {
+  const elements: (string | null)[] = [];
+  let index = 0;
+  const skipSpace = (): void => {
+    while (index < text.length && ARRAY_SPACE.test(text[index]!)) {
+      index += 1;
+    }
+  };
+
+  skipSpace();
+
+  if (text[index] !== "{") {
     return undefined;
   }
 
-  const elements: (string | null)[] = [];
-  let index = 1;
+  index += 1;
+  skipSpace();
 
-  if (text === "{}") {
-    return elements;
-  }
-
-  while (index < text.length) {
-    let element = "";
-
+  // `{}` and `{ }` hold nothing; after a delimiter an element must follow.
+  while (text[index] !== "}" || elements.length > 0) {
     if (text[index] === '"') {
+      let element = "";
+
       index += 1;
 
       while (text[index] !== '"') {
-        if (index >= text.length) {
-          return undefined;
-        }
-
         if (text[index] === "\\") {
           index += 1;
+        }
+
+        if (index >= text.length) {
+          return undefined;
         }
 
         element += text[index];
@@ -74,77 +97,153 @@ const arrayElements = (text: string): (string | null)[] | undefined => {
       index += 1;
       elements.push(element);
     } else {
-      while (text[index] !== "," && text[index] !== "}") {
-        if (text[index] === "{" || index >= text.length) {
+      const start = index;
+
+      while (text[index] !== delimiter && text[index] !== "}") {
+        if (index >= text.length || '{"\\'.includes(text[index]!)) {
           return undefined;
         }
 
-        element += text[index];
         index += 1;
       }
 
-      elements.push(element === "NULL" ? null : element.trim());
+      let end = index;
+
+      while (end > start && ARRAY_SPACE.test(text[end - 1]!)) {
+        end -= 1;
+      }
+
+      if (end === start) {
+        return undefined;
+      }
+
+      const element = text.slice(start, end);
+
+      elements.push(/^[nN][uU][lL][lL]$/.test(element) ? null : element);
+    }
+
+    // After an element: its delimiter, or the end of the array.
+    skipSpace();
+
+    if (text[index] === "}") {
+      break;
+    }
+
+    if (text[index] !== delimiter) {
+      return undefined;
     }
 
     index += 1;
+    skipSpace();
   }
 
-  return elements;
+  index += 1;
+  skipSpace();
+
+  return index === text.length ? elements : undefined;
 };
 
-/** JSON with its object keys sorted, as jsonb holds no key order. */
-const sortedJson = (value: unknown): unknown =>
-  Array.isArray(value)
-    ? value.map(sortedJson)
-    : value && typeof value === "object"
-      ? Object.fromEntries(
-          Object.keys(value)
-            .sort()
-            .map((key) => [
-              key,
-              sortedJson((value as Record<string, unknown>)[key]),
-            ]),
-        )
-      : value;
-
-/** A timestamp as epoch milliseconds; one without a zone reads as UTC. */
-const timestampKey = (text: string, zoned: boolean): string | undefined => {
-  const iso = text
-    .trim()
-    .replace(" ", "T")
-    .replace(/([+-]\d{2})$/, "$1:00");
-  const time = Date.parse(
-    zoned || /(?:Z|[+-]\d{2}:\d{2})$/.test(iso) ? iso : `${iso}Z`,
-  );
-
-  return Number.isNaN(time) ? undefined : String(time);
+/** Exact decimal key of a validated JSON number, without expanding exponents. */
+const jsonNumberKey = (source: string): string => {
+  const [mantissa, exponent = "0"] = source.toLowerCase().split("e");
+  const [whole, fraction = ""] = mantissa!.replace(/^-/, "").split(".");
+  const digits = (whole! + fraction).replace(/^0+/, "");
+  if (!digits) {
+    return "n0";
+  }
+  const significant = digits.replace(/0+$/, "");
+  const power =
+    BigInt(exponent) +
+    BigInt(digits.length - significant.length - fraction.length);
+  return `n${source.startsWith("-") ? "-" : ""}${significant}e${power}`;
 };
+
+/** `interval` and `interval(3)`, as normalizeSqlType writes them. */
+const PLAIN_INTERVAL = /^interval(?:\(\d\))?$/;
 
 /** A key equal for two spellings of one default value of a column type. */
 const valueKey = (text: string, sqlType: string): string | undefined => {
   if (sqlType.endsWith("[]")) {
-    const elements = arrayElements(text);
+    // Elements of a box are apart by a semicolon; the other types' by a comma.
+    const elements = arrayElements(text, sqlType === "box[]" ? ";" : ",");
 
     return elements && JSON.stringify(elements);
   }
 
-  if (sqlType === "jsonb" || sqlType === "json") {
+  if (sqlType === "json") {
+    return text; // Unlike jsonb, PostgreSQL json preserves its source text.
+  }
+
+  if (sqlType === "jsonb") {
     try {
-      return JSON.stringify(sortedJson(JSON.parse(text)));
+      // Revivers see children first: sort object keys, but keep numeric
+      // tokens as written rather than rounding them to JavaScript numbers.
+      return JSON.stringify(
+        JSON.parse(
+          text,
+          (_key: string, value: unknown, context?: { source?: string }) => {
+            if (typeof value === "number") {
+              return jsonNumberKey(context!.source!);
+            }
+            if (typeof value === "string") {
+              return `s${value}`;
+            }
+            return value !== null &&
+              typeof value === "object" &&
+              !Array.isArray(value)
+              ? Object.fromEntries(
+                  Object.entries(value).sort(([a], [b]) =>
+                    a < b ? -1 : a > b ? 1 : 0,
+                  ),
+                )
+              : value;
+          },
+        ),
+      );
     } catch {
       return undefined;
     }
   }
 
   if (sqlType.startsWith("timestamp")) {
-    return timestampKey(text, sqlType.includes("with time zone"));
+    // normalizeSqlType puts the precision after the zone suffix.
+    return timestampKey(
+      text,
+      sqlType.replace(/( with(?:out)? time zone)(\(\d\))$/, "$2$1"),
+    );
   }
 
-  if (sqlType.startsWith("interval")) {
+  // An interval restricted to some fields (`interval hour to minute`) reads
+  // a number without a unit in another unit, so only the plain type has a key.
+  if (PLAIN_INTERVAL.test(sqlType)) {
     return intervalKey(text);
   }
 
   return undefined;
+};
+
+/**
+ * The value key of SQL that is one literal of the column's type, if it is;
+ * `typed` asks for the cast to that type to be written out.
+ */
+const literalKey = (
+  sql: string,
+  sqlType: string,
+  typed = false,
+): string | undefined => {
+  const literal = LITERAL.exec(sql);
+
+  if (!literal) {
+    return undefined;
+  }
+
+  const cast = literal[3] && normalizeSqlType(literal[3]);
+  const text = literalText(literal[1] === "E", literal[2]!);
+
+  // A literal cast to another type than the column's is an expression.
+  return text !== undefined && (cast ? cast === sqlType : !typed)
+    ? valueKey(text, sqlType)
+    : undefined;
 };
 
 /**
@@ -156,21 +255,22 @@ export const defaultKey = (
   column: { readonly name: string; readonly sqlType: string },
 ): string => {
   const sqlType = normalizeSqlType(column.sqlType);
-  const literal = LITERAL.exec(sql.trim());
+  const key = literalKey(sql.trim(), sqlType);
 
-  if (literal) {
-    const cast = literal[3] && normalizeSqlType(literal[3]);
-    const text = literalText(literal[1] === "E", literal[2]!);
-
-    // A literal cast to another type than the column's is an expression.
-    if (text !== undefined && (!cast || cast === sqlType)) {
-      const key = valueKey(text, sqlType);
-
-      if (key !== undefined) {
-        return `value ${key}`;
-      }
-    }
+  if (key !== undefined) {
+    return `value ${key}`;
   }
 
-  return expressionKey(sql, new Map([[column.name, column.sqlType]]));
+  const expression = expressionKey(
+    sql,
+    new Map([[column.name, column.sqlType]]),
+  );
+  // The other spellings of an interval literal (`INTERVAL '1 day'`,
+  // `('1 day')::interval`) are that literal in the normalized expression,
+  // so they are the same default as `'1 day'::interval`.
+  const typed = PLAIN_INTERVAL.test(sqlType)
+    ? literalKey(expression, sqlType, true)
+    : undefined;
+
+  return typed === undefined ? expression : `value ${typed}`;
 };

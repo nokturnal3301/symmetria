@@ -3,10 +3,14 @@
  * `symmetria` command line. Parsing and flag rules live in ./options,
  * the shared environment in ./context and each command in ./commands.
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { runCommand } from "./commands";
 import { createContext, leftClosing, type Output } from "./context";
 import { formatHelp } from "./ui/format";
 import { help, parseCommandLine, resolveCommand } from "./options";
+import { flagGiven } from "./signals";
 import { formatError, supportsColor, terminalOutput } from "./ui/style";
 import { sqlState } from "symmetria";
 import { MigrationExecutionError } from "../migrations/execution";
@@ -31,6 +35,42 @@ const errorJSON = (error: unknown, message: string) => {
 };
 
 /**
+ * The version of the symmetria-kit this file belongs to, from the nearest
+ * package.json above it: one level up from the built `dist/`, two from
+ * `src/cli/` in the repository.
+ */
+const packageVersion = (): string => {
+  let directory = dirname(fileURLToPath(import.meta.url));
+
+  while (true) {
+    try {
+      const manifest = JSON.parse(
+        readFileSync(join(directory, "package.json"), "utf8"),
+      ) as { name?: unknown; version?: unknown };
+
+      if (
+        manifest.name === "symmetria-kit" &&
+        typeof manifest.version === "string"
+      ) {
+        return manifest.version;
+      }
+    } catch {
+      // No package.json here, or another package's: look further up.
+    }
+
+    const parent = dirname(directory);
+
+    if (parent === directory) {
+      throw new Error(
+        "symmetria: cannot read the version: no package.json of symmetria-kit was found above the command's own files",
+      );
+    }
+
+    directory = parent;
+  }
+};
+
+/**
  * Results on stdout. A terminal gets them without escape sequences other than
  * the CLI's colours: names and messages can come from the database. Piped
  * output (files, other programs) keeps every byte.
@@ -44,6 +84,14 @@ const runMigrationCLI = async (
 ): Promise<void> => {
   const parsed = parseCommandLine(argumentsList);
   const context = createContext(parsed.values, output, runMigrationCLI);
+
+  if (parsed.values.version && !parsed.values.help) {
+    const version = packageVersion();
+
+    output(parsed.values.json ? JSON.stringify({ version }) : version);
+
+    return;
+  }
 
   if (
     parsed.values.help ||
@@ -98,7 +146,9 @@ if (import.meta.main) {
 
     const message = messages.length ? messages.join("\n") : String(error);
 
-    if (process.argv.includes("--json")) {
+    const given = process.argv.slice(2);
+
+    if (flagGiven(given, "--json")) {
       // Machine-readable runs get JSON on failure too, on stdout like a result.
       console.log(JSON.stringify({ error: errorJSON(error, message) }));
     } else {
@@ -106,8 +156,8 @@ if (import.meta.main) {
         formatError(
           message,
           supportsColor() &&
-            !process.argv.includes("--no-color") &&
-            !process.argv.includes("--sql"),
+            !flagGiven(given, "--no-color") &&
+            !flagGiven(given, "--sql"),
         ),
       );
     }

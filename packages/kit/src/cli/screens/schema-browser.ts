@@ -5,6 +5,7 @@ import stringWidth from "string-width";
 import { emitKeypressEvents } from "node:readline";
 import { stripVTControlCharacters } from "node:util";
 import type { SchemaSnapshot, TableSnapshot } from "symmetria";
+import { interrupt } from "../signals";
 import { fitLine, numberedLines, theme, wrapLines } from "../ui/style";
 import {
   highlightSQL,
@@ -409,7 +410,13 @@ export const inspectSchema = (
       input: string,
       key: { name?: string; ctrl?: boolean; meta?: boolean },
     ) => {
-      if (key.ctrl && ["c", "d"].includes(key.name ?? "")) {
+      // Ctrl-C in raw mode is a key, not a signal: it takes the signal's
+      // path, which restores the screen and exits with 130.
+      if (key.ctrl && key.name === "c") {
+        return interrupt();
+      }
+
+      if (key.ctrl && key.name === "d") {
         return finish();
       }
 

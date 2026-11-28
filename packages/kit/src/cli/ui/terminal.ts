@@ -334,9 +334,9 @@ export const view = (
   });
 
 /**
- * One line of input. Closing the question (Ctrl-D, end of input, a signal)
- * gives "", a cancel; Ctrl-C also takes the signal's path, so the run ends
- * with 130 once the caller has unwound.
+ * One line of input. Closing the question (Escape, Ctrl-D, end of input, a
+ * signal) gives "", a cancel; Ctrl-C also takes the signal's path, so the run
+ * ends with 130 once the caller has unwound.
  */
 export const ask = (
   question: string,
@@ -357,10 +357,23 @@ export const ask = (
       }
     };
 
+    // readline has no key for leaving a question unanswered; Escape closes
+    // it as it closes a menu. The keys of a sequence (an arrow) are not it.
+    const escape = (_input: string, key?: { name?: string }) => {
+      if (key?.name === "escape") {
+        // The typed text stays on its line; what follows starts below it.
+        process.stdout.write("\n");
+        close();
+      }
+    };
+
+    process.stdin.on("keypress", escape);
+
     const unregister = interruptible({ cancel: close, restore: close });
 
     // A closed question settles neither way on its own: answer "".
     terminal.once("close", () => {
+      process.stdin.off("keypress", escape);
       unregister();
       resolve("");
     });

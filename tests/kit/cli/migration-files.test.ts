@@ -8,10 +8,12 @@ import {
   mkdir,
   rename,
   rm,
+  symlink,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { schema, int, text } from "../../../packages/runtime/src";
 import {
+  discardMigration,
   emptySnapshot,
   generateMigration,
   loadMigrations,
@@ -228,6 +230,127 @@ test("generation failures release the lock and empty migrations retain the lates
       generateMigration({ directory, name: "locked", empty: true }),
     ).rejects.toThrow(/locked/);
     await expect(loadMigrations(directory)).rejects.toThrow(/locked/);
+    // A killed generator leaves the lock: the message names the way out.
+    await expect(loadMigrations(directory)).rejects.toThrow(
+      `${join(directory, ".symmetria-generate.lock")} exists, so a generate, squash or discard is running in this directory. If that process was interrupted or killed, "symmetria recover" removes what it left`,
+    );
+  }));
+
+test("a generation, squash or discard stopped before it publishes leaves no lock and no staged files", () =>
+  withMigrationDirectory(async (directory) => {
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: schema({ records: { id: int } }).$snapshot(),
+    });
+    await generateMigration({
+      directory,
+      name: "title",
+      snapshot: schema({
+        records: { id: int, title: text.nullable },
+      }).$snapshot(),
+    });
+    const original = await loadMigrationState(directory);
+    const listing = (await readdir(directory)).sort();
+    // What Ctrl-C and SIGTERM hand the commands.
+    const signal = AbortSignal.abort(new Error("symmetria: interrupted"));
+
+    for (const stopped of [
+      () => generateMigration({ directory, name: "more", empty: true, signal }),
+      () => squashMigrations({ directory, name: "base", signal }),
+      () => discardMigration({ directory, signal }),
+    ]) {
+      await expect(stopped()).rejects.toThrow("symmetria: interrupted");
+      expect((await readdir(directory)).sort()).toEqual(listing);
+      expect(await loadMigrationState(directory)).toEqual(original);
+    }
+
+    // Without a signal the same calls go through.
+    expect((await discardMigration({ directory })).id).toBe("000002_title");
+  }));
+
+test("dot-files in meta/ are skipped like those beside the migrations, and any other stray entry is named", () =>
+  withMigrationDirectory(async (directory) => {
+    // What Finder leaves in a folder it has shown, before any migration exists.
+    await mkdir(join(directory, "meta"));
+    await writeFile(join(directory, "meta", ".DS_Store"), "finder");
+    await writeFile(join(directory, ".DS_Store"), "finder");
+    expect(await loadMigrations(directory)).toEqual([]);
+
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: schema({ records: { id: int } }).$snapshot(),
+    });
+    expect(
+      (await loadMigrations(directory)).map((migration) => migration.id),
+    ).toEqual(["000001_initial"]);
+    // Generation and squash publish beside the file and leave it alone.
+    await generateMigration({ directory, name: "next", empty: true });
+    expect((await squashMigrations({ directory, name: "base" }))?.id).toBe(
+      "000001_base",
+    );
+    expect((await readdir(join(directory, "meta"))).sort()).toEqual([
+      ".DS_Store",
+      "migration.json",
+      "snapshot.json",
+    ]);
+
+    const refusal = async () => {
+      const error: unknown = await loadMigrations(directory).catch(
+        (thrown: unknown) => thrown,
+      );
+
+      return error instanceof Error ? error.message : "loaded";
+    };
+    const found = (problems: string) =>
+      `symmetria: migration metadata must contain only the files meta/snapshot.json and meta/migration.json; in ${join(directory, "meta")}: ${problems}`;
+
+    await writeFile(join(directory, "meta", "notes.txt"), "stray");
+    expect(await refusal()).toBe(found('"notes.txt" does not belong there'));
+    await rm(join(directory, "meta", "snapshot.json"));
+    expect(await refusal()).toBe(
+      found('"notes.txt" does not belong there; snapshot.json is missing'),
+    );
+
+    // A directory or a link under the right name is there, and is not the
+    // file: the message says which.
+    await mkdir(join(directory, "meta", "snapshot.json"));
+    await rm(join(directory, "meta", "notes.txt"));
+    expect(await refusal()).toBe(
+      found("snapshot.json is a directory, not a file"),
+    );
+    await rm(join(directory, "meta", "snapshot.json"), { recursive: true });
+    await symlink(
+      join(directory, "meta", "migration.json"),
+      join(directory, "meta", "snapshot.json"),
+    );
+    expect(await refusal()).toBe(
+      found("snapshot.json is a symbolic link, not a file"),
+    );
+    await rm(join(directory, "meta", "snapshot.json"));
+
+    // A name is quoted with its line breaks and control characters written
+    // out, so the message stays on one line; a long list is cut.
+    await writeFile(
+      join(directory, "meta", "bad\n\u001b[31mname\u2028.json"),
+      "stray",
+    );
+    const named = await refusal();
+    expect(named).toBe(
+      found(
+        '"bad\\n\\u001b[31mname\\u2028.json" does not belong there; snapshot.json is missing',
+      ),
+    );
+    expect(named.split(/[\n\r\u2028]/)).toHaveLength(1);
+
+    for (let count = 0; count < 7; count += 1) {
+      await writeFile(join(directory, "meta", `stray-${count}.tmp`), "stray");
+    }
+
+    expect(await refusal()).toContain(
+      '"stray-3.tmp" does not belong there; nor do 3 more entries; snapshot.json is missing',
+    );
   }));
 
 test("CLI generate, diff, lint and squash use the shared metadata without a database", () =>

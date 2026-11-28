@@ -7,6 +7,7 @@
 
 import {
   arrayCodec,
+  builderEncode,
   codecFor,
   jsonText,
   type Codec,
@@ -905,7 +906,8 @@ export type TsVector = Branded<string, "tsvector">;
  * or keep it current with a trigger; read values are PostgreSQL's lexeme text.
  */
 export const tsvector = customType<TsVector>("tsvector", {
-  encode: (value) => value,
+  // A builder's encode: a tsvector value is text, never a list.
+  encode: builderEncode((value: TsVector) => value),
   decode: (value) => String(value) as TsVector,
 });
 

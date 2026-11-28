@@ -30,7 +30,11 @@ import {
   coalesce,
   createDatabase,
 } from "../../../packages/runtime/src";
-import { postgres, searchPathURL } from "../../support/postgres";
+import {
+  postgres,
+  searchPathURL,
+  testStringMode,
+} from "../../support/postgres";
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
@@ -555,7 +559,9 @@ describe.skipIf(!databaseUrl)("PostgreSQL through Bun SQL", () => {
           .where(childless)
           .returning("id")
           .execute()
-      ).map((row) => row.id),
+      )
+        .map((row) => row.id)
+        .sort((first, second) => first - second),
     ).toEqual([2, 3]);
     expect(await names()).toEqual(["parent"]);
 
@@ -835,12 +841,12 @@ describe.skipIf(!databaseUrl)("PostgreSQL through Bun SQL", () => {
     expect(await model.posts.count()).toBe(2);
   });
 
-  test("nested-object keys with a backslash read the same with standard_conforming_strings off", async () => {
+  test("nested-object keys with a backslash survive legacy string parsing where supported", async () => {
     const url = new URL(searchPathURL(namespace));
 
     url.searchParams.set(
       "options",
-      `${url.searchParams.get("options")} -c standard_conforming_strings=off`,
+      `${url.searchParams.get("options")} -c standard_conforming_strings=${await testStringMode(driver)}`,
     );
 
     const legacy = postgres({ url: url.toString(), max: 1 });

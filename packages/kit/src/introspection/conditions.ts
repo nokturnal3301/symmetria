@@ -16,9 +16,13 @@ import { quoteString } from "./names";
  * hand-written `big < 10` (an integer literal) stays `sql`.
  */
 export type ValueKind =
+  /**
+   * `small` marks a smallint value: a column, or arithmetic between two of
+   * them. The DSL compares it with numbers of the smallint range only.
+   */
+  | { readonly kind: "integer"; readonly small?: boolean }
   | {
       readonly kind:
-        | "integer"
         | "real"
         | "double"
         | "bigint"
@@ -60,10 +64,14 @@ export const valueKind = (
   }
 
   const type = normalizeSqlType(sqlType).replace(/\(.*?\)/, "");
+
+  if (type === "smallint") {
+    return { kind: "integer", small: true };
+  }
+
   const simple = (
     {
       integer: "integer",
-      smallint: "integer",
       real: "real",
       "double precision": "double",
       bigint: "bigint",
@@ -91,6 +99,25 @@ const typeOf = (kind: ValueKind): string =>
       ? "number"
       : kind.kind;
 
+/**
+ * The TypeScript type the builder of a kind gives its values, which the
+ * predicates written for that kind are typed for; undefined for an enum,
+ * whose labels are its type, and for a kind without predicates of its own.
+ */
+export const builderValueType = (kind: ValueKind): string | undefined =>
+  (
+    ({
+      integer: "number",
+      real: "number",
+      double: "number",
+      bigint: "bigint",
+      decimal: "Decimal",
+      boolean: "boolean",
+      string: "string",
+      timestamp: "Date",
+    }) as Readonly<Record<string, string>>
+  )[kind.kind];
+
 /** Kinds arithmetic works on; real and double results are double precision. */
 const NUMERIC_KINDS = new Set([
   "integer",
@@ -101,6 +128,8 @@ const NUMERIC_KINDS = new Set([
 ]);
 /** Kinds whose column-to-column arithmetic PostgreSQL stores without casts of its own. */
 const EXACT_KINDS = new Set(["integer", "bigint", "decimal"]);
+/** Kinds PostgreSQL divides as integers, toward zero: `7 / 2` is 3. */
+const INTEGER_KINDS = new Set(["integer", "bigint"]);
 const COMPARISON_METHODS: Readonly<Record<string, string>> = {
   "=": "is",
   "<>": "isNot",
@@ -158,13 +187,20 @@ const literal = (node: SqlExpression, kind: ValueKind): string | undefined => {
   const { value: text, type } = node;
 
   switch (kind.kind) {
-    case "integer":
+    case "integer": {
+      // PostgreSQL compares a smallint with any integer (`boxes <= 40000`);
+      // the DSL takes a number of the left side's own type, and refuses
+      // another one when the module loads.
+      const limit = kind.small ? 32768 : 2147483648;
+
       // PostgreSQL prints integer literals bare, negative ones as '-1'::integer.
       return INTEGER.test(text) &&
         (type === "integer" || (type === undefined && node.numeric)) &&
-        Math.abs(Number(text)) <= 2147483647
+        Number(text) >= -limit &&
+        Number(text) < limit
         ? String(Number(text))
         : undefined;
+    }
     case "real":
     case "double":
       return type === (kind.kind === "real" ? "real" : "double precision") &&
@@ -200,20 +236,30 @@ const literal = (node: SqlExpression, kind: ValueKind): string | undefined => {
 
 /**
  * The kind of `left` combined with `right`, as plus() and friends type it. Any
- * real or double operand makes a double precision result.
+ * real or double operand makes a double precision result, and two smallints a
+ * smallint, as in PostgreSQL.
  */
 const promoted = (left: ValueKind, right: ValueKind): ValueKind => {
   const kinds: string[] = [left.kind, right.kind];
 
-  return {
-    kind: kinds.includes("decimal")
-      ? "decimal"
-      : kinds.includes("real") || kinds.includes("double")
-        ? "double"
-        : kinds.includes("bigint")
-          ? "bigint"
-          : "integer",
-  };
+  if (kinds.includes("decimal")) {
+    return { kind: "decimal" };
+  }
+
+  if (kinds.includes("real") || kinds.includes("double")) {
+    return { kind: "double" };
+  }
+
+  if (kinds.includes("bigint")) {
+    return { kind: "bigint" };
+  }
+
+  return left.kind === "integer" &&
+    left.small &&
+    right.kind === "integer" &&
+    right.small
+    ? { kind: "integer", small: true }
+    : { kind: "integer" };
 };
 
 const sameNode = (left: SqlExpression, right: SqlExpression): boolean =>
@@ -250,14 +296,29 @@ const renderer = (scope: ConditionScope) => {
       return undefined;
     }
 
-    // PostgreSQL widens a literal next to a real to double precision.
+    // PostgreSQL divides two integers as integers, which quotient() writes as
+    // it is: `items / 2`. divide() never truncates (it divides integers as
+    // numeric), so it stands only for a division PostgreSQL itself computes
+    // as numeric or double precision.
+    const method = (right: ValueKind): string =>
+      node.operator === "/" &&
+      INTEGER_KINDS.has(left.kind.kind) &&
+      INTEGER_KINDS.has(right.kind)
+        ? "quotient"
+        : ARITHMETIC_METHODS[node.operator]!;
+    // PostgreSQL widens a literal next to a real to double precision, and an
+    // integer literal next to a smallint makes an integer: `small + 40000`.
     const floating = left.kind.kind === "real" || left.kind.kind === "double";
-    const kind: ValueKind = floating ? { kind: "double" } : left.kind;
+    const kind: ValueKind = floating
+      ? { kind: "double" }
+      : left.kind.kind === "integer"
+        ? { kind: "integer" }
+        : left.kind;
     const constant = literal(node.right, kind);
 
     if (constant !== undefined) {
       return {
-        source: `${left.source}.${ARITHMETIC_METHODS[node.operator]}(${constant})`,
+        source: `${left.source}.${method(kind)}(${constant})`,
         kind,
       };
     }
@@ -268,7 +329,7 @@ const renderer = (scope: ConditionScope) => {
       EXACT_KINDS.has(left.kind.kind) &&
       EXACT_KINDS.has(right.kind.kind)
       ? {
-          source: `${left.source}.${ARITHMETIC_METHODS[node.operator]}(${right.source})`,
+          source: `${left.source}.${method(right.kind)}(${right.source})`,
           kind: promoted(left.kind, right.kind),
         }
       : undefined;

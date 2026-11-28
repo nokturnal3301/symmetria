@@ -176,6 +176,25 @@ const members = link({ person: people, team: teams });
 table is a keyed link and has no slots to name, so a key is written `one(users)`
 or `maybe(users.inverse("edited"))` there; `symmetria pull` writes this form.
 
+A many-to-many of a table with itself joins two slots of that table:
+
+```ts
+const users = table({
+  id: int.auto,
+  name: text,
+  following: many,
+  followers: many,
+});
+const follows = link(users.following, users.followers);
+// user.following and user.followers; db.follows holds the link rows
+```
+
+Each key of the junction is named after the collection its user appears in:
+`followers_id` is the user who follows and `following_id` the user who is
+followed, so `user.following` and `user.followers` read the same rows from
+either end. Both keys point at `users`, so `users` gets no collection of the
+link rows themselves; read them through the junction table (`db.follows`).
+
 ### Reference modifiers and the earlier spelling
 
 A relation can also be written without slots, as a reference to the table
@@ -904,7 +923,9 @@ The selected query retains `.as()`, `.cte()`, `.recursive()`, `.prepare()`,
 `.inspect()`, `.first()`, `.one()`, `.maybeOne()`, `.count()`, `.exists()`,
 `.page()` and `.pages()`. `count()` and `exists()` also work before a selection:
 `db.posts.count()`, `db.posts({ where }).exists()` and
-`db.users.byId(7).exists()`; a limited, grouped or distinct source counts its
+`db.users.byId(7).exists()`. Both methods use result rows: a report selecting
+`count(*)` has one row even for empty input, and selecting `unnest(tags)` counts
+the emitted tags. A limited, grouped or distinct source likewise counts its
 result rows, and one with `forUpdate`/`forShare` locks every row it selects (see
 [transactions](#transactions)). An object selection containing exactly one
 scalar expression supports `.scalar()` and column `.in(query)` /
@@ -1152,17 +1173,42 @@ Pages use keyset comparisons and fetch one extra row. ORDER BY must use root
 columns, computed fields or raw SQL over root columns, and include a full PK or
 a non-null unique column. Both directions and NULLS FIRST/LAST work; ordering
 keys can be omitted from the projection. Cursor values preserve PostgreSQL
-timestamp microseconds and storage precision. Cursors are checked against the
-query, its parameters, ordering and the value formats of the ordering columns;
-expressions are treated as nullable. Use `sql.of(column)` to declare the storage
-type of raw expressions. Pages cover root-table queries without joins, grouping,
-DISTINCT, LIMIT or OFFSET. Every page carries `nextCursor` and `previousCursor`:
-pass `after` to move forward or `before` to move back (never both); items always
+timestamp microseconds, array bounds and storage precision. Long text sort keys
+produce proportionally long cursors. Cursors are checked against the query, its
+parameters (including distinct `NaN`, `Infinity` and `-Infinity` filters),
+ordering and the value formats of the ordering columns; expressions are treated
+as nullable. Use `sql.of(column)` to declare the storage type of raw
+expressions. Pages cover root-table queries without joins, grouping, DISTINCT,
+LIMIT or OFFSET. Every page carries `nextCursor` and `previousCursor`: pass
+`after` to move forward or `before` to move back (never both); items always
 arrive in the declared order. A `null` cursor marks the last or first page. A
 backward page that finds no rows cannot name a next cursor, so keep the cursor
 you came from.
 
+A cursor is not encrypted or signed: it carries the text of the row's ordering
+values (also of ordering columns the projection leaves out) and a hash of the
+query, so do not order a client-visible page by a column the client must not
+see. A damaged or made-up cursor is refused with
+`invalid page cursor or cursor from another query` before any SQL is sent, also
+when a value has the right form but its column could not hold it: an integer out
+of the column's range, February 31, an enum label the schema does not declare.
+
+With `forUpdate` or `forShare` a page is read from the table itself and locks
+its rows and the one extra row it fetches. PostgreSQL refuses a row lock beside
+a window function or a set-returning function in the projection.
+
+Without a row lock, a page over a projection that holds raw SQL is read through
+a derived table, so that raw SQL which returns several rows or ranks them sees
+every filtered row. PostgreSQL folds that table away for ordinary expressions,
+which cost nothing extra. Raw SQL it cannot inline (a volatile function such as
+`random()`, a set-returning function such as `unnest()`) makes every page read
+all the filtered rows.
+
 ### Streaming rows
+
+If a projection such as `unnest(tags)` produces several rows with the same
+ordering key, `page()` cannot resume between them and reports an error. Use
+`stream()` to read all of those rows in batches.
 
 ```ts
 for await (const row of db.events(exportShape).stream({ size: 1000 })) {
@@ -1947,8 +1993,11 @@ than rows of its table, so `aggregate()` on it is refused: `count()` counts its
 rows, and `query.as("name").aggregate(…)` aggregates its fields.
 
 `count()` returns `number`. `sum()` and `average()` take numbers, bigints and
-decimals (not text) and return lossless decimal strings or `null`. `minimum()`
-and `maximum()` retain the value type and codec and add `null` (no rows, or only
+decimals (not text) and return lossless decimal strings or `null`: integers,
+bigints and decimals are added exactly, and the sum or average of a `real` or
+`doublePrecision` column is the float PostgreSQL computes, read with all its
+digits (`0.1` and `0.2` sum to `"0.30000000000000004"`). `minimum()` and
+`maximum()` retain the value type and codec and add `null` (no rows, or only
 NULLs). `coalesce()` supplies a non-null fallback, written like the column (a
 `jsonb(schema)` fallback in its input form); JSON `null` falls back as SQL NULL
 does, since both read as `null`. A selected query's `.as("recent")` creates a
@@ -2255,16 +2304,18 @@ scope. Raw expressions inside a nested query block only that query's rewrite.
   `isDistinctFrom(null)` does not hold for it. JSON has no `NaN` or `±Infinity`,
   which `JSON.stringify` writes as `null`: a value bound for a json or jsonb
   column, path or parameter that holds one at any depth fails the query before
-  it is sent, instead of writing or comparing JSON `null`.
+  it is sent, instead of writing or comparing JSON `null`. A JSON column default
+  containing one also fails migration generation.
 - `timestamp` (without time zone) → `Date`, read and written as UTC: the
   convention of Prisma, Drizzle and Rails, independent of the server's and the
   process's time zone, on both drivers. `timestamp(3)` and `timestamptz(3)` set
   the fractional-second precision. Both types send a `Date` as UTC ISO text, so
   historic instants whose local offset has seconds (Kyiv before 1924) are stored
   exactly whatever the process time zone; BC years and years past 9999 read and
-  write as Dates on both drivers. An invalid `Date` (`new Date("x")`) fails the
-  query before it is sent, and PostgreSQL's `infinity` throws on read: it has no
-  `Date` form.
+  write as Dates on both drivers. A `Date` used as a column default follows the
+  same UTC and BC-year conventions as an explicit insert. An invalid `Date`
+  (`new Date("x")`) fails the query before it is sent, and PostgreSQL's
+  `infinity` throws on read: it has no `Date` form.
 - `int` and `smallint` → `number`; writes, comparisons and arithmetic accept
   only integers in the column's range (arithmetic: `integer`'s range), so
   `count.above(6.5)`, `small.is(70000)` or `quantity.multiply(1.5)` fails the
@@ -2273,9 +2324,10 @@ scope. Raw expressions inside a nested query block only that query's rewrite.
   `number` (`NaN`, `±Infinity` and `-0` round-trip, except that `-0` reads as
   `0` inside a nested object of a CTE, derived table, `distinct` or grouped
   read, which PostgreSQL builds as `jsonb`, whose numbers have no `-0`). `real`
-  reads as the shortest decimal that is the same single-precision value, as
-  PostgreSQL prints it: `0.1`, not `0.10000000149011612`; `searchRank()` (a
-  `real`) reads the same way.
+  and `doublePrecision` also accept `NaN`, `±Infinity` and `-0` as column
+  defaults. `real` reads as the shortest decimal that is the same
+  single-precision value, as PostgreSQL prints it: `0.1`, not
+  `0.10000000149011612`; `searchRank()` (a `real`) reads the same way.
 - `date` → `"YYYY-MM-DD"` text with no time-zone shift, in PostgreSQL's form on
   both drivers (`"0999-05-05"`, `"0044-03-15 BC"`, `"infinity"`), `time` →
   `"HH:MM:SS"` text, `interval` → PostgreSQL's text form such as
@@ -2464,14 +2516,20 @@ changes the type of a column a prepared statement reads, PostgreSQL refuses the
 statement with "cached plan must not change result type": outside a transaction
 the adapter prepares it again under a new name and runs it, so the call
 succeeds; inside one the error has already aborted the transaction, so that one
-transaction fails and the next one prepares the statement again. At most 500
-statement texts get a name; texts beyond that (IN lists and literal limits of
-every length) are sent unnamed. Bun's pool prepares statements by default and
-turns it off with `prepare: false`. Bun's pool has no place to run the output
-settings' `SET` statements on a new connection, and it sends most values in
-binary, which these settings do not touch; where a database or role changes
-`IntervalStyle`, `extra_float_digits` or `bytea_output`, give the defaults to
-the Bun adapter yourself:
+transaction fails and the next one prepares the statement again. A statement
+that binds a value to the retyped column, in a filter or a write, is another
+matter: on a connection that prepared it, PostgreSQL keeps the parameter's old
+type, so a value only the new type holds is refused there
+(`out of range for type integer`, `operator does not exist`) until the
+connection is replaced. Restart the application, or close its pool, after a
+migration that changes a column's type. At most 500 statement texts get a name;
+texts beyond that (IN lists and literal limits of every length) are sent
+unnamed. Bun's pool prepares statements by default and turns it off with
+`prepare: false`. Bun's pool has no place to run the output settings' `SET`
+statements on a new connection, and it sends most values in binary, which these
+settings do not touch; where a database or role changes `IntervalStyle`,
+`extra_float_digits` or `bytea_output`, give the defaults to the Bun adapter
+yourself:
 `postgres({ url, connection: { IntervalStyle: "postgres", extra_float_digits: 1, bytea_output: "hex" } })`
 (a connection pooler must allow these start-up parameters, which is why the
 adapter does not send them unasked). Bun.SQL cannot read a `bytea` column in the
@@ -2582,7 +2640,10 @@ NULL elements written outside Symmetria; reading one throws
 returning a value its type does not allow, and writing one fails the write too.
 Drop them in SQL where such data exists, for example
 ``sql.of(bigint.array)`array_remove(${post.scores}, NULL)` ``. `jsonb` arrays
-are the exception: JSON `null` is one of their values.
+are the exception: JSON `null` is one of their values. An array column also has
+one dimension: a value of two or more, which only SQL written outside Symmetria
+stores, throws when it is read (`multidimensional arrays are not supported`)
+rather than come back as wrong elements.
 
 ## Full-text search
 
@@ -3716,6 +3777,16 @@ bun packages/kit/src/cli/index.ts status --config examples/symmetria.config.ts
 bun packages/kit/src/cli/index.ts rollback --config examples/symmetria.config.ts
 ```
 
+`diff` and `generate` compare literal defaults using the column type. For
+example, `90 minutes` and `01:30:00` are the same interval, but `1 day` and
+`24 hours` generate a migration: adding a calendar day across a daylight-saving
+change can give a different time than adding 24 elapsed hours. A number without
+a unit is read as PostgreSQL reads it: `1 0:00:00` is one day and `90` is 90
+seconds. A spelling the comparison does not read (ISO 8601 `P1D`, `1h30m`), or
+one whose meaning depends on the `IntervalStyle` setting (`-1 day 2:00`, a minus
+before fields without a sign), is compared as written, so replacing it by an
+equal one gives a migration that sets the same value.
+
 `symmetria --help` prints the same list. A flag of particular commands, such as
 `--sql`, `--plan`, `--to` or `--ignore-table`, is refused by the others; the
 connection, directory, verification-server, timeout and display flags are
@@ -3728,6 +3799,7 @@ matching config and API options.
 | `--config <file>`              | all                                          | Config module (default `symmetria.config.ts`)                                                                                                    |
 | `--dir <directory>`            | all with a project                           | Migrations directory, relative to the working directory                                                                                          |
 | `--database-url <url>`         | database commands, `pull`, `lint`            | Connection; overrides `databaseUrl` and `DATABASE_URL`                                                                                           |
+| `--connect-timeout <ms>`       | database commands, `pull`, `lint`            | How long the database may take to accept a connection (default 30000; 0 disables)                                                                |
 | `--json`                       | all                                          | One JSON object on stdout, `{"error": …}` on failure                                                                                             |
 | `--sql`                        | `diff`                                       | Print executable SQL                                                                                                                             |
 | `--diff <file.json>`           | `generate`, `diff`, `lint`                   | Rename hints and `USING` conversions                                                                                                             |
@@ -3757,6 +3829,7 @@ matching config and API options.
 | `--no-interactive`             | all                                          | No dashboard, schema browser or rename questions                                                                                                 |
 | `--no-color`, `--no-animation` | all                                          | Plain output; no logo or spinner animation                                                                                                       |
 | `--help`, `-h`                 | all                                          | Show the commands and flags                                                                                                                      |
+| `--version`, `-v`              | all                                          | Print the version of symmetria-kit                                                                                                               |
 
 The dashboard stays in one terminal screen, with a softly animated logo, schema
 counts, connection state and pending SQL changes. Set `DATABASE_URL` or pass
@@ -3792,26 +3865,29 @@ integer type, a smaller integer type (`bigint` to `integer`, either to
 before the decimal point (`numeric(20)` to `integer`, `numeric(10,2)` to
 `numeric(8,2)`: likewise), an integer type to `boolean` (every value other than
 0 becomes true), fewer fractional-second digits on
-`timestamp`/`time`/`interval`, a timestamp to `date` or `time`, or a number into
-a floating-point type that keeps fewer digits. A change to a length-limited
-string type is generated without a `USING` cast: an explicit `::varchar(5)`
-would silently cut `Alexandria` to `Alexa`, while PostgreSQL's own assignment
-cast refuses the long value, so the migration fails and rolls back with the data
-intact. The same holds for the `down.sql` of a widening change: a rollback to
-the shorter type fails on values that no longer fit instead of cutting them. A
-type change PostgreSQL has no cast for, in either direction (a number to `uuid`,
-a value to an array of it, `integer` to `date`, `boolean` to `numeric`, `jsonb`
-to `integer`, whose `down.sql` would need `integer` to `jsonb`), is refused when
-the migration is generated, since its SQL could not run even on an empty table;
-give the conversion for both directions under `using` in the `--diff` file.
-`integer` to `bytea` counts as castless, as it is before PostgreSQL 18. A change
-whose plain cast would read the time zone of the session that runs the migration
-(`timestamp`, `date` or text to `timestamptz`, `timestamptz` to `timestamp`,
-`date` or text, a value to `timetz`) converts at UTC instead, in `up.sql` and
-`down.sql`: with `AT TIME ZONE 'UTC'`, or with the session's zone set to UTC
-around the statement, so the stored values do not depend on who migrates. A
-rename needs a `--diff` hint; it is never guessed from similar names. The API
-uses `allowDestructive: true` for intentional removals. Column declarations keep
+`timestamp`/`time`/`interval`, a timestamp to `date` or `time`, an `interval` to
+`time` (months and days are dropped, and so are whole days of hours: `26:00:00`
+becomes `02:00:00`), or a number into a floating-point type that keeps fewer
+digits. A change to a length-limited string type is generated without a `USING`
+cast: an explicit `::varchar(5)` would silently cut `Alexandria` to `Alexa`,
+while PostgreSQL's own assignment cast refuses the long value, so the migration
+fails and rolls back with the data intact. The same holds for the `down.sql` of
+a widening change: a rollback to the shorter type fails on values that no longer
+fit instead of cutting them. A type change PostgreSQL has no cast for, in either
+direction (a number to `uuid`, a value to an array of it, `integer` to `date`,
+`boolean` to `numeric`, `jsonb` to `integer`, whose `down.sql` would need
+`integer` to `jsonb`), is refused when the migration is generated, since its SQL
+could not run even on an empty table; give the conversion for both directions
+under `using` in the `--diff` file. `integer` to `bytea` counts as castless, as
+it is before PostgreSQL 18. A change whose plain cast would read the time zone
+of the session that runs the migration (`timestamp`, `date` or text to
+`timestamptz`, `timestamptz` to `timestamp`, `date` or text, a value to
+`timetz`; arrays of them too, also from or to a string that holds the whole
+array as text) converts at UTC instead, in `up.sql` and `down.sql`: with
+`AT TIME ZONE 'UTC'`, or with the session's zone set to UTC around the
+statement, so the stored values do not depend on who migrates. A rename needs a
+`--diff` hint; it is never guessed from similar names. The API uses
+`allowDestructive: true` for intentional removals. Column declarations keep
 their order in `CREATE TABLE`; snapshot hashes ignore column order so reordering
 source declarations does not create a migration.
 
@@ -3856,13 +3932,20 @@ migration adds `migration`, `direction`, `statement`, `sql`, `sqlState` and
 findings as described below), 130 after Ctrl-C and 143 after SIGTERM. Ctrl-C or
 SIGTERM during `migrate`, `rollback` or another database command first cancels
 the running statement and waits up to five seconds for its rollback, so no lock
-outlives the process; a second Ctrl-C exits at once. When the server does not
-answer in that time, the CLI exits anyway and says whether a statement may still
-be running (on stdout as the JSON error with `--json`). Ctrl-C at a question
-(the rollback confirmation, a rename, the dashboard menu) exits with 130 too;
-Escape closes the question without it. `diff --sql` emits SQL. Terminal output
-includes colored diffs, migration state and loading spinners with elapsed time;
-piped output stays plain. `--no-color` and `NO_COLOR` disable colors, and
+outlives the process; a second Ctrl-C exits at once, and so does the first while
+no connection to the database (for `verify`, to the verification server) has
+been made. When the server does not answer in that time, the CLI exits anyway
+and says whether a statement may still be running (on stdout as the JSON error
+with `--json`). A database that does not accept a connection within
+`--connect-timeout` (30 seconds unless set; 0 waits as long as the operating
+system does) ends the command with an error that names the host and port; the
+limit covers every connection the command opens to the database and to the
+verification server (`--verify-url`), and none of their statements. Ctrl-C at a
+question (the rollback confirmation, a rename, a typed name, the dashboard
+menu), in the schema browser or in the profiler exits with 130 too; Escape
+closes the question without it. `diff --sql` emits SQL. Terminal output includes
+colored diffs, migration state and loading spinners with elapsed time; piped
+output stays plain. `--no-color` and `NO_COLOR` disable colors, and
 `--no-animation` disables the logo shimmer and spinner animation. Failed
 migrations report the failing statement and the underlying PostgreSQL error with
 its `DETAIL` (for example which key value is duplicated) and `HINT`. Text from
@@ -4058,6 +4141,31 @@ appends a journal entry without changing the snapshot.
 - Tables/types use the connection's `search_path`; metadata always uses its
   explicitly qualified schema. Config paths are relative to the config module;
   `--dir` paths are relative to the working directory.
+- A migrations directory that does not exist is not an empty chain. `migrate`,
+  `status`, `rollback`, `verify`, `adopt`, `repair`, `drift`, `lint`, `squash`,
+  `discard` and `recover` fail when the directory named with `--dir` is missing,
+  and when neither a config file nor `./migrations` is found where the command
+  runs; the message names the config path it looked for. In a project whose
+  config file is found and whose directory does not exist yet, `migrate`,
+  `status`, `rollback`, `verify`, `squash` and `recover` exit with 0 and say
+  that `symmetria generate <name>` creates the first migration, and their
+  `--json` output names the directory under `missingDirectory`. `loadMigrations`
+  and `migrator` read a missing directory as an empty chain, as before. The
+  dashboard's header says the same in place of its migration counts.
+- Dot-files in the migrations directory and in `meta/` (a `.DS_Store`) are
+  ignored; any other entry in `meta/` besides the two JSON files is refused, and
+  the error names it.
+- A database URL (`--database-url`, `databaseUrl`, `DATABASE_URL`,
+  `--verify-url`, `verificationDatabaseUrl`) starts with `postgres://` or
+  `postgresql://`; a socket directory is given in the URL
+  (`postgres:///app?host=/var/run/postgresql`) or, for the project's database,
+  as its path (`/var/run/postgresql`). Text without the scheme, such as
+  `host:5432/app`, is refused, since node-postgres would find no host in it and
+  connect to localhost; the error names the flag or setting, never the value.
+- `discard` asks the configured database before it takes a migration back, and
+  also refuses while another process holds the migration lock there (a `migrate`
+  whose transaction is still open has written its journal row where no other
+  session sees it); `--force` does not override that.
 
 Generated down SQL restores schema structure; it cannot recreate deleted data.
 Data backfills and nontrivial conversions can be added to the SQL before
@@ -4138,16 +4246,23 @@ stored them: comparisons with literals and other columns, `IS [NOT] NULL`, `IN`,
 `BETWEEN`, `AND` / `OR` / `NOT`, `LIKE` / `ILIKE`, enum labels,
 `IS DISTINCT FROM`, boolean columns, timestamps and arithmetic
 (`users.score.plus(1).above(users.lower.multiply(2))`,
-`and(t.status.is("active"), t.deletedAt.is(null))`). The rest stays a boolean
-expression, ``sql<boolean>`(length(${t.name}) > 0)` ``: function calls, casts
-the DSL would not write, and literals of another type than the column (a
-`bigint` compared with an integer literal uses another operator than
-`big.below(10n)`). One stored as `((…) = true)`, as older pulls declared it,
-loses the comparison. A schema written with the DSL, migrated and pulled back
-needs no migration, and pulling a database built from a pulled schema gives back
-the same schema. Tables named like a builder or a reserved word (`date`, `text`,
-`sql`, `delete`) are bound under another name in callbacks,
-`({ date: dateTable }) =>`, so they never hide the import.
+`and(t.status.is("active"), t.deletedAt.is(null))`). A division is declared as
+PostgreSQL computes it: `items / 2` between integers is
+`boxes.items.quotient(2)`, which drops the remainder as the database does, and
+`divide()` stands only for a division of `numeric` or `double precision` values,
+which is exact in the database too. The rest stays a boolean expression,
+``sql<boolean>`(length(${t.name}) > 0)` ``: function calls, casts the DSL would
+not write, and literals of another type than the column (a `bigint` compared
+with an integer literal uses another operator than `big.below(10n)`). One stored
+as `((…) = true)`, as older pulls declared it, loses the comparison. A schema
+written with the DSL, migrated and pulled back needs no migration, and pulling a
+database built from a pulled schema gives back the same schema. Tables named
+like anything the module imports or declares (a builder such as `date` or
+`text`, `sql`, `one`, `maybe`, `many`, `link`) or like a reserved word
+(`delete`) are bound under another name in callbacks,
+`({ date: dateTable }) =>`, so they never hide the import. A table whose name
+`schema()` reserves as a key (`then`, `constructor`, `prototype`) gets another
+key and keeps its name: `thenValue: table({ … }).named("then")`.
 
 Everything else is approximated and listed, with a `// pull:` comment on the
 affected line and an entry in the command's review list (`warnings` in `--json`,
@@ -4173,7 +4288,13 @@ each with a `code` and often a `fix`):
   users.
 - Types without a builder (`money`, ranges, …), enums of other schemas and
   arrays of enums go through `customType()` with a passthrough codec, which
-  hands over driver-native values.
+  hands over driver-native values. A `numeric(p,s)` whose scale is above its
+  precision or below zero (`numeric(3,5)`, `numeric(5,-2)`, which PostgreSQL 15
+  and later allow and `numeric()` does not take) is declared as
+  `customType<Decimal>("numeric(3,5)", { base: "numeric" })`: its values are
+  exact decimal text, as a `numeric()` column's, and conditions over it are
+  declared like a numeric column's. A number PostgreSQL accepts but the DSL
+  would refuse (a `smallint` compared with 40000) keeps its condition as `sql`.
 - A column of a domain type is declared with the domain's base type,
   `customType<Decimal>("amount", { base: "numeric(30,10)" })`, so its values
   read as that type's builder reads them (a domain over `bigint` gives `bigint`,
@@ -4191,14 +4312,23 @@ each with a `code` and often a `fix`):
   in place, without rebuilding it.
 - Composite, deferrable or cross-schema foreign keys, `ON UPDATE SET NULL` /
   `SET DEFAULT`, and foreign keys to columns without a primary-key or `UNIQUE`
-  constraint stay plain columns.
+  constraint stay plain columns. A column with more than one foreign key is
+  declared with one of them, the one named `<table>_<column>_fkey` or else the
+  first by name; each other one is listed with its definition, and a database
+  built from the schema lacks it.
 - Multi-column unique constraints are declared as unique indexes of the same
-  name; exclusion constraints, `NULLS NOT DISTINCT` indexes, generated-column
-  expressions and partitions are reported but not declared. A full-text search's
-  stored column (`aboutWords`, nullable, computed as `fullText()` computes it,
-  with its GIN index and no other index or constraint on it) is declared as the
-  search, `.search((t) => ({ about: { words: fullText(…) } }))`; any other
-  generated column stays a column with its warning.
+  name. One that is `DEFERRABLE` is listed without a fix: the index refuses a
+  duplicate at once, where the constraint waits for the end of the statement or
+  the transaction, so a database built from the schema fails writes that hold a
+  duplicate only for a moment. An index key's operator class parameters
+  (`gist_trgm_ops (siglen = 64)`) are listed too: the index is declared without
+  them and built with the operator class's defaults. Exclusion constraints,
+  `NULLS NOT DISTINCT` indexes and constraints, generated-column expressions and
+  partitions are reported but not declared. A full-text search's stored column
+  (`aboutWords`, nullable, computed as `fullText()` computes it, with its GIN
+  index and no other index or constraint on it) is declared as the search,
+  `.search((t) => ({ about: { words: fullText(…) } }))`; any other generated
+  column stays a column with its warning.
 - Views, materialized views and triggers are listed: the schema neither declares
   nor manages them, so migrations leave them alone.
 - More that exists only in the database is listed, each under its own code, so
@@ -4217,6 +4347,13 @@ each with a `code` and often a `fix`):
     `.auto` numbers from 1 by 1.
   - `unlogged`: an `UNLOGGED` table, which the schema declares as an ordinary
     one; the fix is `ALTER TABLE … SET LOGGED`.
+  - `storage-parameters`: a table created `WITH (fillfactor = 70, …)`. The
+    schema declares no table storage parameters, so a database built from it
+    creates the table with the defaults.
+  - `rule`: a rule (`CREATE RULE`) on a table, with its definition. The schema
+    does not manage rules, so migrations neither create nor drop it.
+  - `foreign-table`: a foreign table, with its server. It is not declared, so
+    queries cannot reach it through the schema.
   - `other-schema`: how many tables live in other schemas, per schema. `pull`
     reads one schema (the connection's current one), so those tables are not in
     the generated module. System schemas and tables owned by extensions are not
@@ -4384,7 +4521,8 @@ the session's statement only while one runs. `driver.close()` waits for such an
 attempt until its connection opens or fails: Bun.SQL gives up after its
 `connectionTimeout` (30 seconds by default), while node-postgres waits for good
 on a server that accepts connections but never answers, unless
-`connectionTimeoutMillis` is set.
+`connectionTimeoutMillis` is set. The CLI sets it for its own driver, from
+`--connect-timeout` (30 seconds by default).
 
 ### Online DDL and recovery
 
@@ -4396,10 +4534,11 @@ constraints on existing columns use a concurrent unique index followed by
 both modes (PostgreSQL 12+), preserving the type OID and dependent columns
 without a table rewrite. Inside a transaction a new label cannot be used before
 commit, so a transactional migration whose defaults or CHECKs already need the
-new label rebuilds the type instead; `--online` commits each statement and keeps
-`ADD VALUE`. Enum removals and reordering rebuild the type and rewrite dependent
-columns. A changed default is replaced by a single `SET DEFAULT`, so no commit
-boundary leaves the column without one.
+new label, or that turns a column of another type (text, another enum) into the
+enum, whose rows may hold the new label, rebuilds the type instead; `--online`
+commits each statement and keeps `ADD VALUE`. Enum removals and reordering
+rebuild the type and rewrite dependent columns. A changed default is replaced by
+a single `SET DEFAULT`, so no commit boundary leaves the column without one.
 
 For populated tables, introduce nullable columns first, deploy compatible code,
 backfill in bounded batches, then generate a separate validation migration.
@@ -4441,12 +4580,20 @@ backfill, external function or other data-only operation has already run.
 
 Generation and squash use a durable filesystem publication journal. After a
 process crash, `symmetria recover` restores the previous files or finishes
-cleanup of a committed publication. It refuses a lock owned by a live process or
-another host. With no lock left behind it prints `Nothing to recover`
+cleanup of a committed publication, and removes the staging directory
+(`.symmetria-XXXXXX`) of a generator that stopped before it published anything.
+It refuses a lock owned by a live process or another host, and keeps a staging
+directory whose `backup/` holds files that no publication record accounts for,
+naming it. With no lock left behind it prints `Nothing to recover`
 (`recoverMigrationFiles` resolves `false`, and `true` after a recovery). Keep
 the SQL directories and both shared metadata files on the same filesystem. A
 lock without readable ownership metadata requires manual inspection; the error
-names the lock directory.
+names the lock directory. While a lock exists, every command that reads the
+migrations stops with a message that names `symmetria recover`. Ctrl-C or
+SIGTERM during `generate`, `squash` or `discard` stops before anything is
+published and leaves no lock; once the files are being published, they are
+published. `generateMigration`, `squashMigrations` and `discardMigration` take
+the same `signal`.
 
 ### Disposable-database verification
 
@@ -4491,7 +4638,10 @@ Hooks run during the upgrade/rollback/reapplication pass; `phase` is `up`,
 `down` or `reapply`. Configure `verify.schemaName` for a non-public application
 schema. Managed catalog checks cover tables, columns, constraints, indexes and
 enums; use hooks for data preservation and custom SQL objects such as functions
-and views. Historical snapshots remain unnecessary.
+and views. Historical snapshots remain unnecessary. `connectionTimeoutMs` limits
+how long the verification server may take to accept each connection (the CLI
+passes `--connect-timeout`); the error names the server's host and port, never
+its credentials. `onConnect` is called each time a connection to it opens.
 
 Programmatic APIs are exported from `symmetria-kit`: `migrationSnapshot`,
 `createSchemaSQL`, `diffSchemas`, `lintMigration`, `lintMigrationSQL`,
@@ -4515,7 +4665,13 @@ points at it and drops everything on `close()`. Extensions the schema needs
 are created in the database's default schema when they are missing, which needs
 a role allowed to create them, and their schemas follow the test schema on the
 `search_path`, so their types and operators resolve without a `searchPath`
-option. The extension stays installed for later tests.
+option. The extension stays installed for later tests. Start-up settings in the
+URL's `options` parameter (`-c TimeZone=…`, `-c statement_timeout=…`) apply to
+the test pool as well; the test schema's `search_path` is added after them, so
+it wins over a `search_path` they set. The URL starts with `postgres://` or
+`postgresql://`; other text, also a URL with only the scheme forgotten
+(`host:5432/db`, which node-postgres would read as localhost), is refused before
+anything is created.
 
 ## Development
 

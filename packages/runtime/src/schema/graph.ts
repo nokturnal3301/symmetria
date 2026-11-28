@@ -458,7 +458,29 @@ export type ReverseRelationName<Reference, Source, Destination> =
       ? never
       : Source;
 
+/**
+ * A junction of a table with itself (followers / following): both keys point
+ * at one table, so their reverse collections would share the junction's name
+ * there. It has none; its rows are read through the junction table.
+ */
+export type IsSelfJunction<Columns> =
+  IsJunctionTable<Columns> extends true
+    ? IsUnion<
+        ReferenceTarget<Columns[ReferenceColumnNames<Columns>]>
+      > extends true
+      ? false
+      : true
+    : false;
+
 export type ReverseEdges<
+  Definition extends SchemaDefinitions,
+  SourceName extends StringKeys<Definition>,
+> =
+  IsSelfJunction<Definition[SourceName]> extends true
+    ? never
+    : PlainReverseEdges<Definition, SourceName>;
+
+export type PlainReverseEdges<
   Definition extends SchemaDefinitions,
   SourceName extends StringKeys<Definition>,
 > = {

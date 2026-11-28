@@ -13,6 +13,8 @@ import {
 } from "../../../packages/runtime/src/driver/pool";
 import { postgresParameters } from "../../../packages/runtime/src/driver/parameters";
 import { releaseReserved } from "../../../packages/runtime/src/driver/bun";
+import { postgres as nodePostgres } from "../../../packages/runtime/src/driver/pg";
+import { EventEmitter } from "node:events";
 import {
   queryError,
   scopeViolation,
@@ -536,4 +538,339 @@ test("a reserved Bun.SQL connection released with an error is closed, whatever i
   releaseReserved(reserved, new Error("anything else"));
 
   expect(calls).toEqual(["release", "close", "close", "close"]);
+});
+
+type Sent = {
+  readonly client: number;
+  readonly name?: string;
+  readonly text: string;
+  readonly values?: unknown[];
+};
+
+/**
+ * The node-postgres adapter over clients that answer from `respond` instead
+ * of a server: an Error is thrown, anything else is the rows. `sent` lists
+ * what each client was asked, `closed` the clients the pool has ended.
+ */
+const scriptedNodePostgres = (
+  respond: (sent: Sent) => unknown,
+  options: { max?: number; prepare?: boolean } = {},
+) => {
+  const sent: Sent[] = [];
+  const closed: number[] = [];
+  let clients = 0;
+
+  class Client extends EventEmitter {
+    readonly id = clients++;
+    // What the pool reads before it takes a client back.
+    readonly _queryable = true;
+    readonly _ending = false;
+
+    connect(done: (error?: Error) => void) {
+      queueMicrotask(() => done());
+    }
+
+    end(done?: () => void) {
+      closed.push(this.id);
+      done?.();
+    }
+
+    async query(
+      config: string | { name?: string; text: string; values?: unknown[] },
+      values?: unknown[],
+    ) {
+      const asked: Sent =
+        typeof config === "string"
+          ? { client: this.id, text: config, ...(values ? { values } : {}) }
+          : { client: this.id, ...config };
+
+      // The settings every new connection asks for are not the test's.
+      if (!asked.text.startsWith("SET DateStyle")) {
+        sent.push(asked);
+      }
+
+      // Calls made together are all on their way before any is answered.
+      await new Promise((resolve) => setTimeout(resolve, 1));
+
+      const answer = respond(asked);
+
+      if (answer instanceof Error) {
+        throw answer;
+      }
+
+      const rows = (answer as unknown[] | undefined) ?? [];
+
+      return { rows, rowCount: rows.length };
+    }
+  }
+
+  return {
+    driver: nodePostgres({ prepare: true, max: 3, ...options, Client }),
+    sent,
+    closed,
+    /** What one client was asked, as the statement's name or its text. */
+    asked: (client: number) =>
+      sent
+        .filter((entry) => entry.client === client)
+        .map((entry) => entry.name ?? entry.text),
+  };
+};
+
+const stalePlan = () =>
+  Object.assign(new Error("cached plan must not change result type"), {
+    code: "0A000",
+  });
+
+test("node-postgres: every connection whose prepared statement went stale runs it once more under the new name", async () => {
+  const lookup = { sql: "SELECT n FROM items WHERE id = $1", parameters: [1] };
+  let retyped = false;
+  const { driver, asked } = scriptedNodePostgres((query) =>
+    retyped && query.name === "symmetria_0" ? stalePlan() : [{ n: 1 }],
+  );
+
+  // Three calls at once: each connection prepares the statement.
+  await Promise.all([1, 2, 3].map(() => driver.execute(lookup)));
+  retyped = true;
+
+  // All three are refused, and only the first still finds the old name
+  // registered: every one of them runs again.
+  expect(
+    await Promise.all([1, 2, 3].map(() => driver.execute(lookup))),
+  ).toEqual([1, 2, 3].map(() => ({ rows: [{ n: 1 }], affectedRows: 1 })));
+
+  for (const client of [0, 1, 2]) {
+    expect(asked(client)).toEqual([
+      "symmetria_0",
+      "symmetria_0",
+      'DEALLOCATE "symmetria_0"',
+      "symmetria_1",
+    ]);
+  }
+
+  await driver.close();
+});
+
+test("node-postgres: a statement refused again after it was prepared anew fails after that one run", async () => {
+  const lookup = { sql: "SELECT n FROM items WHERE id = $1", parameters: [1] };
+  const { driver, asked } = scriptedNodePostgres(
+    (query) => (query.name ? stalePlan() : []),
+    { max: 1 },
+  );
+
+  for (const names of [
+    ["symmetria_0", "symmetria_1"],
+    ["symmetria_1", "symmetria_2"],
+  ]) {
+    await expect(driver.execute(lookup)).rejects.toMatchObject({
+      sqlState: "0A000",
+    });
+    expect(asked(0).splice(-3)).toEqual([
+      names[0]!,
+      `DEALLOCATE "${names[0]}"`,
+      names[1]!,
+    ]);
+  }
+
+  expect(asked(0)).toHaveLength(6);
+  await driver.close();
+});
+
+test("node-postgres: a stale statement keeps its place among the named ones", async () => {
+  let stale: string | undefined;
+  const { driver, sent } = scriptedNodePostgres(
+    (query) => (query.name && query.name === stale ? stalePlan() : []),
+    { max: 1 },
+  );
+  const statement = (ordinal: number) => ({
+    sql: `SELECT ${ordinal} WHERE $1`,
+    parameters: [true],
+  });
+  const name = async (ordinal: number) => {
+    await driver.execute(statement(ordinal));
+
+    return sent.at(-1)!.name;
+  };
+
+  // 500 texts get a name; the next one is sent unnamed.
+  for (let ordinal = 0; ordinal < 500; ordinal += 1) {
+    await driver.execute(statement(ordinal));
+  }
+
+  expect(await name(7)).toBe("symmetria_7");
+  expect(await name(500)).toBeUndefined();
+
+  // The stale text gives up its name for a new one: still 500 names.
+  stale = "symmetria_7";
+  expect(await name(7)).toBe("symmetria_500");
+  expect(await name(7)).toBe("symmetria_500");
+  expect(await name(500)).toBeUndefined();
+  expect(await name(8)).toBe("symmetria_8");
+
+  await driver.close();
+});
+
+test("node-postgres: a stale statement inside a transaction fails it, and the next one prepares anew", async () => {
+  const lookup = { sql: "SELECT n FROM items WHERE id = $1", parameters: [1] };
+  let aborted = false;
+  const { driver, asked, closed } = scriptedNodePostgres(
+    (query) => {
+      if (query.name === "symmetria_0") {
+        aborted = true;
+
+        return stalePlan();
+      }
+
+      if (query.text === "ROLLBACK") {
+        aborted = false;
+      }
+
+      // Nothing runs in an aborted transaction.
+      return aborted
+        ? Object.assign(
+            new Error(
+              "current transaction is aborted, commands ignored until end of transaction block",
+            ),
+            { code: "25P02" },
+          )
+        : [{ n: 1 }];
+    },
+    { max: 1 },
+  );
+
+  await expect(
+    driver.transaction((tx) => tx.execute(lookup)),
+  ).rejects.toMatchObject({
+    sqlState: "0A000",
+    message: "cached plan must not change result type",
+  });
+  expect(await driver.transaction((tx) => tx.execute(lookup))).toEqual({
+    rows: [{ n: 1 }],
+    affectedRows: 1,
+  });
+  expect(asked(0)).toEqual([
+    "BEGIN",
+    "symmetria_0",
+    'DEALLOCATE "symmetria_0"',
+    "ROLLBACK",
+    "BEGIN",
+    "symmetria_1",
+    "COMMIT",
+  ]);
+  // The connection was healthy throughout.
+  expect(closed).toEqual([]);
+
+  await driver.close();
+});
+
+test("node-postgres: a named statement that fails without a server error leaves the rest of the transaction unnamed and costs the connection", async () => {
+  const lookup = { sql: "SELECT n FROM items WHERE id = $1", parameters: [1] };
+  // node-postgres gives up on its own, as when a value's toPostgres() throws
+  // while the statement is bound: the server has then dropped the statement
+  // that node-postgres still counts as prepared.
+  const gaveUp = new Error("no text for this value");
+  let fail = true;
+  const { driver, asked, closed } = scriptedNodePostgres(
+    (query) => (query.name && fail ? gaveUp : [{ n: 1 }]),
+    { max: 1 },
+  );
+
+  const [refused, after] = await driver.transaction(async (tx) => [
+    await tx
+      .transaction((savepoint) => savepoint.execute(lookup))
+      .catch((error: unknown) => error),
+    await tx.execute(lookup),
+  ]);
+
+  expect(refused).toBe(gaveUp);
+  expect(after).toEqual({ rows: [{ n: 1 }], affectedRows: 1 });
+  expect(asked(0)).toEqual([
+    "BEGIN",
+    "SAVEPOINT symmetria_savepoint_1",
+    "symmetria_0",
+    "ROLLBACK TO SAVEPOINT symmetria_savepoint_1",
+    "RELEASE SAVEPOINT symmetria_savepoint_1",
+    // The same text, sent without its name.
+    lookup.sql,
+    "COMMIT",
+  ]);
+  // The pool closed that connection; the next call gets a new one, which
+  // prepares the statement itself.
+  expect(closed).toEqual([0]);
+
+  fail = false;
+  await driver.execute(lookup);
+  expect(asked(1)).toEqual(["symmetria_0"]);
+  expect(closed).toEqual([0]);
+
+  await driver.close();
+});
+
+test("node-postgres: a named statement gets its JSON parameters as text, and one JSON cannot hold fails before it is sent", async () => {
+  const bytes = Buffer.from([1, 2]);
+  const custom = { toPostgres: () => "(1,2)" };
+  const document = { owner: "ada", tags: ["a"] };
+  const statement = (...parameters: unknown[]) => ({
+    sql: "SELECT $1, $2, $3, $4",
+    parameters,
+  });
+  const named = scriptedNodePostgres(() => [], { max: 1 });
+
+  await named.driver.execute(statement(document, bytes, custom, null));
+  // Bytes and values that convert themselves stay node-postgres's to send.
+  expect(named.sent[0]).toMatchObject({
+    name: "symmetria_0",
+    values: ['{"owner":"ada","tags":["a"]}', bytes, custom, null],
+  });
+  expect(named.sent[0]!.values![2]).toBe(custom);
+
+  const circular: Record<string, unknown> = {};
+  const refusal = new Error("no JSON for this");
+
+  circular.self = circular;
+
+  for (const [unserializable, thrown] of [
+    [{ balance: 10n }, TypeError],
+    [circular, TypeError],
+    [
+      {
+        toJSON: () => {
+          throw refusal;
+        },
+      },
+      refusal,
+    ],
+  ] as const) {
+    const failed = await named.driver
+      .transaction((tx) => tx.execute(statement(unserializable, 1, 2, 3)))
+      .catch((error: unknown) => error);
+
+    if (thrown === refusal) {
+      expect(failed).toBe(refusal);
+    } else {
+      expect(failed).toBeInstanceOf(thrown as typeof TypeError);
+    }
+  }
+
+  // None of the three statements reached the connection, only the
+  // transactions around them, and the pool keeps the connection.
+  expect(named.asked(0).slice(1)).toEqual([
+    "BEGIN",
+    "ROLLBACK",
+    "BEGIN",
+    "ROLLBACK",
+    "BEGIN",
+    "ROLLBACK",
+  ]);
+  expect(named.closed).toEqual([]);
+  await named.driver.close();
+
+  // An unnamed statement is sent as before, its values node-postgres's to
+  // convert: nothing about it can go out of step.
+  const unnamed = scriptedNodePostgres(() => [], { max: 1, prepare: false });
+
+  await unnamed.driver.execute(statement(document, bytes, custom, null));
+  expect(unnamed.sent[0]!.name).toBeUndefined();
+  expect(unnamed.sent[0]!.values).toEqual([document, bytes, custom, null]);
+  expect(unnamed.sent[0]!.values![0]).toBe(document);
+  await unnamed.driver.close();
 });

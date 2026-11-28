@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   schema,
   table,
+  link,
   one,
   maybe,
   many,
@@ -208,5 +209,122 @@ describe.skipIf(!databaseUrl)("slot relations on PostgreSQL", () => {
     await database.posts.delete().all();
     await database.users.byId(1).delete();
     expect(await database.profiles.count()).toBe(0);
+  });
+});
+
+describe.skipIf(!databaseUrl)("a many-to-many of a table with itself", () => {
+  const people = table({
+    id: int.auto,
+    name: text,
+    following: many,
+    followers: many,
+  });
+  const follows = link(people.following, people.followers, {
+    since: timestamptz.now,
+  });
+  const graph = schema({ people, follows });
+  let isolated: Awaited<ReturnType<typeof testDatabase<typeof graph>>>;
+  let database: typeof isolated.database;
+
+  beforeAll(async () => {
+    isolated = await testDatabase({
+      url: databaseUrl!,
+      schema: graph,
+      prefix: "symmetria_selflink",
+      max: 2,
+    });
+    database = isolated.database;
+  });
+
+  afterAll(async () => {
+    await isolated?.close();
+  });
+
+  test("both directions read, filter and write the same link rows", async () => {
+    await database.people.insert([
+      { name: "Ada" },
+      { name: "Bob" },
+      { name: "Cy" },
+    ]);
+    // Ada follows Bob and Cy; Bob follows Cy.
+    await database.follows.insert([
+      { followersId: 1, followingId: 2 },
+      { followersId: 1, followingId: 3 },
+      { followersId: 2, followingId: 3 },
+    ]);
+
+    const read = () =>
+      database.people(
+        (person) => ({
+          name: person.name,
+          following: person.following((followed) => ({ name: followed.name }), {
+            orderBy: (followed) => followed.id.ascending,
+          }),
+          followers: person.followers((follower) => ({ name: follower.name }), {
+            orderBy: (follower) => follower.id.ascending,
+          }),
+          followed: person.followers.count(),
+        }),
+        { orderBy: (person) => person.id.ascending },
+      );
+
+    expect(await read()).toEqual([
+      {
+        name: "Ada",
+        following: [{ name: "Bob" }, { name: "Cy" }],
+        followers: [],
+        followed: 0,
+      },
+      {
+        name: "Bob",
+        following: [{ name: "Cy" }],
+        followers: [{ name: "Ada" }],
+        followed: 1,
+      },
+      {
+        name: "Cy",
+        following: [],
+        followers: [{ name: "Ada" }, { name: "Bob" }],
+        followed: 2,
+      },
+    ]);
+    expect(
+      await database.people((person) => ({ name: person.name }), {
+        where: (person) =>
+          person.following.some((followed) => followed.name.is("Cy")),
+        orderBy: (person) => person.id.ascending,
+      }),
+    ).toEqual([{ name: "Ada" }, { name: "Bob" }]);
+    expect(
+      await database.people((person) => ({ name: person.name }), {
+        where: (person) => person.followers.none(),
+      }),
+    ).toEqual([{ name: "Ada" }]);
+
+    // A nested connect writes the link in the direction of its relation.
+    const dee = await database.people
+      .insert({ name: "Dee", following: { connect: [1] } })
+      .returning("id");
+    const eve = await database.people
+      .insert({ name: "Eve", followers: { connect: [1] } })
+      .returning("id");
+
+    expect(
+      await database.follows(
+        (row) => ({ follower: row.followersId, followed: row.followingId }),
+        { where: (row) => row.followersId.in([dee.id, 1]) },
+      ),
+    ).toEqual(
+      expect.arrayContaining([
+        { follower: dee.id, followed: 1 },
+        { follower: 1, followed: eve.id },
+      ]),
+    );
+    expect(
+      (await read()).find((person) => person.name === "Ada"),
+    ).toMatchObject({
+      following: [{ name: "Bob" }, { name: "Cy" }, { name: "Eve" }],
+      followers: [{ name: "Dee" }],
+    });
   });
 });

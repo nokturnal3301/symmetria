@@ -341,14 +341,46 @@ export const columnType = (
     };
   }
 
-  const numeric = /^numeric(?:\((\d+)(?:,(\d+))?\))?$/.exec(base);
+  const numeric = /^numeric(?:\((\d+)(?:,(-?\d+))?\))?$/.exec(base);
 
   if (numeric) {
+    const scale = Number(numeric[2] ?? 0);
+
+    if (scale >= 0 && scale <= Number(numeric[1] ?? 0)) {
+      return {
+        type: {
+          kind: "numeric",
+          ...(numeric[1] ? { precision: Number(numeric[1]) } : {}),
+          ...(numeric[2] ? { scale } : {}),
+        },
+        array,
+      };
+    }
+
+    // numeric() takes a scale from zero to the precision. PostgreSQL 15 and
+    // later also allow one above it (`numeric(3,5)`: values below 0.001) or
+    // below zero (`numeric(5,-2)`). Such a column keeps its type through
+    // customType() and the values of numeric, exact decimal text, so it
+    // compares and computes with numeric() columns.
+    const sqlType = array
+      ? column.data_type.replace(/\[\]$/, "")
+      : column.data_type;
+
+    comments.push(`no builder for ${sqlType}`);
+    tools.warn({
+      code: "custom-type",
+      table: table.sqlName,
+      column: column.column_name,
+      object: sqlType,
+      message: `"${table.sqlName}.${column.column_name}" uses ${sqlType}, whose scale numeric() does not take; it is declared through customType() with the values of numeric, exact decimal text`,
+    });
+
     return {
       type: {
-        kind: "numeric",
-        ...(numeric[1] ? { precision: Number(numeric[1]) } : {}),
-        ...(numeric[2] ? { scale: Number(numeric[2]) } : {}),
+        kind: "custom",
+        sqlType,
+        valueType: "Decimal",
+        base: "numeric",
       },
       array,
     };
@@ -530,6 +562,28 @@ export const columnDefault = (
 
 export const unescapeLiteral = (text: string) => text.replaceAll("''", "'");
 
+/**
+ * The text a quoted literal of `type` gives a text or varchar column, which
+ * is not always the text between the quotes. PostgreSQL drops the trailing
+ * spaces of a `bpchar` value when it becomes text (a default of
+ * `'ab '::bpchar` stores `ab`), and a cast to `character varying(n)` keeps
+ * the first n characters (`'abcdef'::character varying(3)` stores `abc`).
+ */
+const textValue = (literal: string, type: string): string => {
+  const value = unescapeLiteral(literal);
+
+  if (type === "bpchar") {
+    return value.replace(/ +$/, "");
+  }
+
+  const length = /^character varying\((\d+)\)$/.exec(type)?.[1];
+
+  // PostgreSQL counts characters, not UTF-16 code units.
+  return length === undefined
+    ? value
+    : Array.from(value).slice(0, Number(length)).join("");
+};
+
 /** JavaScript source for defaults PostgreSQL prints as simple literals. */
 export const literalDefault = (
   text: string,
@@ -553,8 +607,16 @@ export const literalDefault = (
         case "bigint":
           return integer ? `${integer[1]}n` : undefined;
         case "real":
-        case "doublePrecision":
           return decimal ? decimal[1] : undefined;
+        case "doublePrecision":
+          // A real literal reaches the column as the nearest real number,
+          // which is not the number its text reads as (`'0.1'::real` is
+          // 0.10000000149011612): it stays SQL unless both are one number.
+          return decimal &&
+            (decimal[2] !== "real" ||
+              Math.fround(Number(decimal[1])) === Number(decimal[1]))
+            ? decimal[1]
+            : undefined;
         case "date":
           return quoted && quoted[2] === "date"
             ? quoteString(unescapeLiteral(quoted[1]!))
@@ -577,7 +639,7 @@ export const literalDefault = (
         case "uuid":
           return quoted &&
             /^(text|character varying(\(\d+\))?|uuid|bpchar)$/.test(quoted[2]!)
-            ? quoteString(unescapeLiteral(quoted[1]!))
+            ? quoteString(textValue(quoted[1]!, quoted[2]!))
             : undefined;
         case "jsonb":
           return quoted &&
@@ -591,14 +653,43 @@ export const literalDefault = (
     case "varchar":
       return quoted &&
         /^(text|character varying(\(\d+\))?|bpchar)$/.test(quoted[2]!)
-        ? quoteString(unescapeLiteral(quoted[1]!))
+        ? quoteString(textValue(quoted[1]!, quoted[2]!))
         : undefined;
     case "numeric": {
       const decimal =
         /^(-?\d+(?:\.\d+)?)$/.exec(text) ??
-        /^'(-?\d+(?:\.\d+)?)'::numeric(\(\d+(,\d+)?\))?$/.exec(text);
+        /^'(-?\d+(?:\.\d+)?)'::numeric(?:\((\d+)(?:,(\d+))?\))?$/.exec(text);
 
-      return decimal ? quoteString(decimal[1]!) : undefined;
+      if (!decimal) {
+        return undefined;
+      }
+
+      const digits = decimal[1]!;
+
+      if (decimal[2] === undefined) {
+        return quoteString(digits);
+      }
+
+      // A literal cast to numeric(p,s) becomes a number of exactly s
+      // decimals, which is what a fresh row holds: `'7'::numeric(10,2)` is
+      // 7.00, so the zeros are written out. With more decimals than s the
+      // cast rounds (`'1.005'::numeric(10,2)` is 1.01), and with more digits
+      // than p it fails: such a default stays SQL.
+      const scale = Number(decimal[3] ?? 0);
+      const [whole = "", fraction = ""] = digits.replace(/^-/, "").split(".");
+
+      if (
+        fraction.length > scale ||
+        whole.replace(/^0+/, "").length > Number(decimal[2]) - scale
+      ) {
+        return undefined;
+      }
+
+      return quoteString(
+        scale === 0
+          ? digits
+          : `${digits.split(".")[0]}.${fraction.padEnd(scale, "0")}`,
+      );
     }
     case "enum":
       return quoted && type.values.includes(unescapeLiteral(quoted[1]!))

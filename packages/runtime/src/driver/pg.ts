@@ -1,6 +1,7 @@
 /**
  * `symmetria/pg`: PostgreSQL adapter built on node-postgres pools.
  */
+import { isDate } from "node:util/types";
 import { Pool, types, type PoolConfig, type QueryResult } from "pg";
 import type { CompiledQuery, ExecutionResult } from "../query/plan/types";
 import type { QueryProfiler } from "../observability/profiling";
@@ -89,11 +90,13 @@ const parsers: NonNullable<PoolConfig["types"]> = {
       const parseArray = types.getTypeParser(
         1009 as Parameters<typeof types.getTypeParser>[0],
         "text",
-      ) as (value: string) => (string | null)[];
+      ) as (value: string) => (string | null | unknown[])[];
 
+      // An array of more dimensions keeps its nested arrays, which the
+      // column's codec refuses by name.
       return (value: string) =>
         parseArray(value).map((entry) =>
-          entry === null ? null : utcTimestamp(entry),
+          entry === null || Array.isArray(entry) ? entry : utcTimestamp(entry),
         );
     }
 
@@ -123,7 +126,31 @@ const parsers: NonNullable<PoolConfig["types"]> = {
 /** Statements worth preparing: one SELECT or write, not DDL, cursors or transaction control. */
 const PREPARABLE = /^(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/;
 const PREPARED_LIMIT = 500;
-const STALE_STATEMENT = Symbol("symmetria.pg.staleStatement");
+
+/**
+ * A parameter node-postgres sends as JSON text: an object that is not bytes,
+ * a Date or an array, and does not convert itself with `toPostgres()`.
+ */
+const sentAsJson = (value: unknown): value is object =>
+  typeof value === "object" &&
+  value !== null &&
+  !ArrayBuffer.isView(value) &&
+  !Array.isArray(value) &&
+  !isDate(value) &&
+  typeof (value as { toPostgres?: unknown }).toPostgres !== "function";
+
+/**
+ * The values of a named statement with their JSON text made here.
+ * node-postgres makes that text only while it binds, when the statement is
+ * already on its way: a value JSON cannot hold (a BigInt inside, a circular
+ * reference, a `toJSON()` that throws) fails there, and node-postgres then
+ * closes the statement on the server while it goes on counting the name as
+ * prepared. Made here, the same text fails before anything is sent.
+ */
+const withJsonText = (values: unknown[]): unknown[] =>
+  values.some(sentAsJson)
+    ? values.map((value) => (sentAsJson(value) ? JSON.stringify(value) : value))
+    : values;
 
 /**
  * A failure that leaves the client unusable: the connection was lost or the
@@ -190,13 +217,28 @@ export const postgres = (
   // prepared it. node-postgres would keep sending the stale name on that
   // connection, and every connection that prepared it would fail the same
   // way: the text gets a new name, which each connection prepares afresh.
-  const staleStatement = (error: unknown, sql: string, name: string) =>
-    sqlState(error) === "0A000" &&
-    /cached plan must not change result type/.test(
-      error instanceof Error ? error.message : String(error),
-    ) &&
-    statementNames.get(sql) === name &&
-    statementNames.delete(sql);
+  // The first connection to fail moves the text on; calls in flight on the
+  // others fail with the old name after that, and are stale all the same.
+  const staleStatement = (
+    error: unknown,
+    sql: string,
+    name: string,
+  ): boolean => {
+    if (
+      sqlState(error) !== "0A000" ||
+      !/cached plan must not change result type/.test(
+        error instanceof Error ? error.message : String(error),
+      )
+    ) {
+      return false;
+    }
+
+    if (statementNames.get(sql) === name) {
+      statementNames.delete(sql);
+    }
+
+    return true;
+  };
 
   const result = (value: QueryResult | QueryResult[]): ExecutionResult => {
     if (Array.isArray(value)) {
@@ -219,6 +261,13 @@ export const postgres = (
     const client = await pool.connect();
     let released = false;
     let failure: Error | undefined;
+    // Set when a named statement failed with something that is not the
+    // server's answer: node-postgres gave up on its own (a value it could not
+    // convert while binding, a timeout). It may then count a name as prepared
+    // that the server no longer holds, and would bind to the missing
+    // statement from then on. The connection sends the rest of its statements
+    // unnamed and is closed when released.
+    let unsynced: Error | undefined;
 
     // A server that ends the session reports why (57P01, 25P03), and the
     // closed socket follows as "Connection terminated unexpectedly": the
@@ -233,8 +282,17 @@ export const postgres = (
       if (!released) {
         released = true;
         client.removeListener("error", onError);
-        client.release(error ?? failure);
+        client.release(error ?? failure ?? unsynced);
       }
+    };
+
+    /** Rethrows what a named statement failed with; see `unsynced`. */
+    const namedFailure = (error: unknown): never => {
+      if (!sqlState(error)) {
+        unsynced ??= error instanceof Error ? error : new Error(String(error));
+      }
+
+      throw error;
     };
 
     return {
@@ -246,23 +304,47 @@ export const postgres = (
         const values = postgresParameters(query.parameters, true);
         // Without values node-postgres uses the simple protocol, which also
         // takes several commands in one text; a prepared statement takes one.
-        const name = values.length ? statementName(query.sql) : undefined;
+        const name =
+          values.length && !unsynced ? statementName(query.sql) : undefined;
 
         if (!name) {
           return result(await client.query(query.sql, values));
         }
 
+        const bound = withJsonText(values);
+
         try {
-          return result(await client.query({ name, text: query.sql, values }));
+          return result(
+            await client.query({ name, text: query.sql, values: bound }),
+          );
         } catch (error) {
-          if (staleStatement(error, query.sql, name)) {
-            // Fails inside a transaction, which the error has aborted; the
-            // statement is then freed with the connection.
-            await client.query(`DEALLOCATE "${name}"`).catch(() => {});
-            throw Object.assign(error as Error, { [STALE_STATEMENT]: true });
+          if (!staleStatement(error, query.sql, name)) {
+            return namedFailure(error);
           }
 
-          throw error;
+          // Inside a transaction the error has aborted it: the server
+          // refuses this too (25P02), the error stands, and the old statement
+          // is freed with the connection.
+          const aborted = await client.query(`DEALLOCATE "${name}"`).then(
+            () => false,
+            (refusal: unknown) => sqlState(refusal) === "25P02",
+          );
+
+          if (aborted) {
+            throw error;
+          }
+
+          // Outside a transaction the failed statement did nothing: it runs
+          // once more, under the text's new name.
+          const renamed = statementName(query.sql);
+
+          return result(
+            await (renamed
+              ? client
+                  .query({ name: renamed, text: query.sql, values: bound })
+                  .catch(namedFailure)
+              : client.query(query.sql, bound)),
+          );
         }
       },
       release,
@@ -277,17 +359,7 @@ export const postgres = (
         const connection = await connect();
 
         try {
-          try {
-            return await connection.execute(query);
-          } catch (error) {
-            // Outside a transaction the failed statement did nothing: it runs
-            // again under its new name.
-            if ((error as { [STALE_STATEMENT]?: true })[STALE_STATEMENT]) {
-              return await connection.execute(query);
-            }
-
-            throw error;
-          }
+          return await connection.execute(query);
         } catch (error) {
           // A client killed mid-query may not have noticed its closed socket
           // yet; returned to the pool, it would fail the next query.

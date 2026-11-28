@@ -1,5 +1,5 @@
 /** Everything a command needs: terminal mode, output, the project configuration and a database driver. */
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import * as nodeModule from "node:module";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -7,7 +7,8 @@ import { postgres, type PostgresDriver } from "symmetria/driver";
 import { sqlState, type SchemaSnapshot } from "symmetria";
 import type { MigrationConfig } from "../migrations/config";
 import type { MigratorOptions } from "../migrations/runner";
-import { interruptible } from "./signals";
+import { serverAddress } from "../migrations/verify";
+import { interruptible, type Interruptible } from "./signals";
 import { supportsColor, terminalText, theme } from "./ui/style";
 import { choose, withSpinner } from "./ui/terminal";
 import type { CliValues } from "./options";
@@ -98,9 +99,13 @@ export type Project = {
   readonly present: boolean;
   readonly config: MigrationConfig;
   readonly directory: string;
+  /** The migrations directory does not exist (not yet, in a new project). */
+  readonly directoryMissing: boolean;
   readonly databaseUrl: string | undefined;
   /** Where databaseUrl came from, for messages (never the value). */
   readonly databaseUrlSource?: string;
+  /** How long a connection to the database may take to open; 0 sets no limit. */
+  readonly connectTimeoutMs: number;
   /** Where runnerOptions.verificationDatabaseUrl came from, for messages. */
   readonly verificationUrlSource?: string;
   readonly runnerOptions: Omit<MigratorOptions, "driver" | "signal">;
@@ -108,11 +113,40 @@ export type Project = {
   readonly snapshot: () => SchemaSnapshot | undefined;
 };
 
+/** What a command needs to reach the database. */
+export type DatabaseAccess = Pick<
+  Project,
+  "databaseUrl" | "databaseUrlSource" | "connectTimeoutMs"
+>;
+
 const TIMEOUT_FLAGS = [
   ["advisoryLockTimeoutMs", "advisory-lock-timeout"],
   ["lockTimeoutMs", "lock-timeout"],
   ["statementTimeoutMs", "statement-timeout"],
 ] as const;
+
+/**
+ * How long the CLI waits for the database to accept a connection, unless
+ * --connect-timeout says otherwise. Without a limit a host that drops packets
+ * holds a command for as long as the operating system keeps trying.
+ */
+const DEFAULT_CONNECT_TIMEOUT_MS = 30000;
+
+/**
+ * A timeout flag's value: whole milliseconds in decimal digits. Number() would
+ * also read "1e3", "0x10" and "" (as 0, which disables the timeout).
+ */
+const flagMilliseconds = (flag: string, given: string): number => {
+  const value = /^\d+$/.test(given.trim()) ? Number(given) : Number.NaN;
+
+  if (!Number.isSafeInteger(value) || value > 2147483647) {
+    throw new Error(
+      `symmetria: invalid --${flag} ${JSON.stringify(given)}: expected whole milliseconds from 0 to 2147483647`,
+    );
+  }
+
+  return value;
+};
 
 const RESOLVE_EXTENSIONS = [
   ".ts",
@@ -173,17 +207,38 @@ const registerExtensionHooks = (): void => {
 };
 
 /**
+ * Whether text is written as a PostgreSQL URL: the scheme and its two
+ * slashes. `host:5432/db` and `user:password@host/db` are URLs to a parser
+ * as well, with `host:` or `user:` for a scheme.
+ */
+const POSTGRES_URL = /^postgres(?:ql)?:\/\//i;
+
+/** node-postgres's own form for a socket directory: `socket:/dir?db=name`. */
+const SOCKET_URL = /^socket:\//i;
+
+/**
  * A PostgreSQL URL checked when a driver is opened, not when the config
  * loads (commands without a database ignore it). node-postgres resolves any
  * text against `postgres://base`, so a typo would surface as a DNS error for
- * the host "base". This check refuses text that is not an absolute URL and
- * what node-postgres cannot parse, and accepts all else it reads: a socket
- * directory (`/var/run/postgresql`), and credentials without a host
- * (`postgres://user:password@/app?host=/cloudsql/…`), which it parses with a
- * placeholder host as done here. The message names where the
- * value came from, never the value (it can hold a password).
+ * the host "base", and it ignores the scheme of an absolute URL: text with
+ * the `postgres://` forgotten (`host:5432/app`, `user:password@host/app`)
+ * would leave it without a host, and it would connect to localhost, the
+ * wrong server. This check refuses both and what node-postgres cannot parse,
+ * and accepts the forms it reads: a URL with the scheme `postgres://` or
+ * `postgresql://`, also without a host (`postgres:///app?host=/var/run/…`,
+ * `postgres://user:password@/app?host=/cloudsql/…`, which it parses with a
+ * placeholder host as done here), and a socket directory
+ * (`/var/run/postgresql`, `socket:/var/run/postgresql?db=app`). The message
+ * names where the value came from, never the value (it can hold a password).
  */
 export const checkedUrl = (url: string, source: string): string => {
+  // A config can hold anything where the URL belongs.
+  if (typeof url !== "string") {
+    throw new Error(
+      `symmetria: invalid database URL in ${source}: expected a string such as postgres://user:password@host:5432/database`,
+    );
+  }
+
   if (url.startsWith("/")) {
     return url;
   }
@@ -195,9 +250,7 @@ export const checkedUrl = (url: string, source: string): string => {
   const parsed =
     URL.parse(text) ?? URL.parse(text.replace("@/", "@___DUMMY___/"));
 
-  // Relative text has no scheme: node-postgres would read it against
-  // postgres://base. It ignores the scheme of an absolute URL.
-  if (!parsed) {
+  if (!parsed || !(POSTGRES_URL.test(url) || SOCKET_URL.test(url))) {
     throw new Error(
       `symmetria: invalid database URL in ${source}: expected postgres://user:password@host:5432/database`,
     );
@@ -206,12 +259,25 @@ export const checkedUrl = (url: string, source: string): string => {
   return url;
 };
 
-/** The database URL and its source: --database-url, then the config, then DATABASE_URL. */
+/**
+ * The parts of a database URL for display, or undefined for a socket
+ * directory and for text that is no PostgreSQL URL: a parser would read
+ * `user:password@host/app` as a path and show the password with it.
+ */
+export const displayedUrl = (url: unknown): URL | undefined =>
+  typeof url === "string" && POSTGRES_URL.test(url)
+    ? (URL.parse(url) ?? undefined)
+    : undefined;
+
+/**
+ * The database URL and its source (--database-url, then the config, then
+ * DATABASE_URL), and how long a connection to it may take to open.
+ */
 export const databaseUrlOf = (
   values: CliValues,
   config: MigrationConfig,
-): Pick<Project, "databaseUrl" | "databaseUrlSource"> =>
-  values["database-url"] !== undefined
+): DatabaseAccess => ({
+  ...(values["database-url"] !== undefined
     ? {
         databaseUrl: values["database-url"],
         databaseUrlSource: "--database-url",
@@ -224,7 +290,12 @@ export const databaseUrlOf = (
       : {
           databaseUrl: process.env.DATABASE_URL,
           databaseUrlSource: "DATABASE_URL",
-        };
+        }),
+  connectTimeoutMs:
+    values["connect-timeout"] === undefined
+      ? DEFAULT_CONNECT_TIMEOUT_MS
+      : flagMilliseconds("connect-timeout", values["connect-timeout"]),
+});
 
 /** The verification server's URL, checked like the database URL; undefined when none is set. */
 export const verificationUrl = (
@@ -237,16 +308,60 @@ export const verificationUrl = (
     : undefined;
 };
 
-/** A driver for the project's database (its URL is set), after the URL check. */
+/** What node-postgres reports when a new connection did not open within `connectionTimeoutMillis`. */
+const CONNECT_TIMEOUT = "Connection terminated due to connection timeout";
+
+/**
+ * A driver for the project's database (its URL is set), after the URL check.
+ * Every connection it opens, also the ones a migration opens to cancel a
+ * statement or to record a failure, must be accepted within the connection
+ * timeout; an open connection is not limited, so a slow statement on a
+ * server that answers is never cut short. `onConnect` hears of each
+ * connection that opens.
+ */
 export const databaseDriver = (
-  project: Pick<Project, "databaseUrl" | "databaseUrlSource">,
-): PostgresDriver =>
-  postgres(
-    checkedUrl(
-      project.databaseUrl!,
-      project.databaseUrlSource ?? "the database URL",
-    ),
+  project: DatabaseAccess,
+  onConnect?: () => void,
+): PostgresDriver => {
+  const url = checkedUrl(
+    project.databaseUrl!,
+    project.databaseUrlSource ?? "the database URL",
   );
+  const limit = project.connectTimeoutMs;
+  const driver = postgres({
+    url,
+    ...(limit ? { connectionTimeoutMillis: limit } : {}),
+    ...(onConnect ? { onConnect } : {}),
+  });
+
+  if (!limit) {
+    return driver;
+  }
+
+  // The driver's own error names neither the server nor the limit. The
+  // replacement stays a connection failure for code that tells those from
+  // statement errors (ETIMEDOUT is what the operating system reports when
+  // its own, longer limit ends the attempt).
+  const unanswered = (error: unknown): never => {
+    throw error instanceof Error && error.message === CONNECT_TIMEOUT
+      ? Object.assign(
+          new Error(
+            `symmetria: no connection to the database: ${serverAddress(url) ?? "the database server"} did not answer within ${limit}ms (--connect-timeout <ms> sets the limit; 0 waits as long as the operating system does)`,
+          ),
+          { code: "ETIMEDOUT" },
+        )
+      : error;
+  };
+
+  return {
+    ...driver,
+    execute: ((query) =>
+      driver.execute(query).catch(unanswered)) as PostgresDriver["execute"],
+    transaction: (callback, options) =>
+      driver.transaction(callback, options).catch(unanswered),
+    session: (callback) => driver.session(callback).catch(unanswered),
+  };
+};
 
 export const loadProject = async (context: CliContext): Promise<Project> => {
   const { values } = context;
@@ -276,13 +391,38 @@ export const loadProject = async (context: CliContext): Promise<Project> => {
       () => import(pathToFileURL(configPath).href),
     );
 
-    if (!module.default || typeof module.default !== "object") {
+    const exported: unknown = module.default;
+    // A Promise or an array is an object too, and would read as a config
+    // without a single setting.
+    const found =
+      exported === undefined
+        ? "has no default export"
+        : exported === null || typeof exported !== "object"
+          ? `exports ${exported === null ? "null" : `a ${typeof exported}`}`
+          : Array.isArray(exported)
+            ? "exports an array"
+            : typeof (exported as { then?: unknown }).then === "function"
+              ? "exports a Promise, which is not awaited"
+              : undefined;
+
+    if (found) {
       throw new Error(
-        "symmetria: config must default-export a migration configuration",
+        `symmetria: ${configPath} must default-export a migration configuration object, as in "export default defineMigrationConfig({ schema, directory })"; it ${found}`,
       );
     }
 
-    config = module.default;
+    config = exported as MigrationConfig;
+  }
+
+  // null and undefined both leave the default in place.
+  if (
+    config.directory !== undefined &&
+    config.directory !== null &&
+    typeof config.directory !== "string"
+  ) {
+    throw new Error(
+      'symmetria: invalid directory in the config: expected a path such as "./migrations"',
+    );
   }
 
   const directory = values.dir
@@ -291,17 +431,23 @@ export const loadProject = async (context: CliContext): Promise<Project> => {
         present ? dirname(configPath) : process.cwd(),
         config.directory ?? "migrations",
       );
-  const { databaseUrl, databaseUrlSource } = databaseUrlOf(values, config);
+  const directoryMissing = await access(directory).then(
+    () => false,
+    (error: unknown) =>
+      !!error &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "ENOENT",
+  );
+  const { databaseUrl, databaseUrlSource, connectTimeoutMs } = databaseUrlOf(
+    values,
+    config,
+  );
   const timeouts = Object.fromEntries(
     TIMEOUT_FLAGS.flatMap(([key, flag]) => {
       const given = values[flag];
-      // Number("") is 0, which would silently disable the timeout.
       const value =
-        given === undefined
-          ? config[key]
-          : given.trim()
-            ? Number(given)
-            : Number.NaN;
+        given === undefined ? config[key] : flagMilliseconds(flag, given);
 
       if (value === undefined) {
         return [];
@@ -309,7 +455,7 @@ export const loadProject = async (context: CliContext): Promise<Project> => {
 
       if (!Number.isSafeInteger(value) || value < 0 || value > 2147483647) {
         throw new Error(
-          `symmetria: invalid ${given === undefined ? `${key} in the config` : `--${flag} ${JSON.stringify(given)}`}: expected whole milliseconds from 0 to 2147483647`,
+          `symmetria: invalid ${key} in the config: expected whole milliseconds from 0 to 2147483647`,
         );
       }
 
@@ -344,8 +490,10 @@ export const loadProject = async (context: CliContext): Promise<Project> => {
     present,
     config,
     directory,
+    directoryMissing,
     databaseUrl,
     ...(databaseUrlSource ? { databaseUrlSource } : {}),
+    connectTimeoutMs,
     verificationUrlSource:
       values["verify-url"] === undefined
         ? "verificationDatabaseUrl in the config"
@@ -357,20 +505,102 @@ export const loadProject = async (context: CliContext): Promise<Project> => {
         : {}),
       ...(config.metadataTable ? { metadataTable: config.metadataTable } : {}),
       ...(verificationDatabaseUrl ? { verificationDatabaseUrl } : {}),
+      ...(connectTimeoutMs ? { connectionTimeoutMs: connectTimeoutMs } : {}),
       ignoreTables,
       ...timeouts,
       ...(config.onEvent ? { onEvent: config.onEvent } : {}),
     },
     snapshot: () => {
-      const source = config.schema;
+      const source: unknown = config.schema;
 
-      return source
-        ? "$snapshot" in source
-          ? source.$snapshot()
-          : source
-        : undefined;
+      if (source === undefined || source === null) {
+        return undefined;
+      }
+
+      const declared = source as {
+        $snapshot?: unknown;
+        tables?: unknown;
+      };
+
+      if (
+        typeof source === "object" &&
+        typeof declared.$snapshot === "function"
+      ) {
+        return (source as { $snapshot: () => SchemaSnapshot }).$snapshot();
+      }
+
+      // Anything else must be the snapshot itself.
+      if (typeof source !== "object" || !Array.isArray(declared.tables)) {
+        throw new Error(
+          "symmetria: invalid schema in the config: expected a schema() value, or the snapshot its $snapshot() returns",
+        );
+      }
+
+      return source as SchemaSnapshot;
     },
   };
+};
+
+/**
+ * What a command that reads the migration files says about a directory that
+ * does not exist. A directory named with --dir, or the default one when no
+ * config file was found either, is a wrong path: the command fails instead of
+ * reporting an empty chain as success. Under a config file it is a project
+ * before its first `generate`, and the returned note says so.
+ */
+export const missingDirectoryNote = (
+  project: Project,
+  values: CliValues,
+): string | undefined => {
+  if (!project.directoryMissing) {
+    return undefined;
+  }
+
+  if (values.dir) {
+    throw new Error(
+      `symmetria: the migrations directory ${project.directory} (--dir) does not exist`,
+    );
+  }
+
+  if (!project.present) {
+    throw new Error(
+      `symmetria: no config file was found in the current directory (looked for ${project.configPath}), and there is no migrations directory at ${project.directory} either; run the command in the project's directory, or pass --config <file> or --dir <directory>`,
+    );
+  }
+
+  return `No migrations yet: the migrations directory ${project.directory} does not exist. "symmetria generate <name>" creates the first migration.`;
+};
+
+/**
+ * The JSON in a file named by a flag. A file that cannot be read or parsed is
+ * reported with the flag and the path, which JSON.parse's own message lacks.
+ */
+export const readJSONFile = async (
+  flag: string,
+  file: string,
+): Promise<unknown> => {
+  const path = resolve(file);
+  const reason = (error: unknown) =>
+    error instanceof Error ? error.message : String(error);
+  let text: string;
+
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    throw new Error(
+      `symmetria: cannot read the --${flag} file ${path} (${reason(error)})`,
+      { cause: error },
+    );
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    throw new Error(
+      `symmetria: the --${flag} file ${path} is not valid JSON (${reason(error)})`,
+      { cause: error },
+    );
+  }
 };
 
 /**
@@ -380,7 +610,7 @@ export const loadProject = async (context: CliContext): Promise<Project> => {
  * close, so the error is reported at once (see leftClosing).
  */
 export const withDatabase = async <Result>(
-  project: Pick<Project, "databaseUrl" | "databaseUrlSource">,
+  project: DatabaseAccess,
   operation: (driver: PostgresDriver, signal: AbortSignal) => Promise<Result>,
 ): Promise<Result> => {
   if (!project.databaseUrl) {
@@ -389,10 +619,12 @@ export const withDatabase = async <Result>(
     );
   }
 
-  const driver = databaseDriver(project);
   // Whether a connection was made: until then a cancellation leaves no
   // statement behind on the server.
   let connected = false;
+  const driver = databaseDriver(project, () => {
+    connected = true;
+  });
 
   const reached = <Result>(work: Promise<Result>): Promise<Result> => {
     work.then(
@@ -428,13 +660,14 @@ export const withDatabase = async <Result>(
   let failed = false;
 
   try {
-    return await withCancellation(
-      (signal) => operation(tracked, signal),
-      () =>
+    return await withCancellation((signal) => operation(tracked, signal), {
+      unfinished: () =>
         connected
           ? "the database confirmed the cancellation; the statement can run until PostgreSQL notices the closed connection"
           : "a connection to the database was made; nothing was sent",
-    );
+      // Nothing reached the server yet: no statement or lock to wait for.
+      waits: () => connected,
+    });
   } catch (error) {
     failed = true;
     throw error;
@@ -446,8 +679,9 @@ export const withDatabase = async <Result>(
     } else {
       // A failed or interrupted command reports at once. Work it gave up
       // on, such as a journal write whose new connection a server that
-      // does not answer keeps waiting (with node-postgres for good), would
-      // hold the close: the process leaves without it once it has reported.
+      // does not answer keeps waiting (until the connection timeout, or
+      // for good without one), would hold the close: the process leaves
+      // without it once it has reported.
       let timer: ReturnType<typeof setTimeout> | undefined;
       const closed = await Promise.race([
         closing.then(() => true),
@@ -481,12 +715,12 @@ export const leftClosing = (): boolean => closingLeft;
  */
 export const withCancellation = async <Result>(
   operation: (signal: AbortSignal) => Promise<Result>,
-  unfinished?: () => string,
+  state: Pick<Interruptible, "unfinished" | "waits"> = {},
 ): Promise<Result> => {
   const cancellation = new AbortController();
   const unregister = interruptible({
     cancel: (reason) => cancellation.abort(reason),
-    ...(unfinished ? { unfinished } : {}),
+    ...state,
   });
 
   try {

@@ -6,6 +6,7 @@ import {
   int,
   text,
   bool,
+  sql,
 } from "../../../packages/runtime/src";
 import { testDatabase } from "../../support/postgres";
 
@@ -209,5 +210,65 @@ describe.skipIf(!databaseUrl)("query terminals on PostgreSQL", () => {
     expect(await none).toEqual([{ n: 0 }]);
     expect(await none.count()).toBe(1);
     expect(await none.exists()).toBe(true);
+  });
+
+  test("empty input still yields one raw or nested aggregate report", async () => {
+    const none = database.users({ where: (u) => u.id.below(0) });
+    const raw = none(() => ({ n: sql.of(int)`count(*)::integer` }));
+    const nested = none((_u, { count, rowNumber }) => ({
+      stats: { n: count(), pos: rowNumber().over({}) },
+    }));
+    expect(await raw).toEqual([{ n: 0 }]);
+    expect(await nested).toEqual([{ stats: { n: 0, pos: 1 } }]);
+    for (const q of [raw, nested]) {
+      expect(await q.count()).toBe(1);
+      expect(await q.exists()).toBe(true);
+    }
+  });
+
+  test("expanded results count and stream every row and refuse ambiguous page boundaries", async () => {
+    const q = database.users(
+      (u) => ({
+        id: u.id,
+        tag: sql.of(text)`unnest(ARRAY[${u.name}, upper(${u.name})])`,
+      }),
+      { orderBy: (u) => u.id.asc },
+    );
+    const rows = await q;
+    expect(rows).toHaveLength(14);
+    expect(await q.count()).toBe(rows.length);
+    expect(await q.exists()).toBe(true);
+    const streamed = [];
+    for await (const row of q.stream({ size: 1 })) {
+      streamed.push(row);
+    }
+    expect(streamed).toEqual(rows);
+    await expect(q.page({ size: 1 })).rejects.toThrow(/unique cursor/);
+    const empty = database.users(() => ({
+      tag: sql.of(text)`unnest(ARRAY[]::text[])`,
+    }));
+    expect(await empty).toEqual([]);
+    expect(await empty.count()).toBe(0);
+    expect(await empty.exists()).toBe(false);
+  });
+
+  test("raw window ranks survive forward and backward cursor predicates", async () => {
+    const q = database.users(
+      (u) => ({
+        id: u.id,
+        rank: sql.of(int)`(row_number() OVER (ORDER BY ${u.id}))::int`,
+      }),
+      { orderBy: (u) => u.id.asc },
+    );
+    const rows = await q;
+    const one = await q.page({ size: 2 });
+    const two = await q.page({ size: 2, after: one.nextCursor });
+    const three = await q.page({ size: 2, after: two.nextCursor });
+    expect([...one.items, ...two.items, ...three.items]).toEqual(
+      rows.slice(0, 6),
+    );
+    expect(
+      (await q.page({ size: 2, before: three.previousCursor })).items,
+    ).toEqual(two.items);
   });
 });

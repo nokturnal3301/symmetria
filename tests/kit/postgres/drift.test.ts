@@ -506,4 +506,114 @@ describe.skipIf(!databaseUrl)("PostgreSQL drift definitions", () => {
       await fixture.close();
     }
   });
+
+  test("expressions of a partitioned table, an inheritance parent and a partition are compared", async () => {
+    // One declaration for every table: a default, a CHECK, an index and an
+    // expression index, which are all compared through PostgreSQL's own text.
+    const declared = () =>
+      table({ id: int, at: int, v: text.nullable.default("a") })
+        .primaryKey((entry) => [entry.id, entry.at])
+        .indexes((entry) => ({
+          v: index(entry.v),
+          lower: index(sql<string>`lower(${entry.v})`),
+        }))
+        .checks((entry) => ({ v: entry.v.isNot("x") }));
+    const model = schema({
+      marker: { id: int },
+      // Two partitions: PostgreSQL plans a read of the table as an Append.
+      events: declared(),
+      // No partition at all, and one.
+      empty: declared(),
+      single: declared(),
+      // A parent of two INHERITS children, and a partition declared by itself.
+      parent: declared(),
+      part: declared(),
+    });
+    const fixture = await testDatabase({
+      url: databaseUrl!,
+      schema: schema({ marker: { id: int } }),
+    });
+    const run = (statement: string) =>
+      fixture.driver.execute({ sql: statement, parameters: [] });
+    const create = (name: string, suffix = "") => [
+      `CREATE TABLE ${name} (id integer NOT NULL, at integer NOT NULL, v text DEFAULT 'a',
+        CONSTRAINT ${name}_pkey PRIMARY KEY (id, at), CONSTRAINT ${name}_v_check CHECK (v <> 'x')) ${suffix}`,
+      `CREATE INDEX ${name}_v_idx ON ${name} (v)`,
+      `CREATE INDEX ${name}_lower_idx ON ${name} (lower(v))`,
+    ];
+    const drift = () =>
+      detectDrift({
+        execute: fixture.driver.execute,
+        snapshot: model.$snapshot(),
+        schemaName: fixture.namespace,
+        ignoreTables: [
+          "events_low",
+          "events_high",
+          "single_low",
+          "child_a",
+          "child_b",
+          "whole",
+        ],
+      });
+
+    try {
+      for (const statement of [
+        ...create("events", "PARTITION BY RANGE (at)"),
+        `CREATE TABLE events_low PARTITION OF events FOR VALUES FROM (0) TO (100)`,
+        `CREATE TABLE events_high PARTITION OF events FOR VALUES FROM (100) TO (200)`,
+        ...create("empty", "PARTITION BY RANGE (at)"),
+        ...create("single", "PARTITION BY RANGE (at)"),
+        `CREATE TABLE single_low PARTITION OF single FOR VALUES FROM (0) TO (100)`,
+        ...create("parent"),
+        `CREATE TABLE child_a () INHERITS (parent)`,
+        `CREATE TABLE child_b (extra integer) INHERITS (parent)`,
+        `CREATE TABLE whole (id integer NOT NULL, at integer NOT NULL, v text DEFAULT 'a') PARTITION BY RANGE (at)`,
+        `CREATE TABLE part PARTITION OF whole FOR VALUES FROM (0) TO (100)`,
+        `ALTER TABLE part ADD CONSTRAINT part_pkey PRIMARY KEY (id, at), ADD CONSTRAINT part_v_check CHECK (v <> 'x')`,
+        `CREATE INDEX part_v_idx ON part (v)`,
+        `CREATE INDEX part_lower_idx ON part (lower(v))`,
+      ]) {
+        await run(statement);
+      }
+
+      expect(await drift()).toEqual([]);
+
+      // A real difference on the table with two partitions is still found.
+      await run(
+        `ALTER TABLE events DROP CONSTRAINT events_v_check, ADD CONSTRAINT events_v_check CHECK (v <> 'y')`,
+      );
+      await run(`DROP INDEX events_lower_idx`);
+      await run(`CREATE INDEX events_lower_idx ON events (upper(v))`);
+      await run(`ALTER TABLE events ALTER COLUMN v SET DEFAULT 'b'`);
+
+      expect(
+        (await drift()).map(({ kind, table: name, column, expected }) => ({
+          kind,
+          table: name,
+          ...(column === undefined ? {} : { column }),
+          expected,
+        })),
+      ).toEqual([
+        {
+          kind: "default-mismatch",
+          table: "events",
+          column: "v",
+          expected: "E'a'",
+        },
+        {
+          kind: "constraint-mismatch",
+          table: "events",
+          expected: "events_v_check",
+        },
+        {
+          kind: "index-mismatch",
+          table: "events",
+          expected:
+            'CREATE INDEX "events_lower_idx" ON "events" USING btree ((lower("v")))',
+        },
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  });
 });

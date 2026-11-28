@@ -285,6 +285,50 @@ test("many(slot) options and link()", () => {
   ]);
 });
 
+test("a many-to-many of a table with itself joins two slots of that table", () => {
+  const users = table({
+    id: int.auto,
+    name: text,
+    following: many,
+    followers: many,
+  });
+  const follows = link(users.following, users.followers);
+  const tables = schema({ users, follows }, { executor }).$snapshot().tables;
+  const junctionTable = tables.find((entry) => entry.name === "follows")!;
+  const relations = tables.find((entry) => entry.name === "users")!.relations;
+
+  // Each key is named after the collection its user appears in.
+  expect(
+    junctionTable.columns.map((column) => [
+      column.name,
+      column.references?.table,
+    ]),
+  ).toEqual([
+    ["followersId", "users"],
+    ["followingId", "users"],
+  ]);
+  // The two directions mirror each other, and the link rows have no
+  // collection of their own on users: both keys would give it one name.
+  expect(relations).toEqual([
+    expect.objectContaining({
+      name: "following",
+      kind: "through",
+      target: "users",
+      junction: "follows",
+      sourceForeignKey: "followersId",
+      targetForeignKey: "followingId",
+    }),
+    expect.objectContaining({
+      name: "followers",
+      kind: "through",
+      target: "users",
+      junction: "follows",
+      sourceForeignKey: "followingId",
+      targetForeignKey: "followersId",
+    }),
+  ]);
+});
+
 test("plain records and schema callbacks take slots too", () => {
   const database = schema(
     {

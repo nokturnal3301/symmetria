@@ -5,6 +5,9 @@ import {
   table,
   customType,
   int,
+  bigint,
+  real,
+  doublePrecision,
   numeric,
   prepare,
   uuid,
@@ -48,7 +51,16 @@ const entries = table({
 });
 const hosts = table({ id: int.auto, address: inet.unique, label: text });
 const spans = table({ id: int.auto, length: interval.unique, label: text });
-const model = schema({ things, prices, tokens, entries, hosts, spans });
+const instants = table({ at: timestamptz.primaryKey, label: text });
+const model = schema({
+  things,
+  prices,
+  tokens,
+  entries,
+  hosts,
+  spans,
+  instants,
+});
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
@@ -74,6 +86,20 @@ describe.skipIf(!databaseUrl)(
     });
 
     const filler = Array.from({ length: 1001 }, (_, i) => `zz${i}`);
+    test("upsert distinguishes year 99 from 1999", async () => {
+      const rows = ["0099", "1999"].map((year) => ({
+        at: new Date(`${year}-04-03T00:00:00Z`),
+        label: year,
+      }));
+      expect(
+        (await database.instants.upsert(rows, { by: "at" })).affectedRows,
+      ).toBe(2);
+      expect(
+        await database.instants((r) => ({ at: r.at, label: r.label }), {
+          orderBy: (r) => r.at.asc,
+        }),
+      ).toEqual(rows);
+    });
     const prices = Array.from({ length: 1001 }, (_, i) => `${1000 + i}.5`);
     const ids = (where: Parameters<typeof database.things>[1]) =>
       database.things((thing) => ({ id: thing.id }), where);
@@ -385,6 +411,55 @@ describe.skipIf(!databaseUrl)(
       expect(await ids(sized({ size: 3 }))).toEqual([3]);
     });
 
+    test("a prepared numeric or bigint parameter reads the same inside a nested result as at the top level", async () => {
+      const echo = prepare({ price: numeric }, (p) =>
+        database.things(() => ({
+          top: p.price,
+          nested: { price: p.price },
+        })),
+      );
+
+      // Text PostgreSQL reads as a number, in other spellings than it prints.
+      for (const [price, read] of [
+        ["1e3", "1000"],
+        [" 2.50 ", "2.50"],
+        ["-0", "0"],
+        ["inf", "Infinity"],
+        ["+7", "7"],
+        [".5", "0.5"],
+        ["1E-3", "0.001"],
+        ["NaN", "NaN"],
+        ["12345678901234567890.123456789", "12345678901234567890.123456789"],
+      ] as const) {
+        expect(await echo({ price: price as never })).toEqual([
+          { top: read, nested: { price: read } } as never,
+        ]);
+      }
+
+      const optional = prepare({ price: numeric.nullable }, (p) =>
+        database.things(() => ({ nested: { price: p.price } })),
+      );
+
+      expect(await optional({ price: null })).toEqual([
+        { nested: { price: null } },
+      ]);
+      expect(await optional({ price: "1e3" as never })).toEqual([
+        { nested: { price: "1000" } } as never,
+      ]);
+
+      // A bigint beyond the type's range is PostgreSQL's error at both levels.
+      const counted = prepare({ views: bigint }, (p) =>
+        database.things(() => ({ nested: { views: p.views } })),
+      );
+
+      expect(await counted({ views: 9007199254740993n })).toEqual([
+        { nested: { views: 9007199254740993n } },
+      ]);
+      await expect(counted({ views: 2n ** 70n })).rejects.toThrow(
+        "out of range for type bigint",
+      );
+    });
+
     test("in() and notIn() refuse a null in the list", () => {
       expect(() =>
         ids({ where: (thing) => thing.note.notIn(["a", null as never]) }),
@@ -561,6 +636,146 @@ describe.skipIf(!databaseUrl)(
           marks.upsert(rows, { by: "amounts" }).execute(),
         ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
         expect(await marks.count()).toBe(0);
+      } finally {
+        await isolated.close();
+      }
+    });
+
+    test("an array key of floats holds NaN and the infinities apart", async () => {
+      const isolated = await isolatedDatabase({
+        url: databaseUrl!,
+        schema: schema({
+          doubles: table({
+            id: int.auto,
+            bounds: doublePrecision.array.unique,
+            note: text,
+          }),
+          reals: table({
+            id: int.auto,
+            bounds: real.array.unique,
+            note: text,
+          }),
+          levels: table({
+            id: int.auto,
+            bounds: doublePrecision.unique,
+            note: text,
+          }),
+          docs: table({
+            id: int.auto,
+            bounds: jsonb<{ from: number[] }>().unique,
+            note: text,
+          }),
+        }),
+        prefix: "symmetria_float_keys",
+        driver: postgres,
+      });
+
+      try {
+        const { doubles, reals, levels, docs } = isolated.database;
+        const upsert = (
+          target: typeof doubles | typeof reals,
+          first: number[],
+          second: number[],
+        ) =>
+          target
+            .upsert(
+              [
+                { bounds: first, note: "first" },
+                { bounds: second, note: "second" },
+              ],
+              { by: "bounds" },
+            )
+            .execute();
+
+        for (const target of [doubles, reals]) {
+          // JSON writes all three as null, which made one key of them.
+          for (const [first, second] of [
+            [
+              [-Infinity, 0],
+              [Infinity, 0],
+            ],
+            [[Number.NaN], [Infinity]],
+            [[Number.NaN, 0], [-Infinity]],
+            [
+              [Number.NaN, 1],
+              [1, Number.NaN],
+            ],
+            [[Infinity, 1], [1]],
+          ] as const) {
+            expect(await upsert(target, [...first], [...second])).toEqual({
+              affectedRows: 2,
+            });
+          }
+
+          expect(await target.count()).toBe(10);
+          // What PostgreSQL holds equal is still one key: NaN is NaN there,
+          // and -0 is 0.
+          for (const [first, second] of [
+            [
+              [Number.NaN, 2],
+              [Number.NaN, 2],
+            ],
+            [
+              [Infinity, 2],
+              [Infinity, 2],
+            ],
+            [[-Infinity], [-Infinity]],
+            [
+              [-0, 2],
+              [0, 2],
+            ],
+          ] as const) {
+            await expect(
+              upsert(target, [...first], [...second]),
+            ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
+          }
+
+          expect(await target.count()).toBe(10);
+        }
+
+        // A float key that is no array, and a float inside a jsonb key.
+        expect(
+          await levels.upsert(
+            [
+              { bounds: Number.NaN, note: "a" },
+              { bounds: Infinity, note: "b" },
+              { bounds: -Infinity, note: "c" },
+            ],
+            { by: "bounds" },
+          ),
+        ).toEqual({ affectedRows: 3 });
+        await expect(
+          levels
+            .upsert(
+              [
+                { bounds: -0, note: "a" },
+                { bounds: 0, note: "b" },
+              ],
+              { by: "bounds" },
+            )
+            .execute(),
+        ).rejects.toBeInstanceOf(DuplicateConflictKeyError);
+        expect(
+          await docs.upsert(
+            [
+              { bounds: { from: [1.5] }, note: "a" },
+              { bounds: { from: [2.5] }, note: "b" },
+            ],
+            { by: "bounds" },
+          ),
+        ).toEqual({ affectedRows: 2 });
+        // JSON has no NaN: the value is refused, not written as null.
+        await expect(
+          docs
+            .upsert(
+              [
+                { bounds: { from: [Number.NaN] }, note: "a" },
+                { bounds: { from: [Infinity] }, note: "b" },
+              ],
+              { by: "bounds" },
+            )
+            .execute(),
+        ).rejects.toThrow("a json or jsonb value cannot hold NaN or Infinity");
       } finally {
         await isolated.close();
       }

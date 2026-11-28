@@ -109,7 +109,34 @@ export const count = (
     codec: countCodec,
   });
 
-/** A JSON number is summed exactly, as numeric. */
+/** `real` and `double precision`, in the spelling of `valueSqlType()`. */
+export const isFloatType = (sqlType: string): boolean =>
+  sqlType === "real" || sqlType === "double precision";
+
+/**
+ * What SUM and AVG read. A JSON number is added exactly, as numeric. The SQL
+ * renders a float's result through its text (see `aggregateSql`), and decides
+ * by the type the value's node has, a column's by its codec. A float that
+ * only the expression's codec tells (a `customType()` with a float `base`
+ * behind `coalesce()`, a path or a subquery) is cast to that base, which
+ * changes no value and states the type.
+ */
+const summed = (expression: SelectedColumn): ValueNode => {
+  const description = jsonScalar(readColumn(expression), "numeric");
+  const { node, outputName } = description;
+  const sqlType = valueSqlType(description);
+
+  return isFloatType(sqlType) &&
+    node.kind !== "column" &&
+    !isFloatType(valueSqlType({ node, outputName }))
+    ? castNode(node, sqlType)
+    : node;
+};
+
+/**
+ * The sum as decimal text: exact for integers, bigints and decimals, and for
+ * a `real` or `double precision` the float PostgreSQL's own `sum()` gives.
+ */
 export const sum = <
   Expression extends SelectedColumn<number | bigint | Decimal | null>,
 >(
@@ -119,7 +146,7 @@ export const sum = <
     node: freeze({
       kind: "aggregate",
       name: "SUM",
-      value: jsonScalar(readColumn(expression), "numeric").node,
+      value: summed(expression),
       numeric: true,
     }),
     outputName: "sum",
@@ -135,7 +162,7 @@ export const average = <
     node: freeze({
       kind: "aggregate",
       name: "AVG",
-      value: jsonScalar(readColumn(expression), "numeric").node,
+      value: summed(expression),
       numeric: true,
     }),
     outputName: "average",

@@ -62,6 +62,7 @@ export default defineMigrationConfig({
 | `--config <file>`              | all                                          | Config module (default `symmetria.config.ts`)                                                                                      |
 | `--dir <directory>`            | all with a project                           | Migrations directory, relative to the working directory                                                                            |
 | `--database-url <url>`         | database commands, `pull`, `lint`            | Connection; overrides `databaseUrl` and `DATABASE_URL`                                                                             |
+| `--connect-timeout <ms>`       | database commands, `pull`, `lint`            | How long the database may take to accept a connection (default 30000; 0 disables)                                                  |
 | `--json`                       | all                                          | One JSON object on stdout, `{"error": …}` on failure                                                                               |
 | `--sql`                        | `diff`                                       | Print executable SQL                                                                                                               |
 | `--diff <file.json>`           | `generate`, `diff`, `lint`                   | Rename hints and `USING` conversions                                                                                               |
@@ -91,6 +92,7 @@ export default defineMigrationConfig({
 | `--no-interactive`             | all                                          | No dashboard, schema browser or rename questions                                                                                   |
 | `--no-color`, `--no-animation` | all                                          | Plain output; no logo or spinner animation                                                                                         |
 | `--help`, `-h`                 | all                                          | Show the commands and flags                                                                                                        |
+| `--version`, `-v`              | all                                          | Print the version of symmetria-kit                                                                                                 |
 
 `--help` prints the same list. A flag of particular commands (`--sql`, `--plan`,
 `--to`, `--ignore-table`, …) is refused by the others; connection, directory,
@@ -104,8 +106,28 @@ with 143. Ctrl-C at a question (the rollback confirmation, a rename, the
 dashboard menu) exits with 130 too and rolls nothing back; Escape closes the
 question without it. Config paths resolve relative to the config file. SQL lives
 in `migrations/<id>/`; metadata lives in `migrations/meta/snapshot.json` and
-`migrations/meta/migration.json`. Commit SQL and both JSON files together.
-`diff` compares snapshots, not live DB drift.
+`migrations/meta/migration.json`; dot-files such as `.DS_Store` beside them are
+ignored. Commit SQL and both JSON files together. `diff` compares snapshots, not
+live DB drift.
+
+A migrations directory that does not exist is not an empty chain. The commands
+that read it (`migrate`, `status`, `rollback`, `verify`, `adopt`, `repair`,
+`drift`, `lint`, `squash`, `discard`, `recover`) fail when the directory named
+with `--dir` is missing, and when neither a config file nor `./migrations` is
+found where the command runs (the message names the config path it looked for).
+In a project whose config file is found and whose directory does not exist yet,
+`migrate`, `status`, `rollback`, `verify`, `squash` and `recover` still exit
+with 0 and say that `symmetria generate <name>` creates the first migration;
+their `--json` output names the directory under `missingDirectory`. The
+dashboard's header says the same in place of its migration counts.
+
+A database URL (`--database-url`, `databaseUrl`, `DATABASE_URL`, `--verify-url`,
+`verificationDatabaseUrl`) starts with `postgres://` or `postgresql://`; a
+socket directory is given in the URL
+(`postgres:///app?host=/var/run/postgresql`) or, for the project's database, as
+its path (`/var/run/postgresql`). Text without the scheme, such as
+`host:5432/app`, is refused: node-postgres would find no host in it and connect
+to localhost. The error names the flag or setting, never the value.
 
 `init` writes the tables, connection module and config of a new project and
 keeps every file that exists. When `src/database/schema.ts` exists, the
@@ -135,14 +157,21 @@ the generated files.
 `discard` removes the latest migration and puts the snapshot and the journal
 back as they were before it was generated, so the next `generate` starts from
 there. It asks the configured database first and refuses a migration that is
-applied or incomplete there (roll it back, then discard it); without a database,
+applied or incomplete there (roll it back, then discard it), and refuses while
+another process is applying migrations to that database, which `--force` does
+not override: the migration may be the one being applied. Without a database,
 `--force` says that none has applied it. It also refuses an `up.sql` edited
 after generation, which `--force` would lose. Migrations generated by earlier
 releases have no `undo` record; `discard` then takes the earlier snapshot from
 the Git history of `meta/snapshot.json`. When a migration was deleted by hand
 and `generate`, `status` and `diff` stop with "latest snapshot checksum does not
-match the migration journal", `discard` without an ID puts the snapshot back
-from the same places.
+match the migration journal" or "migration journal … does not match the SQL
+directories", `discard` without an ID repairs the chain: it takes a latest
+migration whose directory is gone out of the journal, after the same question to
+the database (or `--force` without one), and puts the snapshot back from the
+same places. The database is asked through its journal table alone, so the
+question works while the local chain does not load; putting back only the
+snapshot asks nothing.
 
 The database journal defaults to `public._symmetria_migrations`.
 `metadataSchema` and `metadataTable` configure its location; migrations create a
@@ -212,17 +241,21 @@ existing rows and drops the old sequence), types without a builder such as
 `money` (declared through `customType()`), columns of a domain type (declared
 through `customType()` with the domain's base type, so a domain over `bigint`
 reads bigints; migrations do not create the domain), multi-column unique
-constraints (declared as unique indexes), unique indexes that stand in for
-constraints (with the `ADD CONSTRAINT … USING INDEX` that converts them),
-composite or deferrable foreign keys, and the views, materialized views and
-triggers the schema does not manage. Things that exist only in the database are
-listed too, so nothing disappears without a word: table inheritance
-(`inheritance`), row-level security and policies (`row-security`), functions and
-procedures (`function`), sequences no column owns or several columns share
-(`sequence`, without the identity fix, which would drop the shared sequence),
-identity columns whose sequence starts or steps differently (`sequence`),
-`UNLOGGED` tables (`unlogged`) and the number of tables in other schemas, which
-`pull` does not read (`other-schema`). The same list is in `--json` output under
+constraints (declared as unique indexes; a `DEFERRABLE` one without a fix,
+because an index checks at once), unique indexes that stand in for constraints
+(with the `ADD CONSTRAINT … USING INDEX` that converts them), composite or
+deferrable foreign keys, every further foreign key of a column that has more
+than one (the schema declares one per column), operator class parameters of an
+index key, and the views, materialized views and triggers the schema does not
+manage. Things that exist only in the database are listed too, so nothing
+disappears without a word: table inheritance (`inheritance`), row-level security
+and policies (`row-security`), functions and procedures (`function`), sequences
+no column owns or several columns share (`sequence`, without the identity fix,
+which would drop the shared sequence), identity columns whose sequence starts or
+steps differently (`sequence`), `UNLOGGED` tables (`unlogged`), table storage
+parameters such as `fillfactor` (`storage-parameters`), rules (`rule`), foreign
+tables (`foreign-table`) and the number of tables in other schemas, which `pull`
+does not read (`other-schema`). The same list is in `--json` output under
 `warnings`, each with a `code` and, when one exists, a `fix`. The file is never
 overwritten without `--force`.
 
@@ -277,8 +310,19 @@ can stay until Prisma no longer deploys.
   SIGTERM during a database command cancels the running statement and waits up
   to five seconds for its rollback, so its locks end with it; when the server
   does not answer in that time, the CLI exits anyway and says whether a
-  statement may still be running. A second Ctrl-C exits at once. The API accepts
-  an abort signal and statement-level events.
+  statement may still be running. A second Ctrl-C exits at once, and so does the
+  first while no connection to the database (for `verify`, to the verification
+  server) has been made. The API accepts an abort signal and statement-level
+  events.
+- A database that does not accept a connection within `--connect-timeout` (30
+  seconds unless set; 0 waits as long as the operating system does) ends the
+  command with an error that names the host and port. The limit covers every
+  connection the command opens to the database and to the verification server
+  (`--verify-url`), and none of their statements.
+- Ctrl-C or SIGTERM during `generate`, `squash` or `discard` stops before
+  anything is published and leaves no lock behind (`signal` in the API). A
+  generator that was killed leaves its lock, every command then names
+  `symmetria recover`, and `recover` also removes the files it had staged.
 - `drift` checks defaults, identities, PK/FK/UNIQUE/CHECK definitions, FK
   actions, enums, indexes and validation state. On a database that is some
   migrations behind the local chain (after `rollback`, say) it reports that
@@ -367,6 +411,11 @@ try {
 tables and returns a typed database. Closing it drops that schema and its data.
 Extensions the schema needs, such as pgvector for a search by meaning, are
 installed when missing and found on the search path without further options.
+Start-up settings in the URL's `options` parameter (`-c TimeZone=…`,
+`-c statement_timeout=…`) apply to the test pool too; the test schema's
+`search_path` is added after them and wins over one they set. The URL starts
+with `postgres://` or `postgresql://`; other text is refused before anything is
+created.
 
 ```ts
 import { testDatabase } from "symmetria-kit/testing";

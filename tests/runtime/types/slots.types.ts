@@ -206,6 +206,34 @@ maybe(users.posts).setNull;
 }
 
 {
+  // A many-to-many of a table with itself: two slots of one table.
+  const people = table({
+    id: int.auto,
+    name: text,
+    following: many,
+    followers: many,
+  });
+  const follows = link(people.following, people.followers);
+  const graph = schema({ people, follows });
+  type Follow = Expect<
+    Equal<
+      typeof graph.follows.$row,
+      { followersId: number; followingId: number }
+    >
+  >;
+  const rows = await graph.people((person) => ({
+    following: person.following((followed) => ({ name: followed.name })),
+    followers: person.followers.count(),
+  }));
+  type Rows = Expect<
+    Equal<typeof rows, { following: { name: string }[]; followers: number }[]>
+  >;
+  // The link rows are read through the junction table, not from people.
+  // @ts-expect-error both keys point at people, so they have no collection there
+  graph.people((person) => ({ links: person.follows }));
+}
+
+{
   // Named references, like junction().
   const people = table({ id: int.auto, name: text });
   const teams = table({ id: int.auto, title: text });

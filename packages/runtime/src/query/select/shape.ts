@@ -17,6 +17,8 @@ import {
   type TableBinding,
 } from "../plan/types";
 import { expressionSqlType } from "../plan/metadata";
+import { writesAsBuiltIn, type RuntimeCodec } from "../codecs";
+import { canonicalType } from "../codecs/type-names";
 import { isVectorType } from "../../schema/column";
 import { SHAPE_SOURCE, shapeExpressions } from "./projections";
 import {
@@ -156,6 +158,28 @@ const sourceColumn = (
 };
 
 /**
+ * Whether one value of a column may be a JavaScript array: an array, JSON or
+ * vector column (a `customType()` by its `base`), or a `customType()` with an
+ * `encode` of its own, which decides what its values are (a range as
+ * `[from, to]`). Any other column takes a scalar, so an array given for it is
+ * a list.
+ */
+export const takesArray = (
+  sqlType: string,
+  codec: RuntimeCodec | undefined,
+): boolean => {
+  const type = codec?.base ?? canonicalType(sqlType);
+
+  return (
+    type.endsWith("[]") ||
+    type === "json" ||
+    type === "jsonb" ||
+    isVectorType(type) ||
+    (codec !== undefined && !writesAsBuiltIn(codec))
+  );
+};
+
+/**
  * `where: { state: "draft", editorId: null }`: every key equals its value,
  * `null` is IS NULL and `undefined` leaves the key out, as in query options.
  */
@@ -169,11 +193,11 @@ export const equalityPredicates = (
     }
 
     const column = sourceColumn(columns, "where", key);
+    const description = readColumn(column);
 
     if (
       Array.isArray(value) &&
-      !/(?:\[\]|^jsonb?)$/.test(expressionSqlType(readColumn(column))) &&
-      !isVectorType(expressionSqlType(readColumn(column)))
+      !takesArray(expressionSqlType(description), description.codec)
     ) {
       throw new Error(
         `symmetria: where: "${key}" takes one value; write a list as a callback, ${key}.in([...])`,

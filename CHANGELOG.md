@@ -1,5 +1,236 @@
 # Changelog
 
+## 3.7.0 — 2026-11-28
+
+Fixes from two rounds after 3.6.0: PostgreSQL 19, raw SQL in counted and paged
+queries and default values, then a bug hunt over reads with aggregates, values
+on every way in and out, transactions, migration generation, `pull`, the command
+line and relations.
+
+### Runtime (`symmetria`)
+
+- PostgreSQL 19 upserts report `DuplicateConflictKeyError` when two input rows
+  match the same unique key, just as earlier server versions do.
+- `count()` and `exists()` now use the rows produced by raw aggregates,
+  set-returning functions and mixed aggregate/window reports. Raw window ranks
+  no longer restart on each cursor page. If two result rows share a cursor after
+  expansion, `page()` refuses it; `stream()` reads every row. A page with
+  `forUpdate` or `forShare` is read from the table itself, as before, and locks
+  its rows and the one row read ahead. Over a window function, such a page with
+  `of` reports PostgreSQL's own error
+  (`FOR UPDATE is not allowed with window functions`) instead of a `TypeError`.
+  A page over raw SQL that PostgreSQL cannot inline (a volatile function such as
+  `random()`, a set-returning one such as `unnest()`) now reads the filtered
+  rows on every page; ordinary expressions cost nothing extra.
+- **Changed:** `sum()` and `average()` of a `real` or `doublePrecision` column
+  or expression return the float PostgreSQL computes with all its digits. They
+  went through PostgreSQL's float-to-numeric cast, which keeps 15 significant
+  digits of a `doublePrecision` and 6 of a `real`: a `real` sum of `123456.78`
+  read `"123457"`, and `2^53` read `"9007199254740990"`. `0.1` and `0.2` now sum
+  to `"0.30000000000000004"`, not `"0.3"`. The same holds in grouped queries,
+  `aggregate()`, relation aggregates, `.over()` windows, nested results and
+  `$batch()`, and a comparison or ordering on such a sum (`having`, a `where`
+  over a relation's sum, `orderBy`) sees the same digits. Sums of integers,
+  bigints, decimals and JSON numbers are unchanged, and page cursors stay valid.
+- An array of two or more dimensions, which only SQL written outside Symmetria
+  can store, is refused when it is read
+  (`multidimensional arrays are not supported`), on both drivers and inside
+  nested results, `$batch()` and streams. It came back as wrong values: `int[]`
+  as `[NaN, NaN]`, `numeric[]` as `["1.5,2.5", …]`, `text[]` as nested arrays.
+- `get()`, `find()`, `byId()`, `by.<key>()` and the object form of `where`
+  accept a value that is an array for a column whose values are arrays: a
+  `customType()` read as `[from, to]`, a `vector` primary key, a domain over
+  `jsonb` or over an array. They refused it with "takes one value". A list given
+  for a scalar column is still refused.
+- A prepared `numeric` or `bigint` parameter selected inside a nested object or
+  collection reads as it does at the top level: `"1e3"` came back as `"1e3"`
+  instead of `"1000"`, and a bigint beyond the type's range came back instead of
+  failing.
+- An upsert keyed by a `real[]` or `doublePrecision[]` column no longer refuses
+  two different keys as duplicates when they hold `NaN`, `Infinity` or
+  `-Infinity`.
+- Bulk upserts distinguish timestamp keys in years 1–99 from 1901–1999. Page
+  cursors for filters binding `NaN`, `Infinity` or `-Infinity` no longer work on
+  a different filter. Restart those pages after upgrading; other cursors keep
+  their fingerprints.
+- Cursor pagination can resume on long text sort keys and on arrays whose first
+  index is not 1. Both drivers read those one-dimensional arrays, including
+  `box[]`, as ordinary JavaScript arrays.
+- A damaged or made-up page cursor whose values have the right form but that no
+  type of the ordering column's family could hold is refused with
+  `invalid page cursor or cursor from another query` before any SQL is sent,
+  instead of surfacing as a database error: an integer beyond `bigint`, February
+  31, year 0000, a zone offset of `+99`, text that is no time or interval,
+  `1e400000` for a numeric column, a NUL character. A value is held to the
+  widest type of its family (any integer to `bigint`, a float to
+  `doublePrecision`) and an enum label is left to PostgreSQL, because the
+  database may be a migration ahead of a running process: a column already
+  widened, a label its schema does not list yet. The reference now says what a
+  cursor holds: it is not encrypted or signed and carries the text of the row's
+  ordering values, also of ordering columns the projection leaves out.
+- `symmetria/pg` with `prepare: true`: a value node-postgres could not turn into
+  text (an object holding a BigInt such as a row with a `bigint` column, a
+  circular object, an object whose `toJSON()` or `toPostgres()` throws), passed
+  inside a transaction or a session, broke that statement on the connection:
+  every later run of the same text there failed with
+  `prepared statement "symmetria_N" does not exist` until the pool replaced the
+  connection. The transaction still fails with the original error and rolls
+  back, and the statement keeps working afterwards. A JSON value now fails
+  before the statement is sent; after any other failure of this kind the
+  connection is closed when the transaction or session ends.
+- `symmetria/pg` with `prepare: true`: after a column changed its type, only the
+  first of several calls in flight on different connections ran again; the
+  others failed with `cached plan must not change result type`. Every call
+  outside a transaction now runs again under the statement's new name, including
+  a statement of `driver.session()` outside a transaction. A transaction still
+  fails once, as documented.
+- A many-to-many of a table with itself (followers and following) can be
+  declared: two slots of the table joined by
+  `link(users.following, users.followers)`. It was refused as an ambiguous
+  relation name, with advice to pass a `schema()` override that does not exist;
+  for other ambiguous names the error now names slots and `.inverse()`.
+
+### Kit (`symmetria-kit`)
+
+- `real` and `doublePrecision` defaults preserve negative zero and accept `NaN`
+  and both infinities, also inside an array default.
+- Migration generation now detects changes to calendar days versus elapsed
+  hours, exact JSONB numbers, timestamp microseconds and wall-clock times, and
+  non-breaking spaces in array defaults.
+- An interval default or CHECK literal with a number that has no unit is
+  compared as PostgreSQL reads it: `'1 0:00:00'` is one day, `'90'` is 90
+  seconds, `'1:30.5'` is a minute and a half. Changing `'1 0:00:00'` to
+  `'0:00:01'` generated no migration. A spelling PostgreSQL refuses is never
+  equal to a valid one. `INTERVAL '1 day'` and `'1 day'::interval` are one
+  default. A spelling whose meaning depends on the server (`'-1 day 2:00'` under
+  `IntervalStyle`, half a microsecond, `'1. day'` before PostgreSQL 16), that
+  the comparison does not read (ISO 8601 `P1D`, `1h30m`, a text of more than 200
+  characters), or that belongs to a column declared with fields
+  (`interval hour to minute`) is compared as written: replacing it by an equal
+  one gives a migration that sets the same default, or drops and adds the CHECK
+  or index that holds it, once.
+- An array default written in SQL is read as PostgreSQL reads it: white space
+  after a quoted element adds no element (`'{"a" ,"b"}'` holds two), `'{ }'` is
+  empty, `'{ "a" }'` holds `a`. Changing `'{"a" ,"b"}'` to `["a", "", "b"]`
+  generated no migration.
+- A `Date` used as a `timestamp` default now stores the same UTC wall-clock time
+  as an explicit insert, even outside UTC. Timestamp defaults also accept BC
+  dates. Generate and apply a migration to update an existing default; changing
+  the default does not rewrite existing rows.
+- JSON defaults now reject `NaN` and infinities instead of silently storing them
+  as JSON `null`.
+- **Changed:** a `text`/`varchar` column turned into `timestamptz[]` (or
+  `timetz[]`), and a `timestamptz[]` column turned into a string, convert at UTC
+  like the other date and time changes, in `up.sql` and `down.sql`. The values
+  no longer depend on the time zone of the session that migrates. The generated
+  SQL sets the session's zone to UTC around the statement.
+- **Changed:** `interval` to `time` (also `interval[]` to `time[]`, and an
+  interval declared with fields such as `interval hour to minute`) is a
+  destructive change. PostgreSQL keeps the time of day only (`1 day 02:00:00`
+  and `26:00:00` both become `02:00:00`) and a rollback cannot restore it.
+  `generate` asks for `--allow-destructive`, and the saved SQL carries the
+  `-- symmetria: destructive:` note.
+- A migration that adds a label to an enum and turns a column of another type
+  (text, varchar, another enum) into that enum failed with SQLSTATE 55P04 when a
+  row held the new label. So did the rollback of a migration that removed a
+  label and turned an enum column into text. **Changed:** such a migration now
+  rebuilds the type, as one whose default or CHECK uses the new label does;
+  `--online` keeps `ADD VALUE`. Like every rebuild of a type, it fails and rolls
+  back while a view, a function or a domain made outside the schema depends on
+  the type; drop and recreate that object around the migration.
+- `pull` declares a division the way PostgreSQL computes it. A hand-written
+  `CHECK (items / 2 = 3)` or index key over integer columns was pulled as
+  `divide()`, an exact division, so a database built from the module accepted
+  and refused other rows than the original, and the module did not type-check.
+  It is now `quotient()`; `divide()` is used only where PostgreSQL divides
+  `numeric` or `double precision` values.
+- A pulled module type-checks when a column needs `.named()` and has an
+  identity, `now()`, `gen_random_uuid()` or `uuidv7()` default: the shortcut is
+  written first (`int.auto.byDefault.named("Id")`). Every PascalCase database
+  was affected.
+- A pulled module loads when a table is named `one`, `maybe`, `many`, `link`,
+  `as_number` or `then`: such a table is bound under another name in callbacks,
+  and `then` gets the key `thenValue` with `.named("then")`.
+- **Changed:** when a column has more than one foreign key, `pull` declares the
+  one named `<table>_<column>_fkey`, or else the first by name, and lists every
+  other one with its definition. Before, the last by name was declared and the
+  others disappeared without a word.
+- `pull` declares a `numeric(p,s)` whose scale is above its precision or below
+  zero (`numeric(3,5)`, `numeric(5,-2)`, PostgreSQL 15+) as
+  `customType<Decimal>("numeric(3,5)", { base: "numeric" })`: its values are
+  exact decimal text, as a `numeric()` column's. A module with `numeric(3,5)`
+  used to throw on import, and one with a CHECK that computes or compares such a
+  column did not type-check. **Changed:** a `numeric(5,-2)` column was
+  `customType<string>` before.
+- A pulled module loads when a CHECK or index predicate compares a `smallint`
+  value with a number outside the smallint range (`CHECK (boxes <= 40000)`,
+  `boxes / per_box < 100000`): PostgreSQL accepts such a condition, the DSL
+  refuses the number, so the condition is kept as `sql`.
+- `pull` now lists what it dropped silently: operator class parameters of an
+  index key (`gist_trgm_ops (siglen = 64)`), rules (`rule`), foreign tables
+  (`foreign-table`) and table storage parameters (`storage-parameters`).
+  **Changed:** a `DEFERRABLE` or `NULLS NOT DISTINCT` multi-column UNIQUE
+  constraint is listed with what a database built from the schema loses and
+  without the `DROP CONSTRAINT` / `CREATE UNIQUE INDEX` fix, which would have
+  made the check immediate (or let NULLs repeat) in the database itself.
+- `pull` declares a default with the value PostgreSQL stores when its literal
+  has another type than the column: `'ab '::bpchar` on a text column is `"ab"`,
+  `'abcdef'::varchar(3)` is `"abc"`; a `numeric(10,2)` literal with fewer
+  decimals is written out with them (`'7'::numeric(10,2)` is `"7.00"`, what a
+  fresh row holds); a `real` literal on a `double precision` column and a
+  `numeric(10,2)` literal with more decimals stay SQL defaults.
+- `drift` no longer fails with a `TypeError` on a partitioned table with two or
+  more partitions that has a default, an index or a CHECK.
+- `testDatabase()` keeps the `options` of the URL it is given (`-c TimeZone=…`)
+  and refuses text that is not a URL. The disposable databases of `verify` keep
+  the options of `--verify-url` as well.
+
+### Command line (`symmetria`)
+
+- **Changed:** `migrate`, `status`, `rollback`, `verify`, `adopt`, `repair`,
+  `drift`, `lint`, `squash`, `discard` and `recover` fail when the directory
+  named with `--dir` does not exist, and when neither a config file nor
+  `./migrations` is found where the command runs; a mistyped path used to report
+  "Database is up to date." In a project whose config is found and whose
+  directory does not exist yet, they still exit with 0 and say that `generate`
+  creates the first migration (`missingDirectory` in `--json`).
+- **Changed:** the CLI gives the database, and the verification server, 30
+  seconds to accept a connection (`--connect-timeout <ms>`, 0 disables) and then
+  fails with an error naming the server's host and port, instead of waiting for
+  the operating system. Ctrl-C before any connection is made exits at once, for
+  `verify` too. `verifyMigrations` takes `connectionTimeoutMs` and `onConnect`.
+- **Changed:** a database URL must start with `postgres://` or `postgresql://`
+  (`--database-url`, `databaseUrl`, `DATABASE_URL`, `--verify-url`,
+  `verificationDatabaseUrl`, and `testDatabase({ url })`). Text with the scheme
+  forgotten, such as `host:5432/app`, passed the check, and node-postgres then
+  connected to localhost instead of the server that was written. Socket
+  directories and `postgres:///app?host=/dir` still work. `adopt` checks the
+  verification URL before it connects.
+- `discard` repairs a latest migration whose directory was deleted by hand also
+  when a database is configured; it asks the database's journal directly and
+  still refuses a migration that database has applied. It also refuses while
+  another process is applying migrations there, with or without `--force`: the
+  journal row of a migration that is still running is not visible to other
+  sessions, so `discard` used to remove the files of a migration the database
+  then listed as applied.
+- `recover` removes the staging directory of a generator that was killed before
+  it published anything. Ctrl-C or SIGTERM during `generate`, `squash` or
+  `discard` leaves no lock (`signal` in the API), and the "already locked" error
+  names `symmetria recover`.
+- A `.DS_Store` or other dot-file in `migrations/meta/` no longer stops every
+  command; another stray entry is named in the error, which also says when one
+  of the two files is a directory or a symbolic link.
+- The dashboard names a migrations directory that does not exist instead of
+  showing "Up to date", and no longer shows parts of a database URL that is not
+  one.
+- **Changed:** timeout flags and `--steps` take plain digits (`1e3` and `0x10`
+  are refused); `rollback --plan` with nothing applied exits with 0; Ctrl-C in
+  the schema browser and the profiler exits with 130; Escape closes a typed
+  question.
+- `symmetria --version` / `-v`. Wrong config values and `--diff` / `--snapshot`
+  files are refused with a message naming the file or option. Non-interactive
+  `profile` gives up after 10 seconds.
+
 ## 3.6.0 — 2026-11-24
 
 Fixes from a bug hunt on 3.5.0 in places no hunt had reached (table search and

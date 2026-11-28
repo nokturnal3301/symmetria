@@ -132,6 +132,15 @@ test("JSON defaults follow JSON serialization semantics and enum ownership is un
       (column) => column.name === "details",
     )?.default,
   ).toBe(`E'{"date":"2026-01-01T00:00:00.000Z"}'::jsonb`);
+  for (const amount of [NaN, Infinity, -Infinity]) {
+    expect(() =>
+      createSchemaSQL(
+        schema({
+          records: { id: int, details: jsonb().default({ amount }) },
+        }).$snapshot(),
+      ),
+    ).toThrow(/NaN or Infinity/);
+  }
   const conflicting = schema({
     firstSecond: { id: int, status: oneOf("a") },
     first: { id: int, secondStatus: oneOf("a") },
@@ -179,6 +188,44 @@ test("array and Standard Schema JSON defaults become typed literals", () => {
       }).$snapshot(),
     ),
   ).toThrow(/unsupported default for "grid.cells"/);
+});
+
+test("a float array default keeps the sign of zero, and a snapshot saved without it gets it once", () => {
+  const model = schema({
+    records: {
+      id: int.auto,
+      single: real.array.default([-0, 1.5, 0]),
+      wide: doublePrecision.array.default([-0]),
+      whole: int.array.default([-0, 1]),
+    },
+  }).$snapshot();
+  const now = migrationSnapshot(model);
+
+  expect(now.tables[0]!.columns.map((column) => column.default)).toEqual([
+    undefined,
+    `E'{"-0","1.5","0"}'::real[]`,
+    `E'{"-0"}'::double precision[]`,
+    // An integer has one zero.
+    `E'{"0","1"}'::integer[]`,
+  ]);
+
+  // Earlier versions wrote "0" for -0: the database holds +0 until one
+  // SET DEFAULT, and generating again changes nothing.
+  const saved = structuredClone(now);
+
+  for (const column of saved.tables[0]!.columns) {
+    if (column.default !== undefined) {
+      column.default = column.default.replaceAll('"-0"', '"0"');
+    }
+  }
+
+  const plan = diffSchemas(saved, model);
+
+  expect(plan.up).toEqual([
+    `ALTER TABLE "records" ALTER COLUMN "single" SET DEFAULT E'{"-0","1.5","0"}'::real[]`,
+    `ALTER TABLE "records" ALTER COLUMN "wide" SET DEFAULT E'{"-0"}'::double precision[]`,
+  ]);
+  expect(diffSchemas(structuredClone(plan.after), model).up).toEqual([]);
 });
 
 test("DDL creates enum types and tables before foreign keys, including cyclic references", () => {
@@ -388,6 +435,85 @@ test("an enum value nothing in the migration uses is appended with ADD VALUE, ev
       sql.startsWith('ALTER TYPE "records_status_enum" RENAME TO'),
     ),
   ).toBe(true);
+});
+
+test("a column that becomes an enum in the migration that adds a label rebuilds the type", () => {
+  const state = (...labels: [string, ...string[]]) =>
+    oneOf(...labels).typeName("State");
+  const before = schema({
+    posts: { id: int.auto, state: state("draft", "published") },
+    comments: { id: int.auto, state: text },
+  }).$snapshot();
+  const shared = state("draft", "published", "hidden");
+  const after = schema({
+    posts: { id: int.auto, state: shared },
+    comments: { id: int.auto, state: shared },
+  }).$snapshot();
+  const plan = diffSchemas(before, after);
+
+  // A row of comments may hold 'hidden', which PostgreSQL refuses to cast in
+  // the transaction that added the label.
+  expect(
+    plan.up.map((sql) => sql.replaceAll(/_previous_\w+/g, "_previous")),
+  ).toEqual([
+    'ALTER TYPE "State" RENAME TO "State_previous"',
+    "CREATE TYPE \"State\" AS ENUM (E'draft', E'published', E'hidden')",
+    'ALTER TABLE "comments" ALTER COLUMN "state" TYPE "State" USING "state"::text::"State"',
+    'ALTER TABLE "posts" ALTER COLUMN "state" TYPE "State" USING "state"::text::"State"',
+    '-- symmetria: caution: type "State_previous" held the previous labels of "State" and is no longer used; dropping it loses no data.\nDROP TYPE "State_previous"',
+  ]);
+  expect(
+    lintMigration(plan).map(
+      (finding) => `${finding.level}: ${finding.message}`,
+    ),
+  ).toContain('caution: Enum "State" is rebuilt to change its labels.');
+  // A renamed column, another enum and a varchar are converted the same way.
+  const mood = oneOf("draft", "hidden").typeName("Mood");
+
+  for (const [column, hints] of [
+    [{ state: varchar(20) }, {}],
+    [{ state: mood }, {}],
+    [
+      { status: text },
+      { renames: { columns: { comments: { status: "state" } } } },
+    ],
+  ] as const) {
+    expect(
+      diffSchemas(
+        schema({
+          posts: { id: int.auto, state: state("draft", "published") },
+          comments: { id: int.auto, ...column },
+        }).$snapshot(),
+        after,
+        hints,
+      ).up.filter((sql) => sql.includes("ADD VALUE")),
+    ).toEqual([]);
+  }
+
+  // Each statement of an online migration commits, so the label is there
+  // when the column is converted.
+  expect(diffSchemas(before, after, { online: true }).up).toEqual([
+    "ALTER TYPE \"State\" ADD VALUE E'hidden'",
+    'ALTER TABLE "comments" ALTER COLUMN "state" TYPE "State" USING "state"::text::"State"',
+  ]);
+  // A column that leaves the enum, or one added with it, converts no row
+  // into the new label.
+  expect(
+    diffSchemas(
+      schema({
+        posts: { id: int.auto, state: state("draft", "published") },
+        comments: { id: int.auto, state: state("draft", "published") },
+      }).$snapshot(),
+      schema({
+        posts: { id: int.auto, state: shared, second: shared.nullable },
+        comments: { id: int.auto, state: text },
+      }).$snapshot(),
+    ).up,
+  ).toEqual([
+    "ALTER TYPE \"State\" ADD VALUE E'hidden'",
+    'ALTER TABLE "comments" ALTER COLUMN "state" TYPE text USING "state"::text::text',
+    'ALTER TABLE "posts" ADD COLUMN "second" "State"',
+  ]);
 });
 
 test("generated object names respect PostgreSQL's byte limit and reject collisions", () => {
@@ -1583,6 +1709,12 @@ test("spellings PostgreSQL treats as one value are no migration", () => {
         id: int.auto,
         tags: text.array.default(["a b", "c"]),
         meta: jsonb<{ a: number }>().default({ a: 1 }),
+        exact: jsonb().default(
+          sql`'{"n":[9007199254740993],"s":"9007199254740993"}'::jsonb`,
+        ),
+        precise: timestamptz.default(
+          sql`'2026-01-01 12:00:00.000001+02'::timestamptz`,
+        ),
         at: timestamptz.default(new Date("2026-01-01T00:00:00Z")),
         wait: interval.default("90 minutes"),
       },
@@ -1592,6 +1724,12 @@ test("spellings PostgreSQL treats as one value are no migration", () => {
         id: int.auto,
         tags: text.array.default(sql`'{"a b",c}'::text[]`),
         meta: jsonb<{ a: number }>().default(sql`'{"a": 1}'::jsonb`),
+        exact: jsonb().default(
+          sql`'{"s":"9007199254740993","n":[9.007199254740993e15]}'::jsonb`,
+        ),
+        precise: timestamptz.default(
+          sql`'2026-01-01 10:00:00.000001Z'::timestamptz`,
+        ),
         at: timestamptz.default(
           sql`'2026-01-01 00:00:00+00'::timestamp with time zone`,
         ),
@@ -1610,6 +1748,47 @@ test("spellings PostgreSQL treats as one value are no migration", () => {
       }).$snapshot(),
     ).up,
   ).toEqual([`ALTER TABLE "items" ALTER COLUMN "wait" SET DEFAULT E'2 hours'`]);
+});
+
+test("an array default is compared as PostgreSQL's array input reads it", () => {
+  const tags = (value: string) => {
+    const snapshot = migrationSnapshot(
+      schema({ items: { id: int.auto, tags: text.array } }).$snapshot(),
+    );
+
+    snapshot.tables[0]!.columns[1]!.default = value;
+
+    return snapshot;
+  };
+  const changes = (from: string, to: string) =>
+    diffSchemas(tags(from), tags(to)).up.length;
+
+  // White space after a quoted element is no element, and `{ }` is empty.
+  expect(changes(`'{"a" ,"b"}'::text[]`, `E'{"a","","b"}'::text[]`)).toBe(1);
+  expect(changes(`'{ }'::text[]`, `E'{""}'::text[]`)).toBe(1);
+  expect(changes(`'{ "a" }'::text[]`, String.raw`E'{"\\"a\\""}'::text[]`)).toBe(
+    1,
+  );
+  expect(changes(`'{NULL}'::text[]`, `'{"NULL"}'::text[]`)).toBe(1);
+  // The same arrays, as written and as PostgreSQL prints them.
+  expect(changes(`'{"a" ,"b"}'::text[]`, `'{a,b}'::text[]`)).toBe(0);
+  expect(changes(`'{ "a" , b }'::text[]`, `E'{"a","b"}'::text[]`)).toBe(0);
+  expect(changes(`'{ }'::text[]`, `E'{}'::text[]`)).toBe(0);
+  expect(
+    changes(` '{"a b" , null ,"NULL"} '`, `'{"a b",NULL,"NULL"}'::text[]`),
+  ).toBe(0);
+  expect(
+    changes(
+      String.raw`'{"a\"b","c\d"}'::text[]`,
+      String.raw`E'{"a\\"b","cd"}'::text[]`,
+    ),
+  ).toBe(0);
+  // What PostgreSQL refuses, other bounds and nested arrays compare as written.
+  expect(changes(`'{a,b}'::text[]`, `'[0:1]={a,b}'::text[]`)).toBe(1);
+  expect(changes(`'{"a"b}'::text[]`, `'{ab}'::text[]`)).toBe(1);
+  expect(changes(`'{a,}'::text[]`, `'{a}'::text[]`)).toBe(1);
+  expect(changes(`'{a,,b}'::text[]`, `'{a,"",b}'::text[]`)).toBe(1);
+  expect(changes(`'{{a}}'::text[]`, `'{a}'::text[]`)).toBe(1);
 });
 
 test("an extension name may have a hyphen, as uuid-ossp does", () => {
@@ -1762,6 +1941,40 @@ test("date and time conversions where a time zone enters convert at UTC, up and 
   ]);
 });
 
+test("a string that holds an array of timestamptz as text converts at UTC, up and down", () => {
+  const change = (from: Column, to: Column) =>
+    diffSchemas(
+      schema({ items: table({ id: int.auto, at: from }) }).$snapshot(),
+      schema({ items: table({ id: int.auto, at: to }) }).$snapshot(),
+    );
+  const read = change(text, timestamptz.array);
+
+  // Each element is read and written as a single value is: in the session's
+  // zone, unless it is set.
+  expect(read.up).toEqual([
+    "SET TIME ZONE 'UTC'",
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE timestamptz[] USING "at"::timestamptz[]',
+    "RESET TIME ZONE",
+  ]);
+  expect(read.down).toEqual([
+    "SET TIME ZONE 'UTC'",
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE text USING "at"::text',
+    "RESET TIME ZONE",
+  ]);
+  expect(change(timestamptz.array, varchar).up).toEqual([
+    "SET TIME ZONE 'UTC'",
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE varchar USING "at"::varchar',
+    "RESET TIME ZONE",
+  ]);
+  // An array without a zone in it reads none.
+  expect(change(text, timestamp.array).up).toEqual([
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE timestamp[] USING "at"::timestamp[]',
+  ]);
+  expect(change(text, int.array).down).toEqual([
+    'ALTER TABLE "items" ALTER COLUMN "at" TYPE text USING "at"::text',
+  ]);
+});
+
 test("type changes between built-in types without a cast are refused, in either direction", () => {
   const change = (from: Column, to: Column) => () =>
     diffSchemas(
@@ -1851,6 +2064,57 @@ test("numeric to an integer type narrows when its digits before the point can ex
   expect(destructive(numeric(18, 0), bigint)).toEqual([]);
 });
 
+test("interval to time narrows: PostgreSQL keeps the time of day only", () => {
+  const change = (from: Column, to: Column) =>
+    diffSchemas(
+      schema({ t: table({ id: int.auto, wait: from }) }).$snapshot(),
+      schema({ t: table({ id: int.auto, wait: to }) }).$snapshot(),
+    );
+  const message =
+    'Column "wait" narrows from interval to time: months and days are dropped, and so are whole days of hours (26:00:00 becomes 02:00:00).';
+  const plan = change(interval, time);
+
+  // `1 day 02:00:00` and `26:00:00` become `02:00:00`, and a rollback cannot
+  // bring them back.
+  expect(plan.up).toEqual([
+    `-- symmetria: destructive: ${message}\nALTER TABLE "t" ALTER COLUMN "wait" TYPE time USING "wait"::time`,
+  ]);
+  expect(
+    lintMigration(plan).map((finding) => [finding.level, finding.message]),
+  ).toEqual([["destructive", message]]);
+  // The saved file is rated as the plan is.
+  expect(
+    lintMigrationSQL(`${plan.up[0]};`).map((finding) => finding.level),
+  ).toContain("destructive");
+  expect(
+    lintMigrationSQL(`${plan.down[0]};`).map((finding) => finding.level),
+  ).toEqual(["caution"]);
+  expect(
+    lintMigration(change(interval.array, time.array)).map(
+      (finding) => finding.level,
+    ),
+  ).toEqual(["destructive"]);
+  // An interval declared with fields loses the same days.
+  expect(
+    lintMigration(
+      change(
+        customType<string>("interval hour to minute", {
+          encode: (value) => value,
+          decode: String,
+        }),
+        time,
+      ),
+    ).map((finding) => finding.level),
+  ).toEqual(["destructive"]);
+  // A time is an interval as it is.
+  expect(plan.down).toEqual([
+    'ALTER TABLE "t" ALTER COLUMN "wait" TYPE interval USING "wait"::interval',
+  ]);
+  expect(
+    lintMigration(change(time, interval)).map((finding) => finding.level),
+  ).toEqual(["caution"]);
+});
+
 test("CHECK literals PostgreSQL stores in another spelling compare as the same", () => {
   const timetz = customType<string>("timetz", {
     encode: (value) => value,
@@ -1928,6 +2192,96 @@ test("interval literals compare as PostgreSQL keeps them: months, days and time 
   expect(changes("1 day", "24 hours")).toBe(2);
   expect(changes("1.5 days", "36 hours")).toBe(2);
   expect(changes("1 mon", "30 days")).toBe(2);
+});
+
+test("an interval is compared as PostgreSQL reads it, and a spelling it reads another way as written", () => {
+  const wait = (value: string) => {
+    const snapshot = migrationSnapshot(
+      schema({ items: { id: int.auto, wait: interval } }).$snapshot(),
+    );
+
+    snapshot.tables[0]!.columns[1]!.default = value;
+
+    return snapshot;
+  };
+  const changes = (from: string, to: string) =>
+    diffSchemas(wait(from), wait(to)).up.length;
+  const check = (bound: string) =>
+    schema({
+      t: table({ id: int.auto, iv: interval }).checks((t) => ({
+        short: t.iv.below(bound),
+      })),
+    }).$snapshot();
+
+  // A number before a clock time is days: one day against one second.
+  expect(diffSchemas(wait("E'1 0:00:00'"), wait("E'0:00:01'")).up).toEqual([
+    `ALTER TABLE "items" ALTER COLUMN "wait" SET DEFAULT E'0:00:01'`,
+  ]);
+  expect(changes("E'3 4:05:06'", "E'04:05:09'")).toBe(1);
+  expect(diffSchemas(check("1 0:00:00"), check("0:00:01")).up).toHaveLength(2);
+  // Two numbers and a fraction are minutes and seconds, without it hours
+  // and minutes; a number before hours is days.
+  expect(changes("E'1:30'", "E'1:30.0'")).toBe(1);
+  expect(changes("E'1:30.0'", "'00:01:30'::interval")).toBe(0);
+  expect(changes("E'2 hours 1'", "E'1 2 hours'")).toBe(1);
+  // The spellings PostgreSQL prints for a value are that value.
+  for (const [written, printed] of [
+    ["1 0:00:00", "1 day"],
+    ["1 2:03:04", "1 day 02:03:04"],
+    ["1 2 hours", "1 day 02:00:00"],
+    ["90", "00:01:30"],
+    ["1.5 days", "1 day 12:00:00"],
+    ["1.5 years", "1 year 6 mons"],
+    ["0.5 weeks 1 ms", "3 days 12:00:00.001"],
+    ["-1 day +2:00", "-1 days +02:00:00"],
+    ["@ 1 hour 30 mins ago", "-01:30:00"],
+    ["1 Decade\t2 D", "10 years 2 days"],
+  ]) {
+    expect([
+      written,
+      changes(`E'${written}'`, `'${printed}'::interval`),
+    ]).toEqual([written, 0]);
+  }
+
+  expect(changes("INTERVAL '1 d'", "'1 day'::interval")).toBe(0);
+  expect(changes("('1 day')::interval", "E'24 hours'")).toBe(1);
+  // What PostgreSQL refuses is no value, so it is never equal to one.
+  for (const [refused, valid] of [
+    ["1 day 1 day", "2 days"],
+    ["1 12", "00:00:13"],
+    ["-.5 days", "-12:00:00"],
+    ["1:60", "02:00:00"],
+    ["1 ago", "-00:00:01"],
+    ["", "00:00:00"],
+    ["1\u00a0day", "1 day"],
+    // Longer than the 256 bytes PostgreSQL reads an interval into.
+    [`1.5${"0".repeat(260)} hours`, "01:30:00"],
+  ]) {
+    expect([refused, changes(`E'${refused}'`, `'${valid}'::interval`)]).toEqual(
+      [refused, 1],
+    );
+  }
+
+  // Left to the text: read differently under IntervalStyle sql_standard, by
+  // PostgreSQL versions (half a microsecond), or not read here (ISO 8601).
+  expect(changes("E'-1 day 2:00'", "'-1 days +02:00:00'::interval")).toBe(1);
+  expect(changes("E'1.0000005 seconds'", "'00:00:01'::interval")).toBe(1);
+  expect(changes("E'P1D'", "'1 day'::interval")).toBe(1);
+  // A number that ends in its point is read from PostgreSQL 16, refused before.
+  expect(changes("E'24. seconds'", "'00:00:24'::interval")).toBe(1);
+  expect(changes("E'1. day'", "'1 day'::interval")).toBe(1);
+  // A type restricted to some fields reads a bare number in its own unit.
+  const minutes = (value: string) => {
+    const snapshot = wait(value);
+
+    snapshot.tables[0]!.columns[1]!.sqlType = "interval minute";
+
+    return snapshot;
+  };
+
+  expect(diffSchemas(minutes("E'90'"), minutes("E'00:01:30'")).up).toHaveLength(
+    1,
+  );
 });
 
 test("typed literals and IN lists compare the way PostgreSQL stores them", () => {

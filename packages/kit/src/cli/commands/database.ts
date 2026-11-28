@@ -2,7 +2,6 @@
  * Database-backed CLI commands: verify, drift, repair, adopt, status, migrate and rollback.
  * Each one opens a connection through the shared context and prints or emits JSON.
  */
-import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   detectDrift,
@@ -23,6 +22,7 @@ import {
   rollbackSummary,
 } from "../screens/rollback-prompt";
 import {
+  readJSONFile,
   verificationUrl,
   withCancellation,
   withDatabase,
@@ -43,13 +43,27 @@ export const verify = async (
     );
   }
 
-  const result = await withCancellation((signal) =>
-    verifyMigrations({
-      ...project.runnerOptions,
-      ...project.config.verify,
-      url,
-      signal,
-    }),
+  // Whether a connection to the verification server was made: until then an
+  // interrupt leaves nothing there to stop or to clean up.
+  let connected = false;
+  const result = await withCancellation(
+    (signal) =>
+      verifyMigrations({
+        ...project.runnerOptions,
+        ...project.config.verify,
+        url,
+        signal,
+        onConnect: () => {
+          connected = true;
+        },
+      }),
+    {
+      unfinished: () =>
+        connected
+          ? undefined
+          : "a connection to the verification server was made; nothing was sent",
+      waits: () => connected,
+    },
   );
   context.emit({
     json: result,
@@ -230,11 +244,12 @@ const plan = async (
   context: CliContext,
   runner: Runner,
   direction: "up" | "down",
+  count?: number,
 ): Promise<void> => {
   const { values } = context;
   const steps = await runner.plan({
     ...(values.to ? { to: values.to } : {}),
-    ...(values.steps ? { steps: Number(values.steps) } : {}),
+    ...(count === undefined ? {} : { steps: count }),
     direction,
   });
   context.emit({
@@ -242,6 +257,19 @@ const plan = async (
     indent: 2,
     plain: () => formatPlan(steps),
   });
+};
+
+/** The snapshot in the file given to --snapshot; what is wrong with it names the file. */
+const snapshotFile = async (file: string) => {
+  const content = await readJSONFile("snapshot", file);
+
+  try {
+    return parseMigrationSnapshot(content);
+  } catch (error) {
+    throw new Error(
+      `symmetria: the --snapshot file ${resolve(file)} is not a migration snapshot such as meta/snapshot.json (${(error instanceof Error ? error.message : String(error)).replace(/^symmetria: /, "")})`,
+    );
+  }
 };
 
 export const repair = (
@@ -256,12 +284,7 @@ export const repair = (
     // The snapshot file of the boundary, such as meta/snapshot.json as it was
     // before the migration was generated; the runner checks its hash.
     const file = context.values.snapshot;
-    const snapshot =
-      file === undefined
-        ? undefined
-        : parseMigrationSnapshot(
-            JSON.parse(await readFile(resolve(file), "utf8")),
-          );
+    const snapshot = file === undefined ? undefined : await snapshotFile(file);
     await runner.repair({ id, action, ...(snapshot ? { snapshot } : {}) });
     context.emit({
       json: { repaired: id, action },
@@ -272,6 +295,8 @@ export const repair = (
 export const adopt = (context: CliContext, project: Project): Promise<void> =>
   withRunner(project, async (runner) => {
     const { values } = context;
+    // Checked before the runner may need it to verify the boundary.
+    verificationUrl(project);
     const adopted = await context.progress("Recording the local chain", () =>
       runner.adopt(values.to ? { to: values.to } : {}),
     );
@@ -349,18 +374,48 @@ export const migrate = (context: CliContext, project: Project): Promise<void> =>
     });
   });
 
-export const rollback = (
+export const rollback = async (
   context: CliContext,
   project: Project,
-): Promise<void> =>
-  withRunner(project, async (runner) => {
-    const { values } = context;
+): Promise<void> => {
+  const { values } = context;
 
+  // Checked before a connection is opened: Number("abc") would reach the
+  // runner as NaN, and "1e1" as ten migrations.
+  if (
+    values.steps !== undefined &&
+    !(
+      /^\d+$/.test(values.steps) &&
+      Number.isSafeInteger(Number(values.steps)) &&
+      Number(values.steps) >= 1
+    )
+  ) {
+    throw new Error(
+      `symmetria: invalid --steps ${JSON.stringify(values.steps)}: expected a whole number of migrations, 1 or more`,
+    );
+  }
+
+  const steps = values.steps === undefined ? 1 : Number(values.steps);
+
+  return withRunner(project, async (runner) => {
     if (values.plan) {
-      return plan(context, runner, "down");
+      // With nothing applied there is nothing to plan, which rollback
+      // itself reports the same way.
+      if (
+        !(await runner.status()).some((entry) => entry.status !== "pending")
+      ) {
+        context.emit({
+          json: { steps: [] },
+          indent: 2,
+          plain: () => "No applied migrations.",
+        });
+
+        return;
+      }
+
+      return plan(context, runner, "down", steps);
     }
 
-    const steps = values.steps === undefined ? 1 : Number(values.steps);
     let expected: string[] | undefined;
 
     // down.sql usually removes columns or tables, so it never runs unasked.
@@ -419,3 +474,4 @@ export const rollback = (
           : "No applied migrations.",
     });
   });
+};

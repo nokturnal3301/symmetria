@@ -29,16 +29,62 @@ export type VerifyOptions = ExecutionOptions & {
    * catalog comparisons; tables the latest snapshot declares are compared.
    */
   ignoreTables?: readonly string[];
+  /**
+   * Milliseconds the server of `url` may take to accept a connection; without
+   * it a server that does not answer is waited for as long as the operating
+   * system keeps trying.
+   */
+  connectionTimeoutMs?: number;
+  /**
+   * Called each time a connection to the server of `url` opens. Until the
+   * first call nothing has reached that server.
+   */
+  onConnect?: () => void;
   beforeMigration?: (context: VerificationContext) => Promise<void>;
   afterMigration?: (context: VerificationContext) => Promise<void>;
+};
+
+/** node-postgres's message when a connection was not accepted in time. */
+const CONNECT_TIMEOUT = "Connection terminated due to connection timeout";
+
+/**
+ * The server a connection URL points at, as `host:port` or as its socket
+ * directory, for messages: never the credentials, the database or the
+ * options. Undefined when the text names no host (node-postgres then takes
+ * PGHOST or localhost).
+ */
+export const serverAddress = (url: string): string | undefined => {
+  if (url.startsWith("/")) {
+    return `the socket directory ${url.split(" ")[0]}`;
+  }
+
+  const parsed = /^postgres(?:ql)?:\/\//i.test(url) ? URL.parse(url) : null;
+  // `?host=` (a socket directory, as Cloud SQL uses) overrides the URL's host.
+  const host = parsed?.searchParams.get("host") || parsed?.hostname;
+
+  return host
+    ? host.startsWith("/")
+      ? `the socket directory ${host}`
+      : `${host}:${parsed?.searchParams.get("port") || parsed?.port || "5432"}`
+    : undefined;
 };
 
 const disposableDatabase = async <Result>(
   url: string,
   schemaName: string,
   callback: (driver: Driver) => Promise<Result>,
+  {
+    connectionTimeoutMs,
+    onConnect,
+  }: Pick<VerifyOptions, "connectionTimeoutMs" | "onConnect"> = {},
 ): Promise<Result> => {
-  const admin = postgres({ url, max: 1 });
+  const connecting = {
+    ...(connectionTimeoutMs
+      ? { connectionTimeoutMillis: connectionTimeoutMs }
+      : {}),
+    ...(onConnect ? { onConnect } : {}),
+  };
+  const admin = postgres({ url, max: 1, ...connecting });
   const name = `symmetria_verify_${randomUUID().replaceAll("-", "")}`;
   let created = false;
   let driver: Driver | undefined;
@@ -54,11 +100,14 @@ const disposableDatabase = async <Result>(
     // Migrations run in sessions, whose connections are closed afterwards, so
     // every connection takes the search_path from its startup options. The
     // second connection answers the migrator's transaction-pooling check.
+    // Start-up settings the URL already carries stay; the search_path,
+    // written last, is the one in force.
+    const given = address.searchParams.getAll("options").at(-1);
     address.searchParams.set(
       "options",
-      `-c search_path=${quoteIdentifier(schemaName).replace(/[\\\s]/g, "\\$&")}`,
+      `${given ? `${given} ` : ""}-c search_path=${quoteIdentifier(schemaName).replace(/[\\\s]/g, "\\$&")}`,
     );
-    driver = postgres({ url: address.toString(), max: 2 });
+    driver = postgres({ url: address.toString(), max: 2, ...connecting });
 
     if (schemaName !== "public") {
       await executeSQL(
@@ -68,6 +117,18 @@ const disposableDatabase = async <Result>(
     }
 
     return await callback(driver);
+  } catch (error) {
+    // The driver's own error names neither the server nor the limit.
+    throw connectionTimeoutMs &&
+      error instanceof Error &&
+      error.message === CONNECT_TIMEOUT
+      ? Object.assign(
+          new Error(
+            `symmetria: no connection to the verification server: ${serverAddress(url) ?? "it"} did not answer within ${connectionTimeoutMs}ms`,
+          ),
+          { code: "ETIMEDOUT" },
+        )
+      : error;
   } finally {
     try {
       await driver?.close();
@@ -142,6 +203,7 @@ type BoundaryOptions = ExecutionOptions & {
   metadataSchema?: string;
   metadataTable?: string;
   ignoreTables?: readonly string[];
+  connectionTimeoutMs?: number;
 };
 
 /** Reconstruct an older boundary by replaying SQL; no historical snapshots are persisted. */
@@ -174,6 +236,7 @@ const readBoundary = async (
         ignoreTables,
       });
     },
+    options,
   );
 
   return { expected, actual };
@@ -232,50 +295,60 @@ export const verifyMigrations = async (
     }
   };
 
-  await disposableDatabase(options.url, schemaName, async (driver) => {
-    await migrator({ ...options, driver }).migrate();
-    await assertLatest(driver);
-  });
-  await disposableDatabase(options.url, schemaName, async (driver) => {
-    const runner = migrator({ ...options, driver });
+  await disposableDatabase(
+    options.url,
+    schemaName,
+    async (driver) => {
+      await migrator({ ...options, driver }).migrate();
+      await assertLatest(driver);
+    },
+    options,
+  );
+  await disposableDatabase(
+    options.url,
+    schemaName,
+    async (driver) => {
+      const runner = migrator({ ...options, driver });
 
-    const catalog = () =>
-      readCatalog({
-        ...options,
-        execute: driver.execute,
-        schemaName,
-        ignoreTables,
-      });
+      const catalog = () =>
+        readCatalog({
+          ...options,
+          execute: driver.execute,
+          schemaName,
+          ignoreTables,
+        });
 
-    for (const migration of state.migrations) {
-      const before = await catalog();
-      const up: VerificationContext = {
-        driver,
-        migration: migration.id,
-        phase: "up",
-      };
-      await options.beforeMigration?.(up);
-      await runner.migrate({ to: migration.id });
-      const after = await catalog();
-      await options.afterMigration?.(up);
-      const down: VerificationContext = { ...up, phase: "down" };
-      await options.beforeMigration?.(down);
-      await runner.rollback();
-      catalogMatches(before, await catalog(), `rollback of ${migration.id}`);
-      await options.afterMigration?.(down);
-      const reapply: VerificationContext = { ...up, phase: "reapply" };
-      await options.beforeMigration?.(reapply);
-      await runner.migrate({ to: migration.id });
-      catalogMatches(
-        after,
-        await catalog(),
-        `reapplication of ${migration.id}`,
-      );
-      await options.afterMigration?.(reapply);
-    }
+      for (const migration of state.migrations) {
+        const before = await catalog();
+        const up: VerificationContext = {
+          driver,
+          migration: migration.id,
+          phase: "up",
+        };
+        await options.beforeMigration?.(up);
+        await runner.migrate({ to: migration.id });
+        const after = await catalog();
+        await options.afterMigration?.(up);
+        const down: VerificationContext = { ...up, phase: "down" };
+        await options.beforeMigration?.(down);
+        await runner.rollback();
+        catalogMatches(before, await catalog(), `rollback of ${migration.id}`);
+        await options.afterMigration?.(down);
+        const reapply: VerificationContext = { ...up, phase: "reapply" };
+        await options.beforeMigration?.(reapply);
+        await runner.migrate({ to: migration.id });
+        catalogMatches(
+          after,
+          await catalog(),
+          `reapplication of ${migration.id}`,
+        );
+        await options.afterMigration?.(reapply);
+      }
 
-    await assertLatest(driver);
-  });
+      await assertLatest(driver);
+    },
+    options,
+  );
 
   return {
     migrations: state.migrations.map((migration) => migration.id),

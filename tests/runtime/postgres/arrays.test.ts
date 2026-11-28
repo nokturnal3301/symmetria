@@ -5,6 +5,11 @@ import {
   text,
   bigint,
   bool,
+  numeric,
+  real,
+  date,
+  jsonb,
+  timestamp,
   timestamptz,
   customType,
 } from "../../../packages/runtime/src";
@@ -23,6 +28,23 @@ const model = schema({
       encode: (value: string) => value,
       decode: (value: unknown) => String(value),
     }).array.nullable,
+  },
+  grids: {
+    id: int.auto,
+    note: text.nullable,
+    counts: int.array,
+    amounts: numeric.array,
+    ratios: real.array,
+    tags: text.array,
+    days: date.array,
+    moments: timestamp.array,
+    // One dimension of elements that are arrays in JavaScript.
+    docs: jsonb<number[]>().array,
+    spans: customType<[number, number]>("int4range", {
+      encode: ([from, to]) => `[${from},${to})`,
+      decode: (value: unknown) =>
+        String(value).slice(1, -1).split(",").map(Number) as [number, number],
+    }).array,
   },
 });
 
@@ -135,6 +157,10 @@ describe.skipIf(!databaseUrl)(
           .where((items) => items.id.is(2))
           .returning("boxes"),
       ).toEqual([{ boxes }]);
+      await isolated.driver.execute({
+        sql: `UPDATE items SET boxes = '[-1:0]={(1,1),(0,0);(3,4),(2,2)}'::box[] WHERE id = 2`,
+        parameters: [],
+      });
       expect(
         await database.items((items) => ({ boxes: items.boxes }), {
           where: (items) => items.id.is(2),
@@ -143,6 +169,72 @@ describe.skipIf(!databaseUrl)(
       await database.items
         .update({ boxes: null })
         .where((items) => items.id.is(2));
+    });
+
+    test("an array of two dimensions, which only SQL written outside Symmetria stores, is refused on every way out", async () => {
+      await isolated.driver.execute({
+        sql: `INSERT INTO grids (counts, amounts, ratios, tags, days, moments, docs, spans)
+              VALUES ('{{1,2},{3,4}}', '{{1.5,2.5},{3.5,4.5}}', '{{1.5,2.5},{3.5,4.5}}', '{{a,b},{c,d}}',
+                      '{{2024-01-01,2024-01-02},{2024-01-03,2024-01-04}}',
+                      '{{"2024-01-01 00:00:00"},{"2024-06-01 12:00:00"}}', '{"[1,2]","[3]"}', '{"[1,5)","[2,3)"}')`,
+        parameters: [],
+      });
+
+      // Read as one dimension, [1, 2] would be the number NaN, ["1.5", "2.5"]
+      // the decimal "1.5,2.5", a text[] value arrays under the type string[],
+      // and two rows of one timestamp each two Dates.
+      for (const column of [
+        "counts",
+        "amounts",
+        "ratios",
+        "tags",
+        "days",
+        "moments",
+      ] as const) {
+        const query = database.grids((grid) => ({ value: grid[column] }));
+
+        for (const read of [
+          () => query.execute(),
+          () =>
+            database
+              .grids((grid) => ({ nested: { value: grid[column] } }))
+              .execute(),
+          () =>
+            database.$batch((database) => [
+              database.grids((grid) => ({ value: grid[column] })),
+            ]),
+          async () => {
+            for await (const row of query.stream()) {
+              void row;
+            }
+          },
+          async () =>
+            await database.grids
+              .update({ note: "seen" })
+              .all()
+              .returning(column),
+        ]) {
+          await expect(read()).rejects.toThrow(
+            "symmetria: multidimensional arrays are not supported",
+          );
+        }
+      }
+
+      const flat = {
+        docs: [[1, 2], [3]],
+        spans: [
+          [1, 5],
+          [2, 3],
+        ],
+      };
+
+      expect(
+        await database.grids((grid) => ({
+          docs: grid.docs,
+          spans: grid.spans,
+          nested: { docs: grid.docs, spans: grid.spans },
+        })),
+      ).toEqual([{ ...flat, nested: flat }] as never);
     });
 
     test("search() matches stemmed words and searchRank() orders results", async () => {

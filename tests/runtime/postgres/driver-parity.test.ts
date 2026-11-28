@@ -13,6 +13,8 @@ import {
   bigint,
   bytea,
   createDatabase,
+  sql,
+  QueryError,
 } from "../../../packages/runtime/src";
 import { bun, transactionPooling } from "../../support/postgres";
 import { postgres as pg } from "../../../packages/runtime/src/entries/pg";
@@ -429,6 +431,347 @@ describe.skipIf(!url)("named prepared statements on node-postgres", () => {
       await fixture.close();
     }
   });
+
+  /** The pool, a transaction or a session: whatever runs a statement. */
+  type Executor = {
+    readonly execute: (query: {
+      sql: string;
+      parameters: unknown[];
+    }) => Promise<
+      Record<string, unknown>[] | { rows: Record<string, unknown>[] }
+    >;
+  };
+
+  const rows = async (
+    executor: Executor,
+    sql: string,
+    parameters: unknown[] = [],
+  ): Promise<Record<string, unknown>[]> => {
+    const result = await executor.execute({ sql, parameters });
+
+    return Array.isArray(result) ? result : result.rows;
+  };
+
+  /** A pool of `max` connections on a table whose column `n` changes its type. */
+  const retyped = async (max: number) => {
+    const fixture = await testDatabase({
+      url: url!,
+      schema: schema({ items: { id: int, n: int } }),
+      driver: (options) => pg({ ...options, prepare: true }),
+      max,
+      prefix: "symmetria_prepared",
+    });
+    const read = (executor: Executor = fixture.driver) =>
+      rows(executor, "SELECT n FROM items WHERE id = $1", [1]);
+
+    await fixture.database.items.insert({ id: 1, n: 1 });
+
+    return {
+      ...fixture,
+      read,
+      /** Every connection prepares the statement, then the column changes. */
+      retype: async (type: "bigint" | "integer") => {
+        for (let round = 0; round < 3; round += 1) {
+          await Promise.all(Array.from({ length: max * 2 }, () => read()));
+        }
+
+        await rows(
+          fixture.driver,
+          `ALTER TABLE items ALTER COLUMN n TYPE ${type}`,
+        );
+      },
+    };
+  };
+
+  // Through a pooler in transaction mode a call has no connection of its own
+  // to have prepared the statement on.
+  test.skipIf(transactionPooling)(
+    "calls in flight on every connection when a column changes its type all run again",
+    async () => {
+      for (const max of [1, 4]) {
+        const fixture = await retyped(max);
+        const calls = (count: number) =>
+          Promise.all(Array.from({ length: count }, () => fixture.read()));
+
+        try {
+          for (const [type, n] of [
+            ["bigint", 1n],
+            ["integer", 1],
+          ] as const) {
+            await fixture.retype(type);
+
+            // One call per connection, each with the old plan: PostgreSQL
+            // refuses them all at once, and every one of them runs again.
+            expect(await calls(max)).toEqual(
+              Array.from({ length: max }, () => [{ n }]),
+            );
+            expect(await calls(max * 3)).toEqual(
+              Array.from({ length: max * 3 }, () => [{ n }]),
+            );
+          }
+        } finally {
+          await fixture.close();
+        }
+      }
+    },
+  );
+
+  test.skipIf(transactionPooling)(
+    "after a type change a session statement outside a transaction runs again, and a transaction fails once",
+    async () => {
+      const fixture = await retyped(2);
+      const { driver, read } = fixture;
+
+      try {
+        await fixture.retype("bigint");
+
+        expect(
+          await driver.session(async (session) => [
+            await read(session),
+            await read(session),
+          ]),
+        ).toEqual([[{ n: 1n }], [{ n: 1n }]]);
+
+        // The error has aborted the transaction, so nothing can run again
+        // inside it: it fails with PostgreSQL's error, and the next one
+        // prepares the statement afresh.
+        await fixture.retype("integer");
+
+        const refused = await driver
+          .transaction((tx) => read(tx))
+          .catch((error: unknown) => error);
+
+        expect(refused).toBeInstanceOf(QueryError);
+        expect(refused).toMatchObject({
+          sqlState: "0A000",
+          message: "cached plan must not change result type",
+        });
+        expect(await driver.transaction((tx) => read(tx))).toEqual([{ n: 1 }]);
+
+        // The same inside a session: its transaction fails, the session goes on.
+        await fixture.retype("bigint");
+
+        expect(
+          await driver.session(async (session) => [
+            await session
+              .transaction((tx) => read(tx))
+              .catch((error: { sqlState?: unknown }) => error.sqlState),
+            await read(session),
+          ]),
+        ).toEqual(["0A000", [{ n: 1n }]]);
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
+
+  // Values node-postgres turns into text only while it binds a statement, and
+  // the error it throws for each when it cannot.
+  const refusal = new Error("this value has no text");
+  const circular: Record<string, unknown> = {};
+
+  circular.self = circular;
+
+  const unbindable: [
+    name: string,
+    value: unknown,
+    thrown: (error: unknown) => boolean,
+  ][] = [
+    [
+      "an object that holds a BigInt",
+      { owner: "ada", balance: 10n },
+      (error) => error instanceof TypeError && /BigInt/.test(error.message),
+    ],
+    [
+      "a circular object",
+      circular,
+      (error) =>
+        error instanceof TypeError && /circular|cyclic/i.test(error.message),
+    ],
+    [
+      "an object whose toJSON() throws",
+      {
+        toJSON: () => {
+          throw refusal;
+        },
+      },
+      (error) => error === refusal,
+    ],
+    [
+      "an object whose toPostgres() throws",
+      {
+        toPostgres: () => {
+          throw refusal;
+        },
+      },
+      (error) => error === refusal,
+    ],
+  ];
+
+  // Such a value fails its own statement and whatever transaction holds it,
+  // with node-postgres's error, and nothing after it: unnamed statements
+  // (`prepare: false`) always behaved so, named ones must too.
+  for (const prepare of [true, false]) {
+    test.skipIf(transactionPooling)(
+      `a value node-postgres cannot turn into text fails only its own statement (prepare: ${prepare})`,
+      async () => {
+        const fixture = await testDatabase({
+          url: url!,
+          schema: schema({ logs: { id: int.auto, message: text } }),
+          driver: (options) => pg({ ...options, prepare }),
+          // One connection, so every later call uses the one that failed.
+          max: 1,
+          prefix: "symmetria_prepared",
+        });
+        const { driver } = fixture;
+        const failure = (work: Promise<unknown>): Promise<unknown> =>
+          work.then(
+            () => undefined,
+            (error: unknown) => error,
+          );
+        const logged = async (message: string) =>
+          (
+            await rows(driver, "SELECT id FROM logs WHERE message = $1", [
+              message,
+            ])
+          ).length;
+        let statements = 0;
+
+        try {
+          for (const [name, value, thrown] of unbindable) {
+            // The failing run is the statement's first on the connection, or
+            // comes after the connection has prepared it.
+            for (const prepared of [false, true]) {
+              for (const place of ["transaction", "savepoint", "session"]) {
+                const mark = `${name}, ${prepared ? "prepared" : "new"}, ${place}`;
+                const sql = `SELECT $1::jsonb ->> 'owner' AS owner, ${++statements} AS statement`;
+                const owner = async (executor: Executor, document: unknown) =>
+                  (await rows(executor, sql, [document]))[0]?.owner;
+                const log = (executor: Executor) =>
+                  rows(executor, "INSERT INTO logs (message) VALUES ($1)", [
+                    mark,
+                  ]);
+
+                if (prepared) {
+                  expect(await owner(driver, { owner: "ada" })).toBe("ada");
+                }
+
+                if (place === "transaction") {
+                  const failed = await failure(
+                    driver.transaction(async (tx) => {
+                      await log(tx);
+                      await owner(tx, value);
+                    }),
+                  );
+
+                  expect([mark, thrown(failed)]).toEqual([mark, true]);
+                  expect([mark, await logged(mark)]).toEqual([mark, 0]);
+                } else if (place === "savepoint") {
+                  // The transaction catches the failure of its savepoint and
+                  // goes on with the same statement.
+                  const [failed, after] = await driver.transaction(
+                    async (tx) => {
+                      await log(tx);
+
+                      return [
+                        await failure(
+                          tx.transaction((savepoint) =>
+                            owner(savepoint, value),
+                          ),
+                        ),
+                        await owner(tx, { owner: "ada" }),
+                      ];
+                    },
+                  );
+
+                  expect([mark, thrown(failed), after]).toEqual([
+                    mark,
+                    true,
+                    "ada",
+                  ]);
+                  expect([mark, await logged(mark)]).toEqual([mark, 1]);
+                } else {
+                  const [failed, after] = await driver.session(
+                    async (session) => [
+                      await failure(owner(session, value)),
+                      await owner(session, { owner: "ada" }),
+                    ],
+                  );
+
+                  expect([mark, thrown(failed), after]).toEqual([
+                    mark,
+                    true,
+                    "ada",
+                  ]);
+                }
+
+                // The pool's connection runs the same statement again.
+                for (let call = 0; call < 3; call += 1) {
+                  expect([mark, await owner(driver, { owner: "ada" })]).toEqual(
+                    [mark, "ada"],
+                  );
+                }
+              }
+            }
+          }
+        } finally {
+          await fixture.close();
+        }
+      },
+    );
+  }
+
+  test.skipIf(transactionPooling)(
+    "a document JSON cannot hold, interpolated in a transaction, fails before the statement is sent",
+    async () => {
+      const fixture = await testDatabase({
+        url: url!,
+        schema: schema({ logs: { id: int.auto, message: text } }),
+        driver: (options) => pg({ ...options, prepare: true }),
+        max: 1,
+        prefix: "symmetria_prepared",
+      });
+      const owner = (database: typeof fixture.database, document: unknown) =>
+        database.logs((log) => ({
+          id: log.id,
+          owner: sql<string>`${document}::jsonb ->> 'owner'`,
+        }));
+      const backend = async () =>
+        (await rows(fixture.driver, "SELECT pg_backend_pid() AS pid"))[0]!.pid;
+
+      try {
+        await fixture.database.logs.insert({ message: "seed" });
+        expect(await owner(fixture.database, { owner: "ada" })).toEqual([
+          { id: 1, owner: "ada" },
+        ]);
+
+        const pid = await backend();
+        // A row of a table with a bigint column is such a document.
+        const failed = await fixture.database
+          .$transaction(async (tx) => {
+            await tx.logs.insert({ message: "rolled back" });
+            await owner(tx as never, { owner: "ada", balance: 10n });
+          })
+          .catch((error: unknown) => error);
+
+        expect(failed).toBeInstanceOf(TypeError);
+        expect(
+          await fixture.database.logs((log) => ({ message: log.message })),
+        ).toEqual([{ message: "seed" }]);
+
+        for (let call = 0; call < 3; call += 1) {
+          expect(await owner(fixture.database, { owner: "ada" })).toEqual([
+            { id: 1, owner: "ada" },
+          ]);
+        }
+
+        // Nothing reached the connection, so the pool keeps it.
+        expect(await backend()).toBe(pid);
+      } finally {
+        await fixture.close();
+      }
+    },
+  );
 });
 
 // A pooler in transaction mode refuses start-up parameters it does not know.

@@ -2,10 +2,12 @@ import { INDEX_METHODS as RUNTIME_INDEX_METHODS } from "symmetria/internal";
 import type { CatalogConstraint } from "../migrations/catalog";
 import type { IndexDetailRow } from "./catalog";
 import {
+  builderValueType,
   declaredCondition,
   declaredKey,
   valueKind,
   type ConditionScope,
+  type ValueKind,
 } from "./conditions";
 import {
   camelKey,
@@ -135,14 +137,36 @@ export const conditionScope = (
   enumLabels: ReadonlyMap<string, string[]>,
 ): ConditionScope => {
   const members = scopeMembers(declared);
+  // The value type of each column declared through customType(). Predicates
+  // are typed for the values a builder gives its type, so such a column is
+  // read as its SQL type only when it is declared with those values (a
+  // `numeric(3,5)` as Decimal); with any other, its conditions stay `sql`.
+  const custom = new Map(
+    declared.members.flatMap((member) =>
+      member.kind === "column" && member.type.kind === "custom"
+        ? [[member.sqlName, member.type.valueType] as const]
+        : [],
+    ),
+  );
+  const kindOf = (column: TableFacts["columns"][number]): ValueKind => {
+    const labels =
+      column.enum_name && column.enum_schema === null
+        ? enumLabels.get(column.enum_name)
+        : undefined;
+    const kind = valueKind(column.data_type, labels);
+    const declaredAs = custom.get(column.column_name);
+    const expected = builderValueType(kind);
+
+    return declaredAs !== undefined &&
+      expected !== undefined &&
+      declaredAs !== expected
+      ? { kind: "other" }
+      : kind;
+  };
 
   return new Map(
     table.columns.flatMap((column) => {
       const member = members.get(column.column_name);
-      const labels =
-        column.enum_name && column.enum_schema === null
-          ? enumLabels.get(column.enum_name)
-          : undefined;
 
       return member
         ? [
@@ -151,7 +175,7 @@ export const conditionScope = (
               {
                 source: `${declared.binding}.${member}`,
                 sqlType: column.data_type,
-                value: valueKind(column.data_type, labels),
+                value: kindOf(column),
               },
             ] as const,
           ]
@@ -472,7 +496,11 @@ export const scopeMembers = (declared: PulledTable): Map<string, string> =>
 export const declareIndex = (
   row: IndexDetailRow,
   tools: IndexTools,
-  options: { exact?: boolean },
+  options: {
+    exact?: boolean;
+    /** Notes for the index's `// pull:` comment. */
+    comments?: readonly string[];
+  },
 ): void => {
   const { table, declared, warn } = tools;
   const skip = (reason: string) =>
@@ -492,8 +520,33 @@ export const declareIndex = (
   }
 
   const members = scopeMembers(declared);
-  const comments: string[] = [];
+  const comments: string[] = [...(options.comments ?? [])];
   const keys: IndexKeySource[] = [];
+  // Operator class parameters (`gist_trgm_ops (siglen = 64)`) have no
+  // declaration: the index is declared without them, and says so.
+  const parameters = row.keys.flatMap((key, position) => {
+    const set = row.opclass_options?.[position];
+
+    return set ? [`${key.trim()} (${set})`] : [];
+  });
+  const declare = (index: { exact: boolean; index: PulledIndex }) => {
+    if (parameters.length) {
+      warn({
+        code: "index",
+        table: table.sqlName,
+        object: row.index_name,
+        message: `index "${row.index_name}" is declared without its operator class parameters, which the schema cannot declare: ${parameters.join(", ")}; a database built from this schema creates the index with the operator class's defaults (${row.definition})`,
+      });
+    }
+
+    tools.declare(index);
+  };
+
+  if (parameters.length) {
+    comments.push(
+      `operator class parameters are not declared: ${parameters.join(", ")}`,
+    );
+  }
 
   for (const [position, rawKey] of row.keys.entries()) {
     const bits = row.options[position] ?? 0;
@@ -645,7 +698,7 @@ export const declareIndex = (
       row.index_name &&
     !declared.indexes.some((entry) => entry.key === derivedKey)
   ) {
-    tools.declare({ exact: false, index: { ...index, key: derivedKey } });
+    declare({ exact: false, index: { ...index, key: derivedKey } });
 
     return;
   }
@@ -664,5 +717,5 @@ export const declareIndex = (
   }
 
   comments.push("name kept exactly");
-  tools.declare({ exact: true, index: { ...index, key: row.index_name } });
+  declare({ exact: true, index: { ...index, key: row.index_name } });
 };

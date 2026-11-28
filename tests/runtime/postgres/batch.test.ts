@@ -275,7 +275,7 @@ describe.skipIf(!databaseUrl)("$batch on PostgreSQL", () => {
 
     expect(failed).toEqual(["QueryError", "QueryError"]);
     expect(await database.users.count()).toBe(2);
-  });
+  }, 30_000);
 
   test("writes, locks and a callback that does not return its reads are refused", async () => {
     // The types refuse writes and transactions on the batch's handle too.

@@ -26,6 +26,7 @@ export const help = `symmetria <command>
   --config <file>       Config module (default: symmetria.config.ts)
   --dir <directory>     Override the migrations directory
   --database-url <url>  Override config/database environment URL
+  --connect-timeout <ms>  How long the database may take to accept a connection (default: 30000; 0 disables)
   --profile-url <url>   Profiler endpoint (default: http://127.0.0.1:7331)
   --profile-token <t>   Profiler token (default: SYMMETRIA_PROFILE_TOKEN)
   --diff <file.json>    Explicit rename hints and USING conversions for generate
@@ -56,6 +57,7 @@ export const help = `symmetria <command>
   --no-animation       Disable logo and loading animations
   --no-interactive     Disable dashboard, schema browser and rename questions
   --help, -h           Show this help
+  --version, -v        Print the symmetria-kit version
 `;
 
 const COMMANDS = [
@@ -86,6 +88,7 @@ export const FLAGS = {
   config: { type: "string" },
   dir: { type: "string" },
   "database-url": { type: "string" },
+  "connect-timeout": { type: "string" },
   "profile-url": { type: "string" },
   "profile-token": { type: "string" },
   diff: { type: "string" },
@@ -110,6 +113,7 @@ export const FLAGS = {
   steps: { type: "string" },
   yes: { type: "boolean" },
   help: { type: "boolean", short: "h" },
+  version: { type: "boolean", short: "v" },
   sql: { type: "boolean" },
   json: { type: "boolean" },
   relations: { type: "boolean" },

@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import {
   createProfiler,
@@ -21,6 +23,7 @@ import {
   canonicalJSON,
   checksum,
 } from "../../../packages/kit/src/migrations/snapshot";
+import { profiledRequests } from "../../../packages/kit/src/cli/commands/profile";
 import { formatSchema } from "../../../packages/kit/src/cli/ui/format";
 import { FLAGS, help } from "../../../packages/kit/src/cli/options";
 import { withMigrationDirectory } from "../../support/directories";
@@ -199,6 +202,79 @@ test("recover reports when nothing was left behind", () =>
     );
   }));
 
+test("recover removes what a generator left when it stopped before its first publication record", () =>
+  withMigrationDirectory(async (directory) => {
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: schema({ users: { id: int.auto } }).$snapshot(),
+    });
+    const listing = (await readdir(directory)).sort();
+    const lock = join(directory, ".symmetria-generate.lock");
+    // The lock of a generator: the directory and the record of its process.
+    const lockedBy = async (pid: number) => {
+      await mkdir(lock, { recursive: true });
+      await writeFile(
+        join(lock, "owner.json"),
+        JSON.stringify({ pid, host: hostname() }),
+      );
+    };
+    // A staging directory as it is before the first record: the files to
+    // publish, and a backup that holds nothing yet.
+    const staging = async (name: string) => {
+      await mkdir(join(directory, name, "staged", "meta"), { recursive: true });
+      await mkdir(join(directory, name, "backup", "meta"), { recursive: true });
+      await writeFile(
+        join(directory, name, "staged", "meta", "snapshot.json"),
+        "{}",
+      );
+    };
+    // Nothing of a generator, whatever its name: a directory with something
+    // else in it, and one whose name is not what a generator makes.
+    await mkdir(join(directory, ".symmetria-shared"));
+    await writeFile(join(directory, ".symmetria-shared", "todo.txt"), "keep");
+    await mkdir(join(directory, ".symmetria-old"));
+
+    // While the owner lives nothing is touched.
+    await lockedBy(process.pid);
+    await staging(".symmetria-AbCdEf");
+    await expect(recoverMigrationFiles(directory)).rejects.toThrow(
+      "owner is still running",
+    );
+    expect(await readdir(directory)).toContain(".symmetria-AbCdEf");
+
+    // A process that has ended.
+    const ended = Bun.spawn([process.execPath, "-e", ""]);
+    await ended.exited;
+    await lockedBy(ended.pid);
+    expect(await run(directory, "recover", "--dir", ".")).toMatchObject({
+      exitCode: 0,
+      stdout: "Migration files recovered.\n",
+    });
+    expect((await readdir(directory)).sort()).toEqual([
+      ".symmetria-old",
+      ".symmetria-shared",
+      ...listing,
+    ]);
+    expect(
+      await readFile(join(directory, ".symmetria-shared", "todo.txt"), "utf8"),
+    ).toBe("keep");
+
+    // Files in backup/ that no record accounts for may be the only copy of
+    // what an earlier generation moved: they stay, and the error names them.
+    await lockedBy(ended.pid);
+    await staging(".symmetria-GhIjKl");
+    await writeFile(
+      join(directory, ".symmetria-GhIjKl", "backup", "meta", "snapshot.json"),
+      "{}",
+    );
+    await expect(recoverMigrationFiles(directory)).rejects.toThrow(
+      `${join(directory, ".symmetria-GhIjKl")} holds files that an earlier interrupted generation moved out of the migrations directory (in backup/)`,
+    );
+    expect(await readdir(directory)).toContain(".symmetria-GhIjKl");
+    expect(await readdir(directory)).toContain(".symmetria-generate.lock");
+  }));
+
 test("broken metadata errors name the file or folder", () =>
   withMigrationDirectory(async (directory) => {
     const first = (await generateMigration({
@@ -227,6 +303,8 @@ test("broken metadata errors name the file or folder", () =>
 
 test("failures print JSON with --json and flags stay with their commands", () =>
   withMigrationDirectory(async (directory) => {
+    // Without a config file the default ./migrations is the project.
+    await mkdir(join(directory, "migrations"));
     const failed = await run(directory, "migrate", "--json");
     expect(failed.exitCode).toBe(1);
     expect(JSON.parse(failed.stdout)).toEqual({
@@ -267,6 +345,28 @@ test("--help, the README and the reference list every flag", async () => {
   }
 });
 
+test("--version and -v print the version of the installed package", () =>
+  withMigrationDirectory(async (directory) => {
+    const { version } = JSON.parse(
+      await readFile(resolve("packages/kit/package.json"), "utf8"),
+    );
+
+    for (const flag of ["--version", "-v"]) {
+      expect(await run(directory, flag)).toMatchObject({
+        exitCode: 0,
+        stdout: `${version}\n`,
+        stderr: "",
+      });
+    }
+
+    // Before any command runs, and as JSON when asked.
+    expect(
+      JSON.parse(
+        (await run(directory, "migrate", "--version", "--json")).stdout,
+      ),
+    ).toEqual({ version });
+  }));
+
 test("profile without a terminal prints its requests as one JSON object", () =>
   withMigrationDirectory(async (directory) => {
     const profiler = createProfiler();
@@ -289,3 +389,35 @@ test("profile without a terminal prints its requests as one JSON object", () =>
       await server.stop(true);
     }
   }));
+
+test("profile without a terminal gives up on a profiler that does not answer, or stops part-way through its answer", async () => {
+  // Accepts the request and says nothing.
+  const silent = createServer(() => {});
+  // Sends its headers and the start of the body, then nothing more.
+  const stalled = createServer((socket) => {
+    socket.on("error", () => {});
+    socket.once("data", () =>
+      socket.write(
+        'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n[{"id":1',
+      ),
+    );
+  });
+
+  try {
+    for (const server of [silent, stalled]) {
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      const { port } = server.address() as { port: number };
+      const started = performance.now();
+
+      await expect(
+        profiledRequests(`http://127.0.0.1:${port}`, "token", 300),
+      ).rejects.toThrow(
+        `symmetria: the profiler at http://127.0.0.1:${port} did not answer within 300ms; check --profile-url and that the application called profiler.serve()`,
+      );
+      expect(performance.now() - started).toBeLessThan(3000);
+    }
+  } finally {
+    silent.close();
+    stalled.close();
+  }
+});

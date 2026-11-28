@@ -7,7 +7,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { currentFrame, currentHolders, runHolding } from "../../driver/serial";
 import { NotFoundError, TooManyRowsError } from "../../errors";
 import { freeze } from "../plan/freeze";
-import { count, readColumn, type PredicateDescription } from "../expressions";
+import {
+  count,
+  readColumn,
+  type PredicateDescription,
+  type ValueNode,
+} from "../expressions";
 import { derivedBinding } from "../plan/derived";
 import { batchCollectors } from "../plan/batching";
 import { containsNode } from "../plan/traverse";
@@ -24,23 +29,28 @@ const countPlans = new WeakMap<SelectPlan, SelectPlan>();
 const existsPlans = new WeakMap<SelectPlan, (SelectPlan | undefined)[]>();
 
 /**
- * A projection of aggregates without GROUP BY (`{ n: count() }`): the query
- * returns one row whatever the source holds, so that is what counts.
+ * Aggregates can collapse rows, and raw SQL can also expand or eliminate
+ * them (unnest, including a user-defined set-returning function). Keep the
+ * actual projection rather than guessing its cardinality from SQL text.
  */
-const aggregatesAll = (plan: SelectPlan): boolean =>
-  !plan.grouping.length &&
-  plan.selection.some(
-    (expression) =>
-      containsNode(expression.node, (node) => node.kind === "aggregate") &&
-      !containsNode(
-        expression.node,
-        (node) => node.kind === "window" || node.kind === "relativeWindow",
-      ),
+const needsProjection = (plan: SelectPlan): boolean => {
+  const mayChangeRows = (node: ValueNode) =>
+    (node.kind === "aggregate" && !plan.grouping.length) ||
+    (node.kind === "raw" && !node.composed);
+  return (
+    plan.selection.some(({ node }) => containsNode(node, mayChangeRows)) ||
+    plan.ordering.some(({ expression }) =>
+      containsNode(expression.node, mayChangeRows),
+    )
   );
+};
 
 /** The selection a wrapped plan keeps so its row count matches the user's query. */
-const innerSelection = (plan: SelectPlan): SelectPlan["selection"] => {
-  if (aggregatesAll(plan)) {
+const innerSelection = (
+  plan: SelectPlan,
+  keepProjection: boolean,
+): SelectPlan["selection"] => {
+  if (keepProjection && plan.selection.length) {
     return plan.selection;
   }
 
@@ -75,6 +85,7 @@ export const countPlan = (plan: SelectPlan): SelectPlan => {
     return derived;
   }
 
+  const keepProjection = needsProjection(plan);
   const counted =
     plan.locking !== undefined ||
     plan.limit !== undefined ||
@@ -82,13 +93,16 @@ export const countPlan = (plan: SelectPlan): SelectPlan => {
     plan.grouping.length > 0 ||
     plan.having.length > 0 ||
     plan.distinct ||
-    aggregatesAll(plan);
+    keepProjection;
 
   derived = counted
     ? freeze({
         ...initialPlan(
           derivedBinding(
-            freeze({ ...plan, selection: innerSelection(plan) }),
+            freeze({
+              ...plan,
+              selection: innerSelection(plan, keepProjection),
+            }),
             "__symmetria_count",
           ),
         ),
@@ -130,9 +144,9 @@ export const existsPlan = (
     typeof plan.limit === "object" || typeof plan.offset === "object";
   const locking = plan.locking !== undefined;
   // Wrapped in a derived table: a parameterized LIMIT or OFFSET, a row lock,
-  // or aggregates without GROUP BY, whose one row exists whatever the source
-  // holds, so it is read as it is.
-  const wrapped = parameterized || aggregatesAll(plan) || locking;
+  // or a projection whose cardinality is decided by PostgreSQL.
+  const keepProjection = needsProjection(plan);
+  const wrapped = parameterized || keepProjection || locking;
 
   if (parameterized && !allowPlaceholderLimit) {
     throw new Error("symmetria: bind a parameterized LIMIT with prepare()");
@@ -152,7 +166,7 @@ export const existsPlan = (
             derivedBinding(
               freeze({
                 ...plan,
-                selection: innerSelection(plan),
+                selection: innerSelection(plan, keepProjection),
               }),
               "__symmetria_exists",
             ),
@@ -162,7 +176,7 @@ export const existsPlan = (
         }
       : {
           ...plan,
-          selection: innerSelection(plan),
+          selection: innerSelection(plan, keepProjection),
           ordering: EMPTY,
           limit: typeof plan.limit === "number" ? Math.min(plan.limit, 1) : 1,
         },

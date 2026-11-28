@@ -4,6 +4,7 @@
 import {
   open,
   readFile,
+  readdir,
   rename,
   rm,
   mkdir,
@@ -14,6 +15,8 @@ import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 export const generationLockName = ".symmetria-generate.lock";
+/** A generator stages its files in a directory with this prefix and a random suffix. */
+export const stagingPrefix = ".symmetria-";
 export type Publication = {
   temporary: string;
   hadMetadata: boolean;
@@ -106,6 +109,64 @@ export const rollbackPublication = async (publication: Publication) => {
   }
 };
 
+/** Whether anything but directories lies below `path`. */
+const holdsFiles = async (path: string): Promise<boolean> => {
+  for (const entry of await readdir(path, { withFileTypes: true })) {
+    if (!entry.isDirectory() || (await holdsFiles(join(path, entry.name)))) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
+/**
+ * Removes the staging directories of a generator that stopped before its
+ * first publication record. Only one generator works in a directory at a time,
+ * and each keeps the lock for as long as its staging directory exists: with
+ * the lock in the hands of a dead process, no live generator owns one. A
+ * directory counts as staging by its name (the prefix and the six characters
+ * mkdtemp adds) and its content (`staged/` and `backup/` at most), so nothing
+ * else named alike is touched. Without a record no file has moved, so
+ * `backup/` holds none; one that does is kept, since it may be the only copy
+ * of the files it holds.
+ */
+const removeUnpublishedStaging = async (directory: string): Promise<void> => {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+
+    if (
+      !entry.isDirectory() ||
+      !entry.name.startsWith(stagingPrefix) ||
+      !/^[A-Za-z0-9]{6}$/.test(entry.name.slice(stagingPrefix.length))
+    ) {
+      continue;
+    }
+
+    const content = await readdir(path, { withFileTypes: true });
+
+    if (
+      content.some(
+        (item) =>
+          !item.isDirectory() || !["staged", "backup"].includes(item.name),
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      content.some((item) => item.name === "backup") &&
+      (await holdsFiles(join(path, "backup")))
+    ) {
+      throw new Error(
+        `symmetria: ${path} holds files that an earlier interrupted generation moved out of the migrations directory (in backup/), and no record says where they belong; move them back or remove the directory by hand, then run recover again`,
+      );
+    }
+
+    await rm(path, { recursive: true, force: true });
+  }
+};
+
 /**
  * Recover a process crash without discarding a live writer or guessing at
  * incomplete metadata. Resolves false when no generation lock is left behind.
@@ -167,7 +228,7 @@ export const recoverMigrationFiles = async (
 
       if (
         !inside(publication.temporary) ||
-        !publication.temporary.startsWith(join(directory, ".symmetria-")) ||
+        !publication.temporary.startsWith(join(directory, stagingPrefix)) ||
         typeof publication.hadMetadata !== "boolean" ||
         typeof publication.committed !== "boolean" ||
         !Array.isArray(publication.moves) ||
@@ -193,6 +254,8 @@ export const recoverMigrationFiles = async (
       }
 
       await rm(publication.temporary, { recursive: true, force: true });
+    } else {
+      await removeUnpublishedStaging(directory);
     }
 
     await rm(lock, { recursive: true, force: true });

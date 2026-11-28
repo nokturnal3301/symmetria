@@ -28,6 +28,7 @@ import {
   fitLine,
   terminalText,
   terminalWidth,
+  wrapLines,
 } from "./style";
 import stringWidth from "string-width";
 
@@ -439,6 +440,11 @@ export const formatDashboard = (
     pending: number;
     changes: number | undefined;
     config: string;
+    /**
+     * What `status` says when the migrations directory does not exist: shown
+     * in place of the counts, which would call a wrong path up to date.
+     */
+    missing?: string;
   },
   color = false,
   frame = -10,
@@ -497,16 +503,20 @@ export const formatDashboard = (
         "MIGRATIONS",
         details.connection === "unavailable"
           ? style("! Unavailable", "danger")
-          : `${style(String(details.connection === "connected" ? (details.applied ?? 0) : (details.local ?? 0)), "strong")} ${style(details.connection === "connected" ? "applied" : "local", "violet")}`,
+          : details.missing
+            ? `${style("—", "strong")} ${style("local", "violet")}`
+            : `${style(String(details.connection === "connected" ? (details.applied ?? 0) : (details.local ?? 0)), "strong")} ${style(details.connection === "connected" ? "applied" : "local", "violet")}`,
         style(
-          details.connection === "connected"
-            ? details.pending
-              ? `${details.pending} pending`
-              : "✓ Up to date"
-            : details.connection === "offline"
-              ? "Database offline"
-              : "Check connection",
-          details.pending ? "warning" : "muted",
+          details.missing
+            ? "No directory"
+            : details.connection === "connected"
+              ? details.pending
+                ? `${details.pending} pending`
+                : "✓ Up to date"
+              : details.connection === "offline"
+                ? "Database offline"
+                : "Check connection",
+          details.missing || details.pending ? "warning" : "muted",
         ),
         "violet",
       ),
@@ -531,6 +541,12 @@ export const formatDashboard = (
         ? [
             `  ${style(fitLine(terminalText(details.migrations), width), "danger")}`,
           ]
+        : []),
+      // A path makes it long: up to three rows, so the advice at its end shows.
+      ...(details.missing
+        ? wrapLines(terminalText(details.missing), width - 4)
+            .slice(0, 3)
+            .map((line) => `  ${style(line, "warning")}`)
         : []),
       `  ${style(fitLine(terminalText(details.config), width), "muted")}`,
     ].join("\n");
@@ -564,7 +580,7 @@ export const formatDashboard = (
             ].join(separator)
           : "not configured"
       }`,
-      `${style("Migrations  ", "muted")}${style(terminalText(details.migrations), details.connection === "unavailable" ? "danger" : details.pending ? "warning" : details.connection === "connected" ? "success" : "muted")}`,
+      `${style("Migrations  ", "muted")}${style(terminalText(details.connection === "unavailable" ? details.migrations : (details.missing ?? details.migrations)), details.connection === "unavailable" ? "danger" : details.missing || details.pending ? "warning" : details.connection === "connected" ? "success" : "muted")}`,
       `${style("Changes     ", "muted")}${style(details.changes === undefined ? "schema not configured" : details.changes ? `${details.changes} SQL statements since last snapshot` : "✓ In sync with the latest snapshot", details.changes ? "warning" : details.changes === 0 ? "success" : "muted")}`,
       style(terminalText(details.config), "muted"),
     ],

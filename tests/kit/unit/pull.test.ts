@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { CatalogConstraint } from "../../../packages/kit/src/migrations/catalog";
@@ -22,9 +23,20 @@ import { interpolate } from "../../../packages/kit/src/introspection/constraints
 import {
   camelKey,
   escapeTemplate,
+  MODULE_HELPERS,
+  MODULE_IDENTIFIERS,
   quoteString,
+  RESERVED_TABLE_KEYS,
+  RUNTIME_IMPORTS,
+  SEARCH_IMPORTS,
+  VECTOR_IMPORTS,
 } from "../../../packages/kit/src/introspection/names";
 import { migrationSnapshot } from "../../../packages/kit/src";
+import {
+  int,
+  schema,
+  table as declaredTable,
+} from "../../../packages/runtime/src";
 import { withMigrationDirectory } from "../../support/directories";
 
 type Column = {
@@ -42,7 +54,16 @@ type Table = {
   name: string;
   columns: Column[];
   primaryKey?: string[] | { name: string; columns: string[] };
-  unique?: ({ name?: string; columns: string[] } | string)[];
+  unique?: (
+    | {
+        name?: string;
+        columns: string[];
+        deferrable?: boolean;
+        initiallyDeferred?: boolean;
+        nullsNotDistinct?: boolean;
+      }
+    | string
+  )[];
   foreignKeys?: {
     name?: string;
     column: string;
@@ -51,11 +72,14 @@ type Table = {
     onDelete?: string;
     onUpdate?: string;
     deferrable?: boolean;
+    definition?: string;
   }[];
   checks?: { name: string; expression: string }[];
   indexes?: (Partial<IndexDetailRow> & { name: string; keys: string[] })[];
   partition?: boolean;
   partitioned?: boolean;
+  /** Storage parameters, as pg_class.reloptions holds them. */
+  storage?: string[];
 };
 
 /** A synthetic catalog in the shape readPullCatalog returns. */
@@ -109,6 +133,9 @@ const catalog = (
         name: entry.name ?? `${table.name}_${entry.columns.join("_")}_key`,
         kind: "u",
         columns: entry.columns,
+        deferrable: entry.deferrable ?? false,
+        initially_deferred: entry.initiallyDeferred ?? false,
+        nulls_not_distinct: entry.nullsNotDistinct ?? false,
       });
     }
 
@@ -123,6 +150,9 @@ const catalog = (
         on_update: foreignKey.onUpdate ?? "a",
         match: "s",
         deferrable: foreignKey.deferrable ?? false,
+        ...(foreignKey.definition === undefined
+          ? {}
+          : { definition: foreignKey.definition }),
       });
     }
 
@@ -148,6 +178,7 @@ const catalog = (
       name: table.name,
       kind: table.partitioned ? "p" : "r",
       partition: table.partition ?? false,
+      ...(table.storage ? { reloptions: table.storage } : {}),
     })),
     columns: sorted.flatMap((table) =>
       [...table.columns]
@@ -205,7 +236,7 @@ const catalog = (
           table_name: table.name,
           index_name: entry.name,
           is_unique: true,
-          nulls_not_distinct: false,
+          nulls_not_distinct: entry.nulls_not_distinct,
           method: "btree",
           keys: entry.columns,
           options: entry.columns.map(() => 0),
@@ -231,6 +262,9 @@ const catalog = (
           (name) => name ?? "default_ops",
         ),
         collations: index.collations ?? index.keys.map(() => null),
+        ...(index.opclass_options
+          ? { opclass_options: index.opclass_options }
+          : {}),
         reloptions: index.reloptions ?? null,
         predicate: index.predicate ?? null,
         definition: `CREATE INDEX ${index.name}`,
@@ -267,6 +301,45 @@ const catalog = (
 
 const runtime = resolve("packages/runtime/src/index.ts");
 
+/**
+ * What the compiler says about rendered modules, under the repository's own
+ * compiler options; empty when they type-check. The files are written below
+ * `.build/`, inside the repository, where the compiler finds its type packages.
+ */
+const typeErrors = async (modules: Record<string, string>): Promise<string> => {
+  const directory = resolve(`.build/pull-typecheck-${randomUUID()}`);
+  await mkdir(directory, { recursive: true });
+
+  try {
+    for (const [name, source] of Object.entries(modules)) {
+      await writeFile(join(directory, name), source);
+    }
+
+    await writeFile(
+      join(directory, "tsconfig.json"),
+      JSON.stringify({
+        extends: "../../tsconfig.json",
+        compilerOptions: { noEmit: true },
+        include: ["*.ts"],
+        exclude: [],
+      }),
+    );
+    const child = Bun.spawn(
+      [resolve("node_modules/.bin/tsc"), "-p", directory],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [output, errors] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+
+    return `${output}${errors}`.trim();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+};
+
 const members = (model: ReturnType<typeof buildPulledSchema>, table: string) =>
   model.tables.find((entry) => entry.sqlName === table)!.members;
 
@@ -287,6 +360,209 @@ const reference = (
   members(model, table).find(
     (member) => member.sqlName === name,
   ) as PulledReference;
+
+/** PascalCase names, which every column declares with `.named()`, next to each default a builder has a shortcut for. */
+const pascalCase = () =>
+  catalog(
+    [
+      {
+        name: "Customers",
+        primaryKey: { name: "Customers_pkey", columns: ["Id"] },
+        unique: [{ name: "Customers_Big_key", columns: ["Big"] }],
+        columns: [
+          { name: "Id", type: "integer", identity: "d" },
+          { name: "Big", type: "bigint", identity: "a" },
+          { name: "Small", type: "smallint", identity: "d" },
+          {
+            name: "CreatedAt",
+            type: "timestamp with time zone",
+            default: "now()",
+          },
+          {
+            name: "SeenAt",
+            type: "timestamp(3) without time zone",
+            default: "now()",
+            nullable: true,
+          },
+          { name: "Token", type: "uuid", default: "gen_random_uuid()" },
+          {
+            name: "Ordered",
+            type: "uuid",
+            default: "uuidv7()",
+            nullable: true,
+          },
+          {
+            name: "Status",
+            type: "OrderStatus",
+            enumeration: "OrderStatus",
+            default: `'New'::"OrderStatus"`,
+          },
+          {
+            name: "NickName",
+            type: "character varying(40)",
+            nullable: true,
+            collation: "C",
+          },
+          { name: "Tags", type: "text[]", default: "'{}'::text[]" },
+          { name: "Score", type: "integer", default: "0" },
+        ],
+      },
+    ],
+    [{ name: "OrderStatus", values: ["New", "Paid"] }],
+  );
+
+/** Divisions as PostgreSQL stores them, by the types of their operands. */
+const DIVISIONS: Record<string, string> = {
+  half: "((score / 2) = 3)",
+  smallHalf: "((small / 2) > 10)",
+  bigHalf: "((big / (2)::bigint) < (2)::bigint)",
+  bigInteger: "((big / 2) < (2)::bigint)",
+  pair: "((score / lower) >= 1)",
+  mixed: "((big / score) > (1)::bigint)",
+  nested: "(((score * 2) / 3) = 2)",
+  price: "((price / (2)::numeric) > (1)::numeric)",
+  share: "(((score)::numeric / price) > (1)::numeric)",
+  weight: "((weight / (2)::double precision) > (0.5)::double precision)",
+};
+
+const divisions = () =>
+  catalog([
+    {
+      name: "items",
+      primaryKey: ["id"],
+      columns: [
+        { name: "id", type: "integer", identity: "a" },
+        { name: "small", type: "smallint" },
+        { name: "score", type: "integer" },
+        { name: "lower", type: "integer" },
+        { name: "big", type: "bigint" },
+        { name: "price", type: "numeric(10,2)" },
+        { name: "weight", type: "double precision" },
+      ],
+      checks: Object.entries(DIVISIONS).map(([key, expression]) => ({
+        name: objectName(
+          "items",
+          key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+          "check",
+        ),
+        expression,
+      })),
+      indexes: [{ name: "items_halves_idx", keys: ["(score / 2)"] }],
+    },
+  ]);
+
+/** numeric(p,s) columns with a scale above the precision or below zero, which numeric() does not take. */
+const oddNumerics = () =>
+  catalog([
+    {
+      name: "rates",
+      primaryKey: ["id"],
+      columns: [
+        { name: "id", type: "integer", identity: "a" },
+        { name: "tiny", type: "numeric(3,5)", default: "0.00123" },
+        { name: "rounded", type: "numeric(5,-2)", nullable: true },
+        { name: "edge", type: "numeric(3,3)" },
+        { name: "whole", type: "numeric(4,0)", nullable: true },
+        { name: "tinies", type: "numeric(3,5)[]", nullable: true },
+      ],
+      checks: [
+        { name: "rates_tiny_check", expression: "(tiny < 0.01)" },
+        {
+          name: "rates_twice_check",
+          expression: "((tiny * (2)::numeric) < 0.5)",
+        },
+        {
+          name: "rates_sum_check",
+          expression: "((tiny + edge) > (0)::numeric)",
+        },
+        {
+          name: "rates_edge_check",
+          expression: "((edge * (2)::numeric) < (1)::numeric)",
+        },
+        // Compared with a numeric() column, on either side.
+        { name: "rates_above_check", expression: "(edge > tiny)" },
+        { name: "rates_below_check", expression: "(tiny < edge)" },
+        {
+          name: "rates_between_check",
+          expression: "((edge >= tiny) AND (edge <= (1)::numeric))",
+        },
+        {
+          name: "rates_in_check",
+          expression: "(rounded = ANY (ARRAY[(100)::numeric, (200)::numeric]))",
+        },
+      ],
+      indexes: [
+        { name: "rates_double_idx", keys: ["(tiny * (2)::numeric)"] },
+        { name: "rates_over_idx", keys: ["edge"], predicate: "(edge >= tiny)" },
+      ],
+    },
+  ]);
+
+/** Numbers at the edges of smallint, integer and bigint, in conditions as PostgreSQL stores them. */
+const INTEGER_RANGES: Record<string, string> = {
+  // PostgreSQL compares a smallint with any integer; the DSL would refuse 40000.
+  over: "(s <= 40000)",
+  top: "(s <= 32767)",
+  bottom: "(s >= '-32768'::integer)",
+  under: "(s >= '-32769'::integer)",
+  sum: "((s + s2) <= 40000)",
+  ratio: "((s / s2) <= 40000)",
+  product: "((s * s2) < 100000)",
+  ratioSmall: "((s / s2) <= 100)",
+  listed: "(s = ANY (ARRAY[1, 40000]))",
+  listedSmall: "(s = ANY (ARRAY[1, 2]))",
+  range: "((s >= 1) AND (s <= 40000))",
+  distinct: "(s IS DISTINCT FROM 40000)",
+  reversed: "(40000 >= s)",
+  // A literal or an integer column next to a smallint makes an integer.
+  step: "((s + 1) <= 40000)",
+  half: "((s / 2) <= 40000)",
+  mixed: "((s + i) <= 40000)",
+  shifted: "((s + 40000) > 0)",
+  // The whole integer and bigint ranges are numbers the DSL takes.
+  intTop: "(i <= 2147483647)",
+  intBottom: "(i >= '-2147483648'::integer)",
+  intSum: "((i + 2147483647) > 0)",
+  intOver: "((i + j) < '3000000000'::bigint)",
+  bigTop: "(b < '9223372036854775807'::bigint)",
+  bigBottom: "(b >= '-9223372036854775808'::bigint)",
+};
+
+const integerRanges = () =>
+  catalog([
+    {
+      name: "counts",
+      primaryKey: ["id"],
+      columns: [
+        { name: "id", type: "integer", identity: "a" },
+        { name: "s", type: "smallint" },
+        { name: "s2", type: "smallint" },
+        { name: "i", type: "integer" },
+        { name: "j", type: "integer" },
+        { name: "b", type: "bigint" },
+      ],
+      checks: Object.entries(INTEGER_RANGES).map(([key, expression]) => ({
+        name: objectName(
+          "counts",
+          key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+          "check",
+        ),
+        expression,
+      })),
+      indexes: [
+        {
+          name: "counts_wide_idx",
+          keys: ["i"],
+          predicate: "((s / s2) < 100000)",
+        },
+        {
+          name: "counts_narrow_idx",
+          keys: ["i"],
+          predicate: "((s / s2) < 100)",
+        },
+      ],
+    },
+  ]);
 
 describe("pull: names", () => {
   test("keys round-trip through snakeCase or are rejected", () => {
@@ -421,6 +697,249 @@ describe("pull: names", () => {
         ["label", "('x\r'::text || 'y\u2029'::text)"],
       ]);
     }));
+
+  test(
+    "tables named after everything a module imports or declares, or after a key schema() reserves, load and type-check",
+    () =>
+      withMigrationDirectory(async (directory) => {
+        // The SQL name whose key is the identifier: `as_number` for `asNumber`.
+        const identifiers = MODULE_IDENTIFIERS.filter((name) =>
+          /^[a-z]/.test(name),
+        );
+        const sqlNames = identifiers.map((name) =>
+          name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+        );
+        expect(sqlNames.map((name) => camelKey(name))).toEqual(identifiers);
+
+        // Every such table refers to itself, so its declaration is a callback
+        // that binds the table next to the builders it uses, and carries a
+        // check and an index, whose callbacks bind it again.
+        const named = (name: string): Table => ({
+          name,
+          primaryKey: ["id"],
+          columns: [
+            { name: "id", type: "integer", identity: "a" },
+            { name: "label", type: "text" },
+            { name: "score", type: "integer" },
+            { name: "parent_id", type: "integer", nullable: true },
+          ],
+          foreignKeys: [
+            {
+              name: objectName(name, "parent_id", "fkey"),
+              column: "parent_id",
+              table: name,
+              onDelete: "n",
+            },
+          ],
+          checks: [
+            {
+              name: objectName(name, "label", "check"),
+              expression:
+                "((label !~~ 'x%'::text) AND ((score > 1) OR (score < 0)))",
+            },
+            {
+              name: objectName(name, "length", "check"),
+              expression: "(length(label) > 0)",
+            },
+          ],
+          indexes: [
+            {
+              name: objectName(name, "pair", "idx"),
+              keys: ["label", "score"],
+              opclasses: ["text_pattern_ops", null],
+            },
+          ],
+        });
+        // One table that uses every builder and helper and refers to every
+        // identifier-named table: all of them are bound in its callback.
+        const referenced = sqlNames.filter(
+          (name) => !["index", "named", "column"].includes(name),
+        );
+        const everything: Table = {
+          name: "everything",
+          primaryKey: ["id"],
+          unique: ["one_id"],
+          columns: [
+            { name: "id", type: "bigint", identity: "d" },
+            { name: "title", type: "text" },
+            { name: "flag", type: "boolean" },
+            { name: "blob", type: "bytea", nullable: true },
+            { name: "day", type: "date", nullable: true },
+            { name: "weight", type: "double precision", nullable: true },
+            { name: "ratio", type: "real", nullable: true },
+            { name: "ip", type: "inet", nullable: true },
+            { name: "wait", type: "interval", nullable: true },
+            { name: "settings", type: "jsonb", nullable: true },
+            { name: "price", type: "numeric(10,2)", nullable: true },
+            { name: "small", type: "smallint", nullable: true },
+            { name: "at", type: "time without time zone", nullable: true },
+            {
+              name: "seen",
+              type: "timestamp(3) without time zone",
+              default: "now()",
+            },
+            {
+              name: "made",
+              type: "timestamp with time zone",
+              default: "now()",
+            },
+            { name: "words", type: "tsvector", nullable: true },
+            { name: "token", type: "uuid", default: "gen_random_uuid()" },
+            { name: "ordered", type: "uuid", default: "uuidv7()" },
+            { name: "nick", type: "character varying(20)", nullable: true },
+            {
+              name: "mood",
+              type: "everything_mood_enum",
+              enumeration: "everything_mood_enum",
+            },
+            { name: "cost", type: "money", nullable: true },
+            { name: "ref", type: "oid", nullable: true },
+            { name: "amount", type: "amount", nullable: true },
+            { name: "near", type: "vector(3)", nullable: true },
+            { name: "half", type: "halfvec(3)", nullable: true },
+            {
+              name: "about_words",
+              type: "tsvector",
+              nullable: true,
+              generated: true,
+              default: `setweight(to_tsvector('simple'::regconfig, COALESCE(title, ''::text)), 'A'::"char")`,
+            },
+            ...referenced.map((name) => ({
+              name: `${name}_id`,
+              type: "integer",
+              nullable: name !== "one",
+            })),
+          ],
+          foreignKeys: referenced.map((name) => ({
+            name: objectName("everything", `${name}_id`, "fkey"),
+            column: `${name}_id`,
+            table: name,
+          })),
+          indexes: [
+            {
+              name: "everything_about_words_idx",
+              keys: ["about_words"],
+              method: "gin",
+            },
+          ],
+        };
+        const junctionOf = (
+          name: string,
+          [first, second]: [string, string],
+          onDelete: string,
+        ): Table => ({
+          name,
+          primaryKey: [`${first}_id`, `${second}_id`],
+          columns: [
+            { name: `${first}_id`, type: "integer" },
+            { name: `${second}_id`, type: "integer" },
+          ],
+          foreignKeys: [first, second].map((target) => ({
+            name: objectName(name, `${target}_id`, "fkey"),
+            column: `${target}_id`,
+            table: target,
+            onDelete,
+          })),
+          indexes: [
+            {
+              name: objectName(name, `${second}_id`, "idx"),
+              keys: [`${second}_id`],
+            },
+          ],
+        });
+        const model = buildPulledSchema({
+          ...catalog(
+            [
+              ...sqlNames.map(named),
+              ...[...RESERVED_TABLE_KEYS].map(named),
+              everything,
+              // link() where both keys cascade, junction() otherwise.
+              junctionOf("pairs", ["link", "junction"], "c"),
+              junctionOf("holds", ["table", "schema"], "a"),
+            ],
+            [{ name: "everything_mood_enum", values: ["happy", "sad"] }],
+          ),
+          domains: [{ name: "amount", base: "numeric(30,10)" }],
+        });
+
+        // Each identifier-named table is bound under another name ...
+        expect(
+          identifiers.map(
+            (key) => model.tables.find((table) => table.key === key)?.binding,
+          ),
+        ).toEqual(identifiers.map((key) => `${key}Table`));
+        // ... and no table takes a key the runtime refuses.
+        expect(
+          model.tables.filter((entry) => RESERVED_TABLE_KEYS.has(entry.key)),
+        ).toEqual([]);
+
+        // The list is the runtime's own: schema() refuses each of these
+        // (`__proto__` it only names; no object literal holds that key).
+        for (const key of [...RESERVED_TABLE_KEYS].filter(
+          (name) => name !== "__proto__",
+        )) {
+          expect(() =>
+            schema(
+              Object.fromEntries([[key, declaredTable({ id: int })]]) as never,
+            ),
+          ).toThrow(`reserved table name "${key}"`);
+        }
+        expect(
+          ["then", "constructor", "prototype"].map(
+            (name) => model.tables.find((table) => table.sqlName === name)?.key,
+          ),
+        ).toEqual(["thenValue", "constructorValue", "prototypeValue"]);
+
+        const source = renderSchema(model, {
+          module: runtime,
+          vectorModule: resolve("packages/runtime/src/entries/vector.ts"),
+          searchModule: resolve("packages/runtime/src/entries/search.ts"),
+        });
+        // This module uses everything a module can import or declare, and
+        // every name it imports or declares is one pull keeps bindings off.
+        const imported = [
+          ...source.matchAll(/^import \{([^}]*)\} from /gm),
+        ].flatMap((match) =>
+          match[1]!
+            .split(",")
+            .map((name) => name.trim())
+            .filter(Boolean),
+        );
+        const declared = [...source.matchAll(/^const (\w+) = /gm)].map(
+          (match) => match[1]!,
+        );
+
+        expect([...imported].sort()).toEqual(
+          [...RUNTIME_IMPORTS, ...VECTOR_IMPORTS, ...SEARCH_IMPORTS].sort(),
+        );
+        expect(declared).toEqual([...MODULE_HELPERS]);
+        expect(
+          [...imported, ...declared]
+            .map((name) => name.replace(/^type /, ""))
+            .filter((name) => !MODULE_IDENTIFIERS.includes(name)),
+        ).toEqual([]);
+
+        const path = join(directory, "identifiers.ts");
+        await writeFile(path, source);
+        const loaded = await import(pathToFileURL(path).href);
+
+        expect(
+          migrationSnapshot(loaded.appSchema.$snapshot())
+            .tables.map((table) => table.name)
+            .sort(),
+        ).toEqual(
+          [
+            ...sqlNames,
+            ...RESERVED_TABLE_KEYS,
+            "everything",
+            "pairs",
+            "holds",
+          ].sort(),
+        );
+        expect(await typeErrors({ "identifiers.ts": source })).toBe("");
+      }),
+    30000,
+  );
 });
 
 describe("pull: columns", () => {
@@ -770,6 +1289,234 @@ describe("pull: columns", () => {
         nested: "positive_amount",
       });
     }));
+
+  test("a column that needs .named() takes its builder's shortcut first: .auto, .now, .v4, .v7", () => {
+    const source = renderSchema(buildPulledSchema(pascalCase()));
+
+    // The shortcuts exist on the builders only: `int.named("Id").auto` does not type-check.
+    for (const line of [
+      'id: int.auto.byDefault.named("Id"),',
+      'big: bigint.auto.named("Big").unique,',
+      'small: smallint.auto.byDefault.named("Small"),',
+      'createdAt: timestamptz.now.named("CreatedAt"),',
+      'seenAt: timestamp(3).now.named("SeenAt").nullable,',
+      'token: uuid.v4.named("Token"),',
+      'ordered: uuid.v7.named("Ordered").nullable,',
+      'status: oneOf("New", "Paid").typeName("OrderStatus").named("Status").default("New"),',
+      'nickName: varchar(40).collate("C").named("NickName").nullable,',
+      "tags: text.array.named(\"Tags\").default(sql`'{}'::text[]`),",
+      'score: int.named("Score").default(0),',
+    ]) {
+      expect(source).toContain(`      ${line}\n`);
+    }
+  });
+
+  test("a numeric whose scale is above its precision or below zero goes through customType() with numeric values", () => {
+    const model = buildPulledSchema(oddNumerics());
+    const source = renderSchema(model);
+
+    // The values are numeric's, exact decimal text, so the column compares
+    // and computes with numeric() columns and type-checks on either side.
+    for (const name of ["tiny", "rounded", "tinies"]) {
+      expect(column(model, "rates", name).type).toMatchObject({
+        kind: "custom",
+        valueType: "Decimal",
+        base: "numeric",
+      });
+    }
+
+    expect(column(model, "rates", "edge").type).toEqual({
+      kind: "numeric",
+      precision: 3,
+      scale: 3,
+    });
+    expect(column(model, "rates", "whole").type).toEqual({
+      kind: "numeric",
+      precision: 4,
+      scale: 0,
+    });
+
+    for (const line of [
+      // numeric(3, 5) is refused by the builder: the module would not load.
+      'tiny: customType<Decimal>("numeric(3,5)", { base: "numeric" }).default(sql`0.00123`), // pull: no builder for numeric(3,5)',
+      'rounded: customType<Decimal>("numeric(5,-2)", { base: "numeric" }).nullable, // pull: no builder for numeric(5,-2)',
+      'tinies: customType<Decimal>("numeric(3,5)", { base: "numeric" }).array.nullable, // pull: no builder for numeric(3,5)',
+      "edge: numeric(3, 3),",
+      'tiny: rates.tiny.below("0.01"),',
+      'twice: rates.tiny.multiply("2").below("0.5"),',
+      'sum: rates.tiny.plus(rates.edge).above("0"),',
+      'edge: rates.edge.multiply("2").below("1"),',
+      "above: rates.edge.above(rates.tiny),",
+      "below: rates.tiny.below(rates.edge),",
+      'between: rates.edge.between(rates.tiny, "1"),',
+      'in: rates.rounded.in(["100", "200"]),',
+      'double: index(rates.tiny.multiply("2")),',
+      "over: index(rates.edge).where(rates.edge.atLeast(rates.tiny)),",
+    ]) {
+      expect(source).toContain(line);
+    }
+
+    expect(source).toMatch(/^import \{[^}]*type Decimal,?\s*\} from /m);
+    expect(source).not.toContain("passthrough");
+    expect(
+      model.warnings.map((warning) => [warning.code, warning.message]),
+    ).toEqual([
+      [
+        "custom-type",
+        '"rates.tiny" uses numeric(3,5), whose scale numeric() does not take; it is declared through customType() with the values of numeric, exact decimal text',
+      ],
+      [
+        "custom-type",
+        '"rates.rounded" uses numeric(5,-2), whose scale numeric() does not take; it is declared through customType() with the values of numeric, exact decimal text',
+      ],
+      [
+        "custom-type",
+        '"rates.tinies" uses numeric(3,5), whose scale numeric() does not take; it is declared through customType() with the values of numeric, exact decimal text',
+      ],
+    ]);
+  });
+
+  test("a text default written as a bpchar or varchar(n) literal is declared with the value PostgreSQL stores", () => {
+    const defaults: Record<string, [type: string, stored: string]> = {
+      // A bpchar value loses its trailing spaces when it becomes text.
+      padded: ["text", "'ab '::bpchar"],
+      blank: ["text", "'  '::bpchar"],
+      quoted: ["text", "'it''s  '::bpchar"],
+      tabbed: ["text", "'ab\t '::bpchar"],
+      short: ["character varying(10)", "'ab '::bpchar"],
+      // A cast to varchar(n) keeps n characters.
+      cut: ["text", "'abcdef'::character varying(3)"],
+      cut_wide: ["text", "'a\u{1f600}bc'::character varying(2)"],
+      limited: ["character varying(5)", "'abcdefgh'::character varying(5)"],
+      // Text and varchar keep their spaces.
+      kept: ["text", "'ab '::character varying(10)"],
+      plain: ["text", "'ab '::text"],
+      // A char(n) column's own default stays as PostgreSQL prints it.
+      fixed: ["character(5)", "'ab'::bpchar"],
+      fixed_text: ["text", "'ab '::character(5)"],
+    };
+    const model = buildPulledSchema(
+      catalog([
+        {
+          name: "codes",
+          primaryKey: ["id"],
+          columns: [
+            { name: "id", type: "integer", identity: "a" },
+            ...Object.entries(defaults).map(([name, [type, stored]]) => ({
+              name,
+              type,
+              default: stored,
+            })),
+          ],
+        },
+      ]),
+    );
+
+    expect(
+      Object.fromEntries(
+        Object.keys(defaults).map((name) => {
+          const value = column(model, "codes", name).default;
+
+          return [
+            name,
+            value?.kind === "value"
+              ? value.source
+              : value?.kind === "sql"
+                ? `sql: ${value.sql}`
+                : undefined,
+          ];
+        }),
+      ),
+    ).toEqual({
+      padded: '"ab"',
+      blank: '""',
+      quoted: '"it\'s"',
+      tabbed: '"ab\\t"',
+      short: '"ab"',
+      cut: '"abc"',
+      cut_wide: '"a\u{1f600}"',
+      limited: '"abcde"',
+      kept: '"ab "',
+      plain: '"ab "',
+      fixed: "sql: 'ab'::bpchar",
+      fixed_text: "sql: 'ab '::character(5)",
+    });
+  });
+
+  test("a number default written as a literal of another type is a value only where that type keeps the number", () => {
+    const defaults: Record<string, [type: string, stored: string]> = {
+      // A real literal is the nearest real number: 0.10000000149011612.
+      widened: ["double precision", "'0.1'::real"],
+      widened_negative: ["double precision", "'-0.1'::real"],
+      // 0.5 and -3 are the same number in both precisions.
+      half: ["double precision", "'0.5'::real"],
+      whole: ["double precision", "'-3'::integer"],
+      narrowed: ["real", "'0.1'::double precision"],
+      // A cast to numeric(10,2) rounds to two decimals: 1.01.
+      rounded: ["numeric", "'-1.005'::numeric(10,2)"],
+      truncated: ["numeric", "'-1.5'::numeric(10)"],
+      exact: ["numeric", "'-1.50'::numeric(10,2)"],
+      plain: ["numeric", "'-1.005'::numeric"],
+      // ... and fills up to them: a fresh row holds 7.00 and -3.000.
+      filled: ["numeric", "'7'::numeric(10,2)"],
+      filled_negative: ["numeric", "'-3'::numeric(8,3)"],
+      filled_zero: ["numeric", "'0'::numeric(2,2)"],
+      integral: ["numeric", "'12'::numeric(4,0)"],
+      // 12345 has more digits than numeric(4,2) holds: PostgreSQL fails.
+      overflow: ["numeric", "'12345'::numeric(4,2)"],
+      // The column's own scale rounds a value as it rounds the literal.
+      scaled: ["numeric(10,2)", "1.005"],
+    };
+    const model = buildPulledSchema(
+      catalog([
+        {
+          name: "rates",
+          primaryKey: ["id"],
+          columns: [
+            { name: "id", type: "integer", identity: "a" },
+            ...Object.entries(defaults).map(([name, [type, stored]]) => ({
+              name,
+              type,
+              default: stored,
+            })),
+          ],
+        },
+      ]),
+    );
+
+    expect(
+      Object.fromEntries(
+        Object.keys(defaults).map((name) => {
+          const value = column(model, "rates", name).default;
+
+          return [
+            name,
+            value?.kind === "value"
+              ? value.source
+              : value?.kind === "sql"
+                ? `sql: ${value.sql}`
+                : undefined,
+          ];
+        }),
+      ),
+    ).toEqual({
+      widened: "sql: '0.1'::real",
+      widened_negative: "sql: '-0.1'::real",
+      half: "0.5",
+      whole: "-3",
+      narrowed: "0.1",
+      rounded: "sql: '-1.005'::numeric(10,2)",
+      truncated: "sql: '-1.5'::numeric(10)",
+      exact: '"-1.50"',
+      plain: '"-1.005"',
+      filled: '"7.00"',
+      filled_negative: '"-3.000"',
+      filled_zero: '"0.00"',
+      integral: '"12"',
+      overflow: "sql: '12345'::numeric(4,2)",
+      scaled: '"1.005"',
+    });
+  });
 });
 
 describe("pull: what the schema cannot declare", () => {
@@ -994,6 +1741,164 @@ describe("pull: what the schema cannot declare", () => {
       ["serial", "invoices", "fix"],
       expect.arrayContaining(["sequence", "receipts"]),
     ]);
+  });
+
+  test("rules, foreign tables, storage parameters, operator class parameters and a deferrable multi-column UNIQUE are listed", () => {
+    const pair = (
+      name: string,
+      unique: NonNullable<Table["unique"]>[number],
+    ): Table => ({
+      name,
+      primaryKey: ["id"],
+      unique: [unique],
+      columns: [
+        { name: "id", type: "integer", identity: "a" },
+        { name: "a", type: "integer" },
+        { name: "b", type: "integer" },
+      ],
+    });
+    const model = buildPulledSchema(
+      catalog(
+        [
+          {
+            name: "docs",
+            primaryKey: ["id"],
+            storage: ["fillfactor=70", "toast.autovacuum_enabled=false"],
+            columns: [
+              { name: "id", type: "integer", identity: "a" },
+              { name: "title", type: "text" },
+              { name: "body", type: "tsvector", nullable: true },
+            ],
+            indexes: [
+              {
+                name: "docs_body_idx",
+                keys: ["body"],
+                method: "gist",
+                opclass_options: ["siglen=500"],
+              },
+              {
+                name: "docs_title_trgm",
+                keys: ["title"],
+                method: "gist",
+                opclasses: ["gist_trgm_ops"],
+                opclass_options: ["siglen=64"],
+              },
+            ],
+          },
+          pair("held", {
+            columns: ["a", "b"],
+            deferrable: true,
+            initiallyDeferred: true,
+          }),
+          pair("late", { columns: ["a", "b"], deferrable: true }),
+          pair("nulls", { columns: ["a", "b"], nullsNotDistinct: true }),
+          pair("plain", { columns: ["a", "b"] }),
+        ],
+        [],
+        [
+          {
+            kind: "foreign table",
+            name: "remote_docs",
+            table_name: null,
+            definition: "files",
+          },
+          {
+            kind: "rule",
+            name: "docs_keep",
+            table_name: "docs",
+            definition:
+              "CREATE RULE docs_keep AS\n    ON DELETE TO docs DO INSTEAD NOTHING;",
+          },
+        ],
+      ),
+    );
+
+    expect(
+      model.warnings.map((warning) => [
+        warning.code,
+        warning.object ?? warning.table ?? "",
+        warning.message,
+        ...(warning.fix === undefined ? [] : [warning.fix]),
+      ]),
+    ).toEqual([
+      [
+        "foreign-table",
+        "remote_docs",
+        'foreign table "remote_docs" of server "files" is not declared; queries cannot reach it through the schema and migrations neither create nor drop it',
+      ],
+      [
+        "rule",
+        "docs_keep",
+        'rule "docs_keep" on "docs" is not declared; the schema does not manage rules, so migrations neither create nor drop it and a database built from this schema lacks it (CREATE RULE docs_keep AS ON DELETE TO docs DO INSTEAD NOTHING;)',
+      ],
+      [
+        "storage-parameters",
+        "docs",
+        '"docs" has storage parameters the schema cannot declare (fillfactor=70, toast.autovacuum_enabled=false); a database built from this schema creates the table with the defaults',
+      ],
+      [
+        "index",
+        "docs_body_idx",
+        'index "docs_body_idx" is declared without its operator class parameters, which the schema cannot declare: body (siglen=500); a database built from this schema creates the index with the operator class\'s defaults (CREATE INDEX docs_body_idx)',
+      ],
+      [
+        "index",
+        "docs_title_trgm",
+        'index "docs_title_trgm" is declared without its operator class parameters, which the schema cannot declare: title (siglen=64); a database built from this schema creates the index with the operator class\'s defaults (CREATE INDEX docs_title_trgm)',
+      ],
+      // No fix for these three: a plain unique index in the constraint's
+      // place would make the database check at once, or let NULLs repeat.
+      [
+        "unique-constraint",
+        "held_a_b_key",
+        'multi-column unique constraint "held_a_b_key" (a, b) is DEFERRABLE INITIALLY DEFERRED, which the schema cannot declare. It is declared as a unique index of the same name, and an index refuses a duplicate at once, where this constraint waits for the end of the transaction: a database built from this schema fails writes that hold a duplicate only for a moment, such as two rows swapping their values. The constraint itself stays undeclared',
+      ],
+      [
+        "unique-constraint",
+        "late_a_b_key",
+        'multi-column unique constraint "late_a_b_key" (a, b) is DEFERRABLE, which the schema cannot declare. It is declared as a unique index of the same name, and an index refuses a duplicate at once, where this constraint waits for the end of the statement (or of the transaction, after SET CONSTRAINTS): a database built from this schema fails writes that hold a duplicate only for a moment, such as two rows swapping their values. The constraint itself stays undeclared',
+      ],
+      [
+        "unique-constraint",
+        "nulls_a_b_key",
+        'multi-column unique constraint "nulls_a_b_key" (a, b) is NULLS NOT DISTINCT, which the schema cannot declare; the constraint stays undeclared, and a database built from this schema lacks it',
+      ],
+      [
+        "index",
+        "nulls_a_b_key",
+        'index "nulls_a_b_key" is not declared: NULLS NOT DISTINCT is not supported (nulls_a_b_key)',
+      ],
+      [
+        "unique-constraint",
+        "plain_a_b_key",
+        'multi-column unique constraint "plain_a_b_key" (a, b) is declared as a unique index of the same name; the constraint itself stays undeclared',
+        'ALTER TABLE "plain" DROP CONSTRAINT "plain_a_b_key"; CREATE UNIQUE INDEX "plain_a_b_key" ON "plain" ("a", "b");',
+      ],
+    ]);
+    expect(model.skippedTables).toEqual([
+      {
+        sqlName: "remote_docs",
+        reason:
+          'a foreign table of server "files"; the schema declares ordinary tables',
+      },
+    ]);
+
+    const source = renderSchema(model);
+
+    for (const line of [
+      '// pull: table "remote_docs" skipped: a foreign table of server "files"; the schema declares ordinary tables',
+      '    // pull: rule "docs_keep" is not declared',
+      "    // pull: storage parameters are not declared: fillfactor=70, toast.autovacuum_enabled=false",
+      'body: index(docs.body).using("gist"), // pull: operator class parameters are not declared: body (siglen=500)',
+      'docs_title_trgm: index(operatorClass(docs.title, "gist_trgm_ops")).using("gist"), // pull: operator class parameters are not declared: title (siglen=64); name kept exactly',
+      "held_a_b_key: index(held.a, held.b).unique, // pull: the constraint is DEFERRABLE INITIALLY DEFERRED; the index checks at once; name kept exactly",
+      "late_a_b_key: index(late.a, late.b).unique, // pull: the constraint is DEFERRABLE; the index checks at once; name kept exactly",
+      "plain_a_b_key: index(plain.a, plain.b).unique, // pull: name kept exactly",
+    ]) {
+      expect(source).toContain(line);
+    }
+
+    expect(source).not.toContain("nulls_a_b_key:");
   });
 });
 
@@ -1829,6 +2734,231 @@ describe("pull: tables and relations", () => {
         'foreign key "items_srid_fkey" is kept as a plain column: the referenced table "spatial_ref_sys" is ignored (ignoreTables)',
     });
   });
+
+  test("a division is quotient() between integers and divide() where PostgreSQL divides exactly", () => {
+    const model = buildPulledSchema(divisions());
+    const items = model.tables.find((table) => table.sqlName === "items")!;
+
+    expect(
+      Object.fromEntries(
+        items.checks.map((check) => [
+          check.key,
+          check.condition.kind === "predicate"
+            ? check.condition.source
+            : `sql: ${check.condition.template}`,
+        ]),
+      ),
+    ).toEqual({
+      // 7 / 2 is 3 between integers; divide() would make it 3.5.
+      half: "items.score.quotient(2).is(3)",
+      smallHalf: "items.small.quotient(2).above(10)",
+      bigHalf: "items.big.quotient(2n).below(2n)",
+      // A bigint over an integer literal is another operator than quotient(2n).
+      bigInteger: "sql: ((${items.big} / 2) < (2)::bigint)",
+      pair: "items.score.quotient(items.lower).atLeast(1)",
+      mixed: "items.big.quotient(items.score).above(1n)",
+      nested: "items.score.multiply(2).quotient(3).is(2)",
+      // numeric and double precision divide exactly, as divide() does.
+      price: 'items.price.divide("2").above("1")',
+      share: 'items.score.divide(items.price).above("1")',
+      weight: "items.weight.divide(2).above(0.5)",
+    });
+    expect(renderSchema(model)).toContain(
+      "halves: index(items.score.quotient(2)),",
+    );
+  });
+
+  test("a number the DSL refuses for a smallint value keeps the condition as SQL, and the module loads", () =>
+    withMigrationDirectory(async (directory) => {
+      const model = buildPulledSchema(integerRanges());
+      const counts = model.tables.find((table) => table.sqlName === "counts")!;
+
+      expect(
+        Object.fromEntries(
+          counts.checks.map((check) => [
+            check.key,
+            check.condition.kind === "predicate"
+              ? check.condition.source
+              : `sql: ${check.condition.template}`,
+          ]),
+        ),
+      ).toEqual({
+        over: "sql: (${counts.s} <= 40000)",
+        top: "counts.s.atMost(32767)",
+        bottom: "counts.s.atLeast(-32768)",
+        under: "sql: (${counts.s} >= '-32769'::integer)",
+        // Two smallints make a smallint, whatever the operator.
+        sum: "sql: ((${counts.s} + ${counts.s2}) <= 40000)",
+        ratio: "sql: ((${counts.s} / ${counts.s2}) <= 40000)",
+        product: "sql: ((${counts.s} * ${counts.s2}) < 100000)",
+        ratioSmall: "counts.s.quotient(counts.s2).atMost(100)",
+        listed: "sql: (${counts.s} = ANY (ARRAY[1, 40000]))",
+        listedSmall: "counts.s.in([1, 2])",
+        range: "sql: ((${counts.s} >= 1) AND (${counts.s} <= 40000))",
+        distinct: "sql: (${counts.s} IS DISTINCT FROM 40000)",
+        reversed: "sql: (40000 >= ${counts.s})",
+        step: "counts.s.plus(1).atMost(40000)",
+        half: "counts.s.quotient(2).atMost(40000)",
+        mixed: "counts.s.plus(counts.i).atMost(40000)",
+        shifted: "counts.s.plus(40000).above(0)",
+        intTop: "counts.i.atMost(2147483647)",
+        intBottom: "counts.i.atLeast(-2147483648)",
+        intSum: "counts.i.plus(2147483647).above(0)",
+        intOver: "sql: ((${counts.i} + ${counts.j}) < '3000000000'::bigint)",
+        bigTop: "counts.b.below(9223372036854775807n)",
+        bigBottom: "counts.b.atLeast(-9223372036854775808n)",
+      });
+
+      const source = renderSchema(model, { module: runtime });
+
+      expect(source).toContain(
+        "wide: index(counts.i).where(sql<boolean>`((${counts.s} / ${counts.s2}) < 100000)`),",
+      );
+      expect(source).toContain(
+        "narrow: index(counts.i).where(counts.s.quotient(counts.s2).below(100)),",
+      );
+
+      // schema() checks every number against its column when the module loads.
+      const path = join(directory, "ranges.ts");
+      await writeFile(path, source);
+      const loaded = await import(pathToFileURL(path).href);
+
+      expect(
+        migrationSnapshot(loaded.appSchema.$snapshot()).tables[0]!.checks,
+      ).toHaveLength(Object.keys(INTEGER_RANGES).length);
+    }));
+
+  test("two foreign keys on one column: one is declared and every other one is listed", () => {
+    const model = buildPulledSchema(
+      catalog([
+        {
+          name: "accounts",
+          primaryKey: ["id"],
+          columns: [{ name: "id", type: "integer", identity: "a" }],
+        },
+        {
+          name: "people",
+          primaryKey: ["id"],
+          columns: [{ name: "id", type: "integer", identity: "a" }],
+        },
+        {
+          name: "memberships",
+          primaryKey: ["id"],
+          columns: [
+            { name: "id", type: "integer", identity: "a" },
+            { name: "owner_id", type: "integer" },
+          ],
+          foreignKeys: [
+            {
+              name: "memberships_account_fk",
+              column: "owner_id",
+              table: "accounts",
+              onDelete: "c",
+              definition:
+                "FOREIGN KEY (owner_id) REFERENCES accounts(id) ON DELETE CASCADE",
+            },
+            {
+              name: "memberships_person_fk",
+              column: "owner_id",
+              table: "people",
+              definition: "FOREIGN KEY (owner_id) REFERENCES people(id)",
+            },
+          ],
+        },
+        {
+          name: "notes",
+          primaryKey: ["id"],
+          columns: [
+            { name: "id", type: "integer", identity: "a" },
+            { name: "account_id", type: "integer", nullable: true },
+          ],
+          foreignKeys: [
+            {
+              name: "fk_notes_account",
+              column: "account_id",
+              table: "accounts",
+              definition: "FOREIGN KEY (account_id) REFERENCES accounts(id)",
+            },
+            {
+              name: "notes_account_id_fkey",
+              column: "account_id",
+              table: "accounts",
+              onDelete: "c",
+            },
+            {
+              name: "notes_account_late_fkey",
+              column: "account_id",
+              table: "accounts",
+              deferrable: true,
+            },
+          ],
+        },
+      ]),
+    );
+
+    // Neither key of memberships.owner_id has the schema's name: the first by name is declared.
+    expect(reference(model, "memberships", "owner_id")).toMatchObject({
+      target: "accounts",
+      onDelete: "cascade",
+      comments: [
+        'foreign key "memberships_person_fk" is not declared: FOREIGN KEY (owner_id) REFERENCES people(id)',
+        'constraint "memberships_account_fk" is named "memberships_owner_id_fkey"',
+      ],
+    });
+    // The key named as the schema names it is declared, wherever it sorts.
+    expect(reference(model, "notes", "account_id")).toMatchObject({
+      target: "accounts",
+      onDelete: "cascade",
+      comments: [
+        'foreign key "fk_notes_account" is not declared: FOREIGN KEY (account_id) REFERENCES accounts(id)',
+      ],
+    });
+    expect(
+      model.warnings.map((warning) => [
+        warning.code,
+        warning.object ?? "",
+        warning.message,
+      ]),
+    ).toEqual([
+      [
+        "foreign-key",
+        "memberships_person_fk",
+        'foreign key "memberships_person_fk" is not declared: "memberships.owner_id" has more than one foreign key and the schema declares one per column, here "memberships_account_fk" (the first by name); migrations neither create nor drop "memberships_person_fk", and a database built from this schema lacks it (FOREIGN KEY (owner_id) REFERENCES people(id))',
+      ],
+      [
+        "foreign-key",
+        "notes_account_late_fkey",
+        'foreign key "notes_account_late_fkey" is kept as a plain column: deferrable constraints are not supported',
+      ],
+      [
+        "foreign-key",
+        "fk_notes_account",
+        'foreign key "fk_notes_account" is not declared: "notes.account_id" has more than one foreign key and the schema declares one per column, here "notes_account_id_fkey" (the one with the name the schema gives the key); migrations neither create nor drop "fk_notes_account", and a database built from this schema lacks it (FOREIGN KEY (account_id) REFERENCES accounts(id))',
+      ],
+      [
+        "constraint-name",
+        "memberships_account_fk",
+        'foreign key "memberships_account_fk" will be expected as "memberships_owner_id_fkey"',
+      ],
+    ]);
+    expect(renderSchema(model)).toContain(
+      'owner: one(accounts).noIndex.cascade, // pull: foreign key "memberships_person_fk" is not declared: FOREIGN KEY (owner_id) REFERENCES people(id); constraint "memberships_account_fk" is named "memberships_owner_id_fkey"',
+    );
+  });
+
+  test("rendered modules type-check: shortcuts next to .named(), divisions, numerics outside the builder's range", async () => {
+    const render = (source: PullCatalog) =>
+      renderSchema(buildPulledSchema(source), { module: runtime });
+
+    expect(
+      await typeErrors({
+        "named.ts": render(pascalCase()),
+        "divisions.ts": render(divisions()),
+        "numerics.ts": render(oddNumerics()),
+        "ranges.ts": render(integerRanges()),
+      }),
+    ).toBe("");
+  }, 30000);
 
   test("long names: hashed derived names are recognized, truncated ones are declared exactly", () => {
     const longTable = "customer_subscription_billing_adjustments";

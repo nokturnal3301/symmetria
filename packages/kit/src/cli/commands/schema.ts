@@ -1,7 +1,6 @@
 /**
  * Schema-only CLI commands that need no database: inspect, lint, diff and generate.
  */
-import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { SchemaSnapshot } from "symmetria";
 import {
@@ -21,7 +20,13 @@ import { inspectSchema } from "../screens/schema-browser";
 import { resolveRenames } from "../screens/rename-prompt";
 import { interruption } from "../signals";
 import { ask, withScreen } from "../ui/terminal";
-import { databaseDriver, type CliContext, type Project } from "../context";
+import {
+  databaseDriver,
+  readJSONFile,
+  withCancellation,
+  type CliContext,
+  type Project,
+} from "../context";
 
 /** The declared schema, required unless the command can run without one. */
 const declaredSchema = (
@@ -43,9 +48,16 @@ const readDiffOptions = async (
   context: CliContext,
 ): Promise<MigrationDiffOptions> => {
   const { values } = context;
-  const options: MigrationDiffOptions = values.diff
-    ? JSON.parse(await readFile(resolve(values.diff), "utf8"))
-    : {};
+  const hints = values.diff ? await readJSONFile("diff", values.diff) : {};
+
+  // null, a list or a bare value would fail later, far from the file.
+  if (!hints || typeof hints !== "object" || Array.isArray(hints)) {
+    throw new Error(
+      `symmetria: the --diff file ${resolve(values.diff!)} must hold a JSON object with rename hints and USING conversions, such as {"renames": {"columns": {"posts": {"title": "headline"}}}}; it holds ${hints === null ? "null" : Array.isArray(hints) ? "an array" : `a ${typeof hints}`}`,
+    );
+  }
+
+  const options: MigrationDiffOptions = hints;
 
   return values.online ? { ...options, online: true } : options;
 };
@@ -237,18 +249,23 @@ export const generate = async (
   }
 
   const migration = await context.progress("Writing migration", () =>
-    generateMigration({
-      ...diffOptions,
-      directory: project.directory,
-      name,
-      ...(snapshot ? { snapshot } : {}),
-      ...(values.empty ? { empty: true } : {}),
-      ...(values["allow-destructive"] ? { allowDestructive: true } : {}),
-      ...(values.transaction
-        ? { transaction: values.transaction as "batch" | "each" | "none" }
-        : {}),
-      ...(values.online ? { online: true } : {}),
-    }),
+    // Ctrl-C and SIGTERM stop it before anything is published; the lock and
+    // the staged files do not outlive the command.
+    withCancellation((signal) =>
+      generateMigration({
+        ...diffOptions,
+        directory: project.directory,
+        name,
+        ...(snapshot ? { snapshot } : {}),
+        ...(values.empty ? { empty: true } : {}),
+        ...(values["allow-destructive"] ? { allowDestructive: true } : {}),
+        ...(values.transaction
+          ? { transaction: values.transaction as "batch" | "each" | "none" }
+          : {}),
+        ...(values.online ? { online: true } : {}),
+        signal,
+      }),
+    ),
   );
   const directory = project.directory;
   // What the migration does to existing data and to the running application:

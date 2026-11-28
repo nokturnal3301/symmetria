@@ -1,10 +1,14 @@
 import { expect, test } from "bun:test";
 import {
   schema,
+  table,
+  one,
+  many,
   prepare,
   int,
   text,
   bigint,
+  numeric,
   jsonb,
   timestamptz,
   customType,
@@ -865,6 +869,74 @@ test("a prepared JSON parameter that may hold null binds JSON null", async () =>
 
   await expect(named({ id: null as never })).rejects.toThrow(
     'parameter "id" cannot be null',
+  );
+});
+
+test("a numeric or bigint parameter inside a nested result is a value of its type before it is text", () => {
+  const amount = customType<string>("amount", { base: "numeric(30,10)" });
+  const owners = table({ id: int.auto, items: many });
+  const items = table({ id: int.auto, owner: one(owners.items) });
+  const database = schema({ owners, items });
+  const echo = prepare(
+    {
+      price: numeric,
+      scaled: numeric(10, 2),
+      maybe: numeric.nullable,
+      views: bigint,
+      amount,
+      prices: numeric.array,
+      counts: bigint.array,
+      name: text,
+      at: timestamptz,
+      size: int,
+    },
+    (p) =>
+      database.owners((owner) => ({
+        price: p.price,
+        views: p.views,
+        nested: {
+          price: p.price,
+          scaled: p.scaled,
+          maybe: p.maybe,
+          views: p.views,
+          amount: p.amount,
+          prices: p.prices,
+          counts: p.counts,
+          name: p.name,
+          at: p.at,
+          size: p.size,
+        },
+        items: owner.items(() => ({ price: p.price, views: p.views })),
+      })),
+  );
+  const { sql } = echo.toSQL({
+    price: "1e3",
+    scaled: "1",
+    maybe: null,
+    views: 1n,
+    amount: "1",
+    prices: ["1"],
+    counts: [1n],
+    name: "a",
+    at: new Date(0),
+    size: 1,
+  });
+
+  expect(sql).toStartWith(
+    'SELECT ($1)::numeric AS "price", ($2)::bigint AS "views", ',
+  );
+  // `($3)::text` alone would make the parameter text: "1e3" would come back
+  // as "1e3" where the top level reads "1000", and a bigint out of range
+  // would come back instead of failing.
+  expect(sql).toContain(
+    "json_build_object('price', (($3)::numeric)::text, 'scaled', (($4)::numeric)::text, 'maybe', (($5)::numeric)::text, 'views', (($6)::bigint)::text, 'amount', (($7)::amount)::text, ",
+  );
+  // An array is cast to its type where it is bound; other types as before.
+  expect(sql).toContain(
+    "'prices', ($8::text::numeric[])::text[], 'counts', ($9::text::bigint[])::text[], 'name', ($10)::text, 'at', ($11)::timestamptz, 'size', ($12)::integer) AS \"nested\"",
+  );
+  expect(sql).toContain(
+    'FROM (SELECT (($13)::numeric)::text AS "price", (($14)::bigint)::text AS "views"',
   );
 });
 

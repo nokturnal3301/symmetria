@@ -9,7 +9,13 @@ import { inspectSchema } from "./schema-browser";
 import { interruption } from "../signals";
 import { formatError } from "../ui/style";
 import { choose, view, withScreen } from "../ui/terminal";
-import { databaseDriver, type CliContext, type Project } from "../context";
+import {
+  databaseDriver,
+  displayedUrl,
+  missingDirectoryNote,
+  type CliContext,
+  type Project,
+} from "../context";
 
 const ACTIONS = [
   [
@@ -49,6 +55,19 @@ const overview = async (context: CliContext, project: Project) => {
     project.directory,
   );
   const snapshot = project.snapshot();
+  // What `status` says of a migrations directory that is not there: a wrong
+  // path, which it refuses, or a project before its first `generate`. The
+  // header says the same instead of counting an empty chain as up to date.
+  let missing: string | undefined;
+
+  try {
+    missing = missingDirectoryNote(project, context.values);
+  } catch (error) {
+    missing = (error instanceof Error ? error.message : String(error))
+      .replace(/^symmetria: /, "")
+      .replace(/^./, (first) => first.toUpperCase());
+  }
+
   const summary = {
     migrations: `${migrations.length} local · database not configured`,
     address: "Offline · set DATABASE_URL to connect",
@@ -58,8 +77,9 @@ const overview = async (context: CliContext, project: Project) => {
   };
 
   if (project.databaseUrl) {
-    // A socket directory is no URL; a bad URL is reported below.
-    const url = URL.parse(project.databaseUrl);
+    // A socket directory is no URL; a bad URL is reported below, and never
+    // shown: text that is not one can hold a password anywhere.
+    const url = displayedUrl(project.databaseUrl);
     summary.address = url
       ? `PostgreSQL · ${url.hostname}:${url.port || "5432"}${url.pathname}`
       : "PostgreSQL";
@@ -94,6 +114,7 @@ const overview = async (context: CliContext, project: Project) => {
 
   return {
     ...summary,
+    ...(missing ? { missing } : {}),
     snapshot,
     local: migrations.length,
     changes: snapshot

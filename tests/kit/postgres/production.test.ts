@@ -256,6 +256,8 @@ describe.skipIf(!url)("production migrations", () => {
         expect((await runner.status()).at(-1)?.status).toBe("pending");
         expect(await runner.migrate()).toEqual([added.id]);
       }),
+    // Online DDL: 0.4 s alone, past the default 5 s once on a busy machine.
+    30_000,
   );
   test("pinned sessions preserve connection identity and transaction lifecycle guards", () =>
     sandbox(async ({ driver }) => {

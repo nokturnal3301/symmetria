@@ -511,6 +511,18 @@ export const typeConversion = (
     }
   }
 
+  // PostgreSQL's cast keeps what is left after whole days of hours:
+  // `1 day 02:00:00` and `26:00:00` both become `02:00:00`. An interval
+  // declared with fields (`interval hour to minute`) loses the same.
+  if (
+    (source.base === "interval" || source.base.startsWith("interval ")) &&
+    TIMES.has(target.base)
+  ) {
+    return lossy(
+      "months and days are dropped, and so are whole days of hours (26:00:00 becomes 02:00:00)",
+    );
+  }
+
   return undefined;
 };
 
@@ -548,7 +560,8 @@ export const halfPrecision = (
  * converts at UTC: through `AT TIME ZONE 'UTC'` where a value allows it (a
  * function of the quoted column and the target type), and otherwise
  * (`"session"`: an array, which has no such operator, a `timetz` target, a
- * string) with the session's zone set to UTC around the statement.
+ * string, also one that holds an array as text) with the session's zone set
+ * to UTC around the statement.
  */
 export const utcConversion = (
   before: MigrationColumn,
@@ -560,13 +573,25 @@ export const utcConversion = (
 
   const source = parse(before.sqlType);
   const target = parse(after.sqlType);
+  const TIMESTAMPTZ = "timestamp with time zone";
+  const TIMETZ = "time with time zone";
 
-  if (source.array !== target.array || source.base === target.base) {
+  // One string holds a whole array as text (`{"2024-03-10 23:30:00+00"}`):
+  // PostgreSQL reads and writes each element as it does a single value.
+  if (source.array !== target.array) {
+    const text = (type: ParsedType) => !type.array && STRINGS.has(type.base);
+
+    return (text(source) &&
+      (target.base === TIMESTAMPTZ || target.base === TIMETZ)) ||
+      (source.base === TIMESTAMPTZ && text(target))
+      ? "session"
+      : undefined;
+  }
+
+  if (source.base === target.base) {
     return undefined;
   }
 
-  const TIMESTAMPTZ = "timestamp with time zone";
-  const TIMETZ = "time with time zone";
   const pair = (from: string, to: string) =>
     source.base === from && target.base === to;
   const value = (

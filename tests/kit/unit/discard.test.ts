@@ -9,6 +9,7 @@ import {
   loadMigrationState,
   snapshotHash,
 } from "../../../packages/kit/src";
+import { discardTarget } from "../../../packages/kit/src/migrations/files";
 import { withMigrationDirectory } from "../../support/directories";
 
 const version = (step: number) =>
@@ -196,4 +197,58 @@ test("a migration deleted by removing its directory: discard takes it out of the
       "000001_initial",
     ]);
     expect(snapshotHash(state.snapshot)).toBe(snapshotHash(before));
+  }));
+
+test("the migration discard would take out of the journal is known while the chain does not load", () =>
+  withMigrationDirectory(async (directory) => {
+    // Nothing to discard, in a directory that need not exist.
+    expect(await discardTarget(directory)).toBeUndefined();
+    expect(await discardTarget(join(directory, "absent"))).toBeUndefined();
+    expect(await readdir(directory)).toEqual([]);
+
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: version(1),
+    });
+    await generateMigration({ directory, name: "reply", snapshot: version(2) });
+    expect(await discardTarget(directory)).toEqual({
+      id: "000002_reply",
+      removed: false,
+    });
+
+    // Its directory deleted by hand: no command loads the chain, and the
+    // migration is still the one the database is asked about before discard
+    // takes it out of the journal.
+    await rm(join(directory, "000002_reply"), { recursive: true });
+    await expect(loadMigrationState(directory)).rejects.toThrow(
+      '"symmetria discard" takes it out of the journal',
+    );
+    const before = await journal(directory);
+    expect(await discardTarget(directory)).toEqual({
+      id: "000002_reply",
+      removed: true,
+    });
+    // Asking changes nothing.
+    expect(await journal(directory)).toEqual(before);
+    expect((await readdir(directory)).sort()).toEqual([
+      "000001_initial",
+      "meta",
+    ]);
+
+    // Its journal entry removed as well: discard only puts the snapshot back,
+    // and no migration leaves the journal, so there is nothing to ask about.
+    before.migrations.pop();
+    await writeFile(
+      join(directory, "meta", "migration.json"),
+      JSON.stringify(before, null, 2),
+    );
+    expect(await discardTarget(directory)).toBeUndefined();
+    expect(await discardMigration({ directory })).toEqual({
+      source: "journal",
+    });
+    expect(await discardTarget(directory)).toEqual({
+      id: "000001_initial",
+      removed: false,
+    });
   }));

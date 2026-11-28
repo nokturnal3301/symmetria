@@ -131,6 +131,24 @@ export const testDatabase = async <
     }
   }
 
+  // node-postgres reads text that is no URL against postgres://base and
+  // then reports the host "base"; text with the `postgres://` forgotten
+  // (`host:5432/db`, `user:password@host/db`) parses as a URL whose scheme is
+  // `host:` or `user:`, leaves it without a host, and it connects to
+  // localhost, the wrong server. The message leaves the value out: it can
+  // hold a password.
+  const connection =
+    typeof options.url === "string" &&
+    /^postgres(?:ql)?:\/\//i.test(options.url)
+      ? URL.parse(options.url)
+      : null;
+
+  if (!connection) {
+    throw new Error(
+      "symmetria: invalid test database URL: expected postgres://user:password@host:5432/database",
+    );
+  }
+
   const snapshot = options.schema.$snapshot();
   const statements = createSchemaSQL(snapshot);
   const connect = options.driver ?? postgres;
@@ -150,10 +168,15 @@ export const testDatabase = async <
       adminSQL,
       snapshot.extensions ?? [],
     );
-    const connection = new URL(options.url);
+    // Start-up settings the caller put in the URL (`-c TimeZone=…`,
+    // `-c statement_timeout=…`) stay, as they are written: a value may hold
+    // an escaped space. PostgreSQL applies them in order, so the test
+    // schema's search_path, written last, is the one in force even when
+    // theirs name one too.
+    const given = connection.searchParams.getAll("options").at(-1);
     connection.searchParams.set(
       "options",
-      `-c search_path=${[
+      `${given ? `${given} ` : ""}-c search_path=${[
         ...new Set([
           namespace,
           ...(options.searchPath ?? []),

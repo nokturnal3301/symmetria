@@ -12,17 +12,35 @@ import {
   table,
   createDatabase,
   int,
+  smallint,
   text,
   bigint,
+  numeric,
+  real,
+  doublePrecision,
+  bool,
+  uuid,
   jsonb,
+  date,
+  time,
+  interval,
+  timestamp,
   timestamptz,
   oneOf,
   sql,
+  dateTrunc,
   prepare,
   customType,
+  type Page,
   type PageCursor,
+  type PageOptions,
 } from "../../../packages/runtime/src";
-import { postgres, searchPathURL } from "../../support/postgres";
+import {
+  postgres,
+  searchPathURL,
+  testDatabase,
+  transactionPooling,
+} from "../../support/postgres";
 import { createSchemaSQL } from "../../../packages/kit/src";
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
@@ -440,6 +458,466 @@ describe.skipIf(!databaseUrl)(
       });
       expect(preciseFirst.items).toEqual([{ id: 1 }]);
       expect(preciseSecond.items).toEqual([{ id: 2 }]);
+    });
+
+    test("cursors distinguish filters on NaN and signed infinities", async () => {
+      const fixture = await testDatabase({
+        url: databaseUrl!,
+        schema: schema({ samples: { id: int.auto, value: doublePrecision } }),
+      });
+      try {
+        const samples = fixture.database.samples;
+        const values = [NaN, Infinity, -Infinity];
+        await samples.insert(
+          [...values, ...values].map((value) => ({ value })),
+        );
+        const query = (value: number) =>
+          samples((r) => ({ id: r.id }), {
+            where: (r) => r.value.is(value),
+            orderBy: (r) => r.id.asc,
+          });
+        for (const [i, value] of values.entries()) {
+          const { nextCursor } = await query(value).page({ size: 1 });
+          expect(
+            (await query(value).page({ size: 1, after: nextCursor })).items,
+          ).toEqual([{ id: i + 4 }]);
+          for (const other of values.filter((v) => !Object.is(v, value))) {
+            await expect(
+              query(other).page({ size: 1, after: nextCursor }),
+            ).rejects.toThrow(/another query/);
+          }
+        }
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    test("cursors round-trip long text and preserve array bounds used to break ties", async () => {
+      const fixture = await testDatabase({
+        url: databaseUrl!,
+        schema: schema({
+          entries: { id: int.auto, label: text, nums: int.array },
+        }),
+      });
+      try {
+        await fixture.driver.execute({
+          sql: `INSERT INTO entries (label, nums) VALUES
+            (repeat('z', 50000), '{1,2}'),
+            (repeat('a', 50000), '[0:1]={1,2}')`,
+          parameters: [],
+        });
+        for (const key of ["label", "nums"] as const) {
+          const query = fixture.database.entries((r) => ({ id: r.id }), {
+            orderBy: (r) => [r[key].ascending, r.id.ascending],
+          });
+          const first = await query.page({ size: 1 });
+          expect(first.items).toEqual([{ id: 2 }]);
+          const second = await query.page({ size: 1, after: first.nextCursor });
+          expect(second.items).toEqual([{ id: 1 }]);
+          expect(second.nextCursor).toBeNull();
+          expect(
+            (await query.page({ size: 1, before: second.previousCursor }))
+              .items,
+          ).toEqual(first.items);
+        }
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    test("a page with a row lock locks its rows and the row read ahead, whatever the projection holds", async () => {
+      const jobs = table({
+        id: int.auto,
+        name: text,
+        createdAt: timestamptz.now,
+      }).computed((job) => ({ upper: sql<string>`upper(${job.name})` }));
+      const fixture = await testDatabase({
+        url: databaseUrl!,
+        schema: schema({ jobs }),
+      });
+      try {
+        const db = fixture.database;
+        type Session = Pick<typeof db, "jobs">;
+        const ids = Array.from({ length: 12 }, (_, index) => index + 1);
+        await db.jobs.insert(ids.map((id) => ({ name: `job ${id}` })));
+        // From another connection: the rows it can no longer lock.
+        const locked = async () => {
+          const free = await db.jobs((job) => ({ id: job.id }), {
+            forUpdate: { skipLocked: true },
+          });
+          return ids.filter((id) => !free.some((row) => row.id === id));
+        };
+        const check = async <Row extends { id: number }>(
+          read: (session: Session) => {
+            page: (options: PageOptions<Row>) => Promise<Page<Row>>;
+          },
+        ) => {
+          // Three pages of two rows, each in a transaction of its own.
+          const first = await db.$transaction((tx) =>
+            read(tx).page({ size: 2 }),
+          );
+          const second = await db.$transaction(async (tx) => {
+            const page = await read(tx).page({
+              size: 2,
+              after: first.nextCursor,
+            });
+            expect(await locked()).toEqual([3, 4, 5]);
+            return page;
+          });
+          const third = await db.$transaction((tx) =>
+            read(tx).page({ size: 2, after: second.nextCursor }),
+          );
+          expect(second.items.map((row) => row.id)).toEqual([3, 4]);
+          // Backward from job 5: jobs 4 and 3, and job 2 read ahead.
+          await db.$transaction(async (tx) => {
+            const page = await read(tx).page({
+              size: 2,
+              before: third.previousCursor,
+            });
+            expect(page.items.map((row) => row.id)).toEqual([3, 4]);
+            expect(await locked()).toEqual([2, 3, 4]);
+          });
+          expect(await locked()).toEqual([]);
+        };
+
+        for (const forUpdate of [true, { of: ["jobs"] }] as const) {
+          await check((session) =>
+            session.jobs((job) => ({ id: job.id, name: job.name }), {
+              orderBy: (job) => job.id.asc,
+              forUpdate,
+            }),
+          );
+          await check((session) =>
+            session.jobs(
+              (job) => ({ id: job.id, day: dateTrunc("day", job.createdAt) }),
+              { orderBy: (job) => job.id.asc, forUpdate },
+            ),
+          );
+          await check((session) =>
+            session.jobs(
+              (job) => ({
+                id: job.id,
+                upper: sql<string>`upper(${job.name})`,
+              }),
+              { orderBy: (job) => job.id.asc, forUpdate },
+            ),
+          );
+          await check((session) =>
+            session.jobs((job) => ({ id: job.id, upper: job.upper }), {
+              orderBy: (job) => job.id.asc,
+              forUpdate,
+            }),
+          );
+          // The whole row holds the computed field.
+          await check((session) =>
+            session.jobs({ orderBy: (job) => job.id.asc, forUpdate }),
+          );
+          // A window function cannot be locked: PostgreSQL says so itself.
+          await expect(
+            db.$transaction((tx) =>
+              tx
+                .jobs(
+                  (job, { rowNumber }) => ({
+                    id: job.id,
+                    position: rowNumber().over({ orderBy: job.id.asc }),
+                  }),
+                  { orderBy: (job) => job.id.asc, forUpdate },
+                )
+                .page({ size: 2 }),
+            ),
+          ).rejects.toThrow(/FOR UPDATE is not allowed with window functions/);
+        }
+
+        await check((session) =>
+          session.jobs(
+            (job) => ({ id: job.id, day: dateTrunc("day", job.createdAt) }),
+            { orderBy: (job) => job.id.asc, forShare: true },
+          ),
+        );
+      } finally {
+        await fixture.close();
+      }
+    });
+
+    test.skipIf(transactionPooling)(
+      "pages walk both ways over the edge values of every ordering type",
+      async () => {
+        const edges = table({
+          id: int.auto,
+          small: smallint,
+          whole: int,
+          big: bigint,
+          exact: numeric,
+          single: real,
+          double: doublePrecision,
+          day: date,
+          moment: timestamp,
+          instant: timestamptz,
+          clock: time,
+          zoned: customType<string>("timetz", {
+            encode: (value) => value,
+            decode: String,
+          }),
+          span: interval,
+          state: oneOf("draft", "published", "archived"),
+          label: text,
+          flag: bool,
+          key: uuid,
+        });
+        // One connection, so the session settings below hold for every page.
+        const fixture = await testDatabase({
+          url: databaseUrl!,
+          schema: schema({ edges }),
+          max: 1,
+        });
+        const run = (statement: string) =>
+          fixture.driver.execute({ sql: statement, parameters: [] });
+        try {
+          // The widest intervals PostgreSQL 14 still reads: later versions
+          // take hours up to 2562047788.
+          await run(`INSERT INTO edges
+            (small, whole, big, exact, single, double, day, moment, instant, clock, zoned, span, state, label, flag, key)
+            VALUES
+            (-32768, -2147483648, -9223372036854775808, 'NaN', 'NaN', 'NaN', '-infinity', '-infinity', '-infinity',
+              '00:00:00', '00:00:00+15:59:59', '-178956970 years -8 mons -2147483648 days -2147483647:59:59.999999',
+              'draft', '', false, '00000000-0000-0000-0000-000000000000'),
+            (32767, 2147483647, 9223372036854775807, '1e400', 'Infinity', 'Infinity', 'infinity', 'infinity', 'infinity',
+              '24:00:00', '24:00:00-15:59:59', '178956970 years 7 mons 2147483647 days 2147483647:59:59.999999',
+              'archived', 'ééé', true, 'ffffffff-ffff-ffff-ffff-ffffffffffff'),
+            (0, 0, 0, '-1e400', '-Infinity', '-Infinity', '4714-11-24 BC', '4714-11-24 00:00:00 BC', '4714-11-24 00:00:00+00 BC',
+              '23:59:59.999999', '23:59:59.999999+05:30', '00:00:00',
+              'published', 'a', true, '00000000-0000-0000-0000-000000000001'),
+            (-1, -1, -1, '1e-400', '3.4028235e38', '1.7976931348623157e308', '5874897-12-31', '294276-12-31 23:59:59.999999', '294276-12-31 23:59:59.999999+00',
+              '12:34:56.7', '12:34:56.7-04:56:02', '1 year 2 mons -3 days +04:05:06.789',
+              'draft', 'b', false, '00000000-0000-0000-0000-000000000002'),
+            (1, 1, 1, '-0.50', '1e-45', '4.9e-324', '0001-02-29 BC', '0001-12-31 23:59:59.999999 BC', '0001-01-01 00:00:00+00',
+              '00:00:00.000001', '00:00:00.000001+00', '-1 mon +1 day -00:00:00.000001',
+              'published', 'c', true, '00000000-0000-0000-0000-000000000003'),
+            (2, 2, 2, '123456789012345678901234567890.123456789', '-0', '-0', '10000-01-01', '10000-01-01 00:00:00', '1800-01-01 00:00:00+00',
+              '23:59:60', '23:59:60+00', '-00:00:00.5',
+              'archived', 'd', false, '00000000-0000-0000-0000-000000000004'),
+            (3, 3, 3, '0', '16777216', '1e15', '2024-02-29', '2024-02-29 12:34:56.789', '0044-03-15 12:00:00+00 BC',
+              '01:02:03', '01:02:03-12', '11 mons 59 days 59:59:59.999999',
+              'draft', 'e', true, '00000000-0000-0000-0000-000000000005')`);
+          const keys = [
+            "small",
+            "whole",
+            "big",
+            "exact",
+            "single",
+            "double",
+            "day",
+            "moment",
+            "instant",
+            "clock",
+            "zoned",
+            "span",
+            "state",
+            "label",
+            "flag",
+            "key",
+          ] as const;
+
+          // Zones on both sides of UTC (one with an offset in seconds for old
+          // dates) and each form PostgreSQL prints an interval in.
+          for (const [zone, style] of [
+            ["America/New_York", "postgres"],
+            ["Pacific/Kiritimati", "postgres_verbose"],
+            ["Etc/GMT+12", "sql_standard"],
+            ["Asia/Manila", "iso_8601"],
+          ]) {
+            await run(`SET TimeZone TO '${zone}'`);
+            await run(`SET IntervalStyle TO ${style}`);
+
+            for (const key of keys) {
+              const query = fixture.database.edges((row) => ({ id: row.id }), {
+                orderBy: (row) => [row[key].asc, row.id.asc],
+              });
+              const expected = await query;
+              const forward: { id: number }[] = [];
+              let page = await query.page({ size: 2 });
+              forward.push(...page.items);
+
+              while (page.nextCursor) {
+                page = await query.page({ size: 2, after: page.nextCursor });
+                forward.push(...page.items);
+              }
+
+              expect(forward).toEqual(expected);
+
+              const backward = [...page.items];
+
+              while (page.previousCursor) {
+                page = await query.page({
+                  size: 2,
+                  before: page.previousCursor,
+                });
+                backward.unshift(...page.items);
+              }
+
+              expect(backward).toEqual(expected);
+            }
+
+            // The settings were in force up to the last page.
+            const session = await run(
+              "SELECT current_setting('TimeZone') AS zone, current_setting('IntervalStyle') AS style",
+            );
+            expect(Array.isArray(session) ? session : session.rows).toEqual([
+              { zone, style },
+            ]);
+          }
+        } finally {
+          await fixture.close();
+        }
+      },
+    );
+
+    test("a cursor whose values PostgreSQL could not read is an invalid cursor, and a data error stays a database error", async () => {
+      const fixture = await testDatabase({
+        url: databaseUrl!,
+        schema: schema({
+          entries: {
+            id: int.auto,
+            small: smallint.default(1),
+            big: bigint.default(1n),
+            price: numeric(5, 2).default("1.00"),
+            ratio: real.default(1),
+            score: doublePrecision.default(1),
+            day: date.default("2024-01-01"),
+            moment: timestamp.now,
+            instant: timestamptz.now,
+            clock: time.default("10:00:00"),
+            span: interval.default("1 day"),
+            state: oneOf("draft", "published").default("draft"),
+            label: text.default("x"),
+          },
+        }),
+      });
+      try {
+        const entries = fixture.database.entries;
+        await entries.insert(
+          Array.from({ length: 4 }, (_, index) => ({
+            label: `entry ${index}`,
+          })),
+        );
+        const forged = [
+          ["id", "9999999999999999999"],
+          ["small", "9223372036854775808"],
+          ["big", "9999999999999999999"],
+          ["price", "1e400000"],
+          ["ratio", "1e309"],
+          ["score", "1e309"],
+          ["day", "2024-02-31"],
+          ["day", "0000-01-01"],
+          ["instant", "2024-01-01 00:00:00+99"],
+          ["instant", "2023-02-29 00:00:00+00"],
+          ["clock", "25:99"],
+          ["span", "garbage"],
+          ["span", "2147483648 days"],
+          ["label", "a\u0000b"],
+        ] as const;
+
+        for (const [key, value] of forged) {
+          const query = entries((row) => ({ id: row.id }), {
+            orderBy: (row) =>
+              key === "id" ? [row.id.asc] : [row[key].asc, row.id.asc],
+          });
+          const { nextCursor } = await query.page({ size: 2 });
+          const issued = JSON.parse(
+            Buffer.from(nextCursor!, "base64url").toString(),
+          );
+          const cursor = Buffer.from(
+            JSON.stringify({
+              ...issued,
+              values: key === "id" ? [value] : [value, "1"],
+            }),
+          ).toString("base64url") as NonNullable<typeof nextCursor>;
+
+          expect(
+            await query.page({ size: 2, after: cursor }).then(
+              () => `${key} ${value}: accepted`,
+              (error) => `${key}: ${error.message}`,
+            ),
+          ).toBe(
+            `${key}: symmetria: invalid page cursor or cursor from another query`,
+          );
+          // The cursor the query issued itself still continues it.
+          expect(
+            (await query.page({ size: 2, after: nextCursor })).items,
+          ).toEqual([{ id: 3 }, { id: 4 }]);
+        }
+
+        // A value PostgreSQL cannot read in a later row is not the cursor's fault.
+        const numbered = entries(
+          (row) => ({ id: row.id, number: sql.of(int)`${row.label}::integer` }),
+          { orderBy: (row) => row.id.asc },
+        );
+        await entries.update({ label: "7" }).all();
+        const { nextCursor } = await numbered.page({ size: 2 });
+        await entries.update(
+          { label: "seven" },
+          { where: (row) => row.id.is(4) },
+        );
+        await expect(
+          numbered.page({ size: 2, after: nextCursor }),
+        ).rejects.toThrow(/invalid input syntax for type integer/);
+
+        // A column the database already holds wider than this schema declares
+        // (a migration applied before the new code runs) pages as before.
+        await fixture.driver.execute({
+          sql: "ALTER TABLE entries ALTER COLUMN small TYPE bigint, ALTER COLUMN ratio TYPE double precision",
+          parameters: [],
+        });
+        await fixture.driver.execute({
+          sql: "UPDATE entries SET small = 3000000000 + id, ratio = 1e300 * id",
+          parameters: [],
+        });
+
+        for (const key of ["small", "ratio"] as const) {
+          const widened = entries((row) => ({ id: row.id }), {
+            orderBy: (row) => [row[key].asc, row.id.asc],
+          });
+          const first = await widened.page({ size: 2 });
+          const rest = await widened.page({ size: 5, after: first.nextCursor });
+          const back = await widened.page({
+            size: 5,
+            before: rest.nextCursor ?? rest.previousCursor,
+          });
+
+          expect([...first.items, ...rest.items]).toEqual([
+            { id: 1 },
+            { id: 2 },
+            { id: 3 },
+            { id: 4 },
+          ]);
+          expect(back.items.length).toBeGreaterThan(0);
+        }
+
+        // A label the database got from a newer migration than this schema
+        // is a value like any other: the page ordered by it keeps its cursor.
+        await fixture.driver.execute({
+          sql: "ALTER TYPE entries_state_enum ADD VALUE 'archived'",
+          parameters: [],
+        });
+        await fixture.driver.execute({
+          sql: "UPDATE entries SET state = 'archived' WHERE id IN (2, 3)",
+          parameters: [],
+        });
+        const byState = entries((row) => ({ id: row.id }), {
+          orderBy: (row) => [row.state.desc, row.id.asc],
+        });
+        const first = await byState.page({ size: 1 });
+        const second = await byState.page({ size: 5, after: first.nextCursor });
+
+        expect([...first.items, ...second.items]).toEqual([
+          { id: 2 },
+          { id: 3 },
+          { id: 1 },
+          { id: 4 },
+        ]);
+      } finally {
+        await fixture.close();
+      }
     });
 
     test("short upserts return computed projections, one/maybeOne enforce cardinality, rebinding retains transactions", async () => {

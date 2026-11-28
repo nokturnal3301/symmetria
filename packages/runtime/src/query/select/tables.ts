@@ -39,7 +39,7 @@ import { executorProfiling } from "../../observability/profiling";
 import { boundMethodDescriptors, extendBuilder } from "../expressions/callable";
 import { createContext } from "./context";
 import type { ShapeCallback } from "./joins";
-import { equalityPredicates, plainRecord } from "./shape";
+import { equalityPredicates, plainRecord, takesArray } from "./shape";
 import { createQueryFactory } from "./query";
 import {
   NO_SCOPES,
@@ -345,8 +345,10 @@ export const createQueryTables = (
 
         if (
           Array.isArray(value) &&
-          !keys[position]!.sqlType.endsWith("[]") &&
-          !keys[position]!.sqlType.startsWith("json")
+          !takesArray(
+            keys[position]!.sqlType,
+            binding.codecs[keys[position]!.name],
+          )
         ) {
           dataError(
             new Error(

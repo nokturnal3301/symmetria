@@ -5,6 +5,7 @@
 import { DuplicateConflictKeyError } from "../../errors";
 import type { ColumnSnapshot } from "../../schema/assembly";
 import { dataError } from "../codecs/deferred";
+import { timestampKey } from "../codecs/timestamp-key";
 import type { ValueNode } from "../expressions";
 import {
   DEFAULT_VALUE,
@@ -70,65 +71,6 @@ const decimalKey = (text: string, scale: number | undefined): string => {
   return `${parts[1] === "-" && digits !== 0n ? "-" : ""}${digits}e-${places}`;
 };
 
-const TIMESTAMP_TYPE =
-  /^(timestamptz|timestamp)(?:\s*\(\s*(\d)\s*\))?(?:\s+with(out)?\s+time\s+zone)?$/;
-const TIMESTAMP_TEXT =
-  /^(\d{4})-(\d\d)-(\d\d)[t ](\d\d):(\d\d):(\d\d)(?:\.(\d{1,6}))?\s*(z|[+-]\d\d(?::?\d\d)?)?$/;
-
-/**
- * A timestamp as the microsecond its column stores: `timestamptz(0)` rounds
- * two instants of one second to the same key, and `…+00:00` is `…Z`. Text in
- * another spelling keeps its own.
- */
-const timestampKey = (text: string, type: string): string | undefined => {
-  const column = TIMESTAMP_TYPE.exec(type);
-  const parts = column && TIMESTAMP_TEXT.exec(text.trim().toLowerCase());
-
-  if (!column || !parts) {
-    return undefined;
-  }
-
-  const zoned = column[1] === "timestamptz" || /with\s+time/.test(type);
-  const zone = parts[8];
-
-  // Without an offset the session's time zone decides, which only PostgreSQL knows.
-  if (zoned && !zone) {
-    return undefined;
-  }
-
-  const offset =
-    zoned && zone !== "z"
-      ? (zone![0] === "-" ? -1 : 1) *
-        (Number(zone!.slice(1, 3)) * 60 +
-          Number(zone!.slice(-2)) * (zone!.length > 3 ? 1 : 0))
-      : 0;
-  const milliseconds =
-    Date.UTC(
-      Number(parts[1]),
-      Number(parts[2]) - 1,
-      Number(parts[3]),
-      Number(parts[4]),
-      Number(parts[5]),
-      Number(parts[6]),
-    ) -
-    offset * 60_000;
-  const micros =
-    BigInt(milliseconds) * 1000n + BigInt((parts[7] ?? "").padEnd(6, "0"));
-  const unit = 10n ** BigInt(6 - Number(column[2] ?? 6));
-  // PostgreSQL counts from 2000-01-01 and rounds half away from that point:
-  // 1999-06-01 00:00:00.5 becomes 00:00:00 in timestamptz(0), 2001 rounds up.
-  const since = micros - POSTGRES_EPOCH;
-  const rounded =
-    since >= 0n
-      ? ((since + unit / 2n) / unit) * unit
-      : -(((-since + unit / 2n) / unit) * unit);
-
-  return `timestamp:${rounded}`;
-};
-
-/** 2000-01-01T00:00:00Z in microseconds since 1970: PostgreSQL's zero. */
-const POSTGRES_EPOCH = 946_684_800_000_000n;
-
 /**
  * The key of a text value as its column's type compares it: decimals by
  * value, UUIDs without regard to case, hyphens or braces, `char(n)` without
@@ -161,6 +103,19 @@ const typedKey = (text: string, sqlType: string): string => {
     : text;
 };
 
+/**
+ * JSON.stringify's replacer for an array or object key. JSON writes NaN and
+ * both infinities as `null`, which would make one key of three floats that
+ * PostgreSQL holds apart, so each keeps its name, the text PostgreSQL reads
+ * it from. `-0` stays `0`, which PostgreSQL holds equal to it, and NaN equals
+ * NaN there.
+ */
+const keyEntry = (_key: string, entry: unknown): unknown =>
+  typeof entry === "bigint" ||
+  (typeof entry === "number" && !Number.isFinite(entry))
+    ? String(entry)
+    : entry;
+
 /** The bound value of a conflict column as a comparable key; undefined when only PostgreSQL knows it. */
 const conflictKey = (
   value: ValueNode | typeof DEFAULT_VALUE | undefined,
@@ -184,9 +139,7 @@ const conflictKey = (
   }
 
   return bound !== null && typeof bound === "object"
-    ? `json:${JSON.stringify(bound, (_key, entry: unknown) =>
-        typeof entry === "bigint" ? String(entry) : entry,
-      )}`
+    ? `json:${JSON.stringify(bound, keyEntry)}`
     : `value:${typedKey(String(bound), sqlType)}`;
 };
 

@@ -6,6 +6,7 @@ import { expressionSqlType, valueSqlType } from "../plan/metadata";
 import { sameExpression } from "../plan/equivalence";
 import { containsNode } from "../plan/traverse";
 import { closedRawSql } from "../expressions/raw-text";
+import { isFloatType } from "../expressions/functions";
 import type {
   ExpressionDescription,
   SearchMode,
@@ -36,6 +37,8 @@ import {
 } from "./postgres/search";
 import { predicateSql } from "./predicates";
 
+const BARE_PARAMETER = /^\(*\$\d+\)*$/;
+
 /**
  * bigint and numeric values travel as text inside JSON to keep their precision,
  * by any of their names (`int8`, `DECIMAL(30,10)`) and as a customType's base.
@@ -60,6 +63,16 @@ export const jsonPrecisionSql = (
       ? type.slice(0, -2)
       : type;
 
+  const parameter =
+    (expression.node.kind === "placeholder" ||
+      expression.node.kind === "parameter") &&
+    sqlType !== "derived";
+  const typed = (): string =>
+    compilation.renderer.cast(value, {
+      kind: "typed",
+      type: sqlType === "enum" ? "text" : sqlType,
+    });
+
   if (
     codec !== bigintCodec &&
     codec !== numericCodec &&
@@ -67,25 +80,21 @@ export const jsonPrecisionSql = (
     !scalarType.startsWith("numeric")
   ) {
     // Polymorphic JSON constructors cannot infer a bare placeholder's type.
-    if (
-      (expression.node.kind === "placeholder" ||
-        expression.node.kind === "parameter") &&
-      sqlType !== "derived"
-    ) {
-      return compilation.renderer.cast(value, {
-        kind: "typed",
-        type: sqlType === "enum" ? "text" : sqlType,
-      });
-    }
-
-    return value;
+    return parameter ? typed() : value;
   }
 
   // Preserve the array shape and NULL elements while stringifying each number.
-  return compilation.renderer.cast(value, { kind: "text", array: !!array });
+  // A bare `$1` cast to text alone would be a text parameter and come back as
+  // the text that was bound (`1e3`, ` 2.50 `, a bigint out of range), so it
+  // is a value of its type first, as at the top level. A page cursor's
+  // fingerprint keeps the single cast, the form earlier versions sent.
+  return compilation.renderer.cast(
+    parameter && !compilation.shapeOnly && BARE_PARAMETER.test(value)
+      ? typed()
+      : value,
+    { kind: "text", array: !!array },
+  );
 };
-
-const BARE_PARAMETER = /^\(*\$\d+\)*$/;
 
 const buildsJson = (node: ValueNode): boolean =>
   node.kind === "jsonObject" || node.kind === "jsonRows";
@@ -216,6 +225,13 @@ const rowQuerySql = (
  * if any, is added right after the call. MIN and MAX of a type
  * without them take the first element of the aggregated one-element arrays,
  * which order by the type's comparison, skipping NULL and JSON null.
+ *
+ * SUM and AVG of a real or a double precision are floats, and PostgreSQL's
+ * cast of a float to numeric keeps 6 significant digits of a real and 15 of a
+ * double precision, fewer than the float holds. Its text is the shortest
+ * decimal that reads back as the same float, so the decimal is read from the
+ * text. A page cursor's fingerprint keeps the plain cast, the form earlier
+ * versions sent, so their cursors stay valid.
  */
 const aggregateSql = (
   compilation: Compilation,
@@ -223,6 +239,11 @@ const aggregateSql = (
   bindings: Bindings,
 ): ((over?: string) => string) => {
   const value = node.value ? valueSql(compilation, node.value, bindings) : "*";
+  const float =
+    !!node.numeric &&
+    !!node.value &&
+    !compilation.shapeOnly &&
+    isFloatType(searchValueType(node.value));
 
   return (over = "") => {
     if (node.element) {
@@ -237,7 +258,15 @@ const aggregateSql = (
     const aggregate = `${node.name}(${value})${over}`;
 
     return node.numeric
-      ? compilation.renderer.cast(aggregate, { kind: "numeric" })
+      ? compilation.renderer.cast(
+          float
+            ? compilation.renderer.cast(aggregate, {
+                kind: "text",
+                array: false,
+              })
+            : aggregate,
+          { kind: "numeric" },
+        )
       : aggregate;
   };
 };

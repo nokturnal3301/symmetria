@@ -22,7 +22,23 @@ const RESERVED_COLUMN_KEYS = new Set([
   "by",
   "column",
 ]);
-const RESERVED_TABLE_KEYS = new Set(["constructor", "prototype", "__proto__"]);
+/**
+ * Table keys schema() refuses: the database's own methods, which a table of
+ * the same name would replace; `then`, which would make the database object
+ * awaitable; and the names every object has.
+ */
+export const RESERVED_TABLE_KEYS: ReadonlySet<string> = new Set([
+  "$scope",
+  "$batch",
+  "$snapshot",
+  "$close",
+  "$transaction",
+  "$createIndexes",
+  "then",
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
 
 /**
  * The camelCase key whose snake_case form is exactly `sqlName`, or undefined when
@@ -153,10 +169,12 @@ export const keyAllocator = (
   };
 };
 
-/** Every identifier a generated module imports or declares at its top level. */
-export const MODULE_IDENTIFIERS: readonly string[] = [
-  // The value type of a customType() over numeric, imported as a type.
-  "Decimal",
+/**
+ * What a generated module imports from the runtime entry, in the order of its
+ * import line. The renderer writes the import line from this list alone, so a
+ * name it imports is always listed here.
+ */
+export const RUNTIME_IMPORTS: readonly string[] = [
   "and",
   "bigint",
   "bool",
@@ -164,19 +182,21 @@ export const MODULE_IDENTIFIERS: readonly string[] = [
   "customType",
   "date",
   "doublePrecision",
-  "fullText",
   "index",
   "inet",
   "int",
   "interval",
   "jsonb",
   "junction",
+  "link",
+  "many",
+  "maybe",
   "not",
   "numeric",
+  "one",
   "oneOf",
   "operatorClass",
   "or",
-  "passthrough",
   "real",
   "schema",
   "smallint",
@@ -189,8 +209,31 @@ export const MODULE_IDENTIFIERS: readonly string[] = [
   "tsvector",
   "uuid",
   "varchar",
-  "vector",
-  "halfvec",
+  // The value type of a customType() over numeric, imported as a type.
+  "type Decimal",
+];
+
+/** The builders a generated module imports from the pgvector entry. */
+export const VECTOR_IMPORTS: readonly string[] = ["halfvec", "vector"];
+
+/** What a generated module imports from the search entry. */
+export const SEARCH_IMPORTS: readonly string[] = ["fullText"];
+
+/** The codec helpers a generated module declares for itself, in the order it declares them. */
+export const MODULE_HELPERS = ["passthrough", "asNumber"] as const;
+
+export type ModuleHelper = (typeof MODULE_HELPERS)[number];
+
+/**
+ * Every identifier a generated module imports or declares at its top level:
+ * a table bound under one of these names inside a callback would hide it
+ * there (`({ one }) => table({ owner: one(one) })`).
+ */
+export const MODULE_IDENTIFIERS: readonly string[] = [
+  ...RUNTIME_IMPORTS.map((name) => name.replace(/^type /, "")),
+  ...VECTOR_IMPORTS,
+  ...SEARCH_IMPORTS,
+  ...MODULE_HELPERS,
 ];
 
 /** Words a module cannot use as a parameter or binding name. */

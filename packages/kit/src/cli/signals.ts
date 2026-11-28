@@ -2,13 +2,29 @@
  * One path for Ctrl-C and SIGTERM in the CLI. Running database work is
  * cancelled first and given a few seconds to stop and roll back, so the
  * statement and its locks end with the process; open prompts close as
- * cancelled. When nothing is left to cancel, or the time is up, or a second
- * signal arrives, the terminal is restored and the process exits with 130
- * (Ctrl-C) or 143 (SIGTERM).
+ * cancelled. When nothing is left to cancel (also while the work still waits
+ * for its first connection), or the time is up, or a second signal arrives,
+ * the terminal is restored and the process exits with 130 (Ctrl-C) or 143
+ * (SIGTERM).
  */
 
 /** How long cancelled database work gets to stop before the CLI exits anyway. */
 const CANCEL_GRACE_MS = 5000;
+
+/**
+ * Whether a flag without a value was given, read from the raw arguments: the
+ * error and signal paths report as JSON or in colour also when the command
+ * line did not parse. Only what stands before a `--` is an option; after it
+ * `--json` is an argument.
+ */
+export const flagGiven = (
+  argumentsList: readonly string[],
+  flag: string,
+): boolean => {
+  const end = argumentsList.indexOf("--");
+
+  return (end < 0 ? argumentsList : argumentsList.slice(0, end)).includes(flag);
+};
 
 type Code = 130 | 143;
 
@@ -20,9 +36,16 @@ export type Interruptible = {
   /**
    * Ends the message "exited before …" when the process exits before the
    * cancelled work ends: what had not happened yet, and what that leaves
-   * behind.
+   * behind. Without an answer the message says only that the work had not
+   * ended.
    */
-  readonly unfinished?: () => string;
+  readonly unfinished?: () => string | undefined;
+  /**
+   * Whether the cancelled work is worth waiting for. False while it has
+   * reached no server (no connection to the database was made): nothing can
+   * still run or hold a lock there, so the process exits at once.
+   */
+  readonly waits?: () => boolean;
 };
 
 const entries: Interruptible[] = [];
@@ -58,7 +81,7 @@ const exitNow = (code: Code): never => {
   if (unfinished.length) {
     const message = `${reasonFor(code).message}: exited before ${unfinished.join("; ")}`;
 
-    if (process.argv.includes("--json")) {
+    if (flagGiven(process.argv.slice(2), "--json")) {
       process.stdout.write(`${JSON.stringify({ error: { message } })}\n`);
     } else {
       process.stderr.write(`${message}\n`);
@@ -85,6 +108,10 @@ const receive = (code: Code): void => {
 
   for (const entry of cancellable) {
     entry.cancel!(reason);
+  }
+
+  if (cancellable.every((entry) => entry.waits?.() === false)) {
+    exitNow(code);
   }
 
   // Unreferenced: a run that unwinds in time exits on its own.

@@ -20,6 +20,7 @@ import { diffSchemas, type MigrationDiffOptions } from "./diff";
 import {
   canonicalJSON,
   checksum,
+  commentText,
   compareNames,
   emptySnapshot,
   migrationSnapshot,
@@ -35,6 +36,7 @@ import {
   recordGenerationOwner,
   rollbackPublication,
   savePublication,
+  stagingPrefix,
   syncPath,
   type Publication,
 } from "./publication";
@@ -69,12 +71,20 @@ export type GenerateMigrationOptions = MigrationDiffOptions & {
   empty?: boolean;
   allowDestructive?: boolean;
   transaction?: "batch" | "each" | "none";
+  /**
+   * Stops the generation while nothing has been published: it rejects with
+   * the signal's reason and leaves no lock or staged files behind. Once the
+   * files are being published, they are published.
+   */
+  signal?: AbortSignal | undefined;
 };
 export type SquashMigrationsOptions = {
   directory: string;
   name: string;
   /** Drop SQL that generate did not write (seeds, views, edited up.sql) instead of refusing. */
   allowCustomSQL?: boolean;
+  /** Stops the squash while nothing has been published, as for generation. */
+  signal?: AbortSignal | undefined;
 };
 type MigrationJournal = {
   version: 1;
@@ -92,6 +102,8 @@ export type DiscardMigrationOptions = {
   id?: string;
   /** Discard an up.sql edited after generation, losing the edits. */
   allowEdited?: boolean;
+  /** Stops the discard while nothing has been published, as for generation. */
+  signal?: AbortSignal | undefined;
 };
 export type DiscardedMigration = {
   /** The removed migration; undefined when only the snapshot was repaired. */
@@ -195,20 +207,46 @@ const readMigrationState = async (
     )
     .map((entry) => entry.name)
     .sort(compareNames);
-  const metadata = await readDirectory(join(directory, "meta"));
+  // Dot-files (a .DS_Store that Finder writes, an editor's swap file) are
+  // skipped here as they are beside the migration directories.
+  const metadata = (await readDirectory(join(directory, "meta"))).filter(
+    (entry) => !entry.name.startsWith("."),
+  );
 
   if (!directories.length && !metadata.length) {
     return { migrations: [], snapshot: emptySnapshot() };
   }
 
-  if (
-    metadata.length !== metadataFiles.length ||
-    metadata.some(
-      (entry) => !entry.isFile() || !metadataFiles.includes(entry.name),
-    )
-  ) {
+  // What is wrong with the directory, one finding each. A name is quoted
+  // with its line breaks and control characters escaped, so it cannot split
+  // the message or draw on the terminal.
+  const stray = metadata
+    .filter((entry) => !metadataFiles.includes(entry.name))
+    .map((entry) => entry.name)
+    .sort(compareNames);
+  const problems = [
+    ...stray
+      .slice(0, 5)
+      .map(
+        (name) => `${commentText(JSON.stringify(name))} does not belong there`,
+      ),
+    ...(stray.length > 5 ? [`nor do ${stray.length - 5} more entries`] : []),
+    ...metadataFiles.flatMap((name) => {
+      const entry = metadata.find((candidate) => candidate.name === name);
+
+      return entry
+        ? entry.isFile()
+          ? []
+          : [
+              `${name} is ${entry.isDirectory() ? "a directory" : entry.isSymbolicLink() ? "a symbolic link" : "not a regular file"}, not a file`,
+            ]
+        : [`${name} is missing`];
+    }),
+  ];
+
+  if (problems.length) {
     throw new Error(
-      "symmetria: migration metadata must contain only meta/snapshot.json and meta/migration.json",
+      `symmetria: migration metadata must contain only the files meta/snapshot.json and meta/migration.json; in ${join(directory, "meta")}: ${problems.join("; ")}`,
     );
   }
 
@@ -343,22 +381,37 @@ const readMigrationState = async (
   };
 };
 
-/** One current schema snapshot and a compact journal for the entire SQL chain. */
-export const loadMigrationState = async (
+/**
+ * Why a command stops while the generation lock exists. A generator that was
+ * killed leaves its lock behind, so the message names the way out.
+ */
+const lockedError = (directory: string): Error =>
+  new Error(
+    `symmetria: migration generation is already locked: ${join(directory, lockName)} exists, so a generate, squash or discard is running in this directory. If that process was interrupted or killed, "symmetria recover" removes what it left`,
+  );
+
+/** Reads the files while no generator is publishing into the directory. */
+const readUnlocked = async (
   directory: string,
-): Promise<MigrationState> => {
+  options?: Parameters<typeof readMigrationState>[1],
+) => {
   const assertUnlocked = async () => {
     if (await exists(join(directory, lockName))) {
-      throw new Error("symmetria: migration generation is already locked");
+      throw lockedError(directory);
     }
   };
 
   await assertUnlocked();
-  const state = await readMigrationState(directory);
+  const state = await readMigrationState(directory, options);
   await assertUnlocked();
 
   return state;
 };
+
+/** One current schema snapshot and a compact journal for the entire SQL chain. */
+export const loadMigrationState = (
+  directory: string,
+): Promise<MigrationState> => readUnlocked(directory);
 
 export const loadMigrations = async (directory: string): Promise<Migration[]> =>
   (await loadMigrationState(directory)).migrations;
@@ -391,7 +444,7 @@ const withGenerationLock = async <Result>(
       "code" in error &&
       error.code === "EEXIST"
     ) {
-      throw new Error("symmetria: migration generation is already locked");
+      throw lockedError(directory);
     }
 
     throw error;
@@ -419,8 +472,15 @@ const writeMigrationFiles = async (
     | GeneratedMigration
     | { readonly id?: undefined; readonly snapshot: MigrationSnapshot },
   manifests: MigrationManifest[],
-  replaced: string[] = [],
-  undo?: MigrationJournal["undo"],
+  {
+    replaced = [],
+    undo,
+    signal,
+  }: {
+    readonly replaced?: string[];
+    readonly undo?: MigrationJournal["undo"];
+    readonly signal?: AbortSignal | undefined;
+  } = {},
 ): Promise<void> => {
   if (
     migration.id !== undefined &&
@@ -430,7 +490,7 @@ const writeMigrationFiles = async (
     throw new Error(`symmetria: migration "${migration.id}" already exists`);
   }
 
-  const temporary = await mkdtemp(join(directory, ".symmetria-"));
+  const temporary = await mkdtemp(join(directory, stagingPrefix));
   const staged = join(temporary, "staged");
   const backup = join(temporary, "backup");
   const moved: Publication["moves"] = [];
@@ -502,6 +562,9 @@ const writeMigrationFiles = async (
       await syncPath(path);
     }
 
+    // The last point where stopping costs nothing: no file of the directory
+    // has moved, so the staged copy and the lock are all there is to remove.
+    signal?.throwIfAborted();
     await savePublication(directory, publication);
     await mkdir(join(directory, "meta"), { recursive: true });
 
@@ -627,12 +690,10 @@ export const squashMigrations = async (
       down,
       checksum: migrationChecksum(manifest, up, down),
     };
-    await writeMigrationFiles(
-      directory,
-      squashed,
-      [manifest],
-      migrations.map((migration) => migration.id),
-    );
+    await writeMigrationFiles(directory, squashed, [manifest], {
+      replaced: migrations.map((migration) => migration.id),
+      signal: options.signal,
+    });
 
     return squashed;
   });
@@ -729,9 +790,11 @@ export const generateMigration = async (
       directory,
       migration,
       [...migrations.map((entry) => entry.manifest), manifest],
-      [],
-      // The way back while no database has applied it: `discard`.
-      { migration: id, snapshot: before },
+      {
+        // The way back while no database has applied it: `discard`.
+        undo: { migration: id, snapshot: before },
+        signal: options.signal,
+      },
     );
 
     return migration;
@@ -812,6 +875,29 @@ const knownSnapshot = async (
 };
 
 /**
+ * The migration `discardMigration` would take out of the journal, read
+ * without changing anything: the latest one, also when its directory was
+ * deleted by hand (`removed`), which is why the chain does not load. Undefined
+ * when discard would only put the snapshot back, or has nothing to discard.
+ * The CLI asks the configured database about this migration first.
+ */
+export const discardTarget = async (
+  directory: string,
+): Promise<{ id: string; removed: boolean } | undefined> => {
+  const state = await readUnlocked(resolve(directory), {
+    snapshotMismatch: "keep",
+  });
+
+  if (state.removed) {
+    return { id: state.removed.id, removed: true };
+  }
+
+  const latest = state.mismatch ? undefined : state.migrations.at(-1);
+
+  return latest ? { id: latest.id, removed: false } : undefined;
+};
+
+/**
  * Takes back the latest migration: its SQL leaves the directory, and the
  * journal and the snapshot are what they were before it was generated. Only
  * for a migration no database has applied; the CLI checks the configured one.
@@ -842,6 +928,7 @@ export const discardMigration = async (
         directory,
         { snapshot: state.snapshot },
         state.migrations.map((entry) => entry.manifest),
+        { signal: options.signal },
       );
 
       return { id: removed.id, source: "journal" };
@@ -868,6 +955,7 @@ export const discardMigration = async (
         directory,
         { snapshot: found.snapshot },
         state.migrations.map((entry) => entry.manifest),
+        { signal: options.signal },
       );
 
       return removed
@@ -911,7 +999,7 @@ export const discardMigration = async (
       directory,
       { snapshot: found.snapshot },
       state.migrations.slice(0, -1).map((entry) => entry.manifest),
-      [latest.id],
+      { replaced: [latest.id], signal: options.signal },
     );
 
     return { id: latest.id, source: found.source };

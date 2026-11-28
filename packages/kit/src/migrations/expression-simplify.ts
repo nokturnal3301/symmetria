@@ -69,62 +69,6 @@ const typedNumber = (text: string, type: string | undefined): string => {
     : zero;
 };
 
-const INTERVAL_UNITS: Readonly<
-  Record<string, [months: number, micros: number]>
-> = {
-  year: [12, 0],
-  month: [1, 0],
-  mon: [1, 0],
-  week: [0, 7 * 86_400e6],
-  day: [0, 86_400e6],
-  hour: [0, 3_600e6],
-  minute: [0, 60e6],
-  min: [0, 60e6],
-  second: [0, 1e6],
-  sec: [0, 1e6],
-};
-
-/**
- * An interval as months and microseconds: `90 minutes` and `01:30:00` are
- * one interval. Days count as 24 hours here, which only matters across a
- * daylight-saving change, never for comparing two spellings of a default.
- */
-export const intervalKey = (text: string): string | undefined => {
-  let months = 0;
-  let micros = 0;
-  let rest = text.trim().toLowerCase();
-  const time = /(-?)(\d+):(\d{2})(?::(\d{2}(?:\.\d+)?))?\s*$/.exec(rest);
-
-  if (time) {
-    const sign = time[1] ? -1 : 1;
-
-    micros +=
-      sign *
-      (Number(time[2]) * 3_600e6 +
-        Number(time[3]) * 60e6 +
-        Number(time[4] ?? 0) * 1e6);
-    rest = rest.slice(0, time.index).trim();
-  }
-
-  for (const part of rest.matchAll(/(-?\d+(?:\.\d+)?)\s*([a-z]+)/g)) {
-    const name = part[2]!.replace(/s$/, "");
-    const unit = Object.hasOwn(INTERVAL_UNITS, name)
-      ? INTERVAL_UNITS[name]
-      : undefined;
-
-    if (!unit) {
-      return undefined;
-    }
-
-    months += Number(part[1]) * unit[0];
-    micros += Number(part[1]) * unit[1];
-  }
-
-  return rest.replace(/(-?\d+(?:\.\d+)?)\s*([a-z]+)/g, "").trim()
-    ? undefined
-    : `${months} ${Math.round(micros)}`;
-};
-
 /** Interval units as PostgreSQL reads them (`m` is a minute, `mon` a month). */
 const INTERVAL_FIELDS: ReadonlyMap<string, string> = new Map(
   (
@@ -136,8 +80,17 @@ const INTERVAL_FIELDS: ReadonlyMap<string, string> = new Map(
       ["hour", ["hour", "hours", "h", "hr", "hrs"]],
       ["minute", ["minute", "minutes", "m", "min", "mins"]],
       ["second", ["second", "seconds", "s", "sec", "secs"]],
-      ["millisecond", ["millisecond", "milliseconds", "ms", "msec", "msecs"]],
-      ["microsecond", ["microsecond", "microseconds", "us", "usec", "usecs"]],
+      [
+        "millisecond",
+        ["millisecond", "milliseconds", "ms", "msec", "msecs", "mseconds"],
+      ],
+      [
+        "microsecond",
+        ["microsecond", "microseconds", "us", "usec", "usecs", "useconds"],
+      ],
+      ["decade", ["decade", "decades", "dec", "decs"]],
+      ["century", ["century", "centuries", "c", "cent"]],
+      ["millennium", ["millennium", "millennia", "mil", "mils"]],
     ] as const
   ).flatMap(([field, spellings]) =>
     spellings.map((spelling) => [spelling, field] as const),
@@ -150,77 +103,305 @@ const TIME_MICROS: ReadonlyMap<string, number> = new Map([
   ["millisecond", 1e3],
   ["microsecond", 1],
 ]);
+const DAY_MICROS = 86_400e6;
+/** Months in each unit of whole years. */
+const YEAR_MONTHS: ReadonlyMap<string, bigint> = new Map([
+  ["year", 12n],
+  ["decade", 120n],
+  ["century", 1_200n],
+  ["millennium", 12_000n],
+]);
+/** The fields `hh:mm:ss` fills: PostgreSQL refuses a field given twice. */
+const CLOCK_FIELDS = [
+  "hour",
+  "minute",
+  "second",
+  "millisecond",
+  "microsecond",
+] as const;
+/** `hh:mm`, `hh:mm:ss`, `hh:mm:ss.fff` and `mm:ss.fff`, with a sign or without. */
+const INTERVAL_CLOCK =
+  /^([+-]?)(\d{1,9}):(\d{1,9})(?::(\d{1,9}))?(?:\.(\d+))?$/;
+/**
+ * `12`, `-1.5`, `.5` and each with its unit attached (`12h`); never `-.5`,
+ * and never `1.`, which PostgreSQL reads from version 16 and refuses before.
+ */
+const INTERVAL_NUMBER = /^(?:([+-]?)(\d{1,9})(?:\.(\d+))?|\.(\d+))([a-z]*)$/;
+/** The largest number of months, of days and of hours a key holds. */
+const INTERVAL_LIMIT = 999_999_999n;
+
+/**
+ * A fraction of a unit as whole microseconds. PostgreSQL rounds what is left
+ * of a microsecond, and its versions disagree at half of one: undefined there.
+ */
+const wholeMicros = (value: number): bigint | undefined => {
+  const whole = Math.trunc(value);
+  const rest = Math.abs(value - whole);
+
+  return Math.abs(rest - 0.5) < 1e-3
+    ? undefined
+    : BigInt(whole) + (rest > 0.5 ? BigInt(Math.sign(value)) : 0n);
+};
 
 /**
  * An interval literal as PostgreSQL keeps it: months, days and time apart,
  * since a day is not always 24 hours and a month not always 30 days. So
  * `'24 hours'`, `'1440 minutes'` and `'24:00:00'` are one value and `'1 day'`
  * another, as are `'1 mon'` and `'30 days'`; `'1.5 days'` is `1 day 12:00:00`.
- * Undefined for a spelling it does not read (it then compares as written).
+ * The key is itself a spelling of that value (`0 mons +1 days +00:00:00`).
+ *
+ * Only for a spelling read here exactly as every supported PostgreSQL reads
+ * it, and undefined for anything else (it then compares as written): words
+ * apart by white space, each a number, a number with its unit, a unit or a
+ * clock time, read from the right as PostgreSQL does. So a number without a
+ * unit is seconds at the end, days before a clock time or an hour (`'1
+ * 0:00:00'` is one day) and its right neighbour's unit otherwise, which
+ * PostgreSQL refuses as a field given twice, as it refuses `'1 day 1 day'`.
+ * Left to the text: ISO 8601 (`P1D`), `'1-2'`, punctuation, a unit glued to
+ * the next number (`1h30m`), a leading minus that the session's IntervalStyle
+ * may or may not spread over the other fields (`'-1 2:00'`), half a
+ * microsecond, a fraction of a decade, numbers of ten digits or more, and a
+ * number that ends in its point (`'1. hours'`), which only PostgreSQL 16 and
+ * later read.
  */
-const intervalParts = (text: string): string | undefined => {
-  let rest = text.trim().toLowerCase().replace(/^@\s*/, "");
-  const ago = /\s+ago$/.test(rest);
-  let months = 0;
-  let days = 0;
-  let micros = 0;
+export const intervalKey = (text: string): string | undefined => {
+  // PostgreSQL skips ASCII white space only, and its letters are ASCII. It
+  // reads the words into a buffer of 256 bytes and refuses a longer spelling.
+  if (text.length > 200 || !/^[\t-\r -~]*$/.test(text)) {
+    return undefined;
+  }
 
-  rest = rest.replace(/\s+ago$/, "");
+  const words = text
+    .toLowerCase()
+    .split(/[\t-\r ]+/)
+    .filter(Boolean);
 
-  while (rest) {
-    const time =
-      /^([+-]?)(\d+):(\d{1,2})(?::(\d{1,2}(?:\.\d+)?))?(?:\s+|$)/.exec(rest);
+  // `@` before the first field is noise to PostgreSQL.
+  if (words[0]?.startsWith("@")) {
+    words.splice(0, 1, ...(words[0] === "@" ? [] : [words[0].slice(1)]));
+  }
 
-    if (time) {
-      micros +=
-        (time[1] === "-" ? -1 : 1) *
-        (Number(time[2]) * 3_600e6 +
-          Number(time[3]) * 60e6 +
-          Number(time[4] ?? 0) * 1e6);
-      rest = rest.slice(time[0].length);
-      continue;
+  const ago = words.at(-1) === "ago";
+
+  if (ago) {
+    words.pop();
+  }
+
+  const signed = words.filter(
+    (word, index) => index > 0 && /^[+-]/.test(word),
+  ).length;
+  const values = words.filter((word) => /^[-+.\d]/.test(word)).length;
+
+  // With IntervalStyle sql_standard a leading minus negates every field
+  // unless another one has a sign of its own.
+  if (words[0]?.startsWith("-") && values > 1 && signed === 0) {
+    return undefined;
+  }
+
+  let months = 0n;
+  let days = 0n;
+  let micros = 0n;
+  // The sums of the magnitudes: within the limit, nothing overflows on the way.
+  let monthsRoom = 0n;
+  let daysRoom = 0n;
+  let microsRoom = 0n;
+  // The unit a number takes: its own, or the one PostgreSQL leaves behind.
+  // After `ago` a number needs a unit of its own.
+  let unit: string | undefined = ago ? "ago" : undefined;
+  let unitOpen = false;
+  const filled = new Set<string>();
+  const fill = (fields: readonly string[]): boolean =>
+    fields.every((field) => !filled.has(field) && filled.add(field));
+  const add = (part: "months" | "days" | "micros", value: bigint): void => {
+    const size = value < 0n ? -value : value;
+
+    if (part === "months") {
+      months += value;
+      monthsRoom += size;
+    } else if (part === "days") {
+      days += value;
+      daysRoom += size;
+    } else {
+      micros += value;
+      microsRoom += size;
     }
-
-    const field = /^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([a-z]*)(?:\s+|$)/.exec(
-      rest,
-    );
-    const unit = field && (field[2] ? INTERVAL_FIELDS.get(field[2]) : "second");
-
-    if (!field || !unit) {
-      return undefined;
-    }
-
-    const value = Number(field[1]);
+  };
+  /** A fraction of a week or a month: whole days, the rest as time. */
+  const spread = (value: number): boolean => {
     const whole = Math.trunc(value);
-    const fraction = value - whole;
+    const time = wholeMicros((value - whole) * DAY_MICROS);
 
-    // Fractions carry down as PostgreSQL carries them: a year's into
-    // months, a month's (30 days) and a week's into days, a day's into time.
-    if (unit === "year") {
-      if (!Number.isInteger(fraction * 12)) {
+    if (time === undefined) {
+      return false;
+    }
+
+    add("days", BigInt(whole));
+    add("micros", time);
+
+    return true;
+  };
+
+  for (let index = words.length - 1; index >= 0; index -= 1) {
+    const word = words[index]!;
+    const clock = INTERVAL_CLOCK.exec(word);
+
+    if (clock) {
+      // Two numbers and a fraction are minutes and seconds.
+      const [hours, minutes, seconds] =
+        clock[4] !== undefined
+          ? [clock[2]!, clock[3]!, clock[4]]
+          : clock[5] !== undefined
+            ? ["0", clock[2]!, clock[3]!]
+            : [clock[2]!, clock[3]!, "0"];
+      const fraction = wholeMicros(Number(`.${clock[5] ?? "0"}`) * 1e6);
+
+      // A clock time replaces the time a fraction of a day to its right
+      // left behind; such a spelling is left to the text.
+      if (
+        unitOpen ||
+        micros !== 0n ||
+        fraction === undefined ||
+        Number(minutes) > 59 ||
+        Number(seconds) > 60 ||
+        !fill(CLOCK_FIELDS)
+      ) {
         return undefined;
       }
 
-      months += whole * 12 + fraction * 12;
-    } else if (unit === "month" || unit === "week") {
-      const spread = fraction * (unit === "month" ? 30 : 7);
+      const time =
+        BigInt(hours) * 3_600_000_000n +
+        BigInt(minutes) * 60_000_000n +
+        BigInt(seconds) * 1_000_000n +
+        fraction;
 
-      months += unit === "month" ? whole : 0;
-      days += (unit === "week" ? whole * 7 : 0) + Math.trunc(spread);
-      micros += (spread - Math.trunc(spread)) * 86_400e6;
-    } else if (unit === "day") {
-      days += whole;
-      micros += fraction * 86_400e6;
-    } else {
-      micros += value * TIME_MICROS.get(unit)!;
+      add("micros", clock[1] === "-" ? -time : time);
+      unit = "day";
+      continue;
     }
 
-    rest = rest.slice(field[0].length);
+    const number = INTERVAL_NUMBER.exec(word);
+
+    if (!number) {
+      const named = INTERVAL_FIELDS.get(word);
+
+      // A unit needs a number before it, and one unit only.
+      if (unitOpen || named === undefined) {
+        return undefined;
+      }
+
+      unit = named;
+      unitOpen = true;
+      continue;
+    }
+
+    if (number[5]) {
+      const named = INTERVAL_FIELDS.get(number[5]);
+
+      // Without a sign, `1.` takes no unit right after the point (`1.h`
+      // is no interval, `-1.h` is one).
+      if (
+        unitOpen ||
+        named === undefined ||
+        (number[3] === "" && number[1] === "")
+      ) {
+        return undefined;
+      }
+
+      unit = named;
+    }
+
+    unit ??= "second";
+    unitOpen = false;
+
+    const negative = number[1] === "-";
+    const whole = BigInt(number[2] ?? "0") * (negative ? -1n : 1n);
+    const fraction =
+      (negative ? -1 : 1) * Number(`.${number[3] || number[4] || "0"}`);
+    const scale = TIME_MICROS.get(unit);
+    const years = YEAR_MONTHS.get(unit);
+
+    if (scale !== undefined) {
+      const time = wholeMicros(fraction * scale);
+
+      // A second with a fraction is its milliseconds and microseconds too.
+      if (
+        time === undefined ||
+        !fill(
+          unit === "second" && fraction !== 0 ? CLOCK_FIELDS.slice(2) : [unit],
+        )
+      ) {
+        return undefined;
+      }
+
+      add("micros", whole * BigInt(scale) + time);
+
+      // A number without a unit before hours is days.
+      if (unit === "hour") {
+        unit = "day";
+      }
+    } else if (unit === "day") {
+      const time = wholeMicros(fraction * DAY_MICROS);
+
+      if (time === undefined || !fill([unit])) {
+        return undefined;
+      }
+
+      add("days", whole);
+      add("micros", time);
+    } else if (unit === "week" || unit === "month") {
+      // A month's fraction counts 30 days, a week's 7.
+      if (!fill([unit]) || !spread(fraction * (unit === "week" ? 7 : 30))) {
+        return undefined;
+      }
+
+      add(
+        unit === "week" ? "days" : "months",
+        unit === "week" ? whole * 7n : whole,
+      );
+    } else if (years !== undefined) {
+      // A year's fraction is whole months; where it is not, and for the
+      // longer units, PostgreSQL's versions round differently.
+      const extra = fraction * 12;
+
+      if (
+        !fill([unit]) ||
+        !Number.isInteger(extra) ||
+        (extra !== 0 && unit !== "year")
+      ) {
+        return undefined;
+      }
+
+      add("months", whole * years + BigInt(extra));
+    } else {
+      return undefined;
+    }
   }
 
-  const sign = ago ? -1 : 1;
+  if (
+    unitOpen ||
+    filled.size === 0 ||
+    monthsRoom > INTERVAL_LIMIT ||
+    daysRoom > INTERVAL_LIMIT ||
+    microsRoom >= (INTERVAL_LIMIT + 1n) * 3_600_000_000n
+  ) {
+    return undefined;
+  }
 
-  return `${sign * months} ${sign * days} ${sign * Math.round(micros)}`;
+  if (ago) {
+    months = -months;
+    days = -days;
+    micros = -micros;
+  }
+
+  const time = micros < 0n ? -micros : micros;
+  const part = (value: bigint): string => value.toString().padStart(2, "0");
+  const fraction = (time % 1_000_000n)
+    .toString()
+    .padStart(6, "0")
+    .replace(/0+$/, "");
+
+  // Every part has its sign, so no IntervalStyle reads the key differently.
+  return `${months} mons ${days < 0n ? "" : "+"}${days} days ${micros < 0n ? "-" : "+"}${part(time / 3_600_000_000n)}:${part((time / 60_000_000n) % 60n)}:${part((time / 1_000_000n) % 60n)}${fraction ? `.${fraction}` : ""}`;
 };
 
 /**
@@ -260,7 +441,8 @@ export const canonicalLiteral = (value: string, type: string): string => {
   }
 
   if (base === "interval") {
-    return intervalParts(text) ?? value;
+    // Untrimmed: PostgreSQL skips ASCII white space only, as intervalKey does.
+    return intervalKey(value) ?? value;
   }
 
   if (base === "uuid") {

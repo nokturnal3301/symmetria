@@ -531,11 +531,19 @@ export const assembleSchema = <
     );
 
     if (clash) {
+      // A junction's keys take no .inverse(): its collections are named by
+      // the slots that link() or many() join.
+      const through = clash.kind === "through" || relation.kind === "through";
       const advice =
         clash.kind === "condition" || relation.kind === "condition"
           ? "Rename the condition relation in relations()."
-          : "Name it explicitly in schema overrides: " +
-            `schema({...}, { ${tableKey}: { <name>: <table>.<foreignKeyColumn> } })`;
+          : through
+            ? "Give each collection its own name: declare them as slots of " +
+              "their tables and join the slots, link(<table>.<slot>, <table>.<slot>) " +
+              "or <slot>: many(<table>.<slot>)"
+            : "Give each its own name: declare the relations as slots " +
+              `(one(${tableKey}.<name>), many(${tableKey}.<name>)) or name the reverse side ` +
+              `on the reference with .inverse("<name>")`;
 
       throw new Error(
         `symmetria: relation name "${relation.name}" on "${tableKey}" is ambiguous ` +
@@ -694,8 +702,18 @@ export const assembleSchema = <
 
   // auto-derived reverse + through relations
   for (const analyzedTable of analyzedTables) {
+    // A junction of a table with itself (followers / following): both keys
+    // point at one table, so the two reverse collections would share the
+    // junction's name there. The many-to-many relations carry the two
+    // directions; the link rows are read through the junction table itself.
+    const selfJunction =
+      analyzedTable.isJunction &&
+      analyzedTable.references.length === 2 &&
+      analyzedTable.references[0]!.target.key ===
+        analyzedTable.references[1]!.target.key;
+
     for (const reference of analyzedTable.references) {
-      if (reference.self) {
+      if (reference.self || selfJunction) {
         continue;
       } // self-reference reverses must be named explicitly
 

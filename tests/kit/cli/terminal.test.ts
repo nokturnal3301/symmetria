@@ -1,14 +1,19 @@
 import { expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { schema, int } from "../../../packages/runtime/src";
+import { withMigrationDirectory } from "../../support/directories";
 
 /**
- * Runs the schema browser in a pseudo-terminal of the given size, types the
- * keys one by one and returns the exit code and everything it drew.
+ * Runs a command in a pseudo-terminal of the given size, types the keys one
+ * by one and returns the exit code and everything it drew.
  */
-const browse = async (
+const type = async (
+  argumentsList: readonly string[],
   size: { cols: number; rows: number },
   keys: readonly string[],
+  cwd = process.cwd(),
 ) => {
   let output = "";
   const decoder = new TextDecoder();
@@ -16,11 +21,10 @@ const browse = async (
     [
       process.execPath,
       resolve("packages/kit/src/cli/index.ts"),
-      "inspect",
-      "--config",
-      resolve("examples/symmetria.config.ts"),
+      ...argumentsList,
     ],
     {
+      cwd,
       env: { ...process.env, DATABASE_URL: "", TERM: "xterm-256color" },
       terminal: {
         ...size,
@@ -49,6 +53,17 @@ const browse = async (
 
   return { exitCode, output };
 };
+
+/** The schema browser over the example schema. */
+const browse = (
+  size: { cols: number; rows: number },
+  keys: readonly string[],
+) =>
+  type(
+    ["inspect", "--config", resolve("examples/symmetria.config.ts")],
+    size,
+    keys,
+  );
 
 /** The rows the browser draws, each addressed as `ESC [row;1H ESC [2K text`. */
 const drawnLines = (output: string): string[] =>
@@ -94,6 +109,110 @@ for (const size of [
     );
   }, 15000);
 }
+
+test("Ctrl-C in the schema browser exits with 130 and restores the terminal", async () => {
+  // Also from a search, where other keys are text.
+  for (const keys of [["\u0003"], ["/", "id", "\u0003"]]) {
+    const { exitCode, output } = await browse({ cols: 100, rows: 30 }, keys);
+
+    expect(exitCode).toBe(130);
+    expect(output.lastIndexOf("\u001b[?1049l")).toBeGreaterThan(
+      output.lastIndexOf("\u001b[?1049h"),
+    );
+    expect(output.lastIndexOf("\u001b[?25h")).toBeGreaterThan(
+      output.lastIndexOf("\u001b[?25l"),
+    );
+  }
+
+  // Ctrl-D still closes it like q.
+  expect((await browse({ cols: 100, rows: 30 }, ["\u0004"])).exitCode).toBe(0);
+}, 30000);
+
+test(
+  "Escape closes a typed question; the keys of an arrow do not",
+  () =>
+    withMigrationDirectory(async (directory) => {
+      await writeFile(
+        join(directory, "symmetria.config.ts"),
+        `export default ${JSON.stringify({ schema: schema({ records: { id: int } }).$snapshot(), directory: "migrations" })};`,
+      );
+      const size = { cols: 100, rows: 30 };
+
+      // The name question of generate, left unanswered.
+      const closed = await type(
+        ["generate"],
+        size,
+        ["abc", "\u001b"],
+        directory,
+      );
+      expect(closed.exitCode).toBe(1);
+      expect(stripVTControlCharacters(closed.output)).toContain(
+        "symmetria: generate requires a migration name",
+      );
+      expect(await readdir(directory)).toEqual(["symmetria.config.ts"]);
+
+      // An arrow starts with the same byte and only moves the cursor.
+      const named = await type(
+        ["generate"],
+        size,
+        ["initia", "\u001b[D", "\u001b[C", "l", "\r"],
+        directory,
+      );
+      expect(named.exitCode).toBe(0);
+      expect(await readdir(join(directory, "migrations"))).toContain(
+        "000001_initial",
+      );
+    }),
+  30000,
+);
+
+test(
+  "the dashboard says that the migrations directory does not exist, as status does",
+  () =>
+    withMigrationDirectory(async (directory) => {
+      const size = { cols: 100, rows: 30 };
+      const screen = async (...argumentsList: string[]) => {
+        const { exitCode, output } = await type(
+          ["--no-animation", ...argumentsList],
+          size,
+          ["\u001b"],
+          directory,
+        );
+
+        expect(exitCode).toBe(0);
+
+        // One line, as the header may wrap the note.
+        return stripVTControlCharacters(output).replace(/\s+/g, " ");
+      };
+
+      // No config file and no ./migrations: the wrong place, not an empty chain.
+      const lost = await screen();
+      expect(lost).toContain(
+        "No config file was found in the current directory",
+      );
+      expect(lost).toContain("No directory");
+      expect(lost).not.toContain("0 local");
+
+      // A project before its first generate.
+      await writeFile(
+        join(directory, "symmetria.config.ts"),
+        'export default { directory: "migrations" };',
+      );
+      const fresh = await screen();
+      expect(fresh).toContain("No migrations yet: the migrations directory");
+      expect(fresh).not.toContain("0 local");
+      expect(await screen("--dir", "migratoins")).toContain(
+        "(--dir) does not exist",
+      );
+
+      // With the directory there, the header counts what it holds.
+      await mkdir(join(directory, "migrations"));
+      const empty = await screen();
+      expect(empty).toContain("0 local");
+      expect(empty).not.toContain("No directory");
+    }),
+  30000,
+);
 
 test("diff and inspect --no-interactive keep their colours on a terminal; piped output stays plain", async () => {
   const run = async (argumentsList: string[], terminal: boolean) => {

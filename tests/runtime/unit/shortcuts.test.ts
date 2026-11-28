@@ -6,6 +6,7 @@ import {
   text,
   bool,
   doublePrecision,
+  customType,
   index,
   sum,
   count,
@@ -214,6 +215,38 @@ test("where takes an object of equalities", () => {
   expect(() => ids({ where: { version: [1, 2] } as never })).toThrow(
     'symmetria: where: "version" takes one value; write a list as a callback, version.in([...])',
   );
+});
+
+test("where: an array is one value for a column whose values are arrays", () => {
+  const spans = schema(
+    {
+      spans: table({
+        id: int.auto,
+        // A range read and written as [from, to).
+        period: customType<[number, number]>("int4range", {
+          encode: ([from, to]) => `[${from},${to})`,
+          decode: (value) =>
+            String(value).slice(1, -1).split(",").map(Number) as [
+              number,
+              number,
+            ],
+        }),
+        tags: text.array,
+      }),
+    },
+    { executor: async () => [] },
+  ).spans;
+
+  expect(
+    spans((span) => ({ id: span.id }), {
+      where: { period: [1, 5] },
+    }).toSQL(),
+  ).toMatchObject({ parameters: ["[1,5)"] });
+  expect(
+    spans((span) => ({ id: span.id }), {
+      where: { tags: ["a", "b"] },
+    }).toSQL().sql,
+  ).toContain('"tags" = $1');
 });
 
 test("where: null in an object is IS NULL", () => {

@@ -395,7 +395,8 @@ const direction = (
 
   // ALTER TYPE ... ADD VALUE runs inside a transaction on PostgreSQL 12+, but the new
   // label cannot be used until commit. Values that a default or CHECK in this migration
-  // already needs force the replace-and-cast rewrite instead.
+  // already needs force the replace-and-cast rewrite instead, and so does a
+  // column that becomes the enum (below).
   const usedInMigration = (enumeration: string, value: string): boolean => {
     return after.tables.some(
       (table) =>
@@ -417,6 +418,33 @@ const direction = (
     );
   };
 
+  // A column of another type (text, another enum) that becomes the enum in
+  // this migration is converted row by row, and a row may hold a label the
+  // migration adds: PostgreSQL refuses the cast in the transaction that added
+  // it. Columns are matched through the table and column renames.
+  const convertedInto = (enumeration: string): boolean =>
+    before.tables.some((table) => {
+      const next = afterTables.get(tableNames.get(table.name) ?? table.name);
+      const columnNames = next && renames.columns.get(next.name);
+
+      return table.columns.some((column) => {
+        const target = next?.columns.find(
+          (candidate) =>
+            candidate.name === (columnNames?.get(column.name) ?? column.name),
+        );
+
+        return (
+          target?.enumeration === enumeration &&
+          // A generated column is computed again, not converted.
+          target.generated === undefined &&
+          column.generated === undefined &&
+          (column.enumeration === undefined ||
+            (enumerationRenames.get(column.enumeration) ??
+              column.enumeration) !== enumeration)
+        );
+      });
+    });
+
   const additiveEnums = new Set(
     after.enumerations
       .filter((next) => {
@@ -429,13 +457,15 @@ const direction = (
             next.values.filter((value) => previous.values.includes(value)),
             previous.values,
           ) &&
-          // Online migrations commit each statement, so later defaults may use the label.
+          // Online migrations commit each statement, so later defaults and
+          // conversions may use the label.
           (online ||
-            !next.values.some(
-              (value) =>
-                !previous.values.includes(value) &&
-                usedInMigration(next.name, value),
-            ))
+            (!convertedInto(next.name) &&
+              !next.values.some(
+                (value) =>
+                  !previous.values.includes(value) &&
+                  usedInMigration(next.name, value),
+              )))
         );
       })
       .map((enumeration) => enumeration.name),

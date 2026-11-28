@@ -2,6 +2,8 @@
 export { quoteIdentifier } from "../query/compile";
 export { normalizeResult } from "../query/plan/types";
 export { postgresArrayLiteral } from "../query/compile/postgres/values";
+export { jsonText, timestampText } from "../query/codecs";
+export { timestampKey } from "../query/codecs/timestamp-key";
 export { indexClausesSQL, INDEX_METHODS } from "../schema/indexes";
 export { objectName } from "../schema/naming";
 export {

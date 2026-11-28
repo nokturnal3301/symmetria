@@ -1384,14 +1384,18 @@ CREATE RULE records_audit AS ON INSERT TO records DO ALSO (
             up,
             `ALTER TABLE records ADD COLUMN ${transaction} text;\n${sleep};\n`,
           );
-          const run = runner().migrate();
+          // Handled from the start: the failure can arrive before the
+          // terminating query below has answered.
+          const run = runner()
+            .migrate()
+            .then(
+              () => undefined,
+              (failure: unknown) => failure as MigrationExecutionError,
+            );
           await rows("SELECT pg_terminate_backend($1)", [
             await runningBackend(rows, sleep),
           ]);
-          const error = await run.then(
-            () => undefined,
-            (failure: unknown) => failure as MigrationExecutionError,
-          );
+          const error = await run;
 
           // The cleanup on the lost session failed too; it is a note, not the error.
           expect(error).toBeInstanceOf(MigrationExecutionError);
@@ -1469,14 +1473,17 @@ CREATE RULE records_audit AS ON INSERT TO records DO ALSO (
             return driver.transaction!(callback, options);
           },
         };
-        const run = runner({ driver: flaky }).migrate();
+        // Handled from the start, as the failure may arrive at any time.
+        const run = runner({ driver: flaky })
+          .migrate()
+          .then(
+            () => undefined,
+            (failure: unknown) => failure as MigrationExecutionError,
+          );
         const backend = await runningBackend(rows, sleep);
         dead = 2;
         await rows("SELECT pg_terminate_backend($1)", [backend]);
-        const error = await run.then(
-          () => undefined,
-          (failure: unknown) => failure as MigrationExecutionError,
-        );
+        const error = await run;
 
         expect(dead).toBe(0);
         expect(error).toBeInstanceOf(MigrationExecutionError);

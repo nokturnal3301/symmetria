@@ -21,6 +21,8 @@ export type PullWarningCode =
   | "unique-index"
   | "view"
   | "trigger"
+  | "rule"
+  | "foreign-table"
   | "migration-table"
   | "index"
   | "junction-index"
@@ -30,6 +32,7 @@ export type PullWarningCode =
   | "name"
   | "partition"
   | "unlogged"
+  | "storage-parameters"
   | "exclusion"
   | "extension"
   | "inheritance"
@@ -80,8 +83,10 @@ export type ColumnType =
   /** `vector(n)`, or `halfvec(n)` when `half`. */
   | { kind: "vector"; dimensions?: number; half?: true }
   /**
-   * `customType()`. `base` is a domain's base type (`numeric(30,10)`), whose
-   * builder the values read and write like; without it, driver-native values.
+   * `customType()`. `base` is the type whose builder the values read and
+   * write like: a domain's base type (`numeric(30,10)`), or `numeric` for a
+   * numeric(p,s) the numeric() builder does not take. Without it,
+   * driver-native values.
    */
   | { kind: "custom"; sqlType: string; valueType: string; base?: string };
 

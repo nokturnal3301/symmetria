@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -105,6 +105,92 @@ const sandbox = async (
     await run(`DROP SCHEMA "${namespace}" CASCADE`);
     await driver.close();
     await rm(directory, { recursive: true, force: true });
+  }
+};
+
+/**
+ * What the compiler says about pulled modules, under the repository's own
+ * compiler options; empty when they type-check. The files are written below
+ * `.build/`, inside the repository, where the compiler finds its type packages.
+ */
+const typeErrors = async (modules: Record<string, string>): Promise<string> => {
+  const directory = resolve(`.build/pull-typecheck-${randomUUID()}`);
+  await mkdir(directory, { recursive: true });
+
+  try {
+    for (const [name, source] of Object.entries(modules)) {
+      await writeFile(join(directory, name), source);
+    }
+
+    await writeFile(
+      join(directory, "tsconfig.json"),
+      JSON.stringify({
+        extends: "../../tsconfig.json",
+        compilerOptions: { noEmit: true },
+        include: ["*.ts"],
+        exclude: [],
+      }),
+    );
+    const child = Bun.spawn(
+      [resolve("node_modules/.bin/tsc"), "-p", directory],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [output, errors] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+
+    return `${output}${errors}`.trim();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+};
+
+/**
+ * Builds a schema's tables in a schema of their own, `<namespace>_copy`, and
+ * hands over a runner whose statements see that schema only.
+ */
+const rebuilt = async (
+  namespace: string,
+  model: { $snapshot: () => Parameters<typeof createSchemaSQL>[0] },
+  callback: (run: (sql: string) => Promise<unknown>) => Promise<void>,
+) => {
+  const copy = `${namespace}_copy`;
+  const address = new URL(url!);
+  address.searchParams.set("options", `-c search_path=${copy}`);
+  const driver = postgres({ url: address.toString(), max: 1 });
+  const run = (statement: string) =>
+    driver.execute({ sql: statement, parameters: [] });
+
+  try {
+    await run(`CREATE SCHEMA "${copy}"`);
+
+    for (const statement of createSchemaSQL(model.$snapshot())) {
+      await run(statement.sql);
+    }
+
+    await callback(run);
+  } finally {
+    await run(`DROP SCHEMA IF EXISTS "${copy}" CASCADE`);
+    await driver.close();
+  }
+};
+
+/** Whether a statement runs, or the constraint that refuses it. */
+const outcome = async (
+  run: (sql: string) => Promise<unknown>,
+  statement: string,
+): Promise<string> => {
+  try {
+    await run(statement);
+
+    return "accepted";
+  } catch (error) {
+    return (
+      /violates check constraint/.exec(String((error as Error).message))?.[0] ??
+      String((error as Error).message)
+    );
   }
 };
 
@@ -1161,6 +1247,7 @@ describe.skipIf(!url)("pull round trip", () => {
 
   test("hand-written conditions become predicates only where PostgreSQL stored the DSL's form", () =>
     sandbox(async ({ driver, directory, run }) => {
+      const cutoff = "TIMESTAMPTZ '2020-01-01 00:00:00+00'";
       await run(`CREATE TABLE readings (
         id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         big bigint NOT NULL,
@@ -1177,7 +1264,7 @@ describe.skipIf(!url)("pull round trip", () => {
         CONSTRAINT readings_price_check CHECK (price > 0 AND price <> 0.5),
         CONSTRAINT readings_label_check CHECK (label NOT LIKE 'x%' AND label IN ('a', 'b', 'c')),
         CONSTRAINT readings_active_check CHECK (active = false OR big IS NOT NULL),
-        CONSTRAINT readings_at_check CHECK (at > '2020-01-01' AND at < now())
+        CONSTRAINT readings_at_check CHECK (at > ${cutoff} AND at < now())
       )`);
 
       const pulled = await pullSchema({
@@ -1185,6 +1272,13 @@ describe.skipIf(!url)("pull round trip", () => {
         module: runtime,
       });
 
+      // PostgreSQL prints the stored instant in the session's time zone.
+      const [{ literal }] = normalizeResult(
+        await driver.execute({
+          sql: `SELECT quote_literal(${cutoff}) AS literal`,
+          parameters: [],
+        }),
+      ).rows as [{ literal: string }];
       for (const line of [
         // A bigint compared with an integer literal uses another operator than the DSL's.
         "big: sql<boolean>`(${readings.big} < 10)`,",
@@ -1195,7 +1289,7 @@ describe.skipIf(!url)("pull round trip", () => {
         'price: and(readings.price.above("0"), readings.price.isNot("0.5")),',
         'label: and(not(readings.label.like("x%")), readings.label.in(["a", "b", "c"])),',
         "active: or(readings.active.is(false), readings.big.isNot(null)),",
-        "at: sql<boolean>`((${readings.at} > '2020-01-01 00:00:00+00'::timestamp with time zone) AND (${readings.at} < now()))`,",
+        `at: sql<boolean>\`((\${readings.at} > ${literal}::timestamp with time zone) AND (\${readings.at} < now()))\`,`,
       ]) {
         expect(pulled.source).toContain(line);
       }
@@ -1209,6 +1303,78 @@ describe.skipIf(!url)("pull round trip", () => {
           snapshot: appSchema.$snapshot(),
         }),
       ).toEqual([]);
+    }));
+
+  test("a division pulls back as PostgreSQL computes it, and the rebuilt checks hold for the same rows", () =>
+    sandbox(async ({ driver, directory, namespace, run }) => {
+      await run(`CREATE TABLE boxes (
+        id integer PRIMARY KEY,
+        items integer NOT NULL,
+        big bigint,
+        small smallint,
+        price numeric(10, 2),
+        weight double precision,
+        CONSTRAINT boxes_items_check CHECK (items / 2 = 3),
+        CONSTRAINT boxes_big_check CHECK (big / 2::bigint < 2::bigint),
+        CONSTRAINT boxes_small_check CHECK (small / items >= 1),
+        CONSTRAINT boxes_price_check CHECK (price / 2 > 1),
+        CONSTRAINT boxes_share_check CHECK (items / price > 1),
+        CONSTRAINT boxes_weight_check CHECK (weight / 2 > 0.5)
+      )`);
+      await run(`CREATE INDEX boxes_half_idx ON boxes ((items / 2))`);
+
+      const pulled = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+
+      for (const line of [
+        // Integers divide as integers: quotient(), not divide().
+        "items: boxes.items.quotient(2).is(3),",
+        "big: boxes.big.quotient(2n).below(2n),",
+        "small: boxes.small.quotient(boxes.items).atLeast(1),",
+        "half: index(boxes.items.quotient(2)),",
+        // numeric and double precision divide exactly.
+        'price: boxes.price.divide("2").above("1"),',
+        'share: boxes.items.divide(boxes.price).above("1"),',
+        "weight: boxes.weight.divide(2).above(0.5),",
+      ]) {
+        expect(pulled.source).toContain(line);
+      }
+
+      expect(pulled.warnings).toEqual([]);
+      expect(await typeErrors({ "boxes.ts": pulled.source })).toBe("");
+
+      const path = join(directory, "boxes.ts");
+      await writeFile(path, pulled.source);
+      const { appSchema } = await import(pathToFileURL(path).href);
+      expect(
+        await detectDrift({
+          execute: driver.execute,
+          snapshot: appSchema.$snapshot(),
+        }),
+      ).toEqual([]);
+
+      await rebuilt(namespace, appSchema, async (second) => {
+        for (const [row, expected] of [
+          // 7 / 2 is 3 between integers and 3.5 as an exact division.
+          ["(1, 7, 3, 7, 3, 3)", "accepted"],
+          ["(2, 6, 3, 11, 3, 3)", "accepted"],
+          // 5 / 2 is 2, which is not below 2; 2.5 is not either.
+          ["(3, 6, 5, 6, 3, 3)", "violates check constraint"],
+          // 9 / 6 is 1 and 5 / 6 is 0.
+          ["(4, 6, 3, 9, 4, 3)", "accepted"],
+          ["(5, 6, 3, 5, 4, 3)", "violates check constraint"],
+          // 3 / 2 is 1.5 for a numeric, 2 / 2 is not above 1.
+          ["(6, 6, 3, 6, 2, 3)", "violates check constraint"],
+          ["(7, 6, 3, 6, 3, 1)", "violates check constraint"],
+        ] as const) {
+          const insert = `INSERT INTO boxes (id, items, big, small, price, weight) VALUES ${row}`;
+
+          expect([row, await outcome(run, insert)]).toEqual([row, expected]);
+          expect([row, await outcome(second, insert)]).toEqual([row, expected]);
+        }
+      });
     }));
 
   test("ignoreTables leaves tables out of pull; foreign keys to them stay columns", () =>
@@ -1613,5 +1779,482 @@ describe.skipIf(!url)("pull round trip", () => {
       expect(
         warnings.find((warning) => warning.code === "sequence")!.message,
       ).toContain("(START 1000 INCREMENT 10)");
+    }));
+
+  test("a PascalCase database pulls to a module that type-checks, loads and has no drift", () =>
+    sandbox(async ({ driver, directory, run }) => {
+      for (const statement of [
+        `CREATE TYPE "OrderStatus" AS ENUM ('New', 'Paid')`,
+        `CREATE TABLE "Customers" (
+          "Id" integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+          "Name" text NOT NULL,
+          "Email" text NOT NULL UNIQUE,
+          "NickName" varchar(40) COLLATE "C",
+          "CreatedAt" timestamptz NOT NULL DEFAULT now(),
+          "UpdatedAt" timestamp(3) DEFAULT now(),
+          "Token" uuid NOT NULL DEFAULT gen_random_uuid(),
+          "OptionalToken" uuid DEFAULT gen_random_uuid() UNIQUE,
+          "Tags" text[] NOT NULL DEFAULT '{}',
+          "Score" integer NOT NULL DEFAULT 0,
+          "Balance" numeric(12,2) NOT NULL DEFAULT 0,
+          "Status" "OrderStatus" NOT NULL DEFAULT 'New',
+          "Settings" jsonb NOT NULL DEFAULT '{}',
+          "Big" bigint GENERATED ALWAYS AS IDENTITY,
+          "Small" smallint GENERATED BY DEFAULT AS IDENTITY UNIQUE,
+          "Code" text NOT NULL
+        )`,
+        `CREATE INDEX "Customers_Code_idx" ON "Customers" ("Code")`,
+        `CREATE TABLE "Orders" (
+          "Id" bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          "CustomerId" integer NOT NULL REFERENCES "Customers"("Id") ON DELETE CASCADE,
+          "ApproverId" integer REFERENCES "Customers"("Id") ON DELETE SET NULL,
+          "BuyerEmail" text REFERENCES "Customers"("Email") ON UPDATE CASCADE,
+          "PlacedAt" timestamp(3) NOT NULL DEFAULT now(),
+          "Ref" uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+          "Status" "OrderStatus" NOT NULL
+        )`,
+        `CREATE INDEX "Orders_CustomerId_idx" ON "Orders" ("CustomerId")`,
+        `CREATE TABLE "Events" (
+          "EventKey" uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+          "At" timestamptz DEFAULT now() NOT NULL
+        )`,
+        `CREATE TABLE "Lines" (
+          "OrderId" bigint NOT NULL REFERENCES "Orders"("Id") ON DELETE CASCADE,
+          "LineNo" integer NOT NULL,
+          "Made" timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY ("OrderId", "LineNo")
+        )`,
+      ]) {
+        await run(statement);
+      }
+
+      const pulled = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+
+      // A shortcut of the builder comes before .named(), which returns a
+      // column typed without it.
+      for (const line of [
+        'id: int.auto.byDefault.named("Id"),',
+        'createdAt: timestamptz.now.named("CreatedAt"),',
+        'updatedAt: timestamp(3).now.named("UpdatedAt").nullable,',
+        'token: uuid.v4.named("Token"),',
+        'optionalToken: uuid.v4.named("OptionalToken").nullable.unique,',
+        'big: bigint.auto.named("Big"),',
+        'small: smallint.auto.byDefault.named("Small").unique,',
+        'eventKey: uuid.v4.named("EventKey").primaryKey,',
+        'placedAt: timestamp(3).now.named("PlacedAt"),',
+        'nickName: varchar(40).collate("C").named("NickName").nullable,',
+        'status: oneOf("New", "Paid").typeName("OrderStatus").named("Status").default("New"),',
+        'customer: one(customers.column("CustomerId")).cascade,',
+        'buyerEmail: maybe(customers.by("email").column("BuyerEmail").inverse("ordersByBuyerEmail")).noIndex.onDelete.noAction.onUpdate.cascade,',
+      ]) {
+        expect(pulled.source).toContain(line);
+      }
+
+      expect(pulled.warnings).toEqual([]);
+      expect(await typeErrors({ "pascal.ts": pulled.source })).toBe("");
+
+      const path = join(directory, "pascal.ts");
+      await writeFile(path, pulled.source);
+      const { appSchema } = await import(pathToFileURL(path).href);
+      expect(
+        await detectDrift({
+          execute: driver.execute,
+          snapshot: appSchema.$snapshot(),
+        }),
+      ).toEqual([]);
+    }));
+
+  test("two foreign keys on one column: one is declared, the other is listed with its definition", () =>
+    sandbox(async ({ driver, directory, run }) => {
+      for (const statement of [
+        `CREATE TABLE accounts (id integer PRIMARY KEY)`,
+        `CREATE TABLE people (id integer PRIMARY KEY)`,
+        `CREATE TABLE memberships (id integer PRIMARY KEY, owner_id integer NOT NULL,
+          CONSTRAINT memberships_account_fk FOREIGN KEY (owner_id) REFERENCES accounts(id) ON DELETE CASCADE,
+          CONSTRAINT memberships_person_fk FOREIGN KEY (owner_id) REFERENCES people(id))`,
+        `CREATE TABLE notes (id integer PRIMARY KEY, account_id integer REFERENCES accounts(id) ON DELETE CASCADE,
+          CONSTRAINT fk_notes_account FOREIGN KEY (account_id) REFERENCES accounts(id))`,
+      ]) {
+        await run(statement);
+      }
+
+      const pulled = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+
+      expect(pulled.source).toContain(
+        'owner: one(accounts).noIndex.cascade, // pull: foreign key "memberships_person_fk" is not declared: FOREIGN KEY (owner_id) REFERENCES people(id); constraint "memberships_account_fk" is named "memberships_owner_id_fkey"',
+      );
+      expect(pulled.source).toContain(
+        'account: maybe(accounts).noIndex.cascade, // pull: foreign key "fk_notes_account" is not declared: FOREIGN KEY (account_id) REFERENCES accounts(id)',
+      );
+      expect(
+        pulled.warnings.map((warning) => [
+          warning.code,
+          warning.object,
+          warning.message,
+        ]),
+      ).toEqual([
+        [
+          "foreign-key",
+          "memberships_person_fk",
+          'foreign key "memberships_person_fk" is not declared: "memberships.owner_id" has more than one foreign key and the schema declares one per column, here "memberships_account_fk" (the first by name); migrations neither create nor drop "memberships_person_fk", and a database built from this schema lacks it (FOREIGN KEY (owner_id) REFERENCES people(id))',
+        ],
+        [
+          "foreign-key",
+          "fk_notes_account",
+          'foreign key "fk_notes_account" is not declared: "notes.account_id" has more than one foreign key and the schema declares one per column, here "notes_account_id_fkey" (the one with the name the schema gives the key); migrations neither create nor drop "fk_notes_account", and a database built from this schema lacks it (FOREIGN KEY (account_id) REFERENCES accounts(id))',
+        ],
+        [
+          "constraint-name",
+          "memberships_account_fk",
+          'foreign key "memberships_account_fk" will be expected as "memberships_owner_id_fkey"',
+        ],
+      ]);
+
+      // Drift names what the entries announced, and nothing else.
+      const path = join(directory, "keys.ts");
+      await writeFile(path, pulled.source);
+      const { appSchema } = await import(pathToFileURL(path).href);
+      expect(
+        (
+          await detectDrift({
+            execute: driver.execute,
+            snapshot: appSchema.$snapshot(),
+          })
+        )
+          .map((finding) =>
+            [finding.kind, finding.table, finding.expected ?? finding.actual]
+              .join(" ")
+              .trim(),
+          )
+          .sort(),
+      ).toEqual([
+        "extra-constraint memberships memberships_account_fk",
+        "extra-constraint memberships memberships_person_fk",
+        "extra-constraint notes fk_notes_account",
+        "missing-constraint memberships memberships_owner_id_fkey",
+      ]);
+    }));
+
+  test("defaults written as a literal of another type keep the value PostgreSQL stores", () =>
+    sandbox(async ({ driver, directory, namespace, run }) => {
+      await run(`CREATE TABLE codes (
+        id integer PRIMARY KEY,
+        padded text NOT NULL DEFAULT 'ab '::bpchar,
+        short varchar(10) DEFAULT 'ab '::bpchar,
+        cut text DEFAULT 'abcdef'::varchar(3),
+        kept text DEFAULT 'ab '::varchar(10),
+        fixed char(4) DEFAULT 'ab',
+        widened double precision DEFAULT '-0.1'::real,
+        price numeric DEFAULT '-1.005'::numeric(10,2),
+        filled numeric DEFAULT '7'::numeric(10,2)
+      )`);
+
+      const pulled = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+
+      for (const line of [
+        // PostgreSQL drops a bpchar's trailing spaces and cuts at varchar(3).
+        'padded: text.default("ab"),',
+        'short: varchar(10).default("ab").nullable,',
+        'cut: text.default("abc").nullable,',
+        'kept: text.default("ab ").nullable,',
+        "fixed: customType<string>(\"character(4)\", passthrough<string>()).default(sql`'ab'::bpchar`).nullable, // pull: no builder for character(4)",
+        // A real is not the number its text reads as, and numeric(10,2) rounds.
+        "widened: doublePrecision.default(sql`'-0.1'::real`).nullable,",
+        "price: numeric.default(sql`'-1.005'::numeric(10,2)`).nullable,",
+        // ... and fills a number up to two decimals: a fresh row holds 7.00.
+        'filled: numeric.default("7.00").nullable,',
+      ]) {
+        expect(pulled.source).toContain(line);
+      }
+
+      const path = join(directory, "codes.ts");
+      await writeFile(path, pulled.source);
+      const { appSchema } = await import(pathToFileURL(path).href);
+      expect(
+        await detectDrift({
+          execute: driver.execute,
+          snapshot: appSchema.$snapshot(),
+        }),
+      ).toEqual([]);
+
+      // A row of defaults is the same row in a database built from the module.
+      const defaults = async (execute: (sql: string) => Promise<unknown>) => {
+        await execute("INSERT INTO codes (id) VALUES (1)");
+
+        return normalizeResult(
+          (await execute(
+            `SELECT '[' || padded || ']' AS padded, '[' || short || ']' AS short, cut, '[' || kept || ']' AS kept, '[' || fixed::text || ']' AS fixed, widened::text, price::text, filled::text FROM codes`,
+          )) as Parameters<typeof normalizeResult>[0],
+        ).rows[0];
+      };
+      const original = await defaults(run);
+
+      expect(original).toEqual({
+        padded: "[ab]",
+        short: "[ab]",
+        cut: "abc",
+        kept: "[ab ]",
+        fixed: "[ab]",
+        widened: "-0.10000000149011612",
+        price: "-1.01",
+        filled: "7.00",
+      });
+      await rebuilt(namespace, appSchema, async (second) => {
+        expect(await defaults(second)).toEqual(original);
+      });
+    }));
+
+  test("a numeric with a scale above its precision or below zero (PostgreSQL 15+) loads, type-checks and has no drift", () =>
+    sandbox(async ({ driver, directory, namespace, run }) => {
+      const version = Number(
+        normalizeResult(
+          await driver.execute({
+            sql: "SHOW server_version_num",
+            parameters: [],
+          }),
+        ).rows[0]!.server_version_num,
+      );
+
+      // Older servers take a scale from zero to the precision only.
+      if (version < 150000) {
+        return;
+      }
+
+      await run(`CREATE TABLE rates (
+        id integer PRIMARY KEY,
+        fee numeric(10,4) NOT NULL DEFAULT 1,
+        tiny numeric(3,5) NOT NULL DEFAULT 0.00123,
+        rounded numeric(5,-2) DEFAULT 12345,
+        CONSTRAINT rates_tiny_check CHECK (tiny < 0.01),
+        CONSTRAINT rates_twice_check CHECK (tiny * 2 < 0.5),
+        CONSTRAINT rates_above_check CHECK (fee > tiny),
+        CONSTRAINT rates_below_check CHECK (tiny < fee),
+        CONSTRAINT rates_between_check CHECK (fee BETWEEN tiny AND 100),
+        CONSTRAINT rates_in_check CHECK (rounded IN (12300, 200))
+      )`);
+      await run(`CREATE INDEX rates_over_idx ON rates (fee) WHERE fee >= tiny`);
+
+      const pulled = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+
+      for (const line of [
+        // numeric(3, 5) is refused by the builder: the module would not load.
+        'tiny: customType<Decimal>("numeric(3,5)", { base: "numeric" }).default(sql`0.00123`), // pull: no builder for numeric(3,5)',
+        'rounded: customType<Decimal>("numeric(5,-2)", { base: "numeric" }).default(sql`12345`).nullable, // pull: no builder for numeric(5,-2)',
+        // Declared with numeric's values, it compares and computes with
+        // numeric() columns on either side.
+        'tiny: rates.tiny.below("0.01"),',
+        'twice: rates.tiny.multiply("2").below("0.5"),',
+        "above: rates.fee.above(rates.tiny),",
+        "below: rates.tiny.below(rates.fee),",
+        'between: rates.fee.between(rates.tiny, "100"),',
+        'in: rates.rounded.in(["12300", "200"]),',
+        "over: index(rates.fee).where(rates.fee.atLeast(rates.tiny)),",
+      ]) {
+        expect(pulled.source).toContain(line);
+      }
+
+      expect(await typeErrors({ "rates.ts": pulled.source })).toBe("");
+
+      const path = join(directory, "rates.ts");
+      await writeFile(path, pulled.source);
+      const { appSchema } = await import(pathToFileURL(path).href);
+      expect(
+        await detectDrift({
+          execute: driver.execute,
+          snapshot: appSchema.$snapshot(),
+        }),
+      ).toEqual([]);
+
+      const stored = async (execute: (sql: string) => Promise<unknown>) => {
+        await execute("INSERT INTO rates (id) VALUES (1)");
+
+        return normalizeResult(
+          (await execute(
+            "SELECT tiny::text, rounded::text FROM rates",
+          )) as Parameters<typeof normalizeResult>[0],
+        ).rows[0];
+      };
+      const original = await stored(run);
+
+      expect(original).toEqual({ tiny: "0.00123", rounded: "12300" });
+      await rebuilt(namespace, appSchema, async (second) => {
+        expect(await stored(second)).toEqual(original);
+      });
+
+      // Through the module the values are exact decimal text, written and read.
+      const database = createDatabase({ schema: appSchema, driver });
+      await database.rates.insert({
+        id: 2,
+        fee: "1.5",
+        tiny: "0.00999",
+        rounded: "12345",
+      });
+      expect(
+        await database.rates(
+          (rates: Record<string, unknown>) => ({
+            fee: rates.fee,
+            tiny: rates.tiny,
+            rounded: rates.rounded,
+          }),
+          {
+            where: (rates: { tiny: { is: (value: string) => unknown } }) =>
+              rates.tiny.is("0.00999"),
+          },
+        ),
+      ).toEqual([{ fee: "1.5000", tiny: "0.00999", rounded: "12300" }]);
+    }));
+
+  test("a number outside a smallint value's range keeps the condition as SQL, and the module loads", () =>
+    sandbox(async ({ driver, directory, namespace, run }) => {
+      await run(`CREATE TABLE stock (
+        id integer PRIMARY KEY,
+        boxes smallint NOT NULL,
+        per_box smallint NOT NULL,
+        total integer NOT NULL,
+        CONSTRAINT stock_ratio_check CHECK (boxes / per_box <= 40000),
+        CONSTRAINT stock_ratio_small_check CHECK (boxes / per_box <= 100),
+        CONSTRAINT stock_boxes_check CHECK (boxes <= 40000),
+        CONSTRAINT stock_floor_check CHECK (boxes >= -32768 AND boxes <= 32767),
+        CONSTRAINT stock_sum_check CHECK (boxes + per_box <= 40000),
+        CONSTRAINT stock_listed_check CHECK (boxes NOT IN (7, 40000)),
+        CONSTRAINT stock_range_check CHECK (boxes BETWEEN 0 AND 40000),
+        CONSTRAINT stock_reversed_check CHECK (40000 >= boxes * per_box),
+        CONSTRAINT stock_step_check CHECK (boxes + 1 <= 40000),
+        CONSTRAINT stock_half_check CHECK (boxes / 2 <= 40000),
+        CONSTRAINT stock_total_check CHECK (boxes + total <= 2147483647)
+      )`);
+      await run(
+        `CREATE INDEX stock_ratio_idx ON stock (id) WHERE boxes / per_box < 100000`,
+      );
+
+      const pulled = await pullSchema({
+        execute: driver.execute,
+        module: runtime,
+      });
+
+      for (const line of [
+        // PostgreSQL compares a smallint with any integer; the DSL refuses
+        // a number outside the smallint range when the module loads.
+        "ratio: sql<boolean>`((${stock.boxes} / ${stock.perBox}) <= 40000)`,",
+        "boxes: sql<boolean>`(${stock.boxes} <= 40000)`,",
+        "sum: sql<boolean>`((${stock.boxes} + ${stock.perBox}) <= 40000)`,",
+        "listed: sql<boolean>`(${stock.boxes} <> ALL (ARRAY[7, 40000]))`,",
+        "range: sql<boolean>`((${stock.boxes} >= 0) AND (${stock.boxes} <= 40000))`,",
+        "reversed: sql<boolean>`(40000 >= (${stock.boxes} * ${stock.perBox}))`,",
+        "ratio: index(stock.id).where(sql<boolean>`(${stock.boxes} / ${stock.perBox}) < 100000`),",
+        // Inside the range, and where a literal or an integer column makes
+        // the left side an integer, the condition is a predicate.
+        "ratioSmall: stock.boxes.quotient(stock.perBox).atMost(100),",
+        "floor: stock.boxes.between(-32768, 32767),",
+        "step: stock.boxes.plus(1).atMost(40000),",
+        "half: stock.boxes.quotient(2).atMost(40000),",
+        "total: stock.boxes.plus(stock.total).atMost(2147483647),",
+      ]) {
+        expect(pulled.source).toContain(line);
+      }
+
+      expect(pulled.warnings).toEqual([]);
+      expect(await typeErrors({ "stock.ts": pulled.source })).toBe("");
+
+      const path = join(directory, "stock.ts");
+      await writeFile(path, pulled.source);
+      const { appSchema } = await import(pathToFileURL(path).href);
+      expect(
+        await detectDrift({
+          execute: driver.execute,
+          snapshot: appSchema.$snapshot(),
+        }),
+      ).toEqual([]);
+
+      await rebuilt(namespace, appSchema, async (second) => {
+        for (const [row, expected] of [
+          ["(1, 100, 2, 5)", "accepted"],
+          // 300 / 2 is 150, above the 100 of the small ratio check.
+          ["(2, 300, 2, 5)", "violates check constraint"],
+          ["(3, 7, 1, 5)", "violates check constraint"],
+        ] as const) {
+          const insert = `INSERT INTO stock (id, boxes, per_box, total) VALUES ${row}`;
+
+          expect([row, await outcome(run, insert)]).toEqual([row, expected]);
+          expect([row, await outcome(second, insert)]).toEqual([row, expected]);
+        }
+      });
+    }));
+
+  test("rules, foreign tables, storage and operator class parameters and a deferrable UNIQUE are reported", () =>
+    sandbox(async ({ driver, namespace, run }) => {
+      // Servers and their wrappers belong to the database, not to a schema.
+      const wrapper = `${namespace}_wrapper`;
+      const server = `${namespace}_server`;
+
+      try {
+        for (const statement of [
+          `CREATE TABLE docs (id integer PRIMARY KEY, title text, body tsvector, a integer, b integer,
+            CONSTRAINT docs_a_b_key UNIQUE (a, b) DEFERRABLE INITIALLY DEFERRED) WITH (fillfactor = 70, autovacuum_enabled = false)`,
+          `CREATE INDEX docs_body_idx ON docs USING gist (body tsvector_ops (siglen = 500))`,
+          `CREATE RULE docs_keep AS ON DELETE TO docs DO INSTEAD NOTHING`,
+          `CREATE FOREIGN DATA WRAPPER "${wrapper}"`,
+          `CREATE SERVER "${server}" FOREIGN DATA WRAPPER "${wrapper}"`,
+          `CREATE FOREIGN TABLE remote_docs (id integer, title text) SERVER "${server}"`,
+        ]) {
+          await run(statement);
+        }
+
+        const pulled = await pullSchema({
+          execute: driver.execute,
+          module: runtime,
+        });
+
+        expect(
+          pulled.warnings.map((warning) => [warning.code, warning.message]),
+        ).toEqual([
+          [
+            "foreign-table",
+            `foreign table "remote_docs" of server "${server}" is not declared; queries cannot reach it through the schema and migrations neither create nor drop it`,
+          ],
+          [
+            "rule",
+            'rule "docs_keep" on "docs" is not declared; the schema does not manage rules, so migrations neither create nor drop it and a database built from this schema lacks it (CREATE RULE docs_keep AS ON DELETE TO docs DO INSTEAD NOTHING;)',
+          ],
+          [
+            "storage-parameters",
+            '"docs" has storage parameters the schema cannot declare (fillfactor=70, autovacuum_enabled=false); a database built from this schema creates the table with the defaults',
+          ],
+          [
+            "unique-constraint",
+            'multi-column unique constraint "docs_a_b_key" (a, b) is DEFERRABLE INITIALLY DEFERRED, which the schema cannot declare. It is declared as a unique index of the same name, and an index refuses a duplicate at once, where this constraint waits for the end of the transaction: a database built from this schema fails writes that hold a duplicate only for a moment, such as two rows swapping their values. The constraint itself stays undeclared',
+          ],
+          [
+            "index",
+            `index "docs_body_idx" is declared without its operator class parameters, which the schema cannot declare: body (siglen=500); a database built from this schema creates the index with the operator class's defaults (CREATE INDEX docs_body_idx ON ${namespace}.docs USING gist (body tsvector_ops (siglen='500')))`,
+          ],
+        ]);
+        // Replacing the constraint by an index would make the check immediate.
+        expect(pulled.warnings.filter((warning) => warning.fix)).toEqual([]);
+
+        for (const line of [
+          `// pull: table "remote_docs" skipped: a foreign table of server "${server}"; the schema declares ordinary tables`,
+          '// pull: rule "docs_keep" is not declared',
+          "// pull: storage parameters are not declared: fillfactor=70, autovacuum_enabled=false",
+          'body: index(docs.body).using("gist"), // pull: operator class parameters are not declared: body (siglen=500)',
+          "docs_a_b_key: index(docs.a, docs.b).unique, // pull: the constraint is DEFERRABLE INITIALLY DEFERRED; the index checks at once; name kept exactly",
+        ]) {
+          expect(pulled.source).toContain(line);
+        }
+      } finally {
+        await run(`DROP FOREIGN DATA WRAPPER IF EXISTS "${wrapper}" CASCADE`);
+      }
     }));
 });

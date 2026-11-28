@@ -15,7 +15,10 @@ export const postgresArrayLiteral = (values: readonly unknown[]): string =>
             ? `\\x${Buffer.from(value).toString("hex")}`
             : typeof value === "object"
               ? JSON.stringify(value)
-              : String(value);
+              : // `String(-0)` is "0"; a float element keeps the sign of zero.
+                Object.is(value, -0)
+                ? "-0"
+                : String(value);
 
       return `"${text.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
     })

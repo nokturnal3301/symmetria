@@ -1,6 +1,6 @@
 import { dataError } from "./deferred";
 import { keyAlias } from "../compile/state";
-import { canonicalType } from "./type-names";
+import { canonicalType, isBuiltInType } from "./type-names";
 
 export type Codec<Value, Input = Value> = {
   readonly encode: (value: Input) => unknown;
@@ -424,6 +424,20 @@ export const bytesCodec: RuntimeCodec = {
   },
 };
 
+/** Non-default PostgreSQL array bounds precede the braces, e.g. `[0:2]={a,b,c}`. */
+export const ARRAY_DIMENSIONS = /^(?:\[-?\d+:-?\d+\])+=\{/;
+
+/**
+ * An array inside an array, as the drivers and JSON hand over a further
+ * dimension: a JavaScript array, or one of Bun's typed number arrays. A
+ * `bytea` element is a `Uint8Array`, which is a value.
+ */
+const isArrayEntry = (entry: unknown): boolean =>
+  Array.isArray(entry) ||
+  (ArrayBuffer.isView(entry) &&
+    !(entry instanceof Uint8Array) &&
+    !(entry instanceof DataView));
+
 /**
  * Arrays travel as JavaScript arrays; the adapters bind them as PostgreSQL
  * array parameters. Their elements are typed non-null (`int.array` is
@@ -437,6 +451,12 @@ export const arrayCodec = (
 ): RuntimeCodec => {
   const type = element?.base ?? canonicalType(elementType);
   const nullable = type === "jsonb" || type === "json";
+  // An element of PostgreSQL's own types never arrives as an array, so one
+  // that does is a further dimension, which the element codec would read as
+  // a wrong value (`Number([1, 2])` is NaN). JSON elements may be arrays, and
+  // so may those of a type known by its name alone (a domain over an array
+  // or over jsonb, inside a nested result).
+  const scalar = !nullable && !type.endsWith("[]") && isBuiltInType(type);
   // PostgreSQL separates the elements of a box array with ";": its own
   // elements hold commas.
   const delimiter = type === "box" ? ";" : ",";
@@ -486,6 +506,10 @@ export const arrayCodec = (
             .join(delimiter)}}`;
     },
     decode: (value) => {
+      if (typeof value === "string" && ARRAY_DIMENSIONS.test(value)) {
+        value = value.slice(value.indexOf("=") + 1);
+      }
+
       const values =
         typeof value === "string" && value.startsWith("[")
           ? (JSON.parse(value) as unknown[])
@@ -510,6 +534,12 @@ export const arrayCodec = (
       return values.map((entry) => {
         if (entry == null && !nullable) {
           throw nullElement("read");
+        }
+
+        if (scalar && isArrayEntry(entry)) {
+          throw new Error(
+            "symmetria: multidimensional arrays are not supported",
+          );
         }
 
         return decodeValue(entry, element);
@@ -689,8 +719,28 @@ const timestampParameter =
     return timestampText(value);
   };
 
-/** The codec of a built-in type, by any of its names (`int8`, `DECIMAL(12,2)`). */
-export const codecFor = (declared: string): RuntimeCodec | undefined => {
+/** The `encode` of every codec `codecFor()` has given. */
+const builtInEncoders = new WeakSet<RuntimeCodec["encode"]>();
+
+/**
+ * Whether a codec writes values as the builder of a PostgreSQL type does: a
+ * codec of `codecFor()`, also behind a `customType()` that only names its
+ * `base`. A `customType()` with an `encode` of its own decides what its
+ * values are, an array among them.
+ */
+export const writesAsBuiltIn = (codec: RuntimeCodec): boolean =>
+  !!codec.passthrough || builtInEncoders.has(codec.encode);
+
+/** Counts an `encode` as a builder's own: the one of a type the library declares with `customType()`. */
+export const builderEncode = <Encode extends RuntimeCodec["encode"]>(
+  encode: Encode,
+): Encode => {
+  builtInEncoders.add(encode);
+
+  return encode;
+};
+
+const builtInCodec = (declared: string): RuntimeCodec | undefined => {
   const sqlType = canonicalType(declared);
 
   if (sqlType.endsWith("[]")) {
@@ -777,6 +827,17 @@ export const codecFor = (declared: string): RuntimeCodec | undefined => {
   }
 
   return undefined;
+};
+
+/** The codec of a built-in type, by any of its names (`int8`, `DECIMAL(12,2)`). */
+export const codecFor = (declared: string): RuntimeCodec | undefined => {
+  const codec = builtInCodec(declared);
+
+  if (codec) {
+    builtInEncoders.add(codec.encode);
+  }
+
+  return codec;
 };
 
 /**

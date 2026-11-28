@@ -6,6 +6,7 @@ import {
   text,
   bool,
   numeric,
+  customType,
   databaseError,
   sqlState,
   CheckViolation,
@@ -34,7 +35,19 @@ const posts = table({
   author: users.index,
   price: numeric(10, 2).default("0"),
 }).checks((post) => ({ positive: post.price.atLeast("0") }));
-const model = schema({ users, posts });
+// A range read and written as [from, to]: one value that is an array.
+const span = customType<[number, number]>("int4range", {
+  encode: ([from, to]) => `[${from},${to})`,
+  decode: (value) =>
+    String(value).slice(1, -1).split(",").map(Number) as [number, number],
+});
+const bookings = table({
+  id: int.auto,
+  period: span.unique,
+  tags: text.array.unique,
+  label: text,
+});
+const model = schema({ users, posts, bookings });
 
 const databaseUrl = process.env.SYMMETRIA_TEST_DATABASE_URL;
 
@@ -191,6 +204,46 @@ describe.skipIf(!databaseUrl)("query and write shortcuts on PostgreSQL", () => {
       .page({ size: 2 });
 
     expect(page.items.map((user) => user.id)).toEqual([1, 2]);
+  });
+
+  test("get(), find() and by.<key>() take a key whose value is an array", async () => {
+    await database.bookings.insert([
+      { period: [1, 5], tags: ["a", "b"], label: "first" },
+      { period: [5, 9], tags: ["c"], label: "second" },
+    ]);
+    const second = {
+      id: 2,
+      period: [5, 9] as [number, number],
+      tags: ["c"],
+      label: "second",
+    };
+
+    // The key takes what a filter on its column takes.
+    expect(
+      await database.bookings((booking) => booking, {
+        where: (booking) => booking.period.is([5, 9]),
+      }),
+    ).toEqual([second]);
+    expect(await database.bookings.find({ period: [5, 9] })).toEqual(second);
+    expect(await database.bookings.get({ period: [5, 9] })).toEqual(second);
+    expect(await database.bookings.by.period([5, 9]).one()).toEqual(second);
+    expect(await database.bookings.by.tags(["c"]).one()).toEqual(second);
+    expect(await database.bookings.find({ period: [9, 12] })).toBeNull();
+    expect(
+      await database.bookings.by.period([1, 5]).update({ label: "moved" }),
+    ).toEqual({ affectedRows: 1 });
+    expect((await database.bookings.get({ tags: ["a", "b"] })).label).toBe(
+      "moved",
+    );
+    // A list for a scalar key is still refused before anything is sent.
+    await expect(database.bookings.find([1, 2] as never)).rejects.toThrow(
+      'symmetria: primary key "id" takes one value, received an array',
+    );
+    await expect(
+      database.users.find({ email: ["ada@x.test"] } as never),
+    ).rejects.toThrow(
+      'symmetria: unique key "email" takes one value, received an array',
+    );
   });
 
   test("write options, upsert and returning forms", async () => {

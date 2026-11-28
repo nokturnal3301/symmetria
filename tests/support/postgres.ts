@@ -42,6 +42,19 @@ export const postgres =
       ? pgPrepared
       : bun;
 
+/** Exercise legacy string parsing where supported; PostgreSQL 19 requires standard strings. */
+export const testStringMode = async (driver: ReturnType<typeof postgres>) => {
+  const result = await driver.execute({
+    sql: "SHOW server_version_num",
+    parameters: [],
+  });
+  return Number(
+    (Array.isArray(result) ? result : result.rows)[0]!.server_version_num,
+  ) < 190000
+    ? "off"
+    : "on";
+};
+
 /** The test URL whose connections start with `search_path` set to `namespace`. */
 export const searchPathURL = (namespace: string, ...rest: string[]): string => {
   const url = new URL(

@@ -6,9 +6,11 @@ import {
   IDENTITY_ALWAYS,
   IDENTITY_BY_DEFAULT,
   INDEX_METHODS,
+  jsonText,
   objectName,
   postgresArrayLiteral,
   quoteIdentifier,
+  timestampText,
 } from "symmetria/internal";
 import type { SchemaSnapshot, IndexSnapshot, CheckSnapshot } from "symmetria";
 
@@ -133,7 +135,7 @@ export const quoteLiteral = (value: unknown): string => {
   }
 
   if (value instanceof Date) {
-    return `${quoteLiteral(value.toISOString())}::timestamptz`;
+    return `${quoteLiteral(timestampText(value))}::timestamptz`;
   }
 
   // An escape string: with standard_conforming_strings off, `'\x41'` would
@@ -169,7 +171,21 @@ const defaultValueSQL = (
     }
 
     if (["json", "jsonb"].includes(sqlType)) {
-      return `${quoteLiteral(canonicalJSON(JSON.parse(JSON.stringify(value))))}::${sqlType}`;
+      return `${quoteLiteral(canonicalJSON(JSON.parse(jsonText(value))))}::${sqlType}`;
+    }
+
+    if (
+      (sqlType === "real" || sqlType === "double precision") &&
+      typeof value === "number" &&
+      (Object.is(value, -0) || !Number.isFinite(value))
+    ) {
+      return `${quoteLiteral(Object.is(value, -0) ? "-0" : String(value))}::${sqlType}`;
+    }
+
+    if (value instanceof Date && /^timestamp(?:\(\d\))?$/.test(sqlType)) {
+      // A timestamp stores the UTC wall clock. Casting through timestamptz
+      // first would convert it to the session's local time on each insert.
+      return `${quoteLiteral(timestampText(value))}::timestamp`;
     }
 
     if (sqlType.endsWith("[]") && Array.isArray(value)) {

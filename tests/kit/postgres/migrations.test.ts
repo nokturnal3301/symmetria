@@ -18,6 +18,11 @@ import {
   bigint,
   bool,
   jsonb,
+  doublePrecision,
+  real,
+  interval,
+  time,
+  timestamp,
   timestamptz,
   date,
   oneOf,
@@ -25,7 +30,7 @@ import {
   sql,
   bytea,
 } from "../../../packages/runtime/src";
-import { postgres } from "../../support/postgres";
+import { postgres, testStringMode } from "../../support/postgres";
 import {
   createSchemaSQL,
   detectDrift,
@@ -126,6 +131,189 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     } finally {
       await Promise.all([driver.close(), secondDriver.close()]);
     }
+  });
+
+  test("generated migrations preserve PostgreSQL default values across upgrades", async () => {
+    const version = (changed: boolean) =>
+      schema({
+        events: {
+          id: int.auto,
+          wait: interval.default(changed ? "24 hours" : "1 day"),
+          doc: jsonb().default(
+            changed
+              ? sql`'{"n":9007199254740993}'::jsonb`
+              : sql`'{"n":9007199254740992}'::jsonb`,
+          ),
+          at: timestamptz.default(
+            changed
+              ? sql`'2026-01-01 12:00:00.123999+00'::timestamptz`
+              : sql`'2026-01-01 12:00:00.123001+00'::timestamptz`,
+          ),
+          wall: timestamp.default(
+            changed
+              ? sql`'2026-01-01 10:00:00+00'::timestamp`
+              : sql`'2026-01-01 12:00:00+02'::timestamp`,
+          ),
+          labels: text.array.default(changed ? sql`'{ a }'::text[]` : ["a"]),
+        },
+      }).$snapshot();
+    for (const [name, changed] of [
+      ["initial", false],
+      ["changed", true],
+    ] as const) {
+      const migration = await generateMigration({
+        directory,
+        name,
+        snapshot: version(changed),
+      });
+      expect(migration).not.toBeNull();
+      await runner().migrate();
+    }
+    const result = await execute(`INSERT INTO events DEFAULT VALUES RETURNING
+      extract(day FROM wait) = 0 AND extract(hour FROM wait) = 24 AS elapsed,
+      doc->>'n' AS n, at = TIMESTAMPTZ '2026-01-01 12:00:00.123999+00' AS micros,
+      wall = TIMESTAMP '2026-01-01 10:00' AS wall, labels[1] AS label`);
+    expect(result).toEqual([
+      {
+        elapsed: true,
+        n: "9007199254740993",
+        micros: true,
+        wall: true,
+        label: "\u00a0a\u00a0",
+      },
+    ]);
+  });
+
+  test("floating defaults preserve signed zero, NaN and both infinities", async () => {
+    const columns = (kind: typeof real | typeof doublePrecision) => ({
+      zero: kind.default(-0),
+      nan: kind.default(NaN),
+      pos: kind.default(Infinity),
+      neg: kind.default(-Infinity),
+    });
+    const model = schema({
+      single: { id: int.auto, ...columns(real) },
+      dbl: { id: int.auto, ...columns(doublePrecision) },
+    });
+    for (const query of createSchemaSQL(model.$snapshot()))
+      await driver.execute(query);
+    for (const [name, bits] of [
+      ["single", 4],
+      ["dbl", 8],
+    ] as const) {
+      expect(
+        await execute(
+          `INSERT INTO ${name} DEFAULT VALUES RETURNING encode(float${bits}send(zero),'hex') AS zero,nan::text,pos::text,neg::text`,
+        ),
+      ).toEqual([
+        {
+          zero: "80" + "00".repeat(bits - 1),
+          nan: "NaN",
+          pos: "Infinity",
+          neg: "-Infinity",
+        },
+      ]);
+    }
+  });
+
+  test("a default changed into a value that only reads alike gets its migration", async () => {
+    const version = (changed: boolean) =>
+      schema({
+        jobs: {
+          id: int.auto,
+          // PostgreSQL reads a number before a clock time as days: one day,
+          // then one second.
+          wait: interval.default(changed ? "0:00:01" : "1 0:00:00"),
+          // White space after a quoted element is no element: two tags, then
+          // three.
+          tags: text.array.default(
+            changed ? ["a", "", "b"] : sql`'{"a" ,"b"}'::text[]`,
+          ),
+          // The zero of a float has a sign, in an array too.
+          ratios: real.array.default(changed ? [-0, 1.5] : [0, 1.5]),
+          wide: doublePrecision.array.default(changed ? [-0] : [0]),
+        },
+      }).$snapshot();
+    const fresh = () =>
+      execute(`INSERT INTO jobs DEFAULT VALUES RETURNING wait::text AS wait,
+        to_jsonb(tags)::text AS tags, encode(float4send(ratios[1]), 'hex') AS ratio,
+        encode(float8send(wide[1]), 'hex') AS wide`);
+
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: version(false),
+    });
+    await runner().migrate();
+    expect(await fresh()).toEqual([
+      {
+        wait: "1 day",
+        tags: '["a", "b"]',
+        ratio: "00000000",
+        wide: "0000000000000000",
+      },
+    ]);
+
+    const migration = await generateMigration({
+      directory,
+      name: "changed",
+      snapshot: version(true),
+    });
+
+    expect(migration?.up.match(/SET DEFAULT/g)).toHaveLength(4);
+    await runner().migrate();
+    expect(await fresh()).toEqual([
+      {
+        wait: "00:00:01",
+        tags: '["a", "", "b"]',
+        ratio: "80000000",
+        wide: "8000000000000000",
+      },
+    ]);
+    expect(
+      await detectDrift({
+        execute: driver.execute,
+        snapshot: version(true),
+        metadataSchema: namespace,
+      }),
+    ).toEqual([]);
+    expect(
+      await generateMigration({
+        directory,
+        name: "again",
+        snapshot: version(true),
+      }),
+    ).toBeNull();
+  });
+
+  test("Date defaults match explicit timestamps outside UTC, including BC dates", async () => {
+    const modern = new Date("2024-02-01T00:00:00.123Z");
+    const ancient = new Date("0000-01-01T00:00:00.000Z");
+    const model = schema({
+      events: {
+        id: int.auto,
+        wall: timestamp(3).default(modern),
+        instant: timestamptz.default(ancient),
+      },
+    });
+    await driver.transaction!(async (tx) => {
+      await tx.execute({
+        sql: "SET LOCAL TIME ZONE 'America/New_York'",
+        parameters: [],
+      });
+      for (const query of createSchemaSQL(model.$snapshot())) {
+        await tx.execute(query);
+      }
+      const result = await tx.execute({
+        sql: `INSERT INTO events DEFAULT VALUES RETURNING
+          wall = TIMESTAMP '2024-02-01 00:00:00.123' AS wall,
+          instant = TIMESTAMPTZ '0001-01-01 00:00:00+00 BC' AS instant`,
+        parameters: [],
+      });
+      expect(Array.isArray(result) ? result : result.rows).toEqual([
+        { wall: true, instant: true },
+      ]);
+    });
   });
 
   test("generated DDL supports defaults, enums, composite keys, cyclic and self foreign keys", async () => {
@@ -567,6 +755,67 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     expect(await execute("SELECT status FROM records")).toEqual([
       { status: "draft" },
     ]);
+  });
+
+  test("a text column turned into an enum in the migration that adds a label converts rows that hold it", async () => {
+    const state = (...labels: [string, ...string[]]) =>
+      oneOf(...labels).typeName("State");
+    const shared = state("draft", "published", "hidden");
+    const before = schema({
+      posts: { id: int.auto, state: state("draft", "published") },
+      comments: { id: int.auto, state: text },
+    });
+    const after = schema({
+      posts: { id: int.auto, state: shared },
+      comments: { id: int.auto, state: shared },
+    });
+
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: before.$snapshot(),
+    });
+    await runner().migrate();
+    await execute(`INSERT INTO posts (state) VALUES ('draft')`);
+    await execute(`INSERT INTO comments (state) VALUES ('draft'), ('hidden')`);
+    await generateMigration({
+      directory,
+      name: "share_state",
+      snapshot: after.$snapshot(),
+    });
+    // PostgreSQL refuses to cast the row that holds 'hidden' in the
+    // transaction that added the label (55P04), so the type is rebuilt.
+    await runner().migrate();
+    expect(
+      await execute(
+        `SELECT state::text AS state, pg_typeof(state)::text AS type FROM comments ORDER BY id`,
+      ),
+    ).toEqual([
+      { state: "draft", type: '"State"' },
+      { state: "hidden", type: '"State"' },
+    ]);
+    expect(
+      (await catalog()).enumerations.map((label) => label.enumlabel),
+    ).toEqual(["draft", "published", "hidden"]);
+    expect(
+      await detectDrift({
+        execute: driver.execute,
+        snapshot: after.$snapshot(),
+        metadataSchema: namespace,
+      }),
+    ).toEqual([]);
+    await runner().rollback();
+    expect(
+      await execute(
+        `SELECT state, pg_typeof(state)::text AS type FROM comments ORDER BY id`,
+      ),
+    ).toEqual([
+      { state: "draft", type: "text" },
+      { state: "hidden", type: "text" },
+    ]);
+    expect(
+      (await catalog()).enumerations.map((label) => label.enumlabel),
+    ).toEqual(["draft", "published"]);
   });
 
   test("CHECK constraints and explicit keys survive renames, type changes and rollback", async () => {
@@ -1452,7 +1701,7 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     ).toEqual([]);
   });
 
-  test("DDL literals and negative numbers read the same with standard_conforming_strings off", async () => {
+  test("DDL literals and negative numbers survive legacy string parsing where supported", async () => {
     const offset = -5;
     const declared = schema({
       blobs: table({
@@ -1469,9 +1718,10 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       })),
     }).$snapshot();
     const legacy = new URL(address);
+    const mode = await testStringMode(driver);
     legacy.searchParams.set(
       "options",
-      `${address.searchParams.get("options")} -c standard_conforming_strings=off`,
+      `${address.searchParams.get("options")} -c standard_conforming_strings=${mode}`,
     );
     const off = postgres({ url: legacy.toString(), max: 1 });
 
@@ -1482,7 +1732,7 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
       });
 
       expect(Array.isArray(setting) ? setting : setting.rows).toEqual([
-        { value: "off" },
+        { value: mode },
       ]);
 
       for (const statement of createSchemaSQL(declared)) {
@@ -1578,6 +1828,110 @@ describe.skipIf(!databaseUrl)("PostgreSQL migrations", () => {
     } finally {
       await Promise.all([newYork.close(), reader.close()]);
     }
+  });
+
+  test("a string that holds an array of timestamptz converts at UTC whatever the migrating session's zone", async () => {
+    const zoned = new URL(address);
+    zoned.searchParams.set(
+      "options",
+      `-c search_path=${namespace} -c TimeZone=Asia/Tokyo`,
+    );
+    const tokyo = postgres({ url: zoned.toString(), max: 2 });
+    const utc = new URL(address);
+    utc.searchParams.set(
+      "options",
+      `-c search_path=${namespace} -c TimeZone=UTC`,
+    );
+    const reader = postgres({ url: utc.toString(), max: 1 });
+    const read = async () => {
+      const result = await reader.execute({
+        sql: "SELECT slots::text AS slots, seen::text AS seen FROM events",
+        parameters: [],
+      });
+
+      return (Array.isArray(result) ? result : result.rows)[0];
+    };
+    const version = (after: boolean) =>
+      schema({
+        events: {
+          id: int.auto,
+          slots: after ? timestamptz.array : text,
+          seen: after ? varchar : timestamptz.array,
+        },
+      }).$snapshot();
+    const migrations = () =>
+      migrator({ driver: tokyo, directory, metadataSchema: namespace });
+
+    try {
+      await generateMigration({
+        directory,
+        name: "initial",
+        snapshot: version(false),
+      });
+      await migrations().migrate();
+      await execute(
+        `INSERT INTO events (slots, seen) VALUES ('{"2024-03-10 23:30:00"}', '{"2024-03-10 23:30:00+00"}')`,
+      );
+      await generateMigration({
+        directory,
+        name: "retype",
+        snapshot: version(true),
+      });
+      await migrations().migrate();
+      // A plain cast in Tokyo read 23:30 as 14:30 UTC and wrote 08:30+09.
+      expect(await read()).toEqual({
+        slots: '{"2024-03-10 23:30:00+00"}',
+        seen: '{"2024-03-10 23:30:00+00"}',
+      });
+      await migrations().rollback({ steps: 1 });
+      expect(await read()).toEqual({
+        slots: '{"2024-03-10 23:30:00+00"}',
+        seen: '{"2024-03-10 23:30:00+00"}',
+      });
+    } finally {
+      await Promise.all([tokyo.close(), reader.close()]);
+    }
+  });
+
+  test("interval to time is refused without allowDestructive: the cast keeps the time of day only", async () => {
+    const version = (after: boolean) =>
+      schema({
+        jobs: { id: int.auto, wait: after ? time : interval },
+      }).$snapshot();
+
+    await generateMigration({
+      directory,
+      name: "initial",
+      snapshot: version(false),
+    });
+    await runner().migrate();
+    await execute(
+      `INSERT INTO jobs (wait) VALUES ('1 day 02:00:00'), ('30:00:00')`,
+    );
+    await expect(
+      generateMigration({
+        directory,
+        name: "retype",
+        snapshot: version(true),
+      }),
+    ).rejects.toThrow(
+      /destructive migration requires[^]*jobs\.wait: Column "wait" narrows from interval to time: months and days are dropped/,
+    );
+
+    const migration = await generateMigration({
+      directory,
+      name: "retype",
+      snapshot: version(true),
+      allowDestructive: true,
+    });
+
+    expect(migration?.up).toStartWith(
+      '-- symmetria: destructive: Column "wait" narrows from interval to time',
+    );
+    await runner().migrate();
+    expect(
+      await execute(`SELECT wait::text AS wait FROM jobs ORDER BY id`),
+    ).toEqual([{ wait: "02:00:00" }, { wait: "06:00:00" }]);
   });
 
   test("a failed migration rolls back its newly created metadata schema", async () => {

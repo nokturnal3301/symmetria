@@ -2,8 +2,8 @@
  * Catalog queries that only introspection needs on top of readCatalog: column
  * declaration order, generated columns, partitioning, structured index details,
  * the domains columns use, and what the schema cannot declare (views,
- * triggers, inheritance, row-level security, routines, sequences, tables of
- * other schemas).
+ * triggers, rules, foreign tables, inheritance, row-level security, routines,
+ * sequences, tables of other schemas).
  */
 import { normalizeResult } from "symmetria/internal";
 import {
@@ -27,6 +27,8 @@ export type TableDetailRow = {
   partition: boolean;
   /** relpersistence: 'p' logged, 'u' UNLOGGED. */
   persistence?: string;
+  /** Storage parameters as `name=value` strings, those of the TOAST table as `toast.name=value`. */
+  reloptions?: string[] | null;
 };
 
 export type IndexDetailRow = {
@@ -45,6 +47,8 @@ export type IndexDetailRow = {
   opclass_names: string[];
   /** Collation per key when it differs from the key's own (a `COLLATE` in the definition), else null. */
   collations: (string | null)[];
+  /** Operator class parameters per key (`siglen=64`), null for a key without them; absent in catalogs built by hand. */
+  opclass_options?: (string | null)[];
   /** Storage parameters as `name=value` strings, or null. */
   reloptions: string[] | null;
   predicate: string | null;
@@ -85,7 +89,10 @@ export const readTableDetails = (options: CatalogOptions) =>
   query<TableDetailRow>(
     options,
     `SELECT relation.relname AS name, relation.relkind::text AS kind, relation.relispartition AS partition,
-      relation.relpersistence::text AS persistence
+      relation.relpersistence::text AS persistence,
+      COALESCE(relation.reloptions::text[], '{}') || ARRAY(SELECT 'toast.' || parameter
+        FROM pg_class toast, unnest(toast.reloptions::text[]) parameter
+        WHERE toast.oid = relation.reltoastrelid) AS reloptions
     FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
     WHERE ${filter} AND relation.relkind IN ('r', 'p')
     ORDER BY relation.relname COLLATE "C"`,
@@ -118,6 +125,9 @@ export const readIndexDetails = (options: CatalogOptions) =>
         FROM generate_series(1, index.indnkeyatts) position
         LEFT JOIN pg_collation collation_entry ON collation_entry.oid = index.indcollation[position - 1]
         ORDER BY position) AS collations,
+      ARRAY(SELECT (SELECT array_to_string(keycolumn.attoptions, ', ') FROM pg_attribute keycolumn
+          WHERE keycolumn.attrelid = index.indexrelid AND keycolumn.attnum = position)
+        FROM generate_series(1, index.indnkeyatts) position ORDER BY position) AS opclass_options,
       indexrelation.reloptions::text[] AS reloptions,
       pg_get_expr(index.indpred, index.indrelid, true) AS predicate,
       pg_get_indexdef(index.indexrelid) AS definition
@@ -132,23 +142,27 @@ export const readIndexDetails = (options: CatalogOptions) =>
 
 /**
  * Objects `pull` cannot declare but must report: views, materialized views,
- * triggers, inheritance children, row-level security and routines.
+ * triggers, rules, foreign tables, inheritance children, row-level security
+ * and routines.
  */
 export type UndeclaredObjectRow = {
   kind:
     | "view"
     | "materialized view"
     | "trigger"
+    | "rule"
+    | "foreign table"
     | "inheritance"
     | "row security"
     | "function";
   name: string;
-  /** The table a trigger, inheritance link or policy set belongs to. */
+  /** The table a trigger, rule, inheritance link or policy set belongs to. */
   table_name: string | null;
   /**
-   * The view or trigger definition; the parent of an inheritance child; the
-   * policy names of a table, one per line, prefixed with `enabled` or
-   * `disabled` for its row-security switch; `function` or `procedure`.
+   * The view, trigger or rule definition; the server of a foreign table; the
+   * parent of an inheritance child; the policy names of a table, one per
+   * line, prefixed with `enabled` or `disabled` for its row-security switch;
+   * `function` or `procedure`.
    */
   definition: string;
 };
@@ -173,6 +187,19 @@ export const readUndeclaredObjects = (options: CatalogOptions) =>
       FROM pg_trigger trigger JOIN pg_class relation ON relation.oid = trigger.tgrelid
       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
       WHERE ${filter} AND NOT trigger.tgisinternal
+      UNION ALL
+      -- A view is stored as a rule named _RETURN, which is the view itself.
+      SELECT 'rule', rule.rulename, relation.relname, pg_get_ruledef(rule.oid, true)
+      FROM pg_rewrite rule JOIN pg_class relation ON relation.oid = rule.ev_class
+      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE ${filter} AND rule.rulename <> '_RETURN'
+      UNION ALL
+      SELECT 'foreign table', relation.relname, NULL::name, server.srvname::text
+      FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      JOIN pg_foreign_table foreign_table ON foreign_table.ftrelid = relation.oid
+      JOIN pg_foreign_server server ON server.oid = foreign_table.ftserver
+      WHERE ${filter} AND relation.relkind = 'f'
+        AND ${notExtensionMember("pg_class", "relation.oid")}
       UNION ALL
       SELECT 'inheritance', relation.relname, relation.relname, parent.relname::text
       FROM pg_inherits inheritance JOIN pg_class relation ON relation.oid = inheritance.inhrelid

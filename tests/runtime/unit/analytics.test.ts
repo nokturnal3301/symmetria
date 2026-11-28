@@ -1,9 +1,21 @@
 import { expect, expectTypeOf, test } from "bun:test";
 import {
   schema,
+  table,
+  one,
+  many,
   int,
   text,
   bigint,
+  numeric,
+  real,
+  doublePrecision,
+  jsonb,
+  customType,
+  sum,
+  average,
+  coalesce,
+  sql,
   rowNumber,
   lag,
   prepare,
@@ -144,4 +156,156 @@ test("a CTE used only in an upsert's doUpdate condition is collected", () => {
     'WHERE "entries"."id" IN (SELECT "leaders"."id" AS "id"',
   );
   expect(compiled.parameters).toEqual(["100", 1, "A", "5", "6"]);
+});
+
+test("sum() and average() of a float are read from its text; other numbers keep the numeric cast", async () => {
+  // A domain over double precision, known by its base alone.
+  const ratio = customType<number>("ratio", { base: "double precision" });
+  const stations = table({ id: int.auto, readings: many });
+  const readings = table({
+    id: int.auto,
+    station: one(stations.readings),
+    level: doublePrecision,
+    spare: doublePrecision.nullable,
+    signal: real,
+    share: ratio,
+    shares: ratio.array,
+    count: int,
+    bytes: bigint,
+    price: numeric(10, 2),
+    meta: jsonb<{ level: number }>(),
+  });
+  const rows = [
+    { id: 1, __symmetria_cursor_0: "1" },
+    { id: 2, __symmetria_cursor_0: "2" },
+    { id: 3, __symmetria_cursor_0: "3" },
+  ];
+  const floats = schema({ stations, readings }, { executor: async () => rows });
+  type Reading = Parameters<Parameters<typeof floats.readings>[0]>[0];
+  const selected = (expression: (reading: Reading) => unknown) =>
+    floats
+      .readings((reading) => ({ value: expression(reading) as never }))
+      .toSQL()
+      .sql.split("\n")[0];
+
+  // `SUM(float)::numeric` keeps 15 digits of a double precision and 6 of a real.
+  for (const [expression, rendered] of [
+    [
+      (reading: Reading) => sum(reading.level),
+      '(SUM("readings"."level"))::text::numeric',
+    ],
+    [
+      (reading: Reading) => average(reading.level),
+      '(AVG("readings"."level"))::text::numeric',
+    ],
+    [
+      (reading: Reading) => sum(reading.signal),
+      '(SUM("readings"."signal"))::text::numeric',
+    ],
+    [
+      (reading: Reading) => average(reading.signal),
+      '(AVG("readings"."signal"))::text::numeric',
+    ],
+    [
+      (reading: Reading) => sum(reading.level.multiply(2)),
+      '(SUM(("readings"."level" * $1::text::double precision)))::text::numeric',
+    ],
+    [
+      (reading: Reading) => average(reading.count.multiply(reading.signal)),
+      '(AVG(((("readings"."count")::double precision) * (("readings"."signal")::double precision))))::text::numeric',
+    ],
+    [
+      (reading: Reading) => sum(coalesce(reading.spare, 0)),
+      '(SUM(COALESCE("readings"."spare", $1)))::text::numeric',
+    ],
+    [
+      (reading: Reading) => sum(sql.of(doublePrecision)`abs(${reading.level})`),
+      '(SUM(abs("readings"."level")))::text::numeric',
+    ],
+    // OVER stays inside the casts.
+    [
+      (reading: Reading) =>
+        sum(reading.level).over({
+          partitionBy: [reading.stationId],
+          orderBy: reading.id.ascending,
+        }),
+      '(SUM("readings"."level") OVER (PARTITION BY "readings"."station_id" ORDER BY "readings"."id" ASC))::text::numeric',
+    ],
+    // A float by its base: the column's codec tells it, and behind
+    // coalesce() or a path the SQL states it.
+    [
+      (reading: Reading) => sum(reading.share),
+      '(SUM("readings"."share"))::text::numeric',
+    ],
+    [
+      (reading: Reading) => sum(coalesce(reading.share, 0)),
+      '(SUM((COALESCE("readings"."share", $1))::double precision))::text::numeric',
+    ],
+    // Integers, bigints, decimals and JSON numbers are exact as numeric.
+    [
+      (reading: Reading) => sum(reading.count),
+      'SUM("readings"."count")::numeric',
+    ],
+    [
+      (reading: Reading) => average(reading.count),
+      'AVG("readings"."count")::numeric',
+    ],
+    [
+      (reading: Reading) => sum(reading.bytes),
+      'SUM("readings"."bytes")::numeric',
+    ],
+    [
+      (reading: Reading) => sum(reading.price),
+      'SUM("readings"."price")::numeric',
+    ],
+    [
+      (reading: Reading) => sum(reading.count.multiply(2)),
+      'SUM(("readings"."count" * $1))::numeric',
+    ],
+    [
+      (reading: Reading) => sum(reading.meta.path("level")),
+      `SUM((((("readings"."meta" #> ARRAY[$1::text]) #>> '{}')))::numeric)::numeric`,
+    ],
+    [
+      (reading: Reading) =>
+        sum(reading.count).over({ orderBy: reading.id.ascending }),
+      'SUM("readings"."count") OVER (ORDER BY "readings"."id" ASC)::numeric',
+    ],
+  ] as const) {
+    expect(selected(expression)).toBe(`SELECT ${rendered} AS "value"`);
+  }
+
+  // Relation aggregates, in their shared subquery and inside a nested object.
+  const totals = floats
+    .stations((station) => ({
+      count: station.readings.count(),
+      level: station.readings.sum.level,
+      nested: { signal: station.readings.average.signal },
+      bytes: station.readings.sum.bytes,
+    }))
+    .toSQL().sql;
+
+  expect(totals).toContain(
+    'LEFT JOIN LATERAL (SELECT COUNT(*) AS "count", (SUM("__symmetria_aggregate_0"."level"))::text::numeric AS "sum", (AVG("__symmetria_aggregate_0"."signal"))::text::numeric AS "average", SUM("__symmetria_aggregate_0"."bytes")::numeric AS "sum_3"',
+  );
+  expect(totals).toContain(
+    `json_build_object('signal', ("__symmetria_shared_0"."average")::text) AS "nested"`,
+  );
+
+  // The cursor 3.6.0 issued for a page that selects float sums: its
+  // fingerprint is the SQL of the query's shape, which keeps the plain cast.
+  const page = await floats
+    .readings(
+      (reading) => ({
+        id: reading.id,
+        total: sum(reading.level).over({ orderBy: reading.id.ascending }),
+        mean: average(reading.signal).over({ orderBy: reading.id.ascending }),
+      }),
+      { orderBy: (reading) => reading.id.ascending },
+    )
+    .page({ size: 2 });
+
+  expect(String(page.nextCursor)).toBe(
+    "eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6Ijg4MTU4YzU5ODZjNWQ4YjRiZWRlNzU0NjBjYTNiY2M1OGFhMGIxYzcwZGU5OWIxMDVhNzE2ZTEwOWE4NmNkMWEiLCJ2YWx1ZXMiOlsiMiJdfQ",
+  );
 });

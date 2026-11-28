@@ -2,7 +2,7 @@
  * Dispatches a parsed command line to the command implementation in ./schema, ./database,
  * ./files, ./graph, ./init, ./pull or ./profile.
  */
-import { loadProject, type CliContext } from "../context";
+import { loadProject, missingDirectoryNote, type CliContext } from "../context";
 import type { Command } from "../options";
 import { dashboard } from "../screens/dashboard";
 import {
@@ -21,23 +21,79 @@ import { profile } from "./profile";
 import { pull } from "./pull";
 import { diff, generate, inspect, lint } from "./schema";
 
+/**
+ * Commands that read the migration files. A migrations directory that does
+ * not exist is refused for them when it is a wrong path (see
+ * missingDirectoryNote). `generate` creates the directory, and `diff`,
+ * `inspect` and `graph` describe the declared schema without it.
+ */
+const READS_MIGRATIONS: readonly Command[] = [
+  "migrate",
+  "status",
+  "rollback",
+  "adopt",
+  "repair",
+  "verify",
+  "drift",
+  "lint",
+  "squash",
+  "discard",
+  "recover",
+];
+
+/**
+ * Of those, the commands whose answer for an empty chain reads as success
+ * ("Database is up to date.", "Verified 0 migrations"). In a project that has
+ * no migrations directory yet they say that instead; `lint` and `drift` still
+ * review the declared schema, and the others fail on their own.
+ */
+const REPORTS_NOTHING: readonly Command[] = [
+  "migrate",
+  "status",
+  "rollback",
+  "verify",
+  "squash",
+  "recover",
+];
+
 /** Runs one command; every command except `profile`, `init` and `pull` works on the loaded project. */
 export const runCommand = async (
   command: Command,
   name: string | undefined,
-  context: CliContext,
+  base: CliContext,
 ): Promise<void> => {
   switch (command) {
     case "profile":
-      return profile(context);
+      return profile(base);
     case "init":
-      return init(context, name);
+      return init(base, name);
     case "pull":
-      return pull(context, name);
+      return pull(base, name);
     default:
   }
 
-  const project = await loadProject(context);
+  const project = await loadProject(base);
+  const note = READS_MIGRATIONS.includes(command)
+    ? missingDirectoryNote(project, base.values)
+    : undefined;
+  // The command still runs, so a database that holds applied migrations of
+  // another chain is reported as before; only its "nothing to do" changes.
+  const context: CliContext =
+    note && REPORTS_NOTHING.includes(command)
+      ? {
+          ...base,
+          emit: ({ json, indent, replacer }) =>
+            base.emit({
+              json: {
+                ...(json as Record<string, unknown>),
+                missingDirectory: project.directory,
+              },
+              ...(indent === undefined ? {} : { indent }),
+              ...(replacer ? { replacer } : {}),
+              plain: () => note,
+            }),
+        }
+      : base;
 
   switch (command) {
     case "recover":

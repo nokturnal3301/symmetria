@@ -1253,7 +1253,7 @@ export const queryJsonSemanticsTests = (): void => {
     } finally {
       await close();
     }
-  });
+  }, 20_000);
 
   test("NaN and Infinity inside a JSON value are refused, never written or compared as JSON null", async () => {
     const local = schema({

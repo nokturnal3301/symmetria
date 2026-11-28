@@ -5493,7 +5493,7 @@ const conflictedTwice = (error: unknown): boolean => {
   };
 
   return typeof routine === "string"
-    ? routine === "ExecOnConflictUpdate"
+    ? routine === "ExecOnConflictUpdate" || routine === "ExecOnConflictLockRow"
     : typeof message === "string" && message.includes("ON CONFLICT DO UPDATE");
 };
 
